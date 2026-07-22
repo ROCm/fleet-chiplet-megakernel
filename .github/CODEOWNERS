@@ -1,0 +1,9 @@
+# CODEOWNERS for fleet-chiplet-megakernel
+#
+# These owners are automatically requested for review when someone opens a
+# pull request that modifies matching files. The last matching pattern takes
+# precedence. See:
+# https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repository.
+* @sangeeta0201
