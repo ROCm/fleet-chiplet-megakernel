@@ -173,13 +173,13 @@ bool KNElementBinaryOp::fingerprint(void) {
 #ifdef MIRAGE_FINGERPRINT_USE_ROCM
 __global__ void
     compute_elementbinary_fingerprint(mirage::type::KNOperatorType type,
-                                     char *dmem_fp_ptr,
-                                     FPType *div_p_lookup_table,
-                                     FPType *div_q_lookup_table,
-                                     mirage::kernel::DTensor input1,
-                                     mirage::kernel::DTensor input2,
-                                     mirage::kernel::DTensor output,
-                                     int num_elements) {
+                                      char *dmem_fp_ptr,
+                                      FPType *div_p_lookup_table,
+                                      FPType *div_q_lookup_table,
+                                      mirage::kernel::DTensor input1,
+                                      mirage::kernel::DTensor input2,
+                                      mirage::kernel::DTensor output,
+                                      int num_elements) {
   mirage::type::FPType *input1_fp_ptr =
       reinterpret_cast<mirage::type::FPType *>(dmem_fp_ptr + input1.fp_offset);
   mirage::type::FPType *input2_fp_ptr =

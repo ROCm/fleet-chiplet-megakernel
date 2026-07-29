@@ -1,8 +1,6 @@
 #pragma once
 
 #include <dlfcn.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 
 #include <cassert>
 #include <cstdio>
@@ -400,16 +398,9 @@ private:
   // Save the generated code to a file, and compile it
   // Can be parallelized to speed up
   void save_and_compile(string const &code) const {
-    int fd = open(cu_file_path.c_str(),
-                  O_WRONLY | O_CREAT | O_TRUNC,
-                  S_IRUSR | S_IWUSR);
-    if (fd == -1) {
-      perror("open");
-      exit(1);
-    }
-    FILE *fp = fdopen(fd, "w");
+    FILE *fp = fopen(cu_file_path.c_str(), "w");
     if (fp == nullptr) {
-      perror("fdopen");
+      perror("fopen");
       exit(1);
     }
     fprintf(fp, "%s\n", code.c_str());

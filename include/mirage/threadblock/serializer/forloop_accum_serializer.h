@@ -15,7 +15,8 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 #include "mirage/layout.h"
 #include "mirage/type.h"
@@ -24,14 +25,14 @@
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_forloop_accum_parameters(int const *params,
-                                          int &param_idx,
-                                          int &accum_num_elements,
-                                          int &per_iter_reduction_degree,
-                                          int &inner_range,
-                                          int &input_smem_offset,
-                                          int &accum_smem_offset) {
+CUTLASS_HOST_DEVICE inline void
+    deserialize_forloop_accum_parameters(int const *params,
+                                         int &param_idx,
+                                         int &accum_num_elements,
+                                         int &per_iter_reduction_degree,
+                                         int &inner_range,
+                                         int &input_smem_offset,
+                                         int &accum_smem_offset) {
   accum_num_elements = params[param_idx++];
   per_iter_reduction_degree = params[param_idx++];
   inner_range = params[param_idx++];

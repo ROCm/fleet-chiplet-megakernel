@@ -15,7 +15,8 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 #include "mirage/layout.h"
 #include "mirage/type.h"
@@ -24,13 +25,13 @@
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_rms_norm_op_parameters(int const *params,
-                                        int &param_idx,
-                                        int &output_num_elements,
-                                        int &norm_size,
-                                        int &input_smem_offset,
-                                        int &output_smem_offset) {
+CUTLASS_HOST_DEVICE inline void
+    deserialize_rms_norm_op_parameters(int const *params,
+                                       int &param_idx,
+                                       int &output_num_elements,
+                                       int &norm_size,
+                                       int &input_smem_offset,
+                                       int &output_smem_offset) {
   output_num_elements = params[param_idx++];
   norm_size = params[param_idx++];
   input_smem_offset = params[param_idx++];

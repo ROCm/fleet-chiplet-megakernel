@@ -15,8 +15,8 @@
 
 #pragma once
 #include "tasks/common/common_header.cuh"
-#include <cutlass/arch/barrier.h>
 #include <cooperative_groups.h>
+#include <cutlass/arch/barrier.h>
 
 namespace kernel {
 

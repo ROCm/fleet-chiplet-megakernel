@@ -46,7 +46,6 @@ __device__ __forceinline__ void rms_norm_impl(void const *input_ptr,
   T const *__restrict__ d_weight = static_cast<T const *>(weight_ptr);
   T *__restrict__ d_output = static_cast<T *>(output_ptr);
 
-
   // using InputDmem =
   //     dmem_row_const<T, BATCH_SIZE, HIDDEN_DIM, HIDDEN_DIM>;
   // using OutputDmem =
@@ -141,7 +140,6 @@ __device__ __forceinline__ void rms_norm_impl(void const *input_ptr,
           *((uint32_t *)((void *)&shared_output_buffer[i * CHUNK_SIZE]));
     }
   }
-
 }
 
 } // namespace kernel

@@ -17,9 +17,13 @@
 // PERF TEST flags (uncomment to test):
 // #define MPK_DISABLE_THREADFENCE  // Disable threadfence_gpu()
 #define MPK_USE_RELAXED_ATOMICS
-#define MPK_USE_NT_MEMORY  // Use non-temporal loads/stores (bypass cache, fence for ordering)
+#define MPK_USE_NT_MEMORY // Use non-temporal loads/stores (bypass cache, fence
+                          // for ordering)
 // #define MPK_ENABLE_TIMING  // Enable timing instrumentation
-// #define MPK_DISABLE_LINEAR  // Disable LINEAR kernel entirely
+// #define MPK_ENABLE_DEVICE_TASK_ACCUM  // Enable per-task-type wall-clock
+// accumulation #define MPK_ENABLE_SPAN_TIMING  // Enable per-stage wall-clock
+// span (first_start→last_end) #define MPK_DISABLE_LINEAR  // Disable LINEAR
+// kernel entirely
 
 // LINEAR kernel section flags (uncomment one at a time to find bottleneck):
 // #define MPK_SKIP_LOAD_INPUT   // Skip loading input from global memory
@@ -66,32 +70,50 @@
 // Non-temporal load (bypasses cache, reads from memory)
 __device__ __forceinline__ unsigned long long int
     ld_nt_u64(unsigned long long int *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   unsigned long long int val;
-  asm volatile(
-      "global_load_dwordx2 %0, %1, off nt\n"
-      "s_waitcnt vmcnt(0)"
-      : "=v"(val) : "v"(addr) : "memory"
-  );
+  asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
   return val;
 #else
   // NVIDIA: use volatile for non-cached access
-  return *reinterpret_cast<volatile unsigned long long int*>(addr);
+  return *reinterpret_cast<unsigned long long int volatile *>(addr);
+#endif
+}
+
+// Non-temporal 32-bit load (bypasses cache, reads from memory)
+__device__ __forceinline__ int ld_nt_s32(int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int val;
+  asm volatile("global_load_dword %0, %1, off nt\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<int volatile *>(addr);
 #endif
 }
 
 // Non-temporal store (bypasses cache, writes to memory)
-__device__ __forceinline__ void
-    st_nt_u64(unsigned long long int *addr, unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  asm volatile(
-      "global_store_dwordx2 %0, %1, off nt\n"
-      "s_waitcnt vmcnt(0)"
-      : : "v"(addr), "v"(val) : "memory"
-  );
+__device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
+                                          unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dwordx2 %0, %1, off nt\n"
+               "s_waitcnt vmcnt(0)"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
 #else
   // NVIDIA: use volatile for non-cached access
-  *reinterpret_cast<volatile unsigned long long int*>(addr) = val;
+  *reinterpret_cast<unsigned long long int volatile *>(addr) = val;
 #endif
 }
 
@@ -104,55 +126,89 @@ __device__ __forceinline__ void
 // Use s_waitcnt vmcnt(0) to ensure stores complete before signaling.
 
 // Write-through 64-bit store (4x bf16 or 2x float)
-__device__ __forceinline__ void
-    st_wt_u64(void *addr, unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  asm volatile(
-      "global_store_dwordx2 %0, %1, off sc0 sc1"
-      : : "v"(addr), "v"(val) : "memory"
-  );
+__device__ __forceinline__ void st_wt_u64(void *addr,
+                                          unsigned long long int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dwordx2 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
 #else
-  *reinterpret_cast<volatile unsigned long long int*>(addr) = val;
+  *reinterpret_cast<unsigned long long int volatile *>(addr) = val;
+#endif
+}
+
+// Write-through 128-bit zero store (4x dword = 16 bytes, sc0 sc1).
+// Uses global_store_dwordx4 for 4x fewer store instructions vs st_wt_u32.
+__device__ __forceinline__ void st_wt_zero128(void *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 zero = {0u, 0u, 0u, 0u};
+  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(zero)
+               : "memory");
+#else
+  reinterpret_cast<unsigned int volatile *>(addr)[0] = 0;
+  reinterpret_cast<unsigned int volatile *>(addr)[1] = 0;
+  reinterpret_cast<unsigned int volatile *>(addr)[2] = 0;
+  reinterpret_cast<unsigned int volatile *>(addr)[3] = 0;
 #endif
 }
 
 // Write-through 32-bit store (1x float or 2x bf16)
-__device__ __forceinline__ void
-    st_wt_u32(void *addr, unsigned int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  asm volatile(
-      "global_store_dword %0, %1, off sc0 sc1"
-      : : "v"(addr), "v"(val) : "memory"
-  );
+__device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_dword %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
 #else
-  *reinterpret_cast<volatile unsigned int*>(addr) = val;
+  *reinterpret_cast<unsigned int volatile *>(addr) = val;
 #endif
 }
 
 // Write-through 16-bit store (1x bf16)
-__device__ __forceinline__ void
-    st_wt_u16(void *addr, unsigned short val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
-  asm volatile(
-      "global_store_short %0, %1, off sc0 sc1"
-      : : "v"(addr), "v"(val) : "memory"
-  );
+__device__ __forceinline__ void st_wt_u16(void *addr, unsigned short val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_short %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(val)
+               : "memory");
 #else
-  *reinterpret_cast<volatile unsigned short*>(addr) = val;
+  *reinterpret_cast<unsigned short volatile *>(addr) = val;
+#endif
+}
+
+// Write-through 8-bit store (1x byte)
+__device__ __forceinline__ void st_wt_u8(void *addr, uint8_t val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  asm volatile("global_store_byte %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"((unsigned)val)
+               : "memory");
+#else
+  *reinterpret_cast<uint8_t volatile *>(addr) = val;
 #endif
 }
 
 __device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
   int old_val;
-  asm volatile(
-      "flat_atomic_add %0, %1, %2 sc0 sc1\n"
-      "s_waitcnt vmcnt(0) lgkmcnt(0)"
-      : "=v"(old_val) : "v"(addr), "v"(val) : "memory"
-  );
+  asm volatile("flat_atomic_add %0, %1, %2 sc0 sc1\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(val)
+               : "memory");
   return old_val;
 #else
   int old_val;
@@ -167,16 +223,17 @@ __device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
 __device__ __forceinline__ unsigned long long int
     atom_add_release_gpu_u64(unsigned long long int *addr,
                              unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
   unsigned long long int old_val;
-  asm volatile(
-      "flat_atomic_add_x2 %0, %1, %2 sc0 sc1\n"
-      "s_waitcnt vmcnt(0) lgkmcnt(0)"
-      : "=v"(old_val) : "v"(addr), "v"(val) : "memory"
-  );
+  asm volatile("flat_atomic_add_x2 %0, %1, %2 sc0 sc1\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(val)
+               : "memory");
   return old_val;
 #else
   unsigned long long int old_val;
@@ -192,21 +249,22 @@ __device__ __forceinline__ unsigned long long int
     atom_cas_release_gpu_u64(unsigned long long int *addr,
                              unsigned long long int cmp,
                              unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   // Inline asm: no compiler-generated buffer_wbl2/buffer_inv around atomic.
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
   // flat_atomic_cmpswap_x2 layout: {swap[63:0], compare[63:0]} in 4 VGPRs.
   typedef unsigned long long v2u64 __attribute__((ext_vector_type(2)));
   v2u64 cmp_swap;
-  cmp_swap[0] = val;  // swap value (low 64 bits) — new value to write
-  cmp_swap[1] = cmp;  // compare value (high 64 bits) — expected old value
+  cmp_swap[0] = val; // swap value (low 64 bits) — new value to write
+  cmp_swap[1] = cmp; // compare value (high 64 bits) — expected old value
   unsigned long long int old_val;
-  asm volatile(
-      "flat_atomic_cmpswap_x2 %0, %1, %2 sc0 sc1\n"
-      "s_waitcnt vmcnt(0) lgkmcnt(0)"
-      : "=v"(old_val) : "v"(addr), "v"(cmp_swap) : "memory"
-  );
+  asm volatile("flat_atomic_cmpswap_x2 %0, %1, %2 sc0 sc1\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(cmp_swap)
+               : "memory");
   return old_val;
 #else
   unsigned long long int old_val;
@@ -220,7 +278,8 @@ __device__ __forceinline__ unsigned long long int
 
 __device__ __forceinline__ unsigned long long int
     ld_acquire_gpu_u64(unsigned long long int *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
 #ifdef MPK_USE_NT_MEMORY
   // Non-temporal load bypasses cache, reads from memory
   return ld_nt_u64(addr);
@@ -239,7 +298,8 @@ __device__ __forceinline__ unsigned long long int
 
 __device__ __forceinline__ unsigned long long int
     ld_acquire_sys_u64(unsigned long long int *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
 #ifdef MPK_USE_RELAXED_ATOMICS
   return __atomic_load_n(addr, __ATOMIC_RELAXED);
 #else
@@ -258,7 +318,8 @@ __device__ __forceinline__ unsigned long long int
 
 __device__ __forceinline__ unsigned long long int
     ld_relaxed_gpu_u64(unsigned long long int *addr) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
 #ifdef MPK_USE_NT_MEMORY
   // Non-temporal load bypasses cache, reads from memory
   return ld_nt_u64(addr);
@@ -275,7 +336,8 @@ __device__ __forceinline__ unsigned long long int
 
 __device__ __forceinline__ void st_relaxed_gpu_u64(unsigned long long int *addr,
                                                    unsigned long long int val) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
 #ifdef MPK_USE_NT_MEMORY
   // Non-temporal store bypasses cache, writes to memory
   st_nt_u64(addr, val);
@@ -288,13 +350,14 @@ __device__ __forceinline__ void st_relaxed_gpu_u64(unsigned long long int *addr,
 #endif
 }
 
-// Memory fence for GPU scope - ensures all previous memory operations are visible
-// Define MPK_DISABLE_THREADFENCE to disable for performance testing
+// Memory fence for GPU scope - ensures all previous memory operations are
+// visible Define MPK_DISABLE_THREADFENCE to disable for performance testing
 __device__ __forceinline__ void threadfence_gpu() {
 #ifdef MPK_DISABLE_THREADFENCE
   // Disabled for performance testing - results may be incorrect
   (void)0;
-#elif defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#elif defined(__HIP_DEVICE_COMPILE__) &&                                       \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   // MI300X: L2 NOT coherent across XCDs — buffer_wbl2 required.
   // Agent scope (sc1) sufficient — no need for system scope (sc0 sc1).
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
@@ -312,14 +375,14 @@ __device__ __forceinline__ void threadfence_gpu() {
 
 // Regular volatile store through L2 — visible to same-XCD CUs immediately
 __device__ __forceinline__ void st_local_u64(unsigned long long int *addr,
-                                              unsigned long long int val) {
-  *((volatile unsigned long long int *)addr) = val;
+                                             unsigned long long int val) {
+  *((unsigned long long int volatile *)addr) = val;
 }
 
 // Regular volatile load from L2 — sees same-XCD stores immediately
 __device__ __forceinline__ unsigned long long int
     ld_local_u64(unsigned long long int const *addr) {
-  return *((volatile unsigned long long int const *)addr);
+  return *((unsigned long long int const volatile *)addr);
 }
 
 // Compiler fence — ensures store ordering without buffer_wbl2.

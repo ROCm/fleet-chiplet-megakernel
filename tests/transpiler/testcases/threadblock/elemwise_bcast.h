@@ -96,7 +96,7 @@ ADD_TESTCASE(Testcase("tb_elemwise_bcast_correctness", {"threadblock", "correctn
 			assert(num_dims == 2);
 			vector<half> input0 = Gen::ARange()(subcase.shape0);
 			vector<half> input1 = Gen::ARange()(subcase.shape1);
-			vector<half> output(static_cast<size_t>(output_shape[0]) * output_shape[1]);
+			vector<half> output(output_shape[0] * output_shape[1]);
 			for (int i = 0; i < output_shape[0]; i++) {
 				for (int j = 0; j < output_shape[1]; j++) {
 					int input0_i = subcase.shape0[0] == 1 ? 0 : i;

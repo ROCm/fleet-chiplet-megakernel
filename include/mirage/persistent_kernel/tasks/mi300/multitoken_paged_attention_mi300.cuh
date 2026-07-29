@@ -12,10 +12,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "multitoken_paged_attention_mfma_mi300.cuh"
-#include "multitoken_paged_attention_mfma_opt_mi300.cuh"
 #include "multitoken_paged_attention_ck_mi300.cuh"
 #include "multitoken_paged_attention_ck_pagedkv_mi300.cuh"
+#include "multitoken_paged_attention_mfma_mi300.cuh"
+#include "multitoken_paged_attention_mfma_opt_mi300.cuh"
 
 namespace kernel {
 template <typename T,
@@ -48,15 +48,15 @@ __device__ __forceinline__ void multitoken_paged_attention_task_impl(
     float k_eps) {
   // AMD MI300: CK PagedKV for decode, hand-written for prefill
   multitoken_paged_attention_ck_pagedkv_task_impl<T,
-                                      NUM_QO_HEADS,
-                                      NUM_KV_HEADS,
-                                      KV_CACHE_STRIDE,
-                                      QKV_STRIDE,
-                                      O_STRIDE,
-                                      HEAD_DIM,
-                                      MAX_SEQ_LEN,
-                                      PAGE_SIZE,
-                                      MAX_TOKENS>(
+                                                  NUM_QO_HEADS,
+                                                  NUM_KV_HEADS,
+                                                  KV_CACHE_STRIDE,
+                                                  QKV_STRIDE,
+                                                  O_STRIDE,
+                                                  HEAD_DIM,
+                                                  MAX_SEQ_LEN,
+                                                  PAGE_SIZE,
+                                                  MAX_TOKENS>(
       qkv_ptr,
       paged_k_cache_ptr,
       paged_v_cache_ptr,

@@ -20,12 +20,13 @@ namespace kernel {
 __device__ __forceinline__ float bf16_to_float(uint16_t v) {
   // BF16 is upper 16 bits of float32
   uint32_t tmp = static_cast<uint32_t>(v) << 16;
-  return *reinterpret_cast<float*>(&tmp);
+  return *reinterpret_cast<float *>(&tmp);
 }
 
 __device__ static __forceinline__ void
     mma_m16n16k16_bf16bf16bf32(float *C, uint32_t *A, uint32_t *B, float *D) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   // AMD scalar implementation of CUDA m16n8k16 MMA
   // This function computes two m16n8k16 matrix multiplies:
   //   D[0:4] += A * B[0:2] (first n8 block)
@@ -34,15 +35,16 @@ __device__ static __forceinline__ void
   // CUDA MMA layout (m16n8k16 with bf16):
   // - A: Each thread t has 4 registers, containing elements for row (t%16)
   //      A[i] contains k = (t/16)*8 + i*2 + {0,1}
-  // - B: Each thread t has 2 registers per n8 block, containing elements for col (t%8)
+  // - B: Each thread t has 2 registers per n8 block, containing elements for
+  // col (t%8)
   //      B[i] contains k = (t/8 % 2)*8 + i*2 + {0,1}
   // - D: Each thread t has 4 registers per n8 block
   //      D[i] = output at row (t/4)*2 + (i/2), col (t%4)*2 + (i%2) + (t/16)*8
 
   int lane = threadIdx.x & 31;
 
-  // Initialize D with C
-  #pragma unroll
+// Initialize D with C
+#pragma unroll
   for (int i = 0; i < 8; i++) {
     D[i] = C[i];
   }
@@ -50,7 +52,8 @@ __device__ static __forceinline__ void
   // Decode this thread's output positions
   // For D[0-3] (first m16n8 block):
   //   row = (lane / 4) * 2 + {0,0,1,1} for D[0,1,2,3]
-  //   col = (lane % 4) * 2 + {0,1,0,1} for D[0,1,2,3], adjusted by (lane/16)*8 -> not quite right
+  //   col = (lane % 4) * 2 + {0,1,0,1} for D[0,1,2,3], adjusted by (lane/16)*8
+  //   -> not quite right
   //
   // Actually, CUDA's m16n8k16 output layout is:
   //   Thread t gets D[0-3] at:
@@ -60,14 +63,14 @@ __device__ static __forceinline__ void
   //     D[3]: row = (t%4)*2+9, col = t/4
   //   Where t/4 wraps at 8 (so cols 0-7)
 
-  int out_col = lane / 4;  // 0-7 for first m16n8
+  int out_col = lane / 4; // 0-7 for first m16n8
   int row0 = (lane % 4) * 2;
   int row1 = row0 + 1;
   int row2 = row0 + 8;
   int row3 = row1 + 8;
 
-  // For each output element, compute the dot product by gathering A and B values
-  // A[row, k] from appropriate thread, B[k, col] from appropriate thread
+  // For each output element, compute the dot product by gathering A and B
+  // values A[row, k] from appropriate thread, B[k, col] from appropriate thread
 
   // Helper: get A element at (row, k)
   // Thread that has A[row, k]: lane = (k/8)*16 + (row%16)
@@ -75,18 +78,20 @@ __device__ static __forceinline__ void
   // Element in register: k%2
 
   // Helper: get B element at (k, col)
-  // Thread that has B[k, col]: lane = (k/8)*8 + col (for B[0:2]) or lane = (k/8)*8 + col (for B[2:4])
-  // Wait, B only has cols 0-7 in first 2 registers
+  // Thread that has B[k, col]: lane = (k/8)*8 + col (for B[0:2]) or lane =
+  // (k/8)*8 + col (for B[2:4]) Wait, B only has cols 0-7 in first 2 registers
 
-  // Actually simpler: since ldmatrix loaded data, A and B already contain the right values
-  // for this thread. We just need to do the reduction across threads.
+  // Actually simpler: since ldmatrix loaded data, A and B already contain the
+  // right values for this thread. We just need to do the reduction across
+  // threads.
 
-  // CUDA MMA computes: for each output (row, col), sum over k: A[row,k] * B[k,col]
-  // The challenge is that different threads hold different (row, k) pairs for A
-  // and different (k, col) pairs for B.
+  // CUDA MMA computes: for each output (row, col), sum over k: A[row,k] *
+  // B[k,col] The challenge is that different threads hold different (row, k)
+  // pairs for A and different (k, col) pairs for B.
 
-  // Approach: Use shared memory to collect all A and B values, then compute scalar matmul
-  // But shared memory is limited and would require synchronization.
+  // Approach: Use shared memory to collect all A and B values, then compute
+  // scalar matmul But shared memory is limited and would require
+  // synchronization.
 
   // Alternative: Pure shuffle-based approach
   // For output D[0] at (row0, out_col), we need sum_k A[row0,k] * B[k,out_col]
@@ -95,12 +100,12 @@ __device__ static __forceinline__ void
   float sums[4] = {0, 0, 0, 0};
   int rows[4] = {row0, row1, row2, row3};
 
-  #pragma unroll
+#pragma unroll
   for (int d_idx = 0; d_idx < 4; d_idx++) {
     int row = rows[d_idx];
     float sum = 0.0f;
 
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < 16; k++) {
       // Get A[row, k]
       int a_lane = (k / 8) * 16 + (row % 16);
@@ -121,15 +126,15 @@ __device__ static __forceinline__ void
     D[d_idx] += sum;
   }
 
-  // Second m16n8 block: D[4-7] (cols 8-15)
-  // B[2:4] contains data for cols 8-15, but thread layout is same (col = lane/4)
-  // So B[2+reg] for the second block
-  #pragma unroll
+// Second m16n8 block: D[4-7] (cols 8-15)
+// B[2:4] contains data for cols 8-15, but thread layout is same (col = lane/4)
+// So B[2+reg] for the second block
+#pragma unroll
   for (int d_idx = 0; d_idx < 4; d_idx++) {
     int row = rows[d_idx];
     float sum = 0.0f;
 
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < 16; k++) {
       // Get A[row, k] - same as before
       int a_lane = (k / 8) * 16 + (row % 16);
@@ -140,7 +145,7 @@ __device__ static __forceinline__ void
 
       // Get B[k, out_col+8] from second m16n8 block (B[2:4])
       int b_lane = (k / 8) * 8 + out_col;
-      int b_reg = 2 + (k % 8) / 2;  // Offset by 2 for second block
+      int b_reg = 2 + (k % 8) / 2; // Offset by 2 for second block
       int b_elem = k % 2;
       uint32_t b_packed = __shfl(B[b_reg], b_lane, 32);
       uint16_t b_bf16 = (b_elem == 0) ? (b_packed & 0xFFFF) : (b_packed >> 16);

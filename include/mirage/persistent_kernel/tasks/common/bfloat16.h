@@ -97,7 +97,8 @@ public:
 // Overload operators
 __host__ __device__ inline bool operator==(bfloat16_t const &lhs,
                                            bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return __heq(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16());
 #else
   return float(lhs) == float(rhs);
@@ -106,7 +107,8 @@ __host__ __device__ inline bool operator==(bfloat16_t const &lhs,
 
 __host__ __device__ inline bool operator!=(bfloat16_t const &lhs,
                                            bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return __hne(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16());
 #else
   return float(lhs) != float(rhs);
@@ -115,7 +117,8 @@ __host__ __device__ inline bool operator!=(bfloat16_t const &lhs,
 
 __host__ __device__ inline bool operator<(bfloat16_t const &lhs,
                                           bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return __hlt(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16());
 #else
   return float(lhs) < float(rhs);
@@ -124,7 +127,8 @@ __host__ __device__ inline bool operator<(bfloat16_t const &lhs,
 
 __host__ __device__ inline bool operator<=(bfloat16_t const &lhs,
                                            bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return __hle(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16());
 #else
   return float(lhs) <= float(rhs);
@@ -133,7 +137,8 @@ __host__ __device__ inline bool operator<=(bfloat16_t const &lhs,
 
 __host__ __device__ inline bool operator>(bfloat16_t const &lhs,
                                           bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return __hgt(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16());
 #else
   return float(lhs) > float(rhs);
@@ -142,7 +147,8 @@ __host__ __device__ inline bool operator>(bfloat16_t const &lhs,
 
 __host__ __device__ inline bool operator>=(bfloat16_t const &lhs,
                                            bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return __hge(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16());
 #else
   return float(lhs) >= float(rhs);
@@ -151,7 +157,8 @@ __host__ __device__ inline bool operator>=(bfloat16_t const &lhs,
 
 __host__ __device__ inline bfloat16_t operator+(bfloat16_t const &lhs,
                                                 bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return bfloat16_t(__hadd(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   return bfloat16_t(float(lhs) + float(rhs));
@@ -159,7 +166,8 @@ __host__ __device__ inline bfloat16_t operator+(bfloat16_t const &lhs,
 }
 
 __host__ __device__ inline bfloat16_t operator-(bfloat16_t const &lhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return bfloat16_t(__hneg(lhs.to_nv_bfloat16()));
 #else
   return bfloat16_t(-float(lhs));
@@ -168,7 +176,8 @@ __host__ __device__ inline bfloat16_t operator-(bfloat16_t const &lhs) {
 
 __host__ __device__ inline bfloat16_t operator-(bfloat16_t const &lhs,
                                                 bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return bfloat16_t(__hsub(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   return bfloat16_t(float(lhs) - float(rhs));
@@ -177,7 +186,8 @@ __host__ __device__ inline bfloat16_t operator-(bfloat16_t const &lhs,
 
 __host__ __device__ inline bfloat16_t operator*(bfloat16_t const &lhs,
                                                 bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return bfloat16_t(__hmul(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   return bfloat16_t(float(lhs) * float(rhs));
@@ -186,7 +196,8 @@ __host__ __device__ inline bfloat16_t operator*(bfloat16_t const &lhs,
 
 __host__ __device__ inline bfloat16_t operator/(bfloat16_t const &lhs,
                                                 bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   return bfloat16_t(__hdiv(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   return bfloat16_t(float(lhs) / float(rhs));
@@ -195,7 +206,8 @@ __host__ __device__ inline bfloat16_t operator/(bfloat16_t const &lhs,
 
 __host__ __device__ inline bfloat16_t &operator+=(bfloat16_t &lhs,
                                                   bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(__hadd(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   lhs = bfloat16_t(float(lhs) + float(rhs));
@@ -205,7 +217,8 @@ __host__ __device__ inline bfloat16_t &operator+=(bfloat16_t &lhs,
 
 __host__ __device__ inline bfloat16_t &operator-=(bfloat16_t &lhs,
                                                   bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(__hsub(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   lhs = bfloat16_t(float(lhs) - float(rhs));
@@ -215,7 +228,8 @@ __host__ __device__ inline bfloat16_t &operator-=(bfloat16_t &lhs,
 
 __host__ __device__ inline bfloat16_t &operator*=(bfloat16_t &lhs,
                                                   bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(__hmul(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   lhs = bfloat16_t(float(lhs) * float(rhs));
@@ -225,7 +239,8 @@ __host__ __device__ inline bfloat16_t &operator*=(bfloat16_t &lhs,
 
 __host__ __device__ inline bfloat16_t &operator/=(bfloat16_t &lhs,
                                                   bfloat16_t const &rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(__hdiv(lhs.to_nv_bfloat16(), rhs.to_nv_bfloat16()));
 #else
   lhs = bfloat16_t(float(lhs) / float(rhs));
@@ -234,7 +249,8 @@ __host__ __device__ inline bfloat16_t &operator/=(bfloat16_t &lhs,
 }
 
 __host__ __device__ inline bfloat16_t &operator++(bfloat16_t &lhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(
       __hadd(lhs.to_nv_bfloat16(), bfloat16_t(1.0f).to_nv_bfloat16()));
 #else
@@ -246,7 +262,8 @@ __host__ __device__ inline bfloat16_t &operator++(bfloat16_t &lhs) {
 }
 
 __host__ __device__ inline bfloat16_t &operator--(bfloat16_t &lhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(
       __hsub(lhs.to_nv_bfloat16(), bfloat16_t(1.0f).to_nv_bfloat16()));
 #else
@@ -259,7 +276,8 @@ __host__ __device__ inline bfloat16_t &operator--(bfloat16_t &lhs) {
 
 __host__ __device__ inline bfloat16_t operator++(bfloat16_t &lhs, int) {
   bfloat16_t ret(lhs);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(
       __hadd(lhs.to_nv_bfloat16(), bfloat16_t(1.0f).to_nv_bfloat16()));
 #else
@@ -272,7 +290,8 @@ __host__ __device__ inline bfloat16_t operator++(bfloat16_t &lhs, int) {
 
 __host__ __device__ inline bfloat16_t operator--(bfloat16_t &lhs, int) {
   bfloat16_t ret(lhs);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) &&                        \
+    !defined(__HIP_PLATFORM_AMD__) && !defined(MIRAGE_AMD_MI300)
   lhs = bfloat16_t(
       __hsub(lhs.to_nv_bfloat16(), bfloat16_t(1.0f).to_nv_bfloat16()));
 #else

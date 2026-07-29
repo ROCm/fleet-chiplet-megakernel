@@ -15,7 +15,8 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 #include "mirage/layout.h"
 #include "mirage/vector_types.h"
@@ -23,8 +24,7 @@
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_input_loader_parameters(
+CUTLASS_HOST_DEVICE inline void deserialize_input_loader_parameters(
     int const *params,
     int &param_idx,
     int3 &input_matrix_row_offset_block_stride,

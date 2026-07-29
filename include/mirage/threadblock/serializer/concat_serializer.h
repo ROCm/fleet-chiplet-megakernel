@@ -15,21 +15,22 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_concat_op_parameters(int const *params,
-                                      int &param_idx,
-                                      int &output_num_elements,
-                                      int &A_concat_dim_size,
-                                      int &B_concat_dim_size,
-                                      int &inner_size,
-                                      int &A_smem_offset,
-                                      int &B_smem_offset,
-                                      int &output_smem_offset) {
+CUTLASS_HOST_DEVICE inline void
+    deserialize_concat_op_parameters(int const *params,
+                                     int &param_idx,
+                                     int &output_num_elements,
+                                     int &A_concat_dim_size,
+                                     int &B_concat_dim_size,
+                                     int &inner_size,
+                                     int &A_smem_offset,
+                                     int &B_smem_offset,
+                                     int &output_smem_offset) {
   output_num_elements = params[param_idx++];
   A_concat_dim_size = params[param_idx++];
   B_concat_dim_size = params[param_idx++];
