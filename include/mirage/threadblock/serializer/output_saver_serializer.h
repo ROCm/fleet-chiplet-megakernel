@@ -15,7 +15,8 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 #include "mirage/layout.h"
 #include "mirage/type.h"
@@ -24,8 +25,7 @@
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_output_saver_parameters(
+CUTLASS_HOST_DEVICE inline void deserialize_output_saver_parameters(
     int const *params,
     int &param_idx,
     int3 &output_matrix_row_offset_block_stride,

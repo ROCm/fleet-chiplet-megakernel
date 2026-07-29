@@ -19,16 +19,20 @@ template <typename T>
 __device__ __forceinline__ void warp_reduce_max_idx(T &val, long long &idx) {
 #pragma unroll
   for (int offset = NUM_THREADS_PER_WARP / 2; offset > 0; offset /= 2) {
-    // AMD: use __shfl_down (no _sync mask); width=64 for AMD wavefront reduction
+    // AMD: use __shfl_down (no _sync mask); width=64 for AMD wavefront
+    // reduction
     float tmp = __shfl_down((float)val, offset, NUM_THREADS_PER_WARP);
     T other_val = (T)tmp;
     // AMD: 64-bit shuffle must split into two 32-bit parts
     // __shfl_down only handles 32-bit values on AMD GPUs
     unsigned int idx_lo = static_cast<unsigned int>(idx & 0xFFFFFFFF);
     unsigned int idx_hi = static_cast<unsigned int>((idx >> 32) & 0xFFFFFFFF);
-    unsigned int other_idx_lo = __shfl_down(idx_lo, offset, NUM_THREADS_PER_WARP);
-    unsigned int other_idx_hi = __shfl_down(idx_hi, offset, NUM_THREADS_PER_WARP);
-    long long other_idx = (static_cast<long long>(other_idx_hi) << 32) | other_idx_lo;
+    unsigned int other_idx_lo =
+        __shfl_down(idx_lo, offset, NUM_THREADS_PER_WARP);
+    unsigned int other_idx_hi =
+        __shfl_down(idx_hi, offset, NUM_THREADS_PER_WARP);
+    long long other_idx =
+        (static_cast<long long>(other_idx_hi) << 32) | other_idx_lo;
     if (other_val > val) {
       val = other_val;
       idx = other_idx;
@@ -61,7 +65,8 @@ __device__ __forceinline__ void block_reduce_max_idx(T &val, long long &idx) {
     T block_max_val = T(-inf);
     long long block_max_idx = -1;
 
-    int num_warps = (blockDim.x + NUM_THREADS_PER_WARP - 1) / NUM_THREADS_PER_WARP;
+    int num_warps =
+        (blockDim.x + NUM_THREADS_PER_WARP - 1) / NUM_THREADS_PER_WARP;
     if (my_lane_id < num_warps) {
       block_max_val = smem_vals[my_lane_id];
       block_max_idx = smem_idxs[my_lane_id];
@@ -121,7 +126,6 @@ __device__ __forceinline__ void
       static_cast<long long const *>(input_idx_ptr);
   long long *__restrict__ final_output =
       static_cast<long long *>(final_output_ptr);
-
 
   int tidx = threadIdx.x;
 // TODO: try vectorize

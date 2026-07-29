@@ -14,12 +14,12 @@
  */
 
 #pragma once
-#include "tasks/common/common_header.cuh"
-#include "linear_ck_mi300.cuh"
-#include "gemm_handtuned_mi300.cuh"
+#include "gang_ksplit_linear_mi300.cuh"
 #include "gang_linear_mi300.cuh"
 #include "gang_splitk_linear_mi300.cuh"
-#include "gang_ksplit_linear_mi300.cuh"
+#include "gemm_handtuned_mi300.cuh"
+#include "linear_ck_mi300.cuh"
+#include "tasks/common/common_header.cuh"
 
 #define DEBUG 0
 
@@ -53,14 +53,22 @@ __device__ __forceinline__ void linear_kernel(void const *input_ptr,
   unsigned long long _t0 = __builtin_amdgcn_s_memrealtime();
 #endif
   linear_kernel_ck<T, BATCH_SIZE, REDUCTION_SIZE, FORCE_SMALL_TILE>(
-      input_ptr, weight_ptr, residual_ptr, output_ptr, num_active_tokens, residual_add,
-      output_size, o_stride);
+      input_ptr,
+      weight_ptr,
+      residual_ptr,
+      output_ptr,
+      num_active_tokens,
+      residual_add,
+      output_size,
+      o_stride);
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     unsigned long long _dur = (__builtin_amdgcn_s_memrealtime() - _t0) * 10;
     printf("[NOGANG_LINEAR] osize=%d ostride=%d dur_us=%.1f\n",
-           output_size, o_stride, (double)_dur / 1000.0);
+           output_size,
+           o_stride,
+           (double)_dur / 1000.0);
   }
 #endif
 }
@@ -73,9 +81,9 @@ template <typename T,
           int O_STRIDE = OUTPUT_SIZE,
           int PIPE_MAX = 3>
 __device__ __forceinline__ void splitk_linear_kernel(void const *input_ptr,
-                                                      void const *weight_ptr,
-                                                      void *workspace_ptr,
-                                                      int num_active_tokens) {
+                                                     void const *weight_ptr,
+                                                     void *workspace_ptr,
+                                                     int num_active_tokens) {
   linear_kernel_ck_splitk<T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE, O_STRIDE>(
       input_ptr, weight_ptr, workspace_ptr, num_active_tokens);
 }
@@ -88,10 +96,15 @@ template <typename T,
           int WS_STRIDE,
           int O_STRIDE = OUTPUT_SIZE>
 __device__ __forceinline__ void splitk_reduce(void const *workspace_ptr,
-                                               void const *residual_ptr,
-                                               void *output_ptr,
-                                               int num_active_tokens) {
-  splitk_reduce_kernel<T, BATCH_SIZE, OUTPUT_SIZE, K_SPLITS, WS_STRIDE, O_STRIDE>(
+                                              void const *residual_ptr,
+                                              void *output_ptr,
+                                              int num_active_tokens) {
+  splitk_reduce_kernel<T,
+                       BATCH_SIZE,
+                       OUTPUT_SIZE,
+                       K_SPLITS,
+                       WS_STRIDE,
+                       O_STRIDE>(
       workspace_ptr, residual_ptr, output_ptr, num_active_tokens);
 }
 
@@ -101,29 +114,40 @@ template <typename T,
           int NPerBlock,
           int REDUCTION_SIZE,
           int K_SPLITS>
-__device__ __forceinline__ void splitk_linear_res_atomic(
-        void const *input_ptr,
-        void const *weight_ptr,
-        void const *residual_ptr,
-        void *workspace_ptr,
-        void *output_ptr,
-        int  *done_counter_ptr,
-        int   num_active_tokens,
-        int   ws_stride,
-        int   o_stride) {
+__device__ __forceinline__ void
+    splitk_linear_res_atomic(void const *input_ptr,
+                             void const *weight_ptr,
+                             void const *residual_ptr,
+                             void *workspace_ptr,
+                             void *output_ptr,
+                             int *done_counter_ptr,
+                             int num_active_tokens,
+                             int ws_stride,
+                             int o_stride) {
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _t0 = __builtin_amdgcn_s_memrealtime();
 #endif
-  splitk_linear_res_atomic_kernel<T, BATCH_SIZE, NPerBlock, REDUCTION_SIZE,
-      K_SPLITS>(
-      input_ptr, weight_ptr, residual_ptr, workspace_ptr,
-      output_ptr, done_counter_ptr, num_active_tokens, ws_stride, o_stride);
+  splitk_linear_res_atomic_kernel<T,
+                                  BATCH_SIZE,
+                                  NPerBlock,
+                                  REDUCTION_SIZE,
+                                  K_SPLITS>(input_ptr,
+                                            weight_ptr,
+                                            residual_ptr,
+                                            workspace_ptr,
+                                            output_ptr,
+                                            done_counter_ptr,
+                                            num_active_tokens,
+                                            ws_stride,
+                                            o_stride);
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   __syncthreads();
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     unsigned long long _dur = (__builtin_amdgcn_s_memrealtime() - _t0) * 10;
     printf("[SPLITK_RES] K=%d ostride=%d dur_us=%.1f\n",
-           REDUCTION_SIZE, o_stride, (double)_dur / 1000.0);
+           REDUCTION_SIZE,
+           o_stride,
+           (double)_dur / 1000.0);
   }
 #endif
 }

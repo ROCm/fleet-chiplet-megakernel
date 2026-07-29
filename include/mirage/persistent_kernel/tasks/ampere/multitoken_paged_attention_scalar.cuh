@@ -26,15 +26,15 @@ namespace kernel {
 
 // Helper function for inline RMS normalization on scalar arrays
 template <typename T, int HEAD_DIM>
-__device__ __forceinline__ void scalar_rms_norm_and_rope(
-    T* data,  // [HEAD_DIM] array to normalize in-place
-    T const* weight_ptr,
-    float eps,
-    bool apply_rope,
-    T const* cos_ptr,
-    T const* sin_ptr,
-    float* reduce_smem,
-    int warp_idx) {
+__device__ __forceinline__ void
+    scalar_rms_norm_and_rope(T *data, // [HEAD_DIM] array to normalize in-place
+                             T const *weight_ptr,
+                             float eps,
+                             bool apply_rope,
+                             T const *cos_ptr,
+                             T const *sin_ptr,
+                             float *reduce_smem,
+                             int warp_idx) {
 
   // Compute sum of squares
   float sum_sq = 0.0f;
@@ -67,7 +67,8 @@ __device__ __forceinline__ void scalar_rms_norm_and_rope(
 
   // Apply normalization and RoPE
   for (int i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
-    float val = static_cast<float>(data[i]) * rms_rcp * static_cast<float>(weight_ptr[i]);
+    float val = static_cast<float>(data[i]) * rms_rcp *
+                static_cast<float>(weight_ptr[i]);
     data[i] = static_cast<T>(val);
   }
   __syncthreads();
@@ -118,8 +119,9 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
     float k_eps) {
 
   constexpr int NUM_QO_PER_KV = NUM_QO_HEADS / NUM_KV_HEADS;
-  constexpr int KV_TILE_SIZE = 32;  // Reduced from 64 to save shared memory
-  constexpr int MAX_PAGES_PER_REQUEST = (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
+  constexpr int KV_TILE_SIZE = 32; // Reduced from 64 to save shared memory
+  constexpr int MAX_PAGES_PER_REQUEST =
+      (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
   constexpr float log2e = 1.4426950408889634f;
   constexpr int Q_ROWS = MAX_TOKENS * NUM_QO_PER_KV;
 
@@ -158,27 +160,29 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
   // Memory-efficient layout - single buffered K/V
   // Total ~48KB for Q_ROWS=32, HEAD_DIM=128, KV_TILE_SIZE=32
   constexpr size_t S_Q_OFFSET = 0;
-  constexpr size_t S_Q_SIZE = sizeof(T) * Q_ROWS * HEAD_DIM;  // 32*128*2 = 8KB
+  constexpr size_t S_Q_SIZE = sizeof(T) * Q_ROWS * HEAD_DIM; // 32*128*2 = 8KB
 
   constexpr size_t S_K_OFFSET = S_Q_OFFSET + S_Q_SIZE;
-  constexpr size_t S_K_SIZE = sizeof(T) * KV_TILE_SIZE * HEAD_DIM;  // 32*128*2 = 8KB
+  constexpr size_t S_K_SIZE =
+      sizeof(T) * KV_TILE_SIZE * HEAD_DIM; // 32*128*2 = 8KB
 
   constexpr size_t S_V_OFFSET = S_K_OFFSET + S_K_SIZE;
-  constexpr size_t S_V_SIZE = sizeof(T) * KV_TILE_SIZE * HEAD_DIM;  // 8KB
+  constexpr size_t S_V_SIZE = sizeof(T) * KV_TILE_SIZE * HEAD_DIM; // 8KB
 
   // Reduction buffer for RMS norm
   constexpr size_t S_REDUCE_OFFSET = S_V_OFFSET + S_V_SIZE;
-  constexpr size_t S_REDUCE_SIZE = sizeof(float) * NUM_WARPS;  // 32 bytes
+  constexpr size_t S_REDUCE_SIZE = sizeof(float) * NUM_WARPS; // 32 bytes
 
   // Online softmax state - m and d per query row
   constexpr size_t S_M_OFFSET = ((S_REDUCE_OFFSET + S_REDUCE_SIZE + 15) & ~15);
-  constexpr size_t S_M_SIZE = sizeof(float) * Q_ROWS;  // 128 bytes
+  constexpr size_t S_M_SIZE = sizeof(float) * Q_ROWS; // 128 bytes
   constexpr size_t S_D_OFFSET = S_M_OFFSET + S_M_SIZE;
-  constexpr size_t S_D_SIZE = sizeof(float) * Q_ROWS;  // 128 bytes
+  constexpr size_t S_D_SIZE = sizeof(float) * Q_ROWS; // 128 bytes
 
   // Output accumulator in fp32 - reuse Q space after Q processing is done
   constexpr size_t S_O_OFFSET = S_D_OFFSET + S_D_SIZE;
-  constexpr size_t S_O_SIZE = sizeof(float) * Q_ROWS * HEAD_DIM;  // 32*128*4 = 16KB
+  constexpr size_t S_O_SIZE =
+      sizeof(float) * Q_ROWS * HEAD_DIM; // 32*128*4 = 16KB
 
   // Total: 8 + 8 + 8 + 0.032 + 0.128 + 0.128 + 16 = ~40KB
 
@@ -203,7 +207,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
   }
 
   // Load Q
-  for (int idx = threadIdx.x; idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM; idx += NUM_THREADS) {
+  for (int idx = threadIdx.x; idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM;
+       idx += NUM_THREADS) {
     int row = idx / HEAD_DIM;
     int col = idx % HEAD_DIM;
     int token = row / NUM_QO_PER_KV;
@@ -217,8 +222,12 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
     T const *q_weight = reinterpret_cast<T const *>(q_norm_weight_ptr);
     for (int token = 0; token < num_tokens; token++) {
       int pos = seq_len - num_tokens + token;
-      T const *cos_data = rope ? reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM : nullptr;
-      T const *sin_data = rope ? reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM : nullptr;
+      T const *cos_data =
+          rope ? reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM
+               : nullptr;
+      T const *sin_data =
+          rope ? reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM
+               : nullptr;
       for (int head = 0; head < NUM_QO_PER_KV; head++) {
         int row = token * NUM_QO_PER_KV + head;
         T *q_head = s_q + row * HEAD_DIM;
@@ -252,7 +261,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
 
         // Apply normalization
         for (int i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
-          float val = static_cast<float>(q_head[i]) * rms_rcp * static_cast<float>(q_weight[i]);
+          float val = static_cast<float>(q_head[i]) * rms_rcp *
+                      static_cast<float>(q_weight[i]);
           q_head[i] = static_cast<T>(val);
         }
         __syncthreads();
@@ -276,7 +286,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
       int pos = seq_len - num_tokens + token;
       T const *cos_data = reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM;
       T const *sin_data = reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM;
-      for (int idx = threadIdx.x; idx < NUM_QO_PER_KV * HEAD_DIM / 2; idx += NUM_THREADS) {
+      for (int idx = threadIdx.x; idx < NUM_QO_PER_KV * HEAD_DIM / 2;
+           idx += NUM_THREADS) {
         int head = idx / (HEAD_DIM / 2);
         int d = idx % (HEAD_DIM / 2);
         int base = (token * NUM_QO_PER_KV + head) * HEAD_DIM;
@@ -299,7 +310,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
     int curr_iter_len = min(seq_len - tile_start, KV_TILE_SIZE);
 
     // Load KV tile
-    for (int idx = threadIdx.x; idx < curr_iter_len * HEAD_DIM; idx += NUM_THREADS) {
+    for (int idx = threadIdx.x; idx < curr_iter_len * HEAD_DIM;
+         idx += NUM_THREADS) {
       int row = idx / HEAD_DIM;
       int col = idx % HEAD_DIM;
       int global_pos = tile_start + row;
@@ -309,8 +321,10 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
         int page_offset = global_pos % PAGE_SIZE;
         int page_idx = page_indices[page_num];
         int src_idx = page_idx * PAGE_SIZE + page_offset;
-        s_k[row * HEAD_DIM + col] = d_paged_k_cache[src_idx * KV_CACHE_STRIDE + col];
-        s_v[row * HEAD_DIM + col] = d_paged_v_cache[src_idx * KV_CACHE_STRIDE + col];
+        s_k[row * HEAD_DIM + col] =
+            d_paged_k_cache[src_idx * KV_CACHE_STRIDE + col];
+        s_v[row * HEAD_DIM + col] =
+            d_paged_v_cache[src_idx * KV_CACHE_STRIDE + col];
       } else {
         // From QKV input
         int qkv_row = global_pos - (seq_len - num_tokens);
@@ -333,8 +347,12 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
           int pos = first_new_token + kv_idx;
           int local_row = local_start + kv_idx;
           T *k_head = s_k + local_row * HEAD_DIM;
-          T const *cos_data = rope ? reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM : nullptr;
-          T const *sin_data = rope ? reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM : nullptr;
+          T const *cos_data =
+              rope ? reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM
+                   : nullptr;
+          T const *sin_data =
+              rope ? reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM
+                   : nullptr;
 
           // Compute sum of squares
           float sum_sq = 0.0f;
@@ -365,7 +383,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
 
           // Apply normalization
           for (int i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
-            float val = static_cast<float>(k_head[i]) * rms_rcp * static_cast<float>(k_weight[i]);
+            float val = static_cast<float>(k_head[i]) * rms_rcp *
+                        static_cast<float>(k_weight[i]);
             k_head[i] = static_cast<T>(val);
           }
           __syncthreads();
@@ -387,22 +406,27 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
         for (int kv_idx = 0; kv_idx < num_new_tokens; kv_idx++) {
           int pos = first_new_token + kv_idx;
           int local_row = local_start + kv_idx;
-          T const *cos_data = reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM;
-          T const *sin_data = reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM;
+          T const *cos_data =
+              reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM;
+          T const *sin_data =
+              reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM;
           for (int d = threadIdx.x; d < HEAD_DIM / 2; d += NUM_THREADS) {
             float k0 = static_cast<float>(s_k[local_row * HEAD_DIM + d]);
-            float k1 = static_cast<float>(s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2]);
+            float k1 = static_cast<float>(
+                s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2]);
             float c = static_cast<float>(cos_data[d]);
             float s = static_cast<float>(sin_data[d]);
             s_k[local_row * HEAD_DIM + d] = static_cast<T>(k0 * c - k1 * s);
-            s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2] = static_cast<T>(k0 * s + k1 * c);
+            s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2] =
+                static_cast<T>(k0 * s + k1 * c);
           }
         }
         __syncthreads();
       }
 
       // Write processed K/V to cache
-      for (int idx = threadIdx.x; idx < num_new_tokens * HEAD_DIM; idx += NUM_THREADS) {
+      for (int idx = threadIdx.x; idx < num_new_tokens * HEAD_DIM;
+           idx += NUM_THREADS) {
         int token = idx / HEAD_DIM;
         int col = idx % HEAD_DIM;
         int global_pos = first_new_token + token;
@@ -411,8 +435,10 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
         int page_idx = page_indices[page_num];
         int dst_idx = page_idx * PAGE_SIZE + page_offset;
         int local_row = local_start + token;
-        d_paged_k_cache[dst_idx * KV_CACHE_STRIDE + col] = s_k[local_row * HEAD_DIM + col];
-        d_paged_v_cache[dst_idx * KV_CACHE_STRIDE + col] = s_v[local_row * HEAD_DIM + col];
+        d_paged_k_cache[dst_idx * KV_CACHE_STRIDE + col] =
+            s_k[local_row * HEAD_DIM + col];
+        d_paged_v_cache[dst_idx * KV_CACHE_STRIDE + col] =
+            s_v[local_row * HEAD_DIM + col];
       }
       __syncthreads();
     }
@@ -444,7 +470,9 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
         }
 
         scores[kc] = score;
-        if (score > m_local) m_local = score;
+        if (score > m_local) {
+          m_local = score;
+        }
       }
 
       // Online softmax update
@@ -464,7 +492,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
         float attn = ptx_exp2(scores[kc] - m_new);
         d_local += attn;
         for (int d = 0; d < HEAD_DIM; d++) {
-          s_o[qr * HEAD_DIM + d] += attn * static_cast<float>(s_v[kc * HEAD_DIM + d]);
+          s_o[qr * HEAD_DIM + d] +=
+              attn * static_cast<float>(s_v[kc * HEAD_DIM + d]);
         }
       }
 
@@ -475,7 +504,8 @@ __device__ __forceinline__ void multitoken_paged_attention_scalar(
   }
 
   // Final normalization and output
-  for (int idx = threadIdx.x; idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM; idx += NUM_THREADS) {
+  for (int idx = threadIdx.x; idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM;
+       idx += NUM_THREADS) {
     int row = idx / HEAD_DIM;
     int col = idx % HEAD_DIM;
     int token = row / NUM_QO_PER_KV;

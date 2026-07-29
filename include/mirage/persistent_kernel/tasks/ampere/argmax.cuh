@@ -54,7 +54,8 @@ __device__ __forceinline__ void block_reduce_max_idx(T &val, long long &idx) {
     T block_max_val = T(-inf);
     long long block_max_idx = -1;
 
-    int num_warps = (blockDim.x + NUM_THREADS_PER_WARP - 1) / NUM_THREADS_PER_WARP;
+    int num_warps =
+        (blockDim.x + NUM_THREADS_PER_WARP - 1) / NUM_THREADS_PER_WARP;
     if (my_lane_id < num_warps) {
       block_max_val = smem_vals[my_lane_id];
       block_max_idx = smem_idxs[my_lane_id];
@@ -116,7 +117,6 @@ __device__ __forceinline__ void
       static_cast<long long const *>(input_idx_ptr);
   long long *__restrict__ final_output =
       static_cast<long long *>(final_output_ptr);
-
 
   int tidx = threadIdx.x;
 // TODO: try vectorize

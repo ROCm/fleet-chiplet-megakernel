@@ -52,9 +52,14 @@ constexpr uint32_t EVENT_NO_SHIFT = 19;
 constexpr uint32_t EVENT_BEGIN = 0x0;
 constexpr uint32_t EVENT_END = 0x1;
 constexpr uint32_t EVENT_INSTANT = 0x2;
+// FETCHED: emitted by the worker the moment it picks a task off its queue,
+// BEFORE the dependency-wait. Lets us split end-to-end task time into:
+//   dep_wait_us = (BEGIN - FETCHED)   compute_us = (END - BEGIN)
+constexpr uint32_t EVENT_FETCHED = 0x3;
 
 __device__ __forceinline__ void sleep_cycles(uint32_t cycles) {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   uint64_t start = __builtin_amdgcn_s_memrealtime();
   uint64_t now;
   do {
@@ -97,11 +102,20 @@ __device__ __forceinline__ uint32_t make_event_tag_instant(uint32_t base_tag,
          (event_no << EVENT_NO_SHIFT) | EVENT_INSTANT;
 }
 
+__device__ __forceinline__ uint32_t make_event_tag_fetched(uint32_t base_tag,
+                                                           uint32_t event_id,
+                                                           uint32_t event_no) {
+  return base_tag | (event_id << EVENT_IDX_SHIFT) |
+         (event_no << EVENT_NO_SHIFT) | EVENT_FETCHED;
+}
+
 __device__ __forceinline__ uint32_t get_timestamp() {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   // s_memrealtime on MI300X runs at ~100 MHz (10ns per tick).
   // Scale to nanoseconds to match NVIDIA's globaltimer_lo (1 GHz).
-  return static_cast<uint32_t>((__builtin_amdgcn_s_memrealtime() * 10) & 0xFFFFFFFFu);
+  return static_cast<uint32_t>((__builtin_amdgcn_s_memrealtime() * 10) &
+                               0xFFFFFFFFu);
 #else
   uint32_t volatile ret;
   asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(ret));
@@ -176,6 +190,19 @@ struct ProfilerEntry {
         tb::make_event_tag_instant(profiler_entry_tag_base, event, event_no);  \
     entry.delta_time = tb::get_timestamp();                                    \
     *profiler_write_ptr = entry.raw;                                           \
+  }                                                                            \
+  __threadfence_block();
+
+// FETCHED is emitted before the dependency-wait. It must advance the write
+// pointer just like BEGIN/END so the buffer stays self-consistent (every
+// task contributes 3 entries: FETCHED, BEGIN, END).
+#define PROFILER_EVENT_FETCHED(event, event_no)                                \
+  if (profiler_write_thread_predicate) {                                       \
+    entry.tag =                                                                \
+        tb::make_event_tag_fetched(profiler_entry_tag_base, event, event_no);  \
+    entry.delta_time = tb::get_timestamp();                                    \
+    *profiler_write_ptr = entry.raw;                                           \
+    profiler_write_ptr += profiler_write_stride;                               \
   }                                                                            \
   __threadfence_block();
 

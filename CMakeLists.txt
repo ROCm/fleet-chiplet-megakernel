@@ -129,6 +129,7 @@ file(GLOB_RECURSE MIRAGE_GPU_SRCS
   ${PROJECT_SOURCE_DIR}/src/*.hip.cu
   ${PROJECT_SOURCE_DIR}/src/kernel/cuda/*.cu
   ${PROJECT_SOURCE_DIR}/src/kernel/device_memory_manager.cu
+  ${PROJECT_SOURCE_DIR}/src/utils/rocm_helper.cu
 )
 
 set(MIRAGE_SRCS ${MIRAGE_CC_SRCS})

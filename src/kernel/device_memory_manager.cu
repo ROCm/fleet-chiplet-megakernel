@@ -184,8 +184,7 @@ void cython_set_gpu_device_id(int gpu_id) {
 
 #ifdef MIRAGE_FINGERPRINT_USE_ROCM
 // ROCm implementation of DeviceMemoryManager
-DeviceMemoryManager::DeviceMemoryManager()
-    : num_devices(1) {
+DeviceMemoryManager::DeviceMemoryManager() : num_devices(1) {
   // fingerprint related fields
   checkCUDA(hipSetDevice(0));
   printf("Mirage::DeviceMemoryManager: ROCm backend (gpu_id=0, num_gpus=1)");
@@ -201,9 +200,9 @@ DeviceMemoryManager::DeviceMemoryManager()
   }
   assert((exp_table[FP_Q - 1] * FP_EXP_BASE) % FP_P == 1);
   checkCUDA(hipMemcpy(exp_lookup_table,
-                       exp_table,
-                       sizeof(FPType) * FP_Q,
-                       hipMemcpyHostToDevice));
+                      exp_table,
+                      sizeof(FPType) * FP_Q,
+                      hipMemcpyHostToDevice));
   // Part 2: division p lookup table
   checkCUDA(
       hipMalloc(&div_p_lookup_table, (sizeof(FPType) * FP_P + 15) / 16 * 16));
@@ -220,9 +219,9 @@ DeviceMemoryManager::DeviceMemoryManager()
     }
   }
   checkCUDA(hipMemcpy(div_p_lookup_table,
-                       div_p_table,
-                       sizeof(FPType) * FP_P,
-                       hipMemcpyHostToDevice));
+                      div_p_table,
+                      sizeof(FPType) * FP_P,
+                      hipMemcpyHostToDevice));
   // Part 3: division q lookup table
   checkCUDA(
       hipMalloc(&div_q_lookup_table, (sizeof(FPType) * FP_Q + 15) / 16 * 16));
@@ -239,9 +238,9 @@ DeviceMemoryManager::DeviceMemoryManager()
     }
   }
   checkCUDA(hipMemcpy(div_q_lookup_table,
-                       div_q_table,
-                       sizeof(FPType) * FP_Q,
-                       hipMemcpyHostToDevice));
+                      div_q_table,
+                      sizeof(FPType) * FP_Q,
+                      hipMemcpyHostToDevice));
   // Part 4: sqrt p lookup table
   checkCUDA(
       hipMalloc(&sqrt_p_lookup_table, (sizeof(FPType) * FP_P + 15) / 16 * 16));
@@ -254,9 +253,9 @@ DeviceMemoryManager::DeviceMemoryManager()
     }
   }
   checkCUDA(hipMemcpy(sqrt_p_lookup_table,
-                       sqrt_p_table,
-                       sizeof(FPType) * FP_P,
-                       hipMemcpyHostToDevice));
+                      sqrt_p_table,
+                      sizeof(FPType) * FP_P,
+                      hipMemcpyHostToDevice));
   // Part 5: sqrt q lookup table
   checkCUDA(
       hipMalloc(&sqrt_q_lookup_table, (sizeof(FPType) * FP_Q + 15) / 16 * 16));
@@ -269,20 +268,18 @@ DeviceMemoryManager::DeviceMemoryManager()
     }
   }
   checkCUDA(hipMemcpy(sqrt_q_lookup_table,
-                       sqrt_q_table,
-                       sizeof(FPType) * FP_Q,
-                       hipMemcpyHostToDevice));
+                      sqrt_q_table,
+                      sizeof(FPType) * FP_Q,
+                      hipMemcpyHostToDevice));
   // data and fingerprints
   for (int i = 0; i < num_devices; i++) {
     if (i == 0) {
       for (int k = 0; k < num_devices; k++) {
-        checkCUDA(
-            hipMalloc(&fp_base_ptr[k], mirage::config::MAX_DMEM_FP_SIZE));
+        checkCUDA(hipMalloc(&fp_base_ptr[k], mirage::config::MAX_DMEM_FP_SIZE));
       }
-      checkCUDA(
-          hipMalloc(&stensor_fp_base_ptr,
-                     mirage::config::MAX_SMEM_FP_SIZE *
-                         mirage::config::MAX_NUM_THREADBLOCKS_PER_KERNEL));
+      checkCUDA(hipMalloc(&stensor_fp_base_ptr,
+                          mirage::config::MAX_SMEM_FP_SIZE *
+                              mirage::config::MAX_NUM_THREADBLOCKS_PER_KERNEL));
     }
   }
 }

@@ -29,7 +29,7 @@ KernelGraphGenerator::KernelGraphGenerator(
   // setting num_thread
   unsigned int max_num_threads = std::thread::hardware_concurrency();
   if (config.search_thread > max_num_threads) {
-    printf("Config number of threads (%zu) too high, setting num_thread to %u",
+    printf("Config number of threads (%d) too high, setting num_thread to %d",
            config.search_thread,
            max_num_threads);
     num_thread = max_num_threads;

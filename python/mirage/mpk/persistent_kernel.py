@@ -86,16 +86,16 @@ static PyObject *finalize_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
-static PyObject *get_event_timing_func(PyObject *self, PyObject *args) {
-  PyObject *py_buffer;
-  int max_entries;
-  if (!PyArg_ParseTuple(args, "Oi", &py_buffer, &max_entries)) {
-    PyErr_SetString(PyExc_TypeError, "Invalid parameters");
+static PyObject *set_rope_tables_func(PyObject *self, PyObject *args) {
+  PyObject *py_cos, *py_sin;
+  if (!PyArg_ParseTuple(args, "OO", &py_cos, &py_sin)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (cos_ptr, sin_ptr)");
     return NULL;
   }
-  unsigned long long *host_buffer = (unsigned long long *)PyLong_AsVoidPtr(py_buffer);
-  int count = get_event_timing(host_buffer, max_entries);
-  return PyLong_FromLong(count);
+  void *cos_ptr = PyLong_AsVoidPtr(py_cos);
+  void *sin_ptr = PyLong_AsVoidPtr(py_sin);
+  set_rope_tables(cos_ptr, sin_ptr);
+  Py_RETURN_NONE;
 }
 
 static PyMethodDef ModuleMethods[] = {
@@ -103,7 +103,7 @@ static PyMethodDef ModuleMethods[] = {
   {"init_request_func", init_request_func, METH_VARARGS, "initialize request resources"},
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
-  {"get_event_timing_func", get_event_timing_func, METH_VARARGS, "get event timing data"},
+  {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
   {NULL, NULL, 0, NULL} // sentinel
 };
 
@@ -225,10 +225,20 @@ def get_compile_command(
         flags = flags + ["-DMPK_ENABLE_GANG_TASKS"]
     if int(os.environ.get("USE_NT_WEIGHTS", "0")) == 1:
         flags = flags + ["-DMPK_NT_WEIGHT_LOADS"]
+    if int(os.environ.get("W13_LDS_WEIGHTS", "0")) == 1:
+        flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
+    if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
+        flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
     # Use when debugging
     # flags = flags + [f"-DMPK_ENABLE_VERBOSE"]
+    if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
+        flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
     if int(os.environ.get("TRACE_MOE", "0")) == 1:
         flags = flags + ["-DMPK_TRACE_MOE_DISPATCH"]
+    if int(os.environ.get("EMBED_DEBUG", "0")) == 1:
+        flags = flags + ["-DEMBED_DEBUG"]
+    if int(os.environ.get("MPK_DEBUG_LAYERS", "0")) == 1:
+        flags = flags + ["-DMPK_DEBUG_RMSNORM", "-DMPK_DEBUG_MOE_MUL_SUM"]
     # Enable debug output for HIP builds
     # if target_cc == 94:
     #    flags = flags + ["-DMPK_ENABLE_VERBOSE"]
@@ -259,16 +269,16 @@ def get_compile_command(
             "-DMPK_ENABLE_TMA",
             "-DMIRAGE_GRACE_BLACKWELL",
         ]
-    elif target_cc == 94:
-        # MI300 / ROCm: use HIP. specific_cmd set below with ROCm-specific args.
+    elif target_cc in (94, 95):
+        # MI300/MI350 ROCm: use HIP. specific_cmd set below with ROCm-specific args.
         specific_cmd = []
     else:
         specific_cmd = [
             "-arch=native",
         ]
 
-    if target_cc == 94:
-        # ROCm/MI300 compile path: hipcc, ROCm includes/libs
+    if target_cc in (94, 95):
+        # ROCm/MI300/MI350 compile path: hipcc, ROCm includes/libs
         rocm_home = os.environ.get("ROCM_PATH", "/opt/rocm")
         rocm_include = os.path.join(rocm_home, "include")
         rocm_lib = os.path.join(rocm_home, "lib")
@@ -280,7 +290,8 @@ def get_compile_command(
             cc,
             "-x", "hip",
             file_name,
-            "-O3",
+            "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
+            "--save-temps",  # TEMP: dump assembly for v_mov analysis
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",
             f"-I{mirage_inc_path}",
@@ -336,14 +347,42 @@ def get_compile_command(
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_TIMING"]
         if int(os.environ.get("MPK_DEVICE_ACCUM", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
-        if int(os.environ.get("MPK_EVENT_TIMING", "0")) == 1:
-            flags = flags + ["-DMPK_ENABLE_EVENT_TIMING"]
+        if int(os.environ.get("MPK_SUBPHASE_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_ENABLE_SUBPHASE_TIMING"]
+        if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
+            flags = flags + ["-DMPK_ENABLE_MOE_SUBPHASE"]
+        if int(os.environ.get("MPK_FUSED_PHASE_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_FUSED_PHASE_TIMING"]
+        if int(os.environ.get("MPK_SPAN_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_ENABLE_SPAN_TIMING"]
         if int(os.environ.get("USE_GANG", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_GANG_TASKS"]
         if int(os.environ.get("USE_NT_WEIGHTS", "0")) == 1:
             flags = flags + ["-DMPK_NT_WEIGHT_LOADS"]
+        if int(os.environ.get("W13_LDS_WEIGHTS", "0")) == 1:
+            flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
+        if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
+            flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_ENABLE_GAP_TIMING"]
+            flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
+        if int(os.environ.get("MPK_HBM_LATENCY", "0")) == 1:
+            flags = flags + ["-DMPK_HBM_LATENCY"]
+        if int(os.environ.get("MPK_MOE_SINGLE_EXPERT", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_SINGLE_EXPERT"]
+        if int(os.environ.get("MPK_FUSED_TAIL_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_FUSED_TAIL_TIMING"]
+        if int(os.environ.get("MPK_K2944_DEBUG", "0")) == 1:
+            flags = flags + ["-DMPK_K2944_DEBUG"]
+        if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
+            flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
+            flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
         if int(os.environ.get("TRACE_MOE", "0")) == 1:
             flags = flags + ["-DMPK_TRACE_MOE_DISPATCH"]
+        if int(os.environ.get("EMBED_DEBUG", "0")) == 1:
+            flags = flags + ["-DEMBED_DEBUG"]
+        if int(os.environ.get("MPK_DEBUG_LAYERS", "0")) == 1:
+            flags = flags + ["-DMPK_DEBUG_RMSNORM", "-DMPK_DEBUG_MOE_MUL_SUM"]
         if int(os.environ.get("CK_FMHA_1TOK", "0")) == 1:
             # Force seqlen_q=1: uses merge path only (faster decode, slower prefill)
             flags = flags + ["-DMPK_MAX_TOKENS_PER_REQUEST=1"]
@@ -387,6 +426,8 @@ class PersistentKernel:
     ):
         self.__finalized__ = False
         self._is_compiled = False
+        self._dummy_counter = 0
+        self._dummy_tensor_refs = []  # prevent GC of dummy tensors (pointer reuse)
         if mode not in valid_persistent_kernel_modes:
             raise ValueError(f"Invalid persistent kernel mode: {mode}")
         self.mode = mode
@@ -423,8 +464,12 @@ class PersistentKernel:
         else:
             self.use_cutlass_kernel = use_cutlass_kernel
         if self.is_rocm:
-            # MI300 (gfx94x): use 94 as target_cc for MPK task selection
-            self.target_cc = 94
+            # Detect AMD GPU generation from offload-arch target
+            amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
+            if "gfx950" in amdgpu_target:
+                self.target_cc = 95  # MI350 (gfx950): 160KB LDS
+            else:
+                self.target_cc = 94  # MI300 (gfx942): 64KB LDS
         else:
             self.target_cc = torch.cuda.get_device_properties(0).major * 10 + torch.cuda.get_device_properties(0).minor
         # Check tensor shapes
@@ -548,6 +593,7 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        actual_hidden_dim: int = 0,
     ):
         # Currently assume that the input/output are 2D tensors
         assert input.num_dims == 2
@@ -558,9 +604,13 @@ class PersistentKernel:
         tb_graph.new_input(output, (0, -1, -1), 1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
         # 94 (MI300): use base "rmsnorm"; 90/100 use hopper
+        # actual_hidden_dim: if > 0, divide by this instead of HIDDEN_DIM in RMS computation
+        # (used when padding hidden dim to avoid bf16 rounding errors from scale factor)
+        params = [actual_hidden_dim] if actual_hidden_dim > 0 else []
         self.kn_graph.register_task(
             tb_graph,
             "rmsnorm_hopper" if (self.target_cc == 90 or self.target_cc == 100) else "rmsnorm",
+            params,
         )
 
     def rmsnorm_linear_layer(
@@ -761,6 +811,20 @@ class PersistentKernel:
             assert q_norm.dim(0) == head_dim
             assert k_norm.dim(0) == head_dim
 
+        # If q_norm/k_norm are None, create dummy tensors (kernel still expects 8 inputs)
+        if q_norm is None:
+            import torch
+            dummy = torch.ones(head_dim, dtype=torch.bfloat16, device="cuda")
+            self._dummy_tensor_refs.append(dummy)
+            q_norm = self.attach_input(torch_tensor=dummy, name=f"_dummy_q_norm_pa_{self._dummy_counter}")
+            self._dummy_counter += 1
+        if k_norm is None:
+            import torch
+            dummy = torch.ones(head_dim, dtype=torch.bfloat16, device="cuda")
+            self._dummy_tensor_refs.append(dummy)
+            k_norm = self.attach_input(torch_tensor=dummy, name=f"_dummy_k_norm_pa_{self._dummy_counter}")
+            self._dummy_counter += 1
+
         # params[0]: num_q_heads
         # params[1]: num_kv_heads
         # params[2]: qk_norm
@@ -884,7 +948,7 @@ class PersistentKernel:
         )
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_sm100", params)
-        elif self.target_cc == 94:
+        elif self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_mi300", params)
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_hopper", params)
@@ -929,7 +993,7 @@ class PersistentKernel:
         )
         if self.target_cc == 100 or self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_merge_sm100", params)
-        elif self.target_cc == 94:
+        elif self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_merge_mi300", params)
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
@@ -957,6 +1021,20 @@ class PersistentKernel:
         q_workspace_stride = q_workspace.dim(1)
         rotary_embed = 1 if cos_pos_embed is not None else 0
         qk_norm = 1 if q_norm is not None else 0
+
+        # If q_norm/k_norm are None, create dummy tensors (kernel still expects 8 inputs)
+        if q_norm is None:
+            import torch
+            dummy = torch.ones(head_dim, dtype=torch.bfloat16, device="cuda")
+            self._dummy_tensor_refs.append(dummy)
+            q_norm = self.attach_input(torch_tensor=dummy, name=f"_dummy_q_norm_{self._dummy_counter}")
+            self._dummy_counter += 1
+        if k_norm is None:
+            import torch
+            dummy = torch.ones(head_dim, dtype=torch.bfloat16, device="cuda")
+            self._dummy_tensor_refs.append(dummy)
+            k_norm = self.attach_input(torch_tensor=dummy, name=f"_dummy_k_norm_{self._dummy_counter}")
+            self._dummy_counter += 1
 
         # params: num_q_heads, num_kv_heads, qk_norm, rotary_embed, max_seq_len, page_size, q_workspace_stride
         params = [num_q_heads, num_kv_heads, qk_norm, rotary_embed,
@@ -988,6 +1066,8 @@ class PersistentKernel:
         attention_params: tuple,
         grid_dim: tuple,
         block_dim: tuple,
+        sinks: DTensor = None,
+        sliding_window: int = 0,
     ):
         assert q_workspace.num_dims == 2  # (num_tokens, q_workspace_stride)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
@@ -1004,10 +1084,11 @@ class PersistentKernel:
         kv_cache_stride = num_kv_heads * head_dim
 
         # params: num_q_heads, num_kv_heads, head_dim, page_size, max_seq_len,
-        #         num_kv_chunks, q_workspace_stride, kv_cache_stride, max_num_requests
+        #         num_kv_chunks, q_workspace_stride, kv_cache_stride,
+        #         max_num_requests, sliding_window
         params = [num_q_heads, num_kv_heads, head_dim, self.page_size,
                   self.max_seq_length, num_kv_chunks, q_workspace_stride,
-                  kv_cache_stride, max_num_requests]
+                  kv_cache_stride, max_num_requests, sliding_window]
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         assert grid_dim[0] == max_num_requests
@@ -1016,13 +1097,25 @@ class PersistentKernel:
         tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
         tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
         tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        # Optional sinks input (GPT-OSS per-head attention sinks).
+        # When provided, sink correction is fused into the attention epilogue,
+        # eliminating the standalone attention_sink_layer task.
+        if sinks is not None:
+            assert sinks.num_dims == 1  # (num_q_heads,)
+            tb_graph.new_input(sinks, (-1, -1, -1), -1, True)
         # o_acc/lse_acc: 2D flat, no partitioning — kernel offsets by kv_head internally
         tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)
         tb_graph.new_input(lse_acc, (-1, -1, -1), -1, True)
-        self.kn_graph.customized(
-            [q_workspace, k_cache, v_cache, o_acc, lse_acc],
-            tb_graph,
-        )
+        if sinks is not None:
+            self.kn_graph.customized(
+                [q_workspace, k_cache, v_cache, sinks, o_acc, lse_acc],
+                tb_graph,
+            )
+        else:
+            self.kn_graph.customized(
+                [q_workspace, k_cache, v_cache, o_acc, lse_acc],
+                tb_graph,
+            )
         self.kn_graph.register_task(tb_graph, "paged_attention_ck_fmha_split_kv_mi300", params)
 
     def paged_attention_ck_fmha_merge_layer(
@@ -1033,13 +1126,18 @@ class PersistentKernel:
         attention_params: tuple,
         grid_dim: tuple,
         block_dim: tuple,
+        sinks: DTensor = None,
     ):
         # lse: 2D (num_tokens, num_kv_heads * chunks * qo_per_kv)
         # output_tmp: 2D (num_tokens, num_kv_heads * chunks * qo_per_kv * head_dim)
         # output: 2D (num_tokens, num_q_heads * head_dim)
+        # sinks (optional): 1D (num_q_heads,) — applies sigmoid(LSE - sink) per
+        # q-head to the merged output (GPT-OSS attention sinks).
         assert lse.num_dims == 2
         assert output_tmp.num_dims == 2
         assert output.num_dims == 2
+        if sinks is not None:
+            assert sinks.num_dims == 1
 
         num_q_heads = attention_params[0]
         head_dim = attention_params[1]
@@ -1054,12 +1152,51 @@ class PersistentKernel:
         # No partitioning — merge kernel handles all offsets internally
         tb_graph.new_input(lse, (-1, -1, -1), -1, True)
         tb_graph.new_input(output_tmp, (-1, -1, -1), -1, True)
+        if sinks is not None:
+            tb_graph.new_input(sinks, (-1, -1, -1), -1, True)
         tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        if sinks is not None:
+            self.kn_graph.customized(
+                [lse, output_tmp, sinks, output],
+                tb_graph,
+            )
+        else:
+            self.kn_graph.customized(
+                [lse, output_tmp, output],
+                tb_graph,
+            )
+        self.kn_graph.register_task(tb_graph, "paged_attention_ck_fmha_merge_mi300", params)
+
+    def attention_sink_layer(
+        self,
+        attn_out: DTensor,
+        lse_acc: DTensor,
+        sinks: DTensor,
+        num_q_heads: int,
+        head_dim: int,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """Post-attention sink correction.
+        Multiplies attention output by sigmoid(LSE - sink) per head.
+        attn_out is modified in-place (same tensor for input and output).
+        """
+        assert attn_out.num_dims == 2  # (max_tokens, num_q_heads * head_dim)
+        assert lse_acc.num_dims == 2   # (max_tokens, num_q_heads)
+        assert sinks.num_dims == 1     # (num_q_heads,)
+
+        params = [num_q_heads, head_dim]
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(attn_out, (-1, 1, -1), -1, True)  # in-place: both input and output
+        tb_graph.new_input(lse_acc, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sinks, (-1, -1, -1), -1, True)
+        tb_graph.new_input(attn_out, (-1, 1, -1), -1, True)  # output = same tensor
         self.kn_graph.customized(
-            [lse, output_tmp, output],
+            [attn_out, lse_acc, sinks, attn_out],
             tb_graph,
         )
-        self.kn_graph.register_task(tb_graph, "paged_attention_ck_fmha_merge_mi300", params)
+        self.kn_graph.register_task(tb_graph, "attention_sink_mi300", params)
 
     def gang_paged_attention_split_kv_layer(
         self,
@@ -1083,7 +1220,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert k_cache.num_dims == 4
         assert v_cache.num_dims == 4
-        assert self.target_cc == 94, "Gang attention only supported on MI300X"
+        assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
 
         head_dim = k_cache.dim(3)
         num_kv_heads = k_cache.dim(2)
@@ -1102,9 +1239,8 @@ class PersistentKernel:
             assert k_norm.num_dims == 1
             qk_norm = 1
 
-        # Total work items = max_requests * num_kv_heads * num_kv_chunks
-        # With NUM_KV_CHUNKS > 1, each (request, kv_head) pair is split into chunks
-        total_work_items = self.max_num_batched_requests * num_kv_heads * num_kv_chunks
+        # Total work items = max_requests * num_kv_heads
+        total_work_items = self.max_num_batched_requests * num_kv_heads
         import math
         total_work_items_per_xcd = math.ceil(total_work_items / 8)
 
@@ -1147,28 +1283,25 @@ class PersistentKernel:
         block_dim: tuple,
     ):
         """Gang merge split-KV: 8 tasks (1 per XCD), broadcast to workers."""
-        assert lse.num_dims == 2
-        assert output_tmp.num_dims == 2
+        assert lse.num_dims == 3
+        assert output_tmp.num_dims == 3
         assert output.num_dims == 2
-        assert self.target_cc == 94, "Gang attention only supported on MI300X"
+        assert self.target_cc in (94, 95), "Gang attention only supported on MI300X"
 
         num_q_heads = attention_params[0]
         head_dim = attention_params[1]
         num_kv_heads = attention_params[2]
-        num_kv_chunks = attention_params[3]
         num_qo_heads_per_kv = num_q_heads // num_kv_heads
 
-        # Merge work items = max_requests * num_kv_heads (NOT x chunks)
         total_work_items = self.max_num_batched_requests * num_kv_heads
         import math
         total_work_items_per_xcd = math.ceil(total_work_items / 8)
 
         # params: [num_qo_heads_per_kv, head_dim, max_seq_len, page_size,
-        #          num_kv_heads, total_work_items_per_xcd, total_work_items,
-        #          num_kv_chunks]
+        #          num_kv_heads, total_work_items_per_xcd, total_work_items]
         params = [num_qo_heads_per_kv, head_dim, self.max_seq_length,
                   self.page_size, num_kv_heads, total_work_items_per_xcd,
-                  total_work_items, num_kv_chunks]
+                  total_work_items]
 
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
@@ -1221,7 +1354,7 @@ class PersistentKernel:
         tb_graph.new_input(moe_masks, (-1, -1, -1), -1, True)
         self.kn_graph.customized([input, moe_topk_weight, moe_routing_indices, moe_masks], tb_graph)
 
-        if self.target_cc == 94:
+        if self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "moe_topk_softmax_mi300")
         else:
             self.kn_graph.register_task(tb_graph, "moe_topk_softmax_sm100")
@@ -1232,6 +1365,7 @@ class PersistentKernel:
         weight: DTensor,
         moe_routing_indices: DTensor,
         moe_mask: DTensor,
+        bias: DTensor,
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
@@ -1241,18 +1375,20 @@ class PersistentKernel:
         assert weight.num_dims == 3  # (num_experts, 2*intermediate_size, hidden_size)
         assert moe_routing_indices.num_dims == 2  # (num_experts_per_tok, batch_size)
         assert moe_mask.num_dims == 1  # (num_experts + 1)
+        assert bias.num_dims == 2  # (num_experts, output_stride)
         assert output.num_dims == 3  # (batch_size, num_expert_per_tok, 2*intermediate_size)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
         tb_graph.new_input(output, (-1, 2, -1), -1, True)
-        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, output], tb_graph)
+        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph)
 
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "moe_w13_linear_sm100")
-        elif self.target_cc == 94:
+        elif self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "moe_w13_linear_mi300")
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "moe_w13_linear_sm90")
@@ -1274,13 +1410,32 @@ class PersistentKernel:
         tb_graph.new_input(output, (0, 1, -1), -1, True)
         self.kn_graph.customized([input, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "moe_silu_mul")
-            
+
+    def moe_swigluoai_layer(
+        self,
+        input: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        # SwigluOAI activation for GPT-OSS
+        # Input: (batch_size, num_expert_per_tok, 2 * intermediate_size) - interleaved gate/up
+        # Output: (batch_size, num_expert_per_tok, intermediate_size)
+        assert input.num_dims == 3
+        assert output.num_dims == 3
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, 1, -1), -1, True)
+        tb_graph.new_input(output, (0, 1, -1), -1, True)
+        self.kn_graph.customized([input, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_swigluoai")
+
     def moe_w2_linear_layer(
         self,
         input: DTensor,
         weight: DTensor,
         moe_routing_indices: DTensor,
-        moe_mask: DTensor, 
+        moe_mask: DTensor,
+        bias: DTensor,
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
@@ -1290,30 +1445,163 @@ class PersistentKernel:
         assert weight.num_dims == 3  # (num_experts, hidden_size, intermediate_size)
         assert moe_routing_indices.num_dims == 2  # (num_experts_per_tok, batch_size)
         assert moe_mask.num_dims == 1  # (num_experts + 1)
+        assert bias.num_dims == 2  # (num_experts, output_stride)
         assert output.num_dims == 3  # (batch_size, num_expert_per_tok, hidden_size)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 2, True)
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
         tb_graph.new_input(output, (-1, 2, -1), -1, True)
-        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, output], tb_graph)
+        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph)
 
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "moe_w2_linear_sm100")
-        elif self.target_cc == 94:
+        elif self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "moe_w2_linear_mi300")
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "moe_w2_linear_sm90")
         else:
             assert False
         
+    def moe_w13_linear_mxfp4_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 16,
+        grid_dim: tuple = (1, 1, 1),
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """MoE W13 linear with MXFP4 weights + bias (native FP4 format, no dequant).
+        Weight shape: [num_experts, expert_wgs, wg_bytes] as uint8.
+        Bias shape: [num_experts, 2*intermediate_size] as bfloat16.
+        """
+        assert input.num_dims == 2   # [batch, hidden_size]
+        assert weight.num_dims == 3  # [num_experts, expert_wgs, wg_bytes] uint8
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 3    # [num_experts, expert_wgs, output_per_wg]
+        assert output.num_dims == 3  # [batch, topk, 2*intermediate]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, 1, -1), 2, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "moe_w13_linear_mxfp4_mi300", [output_per_wg])
+
+    def moe_w2_linear_mxfp4_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 16,
+        grid_dim: tuple = (1, 1, 1),
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """MoE W2 linear with MXFP4 weights + bias (native FP4 format, no dequant).
+        Weight shape: [num_experts, expert_wgs, wg_bytes] as uint8.
+        Bias shape: [num_experts, hidden_size] as bfloat16.
+        """
+        assert input.num_dims == 3   # [batch, topk, intermediate]
+        assert weight.num_dims == 3  # [num_experts, expert_wgs, wg_bytes] uint8
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 3    # [num_experts, expert_wgs, output_per_wg]
+        assert output.num_dims == 3  # [batch, topk, hidden]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 2, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, 1, -1), 2, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "moe_w2_linear_mxfp4_mi300", [output_per_wg])
+
+    def moe_w13_linear_mxfp4_ck_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 16,
+        grid_dim: tuple = (1, 1, 1),
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """MoE W13 linear with MXFP4 weights + bias (MFMA-based, replaces scalar GEMV).
+        Same weight format as moe_w13_linear_mxfp4_layer.
+        """
+        assert input.num_dims == 2
+        assert weight.num_dims == 3
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 3
+        assert output.num_dims == 3
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, 1, -1), 2, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "moe_w13_linear_mxfp4_ck_mi300", [output_per_wg])
+
+    def moe_w2_linear_mxfp4_ck_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 16,
+        grid_dim: tuple = (1, 1, 1),
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """MoE W2 linear with MXFP4 weights + bias (MFMA-based, replaces scalar GEMV).
+        Same weight format as moe_w2_linear_mxfp4_layer.
+        """
+        assert input.num_dims == 3
+        assert weight.num_dims == 3
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 3
+        assert output.num_dims == 3
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 2, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, 1, -1), 2, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized([input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "moe_w2_linear_mxfp4_ck_mi300", [output_per_wg])
+
     def gang_moe_w13_linear_layer(
         self,
         input: DTensor,
         weight: DTensor,
         moe_routing_indices: DTensor,
         moe_mask: DTensor,
+        bias: DTensor,
         output: DTensor,
         block_dim: tuple = (256, 1, 1),
     ):
@@ -1325,8 +1613,9 @@ class PersistentKernel:
         assert weight.num_dims == 3  # [num_experts, 2*intermediate, hidden_size]
         assert moe_routing_indices.num_dims == 2  # [num_experts, batch_size]
         assert moe_mask.num_dims == 1  # [num_experts + 1]
+        assert bias.num_dims == 2  # [num_experts, output_stride]
         assert output.num_dims == 3  # [batch, topk, 2*intermediate]
-        assert self.target_cc == 94, "Gang MoE linear only supported on MI300/MI350"
+        assert self.target_cc in (94, 95), "Gang MoE linear only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1338,8 +1627,8 @@ class PersistentKernel:
         n_tiles = output_size // tile_n
         m_tiles = max(1, batch_size // 16)
         tiles_per_expert = m_tiles * n_tiles
-        max_experts_per_xcd = (num_experts + 7) // 8
-        total_tiles_per_xcd = max_experts_per_xcd * tiles_per_expert
+        total_tiles_all = num_experts * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t (bs={batch_size})"
 
@@ -1349,13 +1638,14 @@ class PersistentKernel:
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
         tb_graph.new_input(output, (-1, 2, -1), -1, True)
         self.kn_graph.customized(
-            [input, weight, moe_routing_indices, moe_mask, output], tb_graph
+            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
         )
         self.kn_graph.register_task(
             tb_graph, "gang_moe_w13_linear_mi300",
-            [tiles_per_expert, max_experts_per_xcd, total_tiles_per_xcd],
+            [tiles_per_expert, 0, total_tiles_per_xcd],
         )
 
     def gang_moe_w2_linear_layer(
@@ -1364,6 +1654,7 @@ class PersistentKernel:
         weight: DTensor,
         moe_routing_indices: DTensor,
         moe_mask: DTensor,
+        bias: DTensor,
         output: DTensor,
         block_dim: tuple = (256, 1, 1),
     ):
@@ -1375,8 +1666,9 @@ class PersistentKernel:
         assert weight.num_dims == 3  # [num_experts, hidden_size, intermediate]
         assert moe_routing_indices.num_dims == 2  # [num_experts, batch_size]
         assert moe_mask.num_dims == 1  # [num_experts + 1]
+        assert bias.num_dims == 2  # [num_experts, output_stride]
         assert output.num_dims == 3  # [batch, topk, hidden_size]
-        assert self.target_cc == 94, "Gang MoE linear only supported on MI300/MI350"
+        assert self.target_cc in (94, 95), "Gang MoE linear only supported on MI300/MI350"
 
         batch_size = self.max_num_batched_tokens
         num_experts = weight.dim(0)
@@ -1388,8 +1680,8 @@ class PersistentKernel:
         n_tiles = output_size // tile_n
         # W2: one token at a time, so tiles_per_expert = n_tiles * batch_size
         tiles_per_expert = n_tiles * batch_size
-        max_experts_per_xcd = (num_experts + 7) // 8
-        total_tiles_per_xcd = max_experts_per_xcd * tiles_per_expert
+        total_tiles_all = num_experts * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
         assert total_tiles_per_xcd <= 65535, \
             f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t (bs={batch_size})"
 
@@ -1399,13 +1691,323 @@ class PersistentKernel:
         tb_graph.new_input(weight, (-1, 1, -1), 2, True)
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
         tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
         tb_graph.new_input(output, (-1, 2, -1), -1, True)
         self.kn_graph.customized(
-            [input, weight, moe_routing_indices, moe_mask, output], tb_graph
+            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
         )
         self.kn_graph.register_task(
             tb_graph, "gang_moe_w2_linear_mi300",
-            [tiles_per_expert, max_experts_per_xcd, total_tiles_per_xcd],
+            [tiles_per_expert, 0, total_tiles_per_xcd],
+        )
+
+    def gang_moe_w13_linear_mxfp4_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Gang MoE W13 MXFP4 linear: 8 tasks (1/XCD), MFMA-based MXFP4 dequant.
+        Weight format: [E, expert_wgs, wg_bytes] (MXFP4 packed per workgroup).
+        Bias format: [E, output_stride] (2D flat).
+        """
+        assert input.num_dims == 2   # [batch, hidden_size]
+        assert weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 2    # [E, output_stride]
+        assert output.num_dims == 3  # [batch, topk, output_size]
+        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = weight.dim(0)
+        expert_wgs = weight.dim(1)
+        output_size = expert_wgs * output_per_wg
+
+        # tiles_per_expert = batch_size * expert_wgs (one tile per token per wg)
+        tiles_per_expert = batch_size * expert_wgs
+        # Spread all expert tiles across 8 XCDs (flat round-robin).
+        # Old: each expert assigned to 1 XCD → only top-k XCDs active.
+        # New: all tiles pooled and distributed → all 8 XCDs active.
+        num_topk = output.dim(1)  # topk dimension from output shape
+        max_activated = min(num_topk * batch_size, num_experts)
+        total_tiles_all = max_activated * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized(
+            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_w13_linear_mxfp4_mi300",
+            [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg],
+        )
+
+    def gang_moe_w13_swiglu_mxfp4_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Gang MoE W13 MXFP4 with SwiGLU fused into epilogue.
+        Same MFMA as W13 but applies SwiGLU(gate+bias, up+bias) in the
+        epilogue and writes half-sized output.
+        Input: [batch, hidden] (2D, same as W13).
+        Weight: [E, expert_wgs, wg_bytes] (interleaved gate/up, MXFP4).
+        Bias: [E, 2*intermediate] (interleaved gate/up bias).
+        Output: [batch, topk, intermediate] (activated, half of W13 output).
+        """
+        assert input.num_dims == 2   # [batch, hidden_size]
+        assert weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 2    # [E, 2*intermediate]
+        assert output.num_dims == 3  # [batch, topk, intermediate]
+        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = weight.dim(0)
+        expert_wgs = weight.dim(1)
+
+        tiles_per_expert = batch_size * expert_wgs
+        num_topk = output.dim(1)
+        max_activated = min(num_topk * batch_size, num_experts)
+        total_tiles_all = max_activated * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized(
+            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_w13_swiglu_mxfp4_mi300",
+            [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg],
+        )
+
+    def gang_moe_w2_linear_mxfp4_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Gang MoE W2 MXFP4 linear: 8 tasks (1/XCD), MFMA-based MXFP4 dequant.
+        Weight format: [E, expert_wgs, wg_bytes] (MXFP4 packed per workgroup).
+        Bias format: [E, output_stride] (2D flat).
+        """
+        assert input.num_dims == 3   # [batch, topk, intermediate]
+        assert weight.num_dims == 3  # [E, expert_wgs, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 2    # [E, output_stride]
+        assert output.num_dims == 3  # [batch, topk, hidden_size]
+        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = weight.dim(0)
+        expert_wgs = weight.dim(1)
+
+        tiles_per_expert = batch_size * expert_wgs
+        num_topk = input.dim(1)  # topk dimension from input shape
+        max_activated = min(num_topk * batch_size, num_experts)
+        total_tiles_all = max_activated * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 2, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized(
+            [input, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_w2_linear_mxfp4_mi300",
+            [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg],
+        )
+
+    def gang_moe_fused_mxfp4_layer(
+        self,
+        input: DTensor,
+        gate_up_weight: DTensor,
+        down_weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        w13_bias: DTensor,
+        w2_bias: DTensor,
+        routing_weight: DTensor,
+        swiglu_out: DTensor,
+        workspace_f32: DTensor,
+        barrier: DTensor,
+        w13_output_per_wg: int = 128,
+        w2_output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused W13+SwiGLU+W2 MoE gang kernel with per-expert pipelining.
+        Single gang task replaces separate W13 and W2 tasks. Phase-ordered
+        tile encoding (all W13 before all W2) with in-kernel atomicAdd
+        barrier per expert. Supports different OPW for W13 and W2.
+
+        W2 epilogue does atomicAdd(workspace_f32, (result+bias)*routing_weight)
+        instead of writing bf16 to mlp_out. This eliminates the standalone
+        MulSumAdd task (~10.2us/layer savings).
+
+        8 inputs: input, gate_up_weight, down_weight, routing, mask, w13_bias, w2_bias, routing_weight
+        3 outputs: swiglu_out (intermediate), workspace_f32 (f32 accumulator), barrier
+        """
+        assert input.num_dims == 2           # [batch, hidden_size]
+        assert gate_up_weight.num_dims == 3  # [E, W13_WGS, wg_bytes]
+        assert down_weight.num_dims == 3     # [E, W2_WGS, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert w13_bias.num_dims == 2        # [E, 2*intermediate]
+        assert w2_bias.num_dims == 2         # [E, hidden]
+        assert routing_weight.num_dims == 2  # [batch, topk] f32
+        assert swiglu_out.num_dims == 3      # [batch, topk, intermediate]
+        assert workspace_f32.num_dims == 2   # [batch, hidden] f32
+        assert barrier.num_dims == 1         # [2*E]
+        assert self.target_cc in (94, 95), "Fused MoE MXFP4 only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = gate_up_weight.dim(0)
+        w13_wgs = gate_up_weight.dim(1)  # 2*intermediate/W13_OPW
+        w2_wgs = down_weight.dim(1)      # hidden/W2_OPW
+
+        # Combined tile count: W13 tiles + W2 tiles (phase-ordered in kernel)
+        w13_tiles = batch_size * w13_wgs
+        w2_tiles = batch_size * w2_wgs
+        tiles_per_expert = w13_tiles + w2_tiles
+
+        num_topk = swiglu_out.dim(1)
+        max_activated = min(num_topk * batch_size, num_experts)
+        # Pad W13 tile space to next multiple of 240 (30 workers/XCD × 8 XCDs)
+        # so every worker's first tile is W13, eliminating compute imbalance.
+        # Must match PAD_MULTIPLE in gang_moe_fused_mxfp4_mi300.cuh.
+        PAD_MULTIPLE = 240
+        total_w13_real = max_activated * w13_tiles
+        total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
+        total_w2 = max_activated * w2_tiles
+        total_tiles_all = total_w13_padded + total_w2
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 8 inputs
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(gate_up_weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(down_weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(w13_bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(w2_bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(routing_weight, (-1, -1, -1), -1, True)
+        # 3 outputs
+        tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), -1, True)
+        tb_graph.new_input(barrier, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, gate_up_weight, down_weight,
+             moe_routing_indices, moe_mask, w13_bias, w2_bias,
+             routing_weight,
+             swiglu_out, workspace_f32, barrier], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_fused_mxfp4_mi300",
+            [tiles_per_expert, w13_output_per_wg, total_tiles_per_xcd, w2_output_per_wg],
+        )
+
+    def gang_moe_swiglu_w2_mxfp4_layer(
+        self,
+        w13_output: DTensor,
+        weight: DTensor,
+        moe_routing_indices: DTensor,
+        moe_mask: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Gang fused SwiGLU+W2 MXFP4: reads interleaved gate/up from W13,
+        applies SwiGLU during FP8 quantization, feeds into W2 MFMA.
+        No cross-WG barrier needed (croc-style activation fusion).
+        Input: [batch, topk, 2*intermediate] (interleaved gate/up from W13).
+        Weight: [E, expert_wgs, wg_bytes] (W2 down weights, MXFP4 packed).
+        Bias: [E, output_stride] (W2 bias).
+        Output: [batch, topk, hidden_size] BF16.
+        """
+        assert w13_output.num_dims == 3   # [batch, topk, 2*intermediate]
+        assert weight.num_dims == 3       # [E, expert_wgs, wg_bytes]
+        assert moe_routing_indices.num_dims == 2
+        assert moe_mask.num_dims == 1
+        assert bias.num_dims == 2         # [E, output_stride]
+        assert output.num_dims == 3       # [batch, topk, hidden_size]
+        assert self.target_cc in (94, 95), "Gang MoE MXFP4 only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        num_experts = weight.dim(0)
+        expert_wgs = weight.dim(1)
+
+        tiles_per_expert = batch_size * expert_wgs
+        num_topk = w13_output.dim(1)
+        max_activated = min(num_topk * batch_size, num_experts)
+        total_tiles_all = max_activated * tiles_per_expert
+        total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        assert total_tiles_per_xcd <= 65535, \
+            f"total_tiles_per_xcd={total_tiles_per_xcd} exceeds uint16_t"
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(w13_output, (-1, -1, -1), 2, True)
+        tb_graph.new_input(weight, (-1, 1, -1), 2, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 2, -1), -1, True)
+        self.kn_graph.customized(
+            [w13_output, weight, moe_routing_indices, moe_mask, bias, output], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_moe_swiglu_w2_mxfp4_mi300",
+            [tiles_per_expert, 0, total_tiles_per_xcd, output_per_wg],
         )
 
     def moe_mul_sum_add_layer(
@@ -1429,7 +2031,7 @@ class PersistentKernel:
         tb_graph.new_input(output, (0, 1, -1), -1, True)
         self.kn_graph.customized([input, weight, residual, output], tb_graph)
 
-        if self.target_cc == 94:
+        if self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "moe_mul_sum_add_mi300")
         else:
             self.kn_graph.register_task(tb_graph, "moe_mul_sum_add_sm100")
@@ -1449,7 +2051,7 @@ class PersistentKernel:
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, 1, -1), 1, True)
         tb_graph.new_input(weight, (0, 1, -1), 1, True)
-        if self.target_cc == 94:
+        if self.target_cc in (94, 95):
             # MI300X: workspace output partitioned by grid_dim.x (N) and grid_dim.y (K-splits)
             tb_graph.new_input(output, (1, 0, -1), -1, True)
         else:
@@ -1458,7 +2060,7 @@ class PersistentKernel:
 
         if self.target_cc == 100:
             self.kn_graph.register_task(tb_graph, "splitk_linear_sm100")
-        elif self.target_cc == 94:
+        elif self.target_cc in (94, 95):
             self.kn_graph.register_task(tb_graph, "splitk_linear_mi300")
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "splitk_linear_swapAB_hopper")
@@ -1480,7 +2082,7 @@ class PersistentKernel:
         """Cross-XCD K-split linear with residual (SKXCCM-style).
         Phase 1: 8 gang tasks, each XCD handles K/8 for ALL N-tiles.
         Phase 2: 8 gang tasks, each XCD finalizes its N-partition."""
-        assert self.target_cc == 94
+        assert self.target_cc in (94, 95)
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
@@ -1527,7 +2129,7 @@ class PersistentKernel:
         """Gang split-K linear with residual: splits K within XCD for better utilization.
         8 tasks (1 per XCD), each with n_tiles × k_splits total tiles.
         Uses XCD-local atomics for merge (cheaper than GPU-scope)."""
-        assert self.target_cc == 94
+        assert self.target_cc in (94, 95)
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
@@ -1559,14 +2161,14 @@ class PersistentKernel:
     ):
         """Gang RMSNorm: 8 tasks (1 per XCD), each computes same RMSNorm.
         Enables XCD-local event counting to avoid cross-XCD barrier."""
-        assert self.target_cc == 94, "Gang RMSNorm only supported on MI300X"
+        assert self.target_cc in (94, 95), "Gang RMSNorm only supported on MI300X"
         grid_dim = (8, 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
         tb_graph.new_input(weight, (-1, -1, -1), 0, True)
         tb_graph.new_input(output, (-1, -1, -1), -1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
-        self.kn_graph.register_task(tb_graph, "gang_rmsnorm_mi300", [input.dim(0)])
+        self.kn_graph.register_task(tb_graph, "gang_rmsnorm_mi300", [])
 
     def gang_linear_layer(
         self,
@@ -1589,7 +2191,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc == 94, "Gang linear only supported on MI300X"
+        assert self.target_cc in (94, 95), "Gang linear only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0, f"Output size {output_size} must be divisible by 8"
@@ -1615,58 +2217,6 @@ class PersistentKernel:
              n_tiles_per_xcd, wgm]
         )
 
-    def gang_linear_n_tiling_layer(
-        self,
-        input: DTensor,
-        weight: DTensor,
-        output: DTensor,
-        tile_n: int,
-        output_stride: int,
-        m_tiles: int = 1,
-        wgn: int = 0,
-        block_dim: tuple = (256, 1, 1),
-    ):
-        """Gang linear with N-fast tile iteration (sister to gang_linear_layer).
-
-        Identical to gang_linear_layer except the per-XCD worker tile order
-        sweeps N as the fast index and M as the slow index. Used to isolate
-        the L2 weight-reuse benefit of the default M-tiling variant: at decode
-        time activations are tiny so this variant should NOT capture any
-        weight-reuse benefit, while gang_linear_layer should.
-
-        Args:
-            m_tiles: number of M-tiles to split batch across (1=no M-split)
-            wgn: window width W for N-major windowed traversal (0 = full N-major)
-        """
-        assert input.num_dims == 2
-        assert weight.num_dims == 2
-        assert output.num_dims == 2
-        assert self.target_cc == 94, "Gang linear N-tiling only supported on MI300X"
-        batch_size = self.max_num_batched_tokens
-        output_size = weight.dim(0)
-        assert output_size % 8 == 0, f"Output size {output_size} must be divisible by 8"
-        chunk_n = output_size // 8
-        assert chunk_n % tile_n == 0, f"Chunk {chunk_n} must be divisible by tile_n {tile_n}"
-        n_tiles_per_xcd = chunk_n // tile_n
-        assert batch_size % m_tiles == 0, f"batch {batch_size} must be divisible by m_tiles {m_tiles}"
-        m_per_tile = batch_size // m_tiles
-        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
-        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (-1, -1, -1), 1, True)
-        # weight: partition dim 0 (rows) by bid.x → each XCD gets chunk of weight rows
-        tb_graph.new_input(weight, (0, -1, -1), 1, True)
-        # output: partition dim 1 (columns) by bid.x → each XCD writes to its column range
-        tb_graph.new_input(output, (1, -1, -1), -1, True)
-        self.kn_graph.customized([input, weight, output], tb_graph)
-        # params: [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-        #          n_tiles_per_xcd, wgn]
-        self.kn_graph.register_task(
-            tb_graph, "gang_linear_n_tiling_mi300",
-            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-             n_tiles_per_xcd, wgn]
-        )
-
     def gang_linear_with_residual_layer(
         self,
         input: DTensor,
@@ -1684,7 +2234,7 @@ class PersistentKernel:
         assert weight.num_dims == 2
         assert residual.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc == 94, "Gang linear only supported on MI300X"
+        assert self.target_cc in (94, 95), "Gang linear only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         output_size = weight.dim(0)
         assert output_size % 8 == 0
@@ -1713,12 +2263,1407 @@ class PersistentKernel:
         )
 
 
+    def gang_linear_bias_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        tile_n: int,
+        output_stride: int,
+        m_tiles: int = 1,
+        wgm: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Gang linear with fused bias_add in epilogue.
+        3 inputs (activation, weight, bias), 1 output."""
+        assert input.num_dims == 2
+        assert weight.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc in (94, 95), "Gang linear only supported on MI300X"
+        batch_size = self.max_num_batched_tokens
+        output_size = weight.dim(0)
+        assert output_size % 8 == 0
+        chunk_n = output_size // 8
+        assert chunk_n % tile_n == 0
+        n_tiles_per_xcd = chunk_n // tile_n
+        assert batch_size % m_tiles == 0
+        m_per_tile = batch_size // m_tiles
+        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)  # bias: partition dim 1 (columns) by bid.x
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, bias, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "gang_linear_bias_mi300",
+            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
+             n_tiles_per_xcd, wgm]
+        )
+
+    def gang_rmsnorm_linear_bias_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        linear_weight: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        actual_hidden_dim: int,
+        tile_n: int,
+        output_stride: int,
+        m_tiles: int = 1,
+        wgm: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + Gang Linear + Bias.
+
+        Eliminates the dispatch barrier between rmsnorm and a downstream
+        gang_linear_bias by having every gang-linear worker compute the
+        RMSNorm prologue locally before its MFMA. All workers write the
+        same normalized values to ``norm_output`` (idempotent), then read
+        from it for their linear tile.
+
+        Inputs: norm_input, norm_weight, norm_output (writable scratch),
+                linear_weight, bias.
+        Output: linear output.
+
+        ``actual_hidden_dim`` is the unpadded hidden size used for the RMS
+        denominator (e.g. 2880 for GPT-OSS, with norm_input padded to 3072).
+        """
+        assert norm_input.num_dims == 2
+        assert linear_weight.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        batch_size = self.max_num_batched_tokens
+        output_size = linear_weight.dim(0)
+        assert output_size % 8 == 0
+        chunk_n = output_size // 8
+        assert chunk_n % tile_n == 0
+        n_tiles_per_xcd = chunk_n // tile_n
+        assert batch_size % m_tiles == 0
+        m_per_tile = batch_size // m_tiles
+        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # forloop_dim must reference an existing dim for each tensor
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)  # 1D tensor
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(linear_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, linear_weight, bias, output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_bias_mi300",
+            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
+             n_tiles_per_xcd, wgm, actual_hidden_dim]
+        )
+
+    def gang_rmsnorm_linear_bias_topk_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        linear_weight: DTensor,
+        bias: DTensor,
+        logits_scratch: DTensor,
+        gang_counter: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        actual_hidden_dim: int,
+        tile_n: int,
+        output_stride: int,
+        num_experts_per_tok: int = 4,
+        m_tiles: int = 1,
+        wgm: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + Gang Linear + Bias + TopK Softmax.
+
+        Eliminates the scheduler gaps between the router gang linear and the
+        TopK softmax routing task. The last gang worker across all 8 XCDs
+        detects completion via an atomic counter and computes TopK inline.
+
+        Inputs (7): norm_input, norm_weight, norm_output (scratch),
+                    linear_weight, bias, logits_scratch (scratch),
+                    gang_counter (scratch).
+        Outputs (3): topk_weight, routing_indices, active_expert_ids.
+        """
+        assert norm_input.num_dims == 2
+        assert linear_weight.num_dims == 2
+        assert logits_scratch.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        batch_size = self.max_num_batched_tokens
+        num_experts = output_stride  # router output width = num_experts
+        output_size = linear_weight.dim(0)
+        assert output_size % 8 == 0
+        chunk_n = output_size // 8
+        assert chunk_n % tile_n == 0
+        n_tiles_per_xcd = chunk_n // tile_n
+        assert batch_size % m_tiles == 0
+        m_per_tile = batch_size // m_tiles
+        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
+        total_gang_tiles = total_tiles_per_xcd * 8  # 8 XCDs on MI300X
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 7 inputs
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(linear_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
+        tb_graph.new_input(gang_counter, (-1, -1, -1), 0, True)
+        # 3 outputs
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, linear_weight, bias,
+             logits_scratch, gang_counter,
+             topk_weight, routing_indices, active_expert_ids],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_bias_topk_mi300",
+            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
+             n_tiles_per_xcd, wgm, actual_hidden_dim, num_experts,
+             num_experts_per_tok, total_gang_tiles]
+        )
+
+    def gang_rmsnorm_linear_mxfp4_bias_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        output_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + MXFP4 Gang Linear + Bias.
+
+        Same as gang_rmsnorm_linear_bias_layer but uses MXFP4 weights with
+        hardware FP4xFP8 MFMA instead of BF16 CK GEMM. Weight is packed in
+        workgroup layout: [n_wgs, wg_bytes].
+
+        ``actual_hidden_dim`` is the unpadded hidden size used for the RMS
+        denominator (e.g. 2880 for GPT-OSS, with norm_input padded to 3072).
+        """
+        assert norm_input.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, mxfp4_weight, bias, output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_mxfp4_bias_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             total_tiles_per_xcd, actual_hidden_dim]
+        )
+
+    def gang_rmsnorm_linear_mxfp4_bias_argmax_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        argmax_part_value: DTensor,
+        argmax_part_index: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        output_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + MXFP4 Gang Linear + Bias + Argmax (norm-once).
+
+        CROC-style: each worker enters once, does RMSNorm+FP8 quant once,
+        then loops internally over all its assigned WGs. Argmax accumulated
+        in registers across ALL tiles. No logits written to HBM.
+
+        total_tiles_per_xcd = workers_per_xcd (each worker enters once).
+        Output: one (bf16 max, int64 abs_idx) per worker.
+        Follow with argmax_reduce_layer(CHUNK_SIZE=0) for final token.
+        """
+        assert norm_input.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        workers_per_xcd = self.num_workers // 8
+        total_tiles_per_xcd = workers_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(argmax_part_value, (1, -1, -1), -1, True)
+        tb_graph.new_input(argmax_part_index, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, mxfp4_weight, bias,
+             argmax_part_value, argmax_part_index],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_mxfp4_bias_argmax_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             workers_per_xcd, actual_hidden_dim]
+        )
+        # Absolute index — CHUNK_SIZE=0 in argmax_reduce skips chunk math
+        self.argmax_partial_output_size = 0
+
+    def gang_mulsumradd_rmsnorm_linear_mxfp4_bias_layer(
+        self,
+        mlp_out: DTensor,
+        routing_weight: DTensor,
+        residual: DTensor,
+        x_output: DTensor,
+        norm_weight: DTensor,
+        norm_scratch: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        qkv_output: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        output_stride: int,
+        num_topk: int = 4,
+        input_stride: int = -1,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused MulSumAdd + RMSNorm + MXFP4 Gang Linear + Bias.
+
+        Merges the MulSumAdd from the previous layer's MoE block into the
+        QKV kernel's prologue, eliminating one task dispatch.
+
+        7 inputs (mlp_out, routing_weight, residual, norm_weight, norm_scratch,
+        mxfp4_weight, bias) + 2 outputs (x_output, qkv_output).
+        """
+        assert mlp_out.num_dims == 3   # (batch, topk, hidden)
+        assert routing_weight.num_dims == 2  # (batch, topk)
+        assert residual.num_dims == 2  # (batch, hidden)
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        if input_stride < 0:
+            input_stride = residual.dim(1)
+
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 7 inputs
+        tb_graph.new_input(mlp_out, (-1, -1, -1), 1, True)
+        tb_graph.new_input(routing_weight, (-1, -1, -1), 1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        # 2 outputs
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(qkv_output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [mlp_out, routing_weight, residual, norm_weight, norm_scratch,
+             mxfp4_weight, bias, x_output, qkv_output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_mulsumradd_rmsnorm_linear_mxfp4_bias_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             total_tiles_per_xcd, actual_hidden_dim, num_topk, input_stride]
+        )
+
+    def gang_rmsnorm_linear_mxfp4_bias_kvupd_layer(
+        self,
+        norm_input: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_workspace: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        head_dim: int,
+        num_q_per_kv: int,
+        kv_stride: int,
+        q_ws_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused RMSNorm + MXFP4 Gang Linear + KV Cache Update (layer 0).
+
+        Combines QKV MFMA with KV cache update: the epilogue applies RoPE and
+        writes Q to q_workspace, K/V to paged caches directly.
+        5 inputs + 3 outputs.
+        """
+        assert norm_input.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 5 inputs
+        tb_graph.new_input(norm_input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        # 3 outputs (un-partitioned caches + workspace)
+        tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(v_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [norm_input, norm_weight, norm_output, mxfp4_weight, bias,
+             k_cache, v_cache, q_workspace],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_rmsnorm_linear_mxfp4_bias_kvupd_mi300",
+            [output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd,
+             actual_hidden_dim, head_dim, num_q_per_kv, self.page_size,
+             kv_stride, q_ws_stride]
+        )
+
+    def gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_layer(
+        self,
+        mlp_out: DTensor,
+        routing_weight: DTensor,
+        residual: DTensor,
+        x_output: DTensor,
+        norm_weight: DTensor,
+        norm_scratch: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_workspace: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        num_topk: int,
+        input_stride: int,
+        head_dim: int,
+        num_q_per_kv: int,
+        kv_stride: int,
+        q_ws_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused MulSumAdd + RMSNorm + MXFP4 Gang Linear + KV Cache Update (layers 1+).
+
+        7 inputs + 4 outputs.
+        """
+        assert mlp_out.num_dims == 3
+        assert routing_weight.num_dims == 2
+        assert residual.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        if input_stride < 0:
+            input_stride = residual.dim(1)
+
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 7 inputs
+        tb_graph.new_input(mlp_out, (-1, -1, -1), 1, True)
+        tb_graph.new_input(routing_weight, (-1, -1, -1), 1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        # 4 outputs
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(v_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [mlp_out, routing_weight, residual, norm_weight, norm_scratch,
+             mxfp4_weight, bias, x_output, k_cache, v_cache, q_workspace],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_mi300",
+            [output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd,
+             actual_hidden_dim, num_topk, input_stride,
+             head_dim, num_q_per_kv, self.page_size,
+             kv_stride, q_ws_stride]
+        )
+
+    def gang_resaddf32_rmsnorm_linear_mxfp4_bias_layer(
+        self,
+        workspace_f32: DTensor,
+        residual: DTensor,
+        x_output: DTensor,
+        norm_weight: DTensor,
+        norm_scratch: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        qkv_output: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        output_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused ResAddF32 + RMSNorm + MXFP4 Gang Linear + Bias.
+
+        Reads from f32 workspace (pre-accumulated by W2 atomicAdd) instead of
+        doing MulSumAdd from 4 expert bf16 slots. Zeros workspace after read.
+
+        6 inputs (workspace_f32, residual, norm_weight, norm_scratch,
+        mxfp4_weight, bias) + 2 outputs (x_output, qkv_output).
+        """
+        assert workspace_f32.num_dims == 2   # (batch, hidden) f32
+        assert residual.num_dims == 2        # (batch, hidden) bf16
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 6 inputs
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        # 2 outputs
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(qkv_output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [workspace_f32, residual, norm_weight, norm_scratch,
+             mxfp4_weight, bias, x_output, qkv_output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_resaddf32_rmsnorm_linear_mxfp4_bias_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             total_tiles_per_xcd, actual_hidden_dim]
+        )
+
+    def gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_layer(
+        self,
+        workspace_f32: DTensor,
+        residual: DTensor,
+        x_output: DTensor,
+        norm_weight: DTensor,
+        norm_scratch: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_workspace: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        head_dim: int,
+        num_q_per_kv: int,
+        kv_stride: int,
+        q_ws_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused ResAddF32 + RMSNorm + MXFP4 Gang Linear + KV Cache Update (layers 1+).
+
+        6 inputs + 4 outputs.
+        """
+        assert workspace_f32.num_dims == 2
+        assert residual.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 6 inputs
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_scratch, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        # 4 outputs
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(v_cache, (-1, -1, -1), -1, True)
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [workspace_f32, residual, norm_weight, norm_scratch,
+             mxfp4_weight, bias, x_output, k_cache, v_cache, q_workspace],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_mi300",
+            [output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd,
+             actual_hidden_dim, head_dim, num_q_per_kv, self.page_size,
+             kv_stride, q_ws_stride]
+        )
+
+    def gang_qkv_attn_fused_layer(
+        self,
+        workspace_f32: DTensor,
+        residual: DTensor,
+        x_output: DTensor,
+        norm_weight: DTensor,
+        norm_scratch: DTensor,
+        mxfp4_weight: DTensor,
+        bias: DTensor,
+        sinks: DTensor,
+        barrier: DTensor,
+        lse_acc: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_workspace: DTensor,
+        o_acc: DTensor,
+        actual_hidden_dim: int,
+        output_per_wg: int,
+        head_dim: int,
+        num_q_per_kv: int,
+        kv_stride: int,
+        q_ws_stride: int,
+        num_kv_chunks: int,
+        num_kv_heads: int,
+        sliding_window: int = 0,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused QKV + Attention gang task (layers 1+).
+
+        Phase 1: ResAddF32+RMSNorm+QKV+KVUpdate (all workers, gang tiles)
+        Phase 2: CK FMHA attention (1 worker per XCD, after hierarchical barrier)
+
+        9 inputs + 5 outputs.
+        """
+        assert workspace_f32.num_dims == 2
+        assert residual.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0
+        n_wgs_per_xcd = n_wgs // 8
+        total_qkv_tiles_per_xcd = batch_size * n_wgs_per_xcd
+
+        has_sinks = 1 if sinks is not None else 0
+        q_workspace_stride = q_workspace.dim(1)
+        kv_cache_stride = num_kv_heads * head_dim
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 9 inputs: slot[6] is sinks (or barrier as placeholder when no sinks)
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)   # [0]
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)        # [1]
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)     # [2]
+        tb_graph.new_input(norm_scratch, (-1, -1, -1), 1, True)    # [3]
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)     # [4]
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)             # [5]
+        sinks_or_placeholder = sinks if sinks is not None else barrier
+        tb_graph.new_input(sinks_or_placeholder, (-1, -1, -1), -1, True)  # [6]
+        tb_graph.new_input(barrier, (-1, -1, -1), -1, True)        # [7]
+        tb_graph.new_input(lse_acc, (-1, -1, -1), -1, True)        # [8]
+        # 5 outputs
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)       # [0]
+        tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)        # [1]
+        tb_graph.new_input(v_cache, (-1, -1, -1), -1, True)        # [2]
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)    # [3]
+        tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)          # [4]
+        self.kn_graph.customized(
+            [workspace_f32, residual, norm_weight, norm_scratch,
+             mxfp4_weight, bias, sinks_or_placeholder, barrier, lse_acc,
+             x_output, k_cache, v_cache, q_workspace, o_acc],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_qkv_attn_fused_mi300",
+            [output_per_wg, n_wgs_per_xcd, total_qkv_tiles_per_xcd,
+             actual_hidden_dim, head_dim, num_q_per_kv, self.page_size,
+             kv_stride, q_ws_stride,
+             self.max_seq_length, num_kv_chunks, q_workspace_stride,
+             kv_cache_stride, num_kv_heads, sliding_window, has_sinks]
+        )
+
+    def moe_residual_add_f32_layer(
+        self,
+        workspace_f32: DTensor,
+        residual: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """MoE residual add from f32 workspace (last layer).
+
+        output[b,h] = bf16(workspace_f32[b,h] + residual_bf16[b,h])
+        workspace_f32[b,h] = 0 (zero for next iteration)
+        """
+        assert workspace_f32.num_dims == 2  # (batch, hidden) f32
+        assert residual.num_dims == 2       # (batch, hidden) bf16
+        assert output.num_dims == 2         # (batch, hidden) bf16
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(workspace_f32, (0, 1, -1), -1, True)
+        tb_graph.new_input(residual, (0, 1, -1), -1, True)
+        tb_graph.new_input(output, (0, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [workspace_f32, residual, output], tb_graph
+        )
+        self.kn_graph.register_task(
+            tb_graph, "moe_residual_add_f32_mi300",
+            [residual.dim(1)]  # output_stride = hidden_size
+        )
+
+    def gang_linear_mxfp4_res_bias_layer(
+        self,
+        input: DTensor,
+        mxfp4_weight: DTensor,
+        residual: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        output_per_wg: int,
+        output_stride: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """MXFP4 Gang Linear with Residual + Bias.
+
+        Replaces gang_splitk_linear_res_bias_layer when weights are MXFP4.
+        No split-K needed since MXFP4 tiles are fast enough.
+
+        4 inputs (input, mxfp4_weight, residual, bias), 1 output.
+        """
+        assert input.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        batch_size = self.max_num_batched_tokens
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        total_tiles_per_xcd = batch_size * n_wgs_per_xcd
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, mxfp4_weight, residual, bias, output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_linear_mxfp4_res_bias_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd,
+             total_tiles_per_xcd]
+        )
+
+    def gang_linear_mxfp4_res_bias_rmsnorm_topk_layer(
+        self,
+        # O-PROJ inputs
+        input: DTensor,
+        mxfp4_weight: DTensor,
+        residual: DTensor,
+        oproj_bias: DTensor,
+        # TopK inputs
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        router_weight: DTensor,
+        router_bias: DTensor,
+        logits_scratch: DTensor,
+        counters: DTensor,
+        # Outputs
+        output: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        # Parameters
+        output_per_wg: int,
+        output_stride: int,
+        actual_hidden_dim: int,
+        num_experts: int,
+        topk_k: int,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused O-PROJ + RMSNorm + Router Linear + TopK Softmax.
+
+        Combines gang_linear_mxfp4_res_bias and gang_rmsnorm_linear_bias_topk
+        into a single gang task, eliminating one event barrier per layer.
+
+        10 inputs, 4 outputs.
+        """
+        assert input.num_dims == 2
+        assert mxfp4_weight.num_dims == 2
+        assert output.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+        batch_size = self.max_num_batched_tokens
+
+        # O-PROJ tiling
+        n_wgs = mxfp4_weight.dim(0)
+        assert n_wgs % 8 == 0, f"n_wgs {n_wgs} must be divisible by 8"
+        n_wgs_per_xcd = n_wgs // 8
+        oproj_tiles_per_xcd = batch_size * n_wgs_per_xcd
+
+        # TopK tiling (one expert per worker)
+        router_output_size = router_weight.dim(0)
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8  # chunk_N per XCD
+        topk_tiles_per_xcd = router_tile_n  # 1 tile per expert
+        total_topk_tiles = topk_tiles_per_xcd * 8
+
+        # Gang dispatch uses max of both tile counts
+        total_tiles_per_xcd = max(oproj_tiles_per_xcd, topk_tiles_per_xcd)
+        # All dispatched workers enter the oproj barrier, not just oproj workers
+        total_oproj_tiles = total_tiles_per_xcd * 8
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 10 inputs
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(mxfp4_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        tb_graph.new_input(oproj_bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)
+        tb_graph.new_input(router_weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(router_bias, (1, -1, -1), 1, True)
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)
+        tb_graph.new_input(counters, (-1, -1, -1), 0, True)
+        # 4 outputs
+        # output is replicated so RMSNorm can read full hidden dim;
+        # O-PROJ epilogue uses xcd_output_col_offset for correct writes
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, mxfp4_weight, residual, oproj_bias,
+             norm_weight, norm_output, router_weight, router_bias,
+             logits_scratch, counters,
+             output, topk_weight, routing_indices, active_expert_ids],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd, total_oproj_tiles,
+             actual_hidden_dim, num_experts, topk_k, router_tile_n,
+             total_topk_tiles, total_tiles_per_xcd]
+        )
+
+    def gang_oproj_topk_moe_fused_layer(
+        self,
+        # O-PROJ inputs
+        input: DTensor,
+        oproj_weight: DTensor,
+        residual: DTensor,
+        oproj_bias: DTensor,
+        norm_weight: DTensor,
+        norm_output: DTensor,
+        router_weight: DTensor,
+        router_bias: DTensor,
+        logits_scratch: DTensor,
+        counters: DTensor,
+        # MoE inputs
+        gate_up_weight: DTensor,
+        down_weight: DTensor,
+        w13_bias: DTensor,
+        w2_bias: DTensor,
+        moe_barrier: DTensor,
+        swiglu_out: DTensor,
+        # Outputs
+        oproj_output: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        routing_weight_moe: DTensor,
+        workspace_f32: DTensor,
+        # Parameters
+        output_per_wg: int,
+        output_stride: int,
+        actual_hidden_dim: int,
+        num_experts: int,
+        topk_k: int,
+        w13_output_per_wg: int = 128,
+        w2_output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Fused O-PROJ+TopK+MoE: combines task 213 and 187 into one gang task.
+        Eliminates one inter-task event barrier per layer.
+
+        16 inputs, 6 outputs.
+        """
+        assert input.num_dims == 2
+        assert oproj_weight.num_dims == 2
+        assert gate_up_weight.num_dims == 3
+        assert down_weight.num_dims == 3
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+
+        # O-PROJ tiling (same as task 213)
+        n_wgs = oproj_weight.dim(0)
+        assert n_wgs % 8 == 0
+        n_wgs_per_xcd = n_wgs // 8
+        oproj_tiles_per_xcd = batch_size * n_wgs_per_xcd
+
+        # TopK tiling (same as task 213)
+        router_output_size = router_weight.dim(0)
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8
+        topk_tiles_per_xcd = router_tile_n
+        total_topk_tiles = topk_tiles_per_xcd * 8
+        total_oproj_tiles = max(oproj_tiles_per_xcd, topk_tiles_per_xcd) * 8
+
+        # MoE dimensions from tensors
+        # hidden_size for MoE = norm_output dimension (PADDED_HIDDEN_SIZE),
+        # NOT input (attn_out) dimension which is num_heads * head_dim.
+        hidden_size = norm_output.dim(1)
+        intermediate_size = swiglu_out.dim(2)
+
+        # MoE tiling (same as task 187)
+        moe_num_experts = gate_up_weight.dim(0)
+        w13_wgs = gate_up_weight.dim(1)
+        w2_wgs = down_weight.dim(1)
+        num_topk = swiglu_out.dim(1)
+        max_activated = min(num_topk * batch_size, moe_num_experts)
+        PAD_MULTIPLE = 240
+
+        w13_tiles = batch_size * w13_wgs
+        w2_tiles = batch_size * w2_wgs
+        total_w13_real = max_activated * w13_tiles
+        total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
+        total_w2 = max_activated * w2_tiles
+        total_tiles_all = total_w13_padded + total_w2
+        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+
+        # Match standalone MoE worker count (30 = 240 workers / 8 XCDs)
+        workers_per_xcd = self.num_workers // 8  # 30
+
+        reduction_size = input.dim(1)
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 16 inputs
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)            # [0] attn_out
+        tb_graph.new_input(oproj_weight, (0, -1, -1), 1, True)      # [1] O-proj weight
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)          # [2] residual
+        tb_graph.new_input(oproj_bias, (1, -1, -1), 1, True)        # [3] O-proj bias
+        tb_graph.new_input(norm_weight, (-1, -1, -1), 0, True)      # [4] RMSNorm weight
+        tb_graph.new_input(norm_output, (-1, -1, -1), 1, True)      # [5] norm output
+        tb_graph.new_input(router_weight, (0, -1, -1), 1, True)     # [6] router weight
+        tb_graph.new_input(router_bias, (1, -1, -1), 1, True)       # [7] router bias
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)    # [8] logits scratch
+        tb_graph.new_input(counters, (-1, -1, -1), 0, True)         # [9] hier barrier
+        tb_graph.new_input(gate_up_weight, (-1, 1, -1), 2, True)    # [10] W13 weight
+        tb_graph.new_input(down_weight, (-1, 1, -1), 2, True)       # [11] W2 weight
+        tb_graph.new_input(w13_bias, (-1, -1, -1), -1, True)        # [12] W13 bias
+        tb_graph.new_input(w2_bias, (-1, -1, -1), -1, True)         # [13] W2 bias
+        tb_graph.new_input(moe_barrier, (-1, -1, -1), -1, True)     # [14] MoE barrier
+        tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)       # [15] SwiGLU scratch
+        # 6 outputs
+        tb_graph.new_input(oproj_output, (-1, -1, -1), -1, True)    # [0] O-proj output
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)      # [1] topk weight
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)  # [2] routing indices
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)  # [3] expert mask
+        tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [4] routing weight (MoE)
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), -1, True)   # [5] MoE accumulator
+
+        self.kn_graph.customized(
+            [input, oproj_weight, residual, oproj_bias,
+             norm_weight, norm_output, router_weight, router_bias,
+             logits_scratch, counters,
+             gate_up_weight, down_weight, w13_bias, w2_bias,
+             moe_barrier, swiglu_out,
+             oproj_output, topk_weight, routing_indices,
+             active_expert_ids, routing_weight_moe, workspace_f32],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_oproj_topk_moe_fused_mi300",
+            [output_stride, output_per_wg, n_wgs_per_xcd, total_oproj_tiles,
+             actual_hidden_dim, num_experts, topk_k, router_tile_n,
+             total_topk_tiles, oproj_tiles_per_xcd,
+             intermediate_size, hidden_size,
+             w13_output_per_wg, w2_output_per_wg,
+             moe_total_tiles_per_xcd, workers_per_xcd]
+        )
+
+    def gang_full_layer_fused_layer(
+        self,
+        # QKV+Attn inputs (from type 214)
+        workspace_f32: DTensor,
+        residual: DTensor,
+        norm_weight_pre: DTensor,
+        norm_scratch_pre: DTensor,
+        qkv_weight: DTensor,
+        qkv_bias: DTensor,
+        sinks: DTensor,
+        qkv_barrier: DTensor,
+        lse_acc: DTensor,
+        # O-proj+TopK inputs (from type 215)
+        oproj_weight: DTensor,
+        oproj_bias: DTensor,
+        norm_weight_post: DTensor,
+        norm_scratch_post: DTensor,
+        router_weight: DTensor,
+        router_bias: DTensor,
+        logits_scratch: DTensor,
+        oproj_counters: DTensor,
+        # MoE inputs
+        gate_up_weight: DTensor,
+        down_weight: DTensor,
+        w13_bias: DTensor,
+        w2_bias: DTensor,
+        moe_barrier: DTensor,
+        swiglu_out: DTensor,
+        o_acc_f32: DTensor,
+        # Outputs (QKV+Attn)
+        x_output: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_workspace: DTensor,
+        o_acc: DTensor,
+        # Outputs (O-proj+TopK+MoE)
+        attn_proj_out: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        routing_weight_moe: DTensor,
+        moe_workspace_f32: DTensor,
+        # Parameters
+        actual_hidden_dim: int,
+        qkv_output_per_wg: int,
+        oproj_output_per_wg: int,
+        head_dim: int,
+        num_q_per_kv: int,
+        kv_stride: int,
+        q_ws_stride: int,
+        num_kv_chunks: int,
+        num_kv_heads: int,
+        num_experts: int,
+        topk_k: int,
+        sliding_window: int = 0,
+        w13_output_per_wg: int = 128,
+        w2_output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Full-layer fused gang task: QKV+Attn+O-proj+TopK+MoE.
+        Combines task 214 and 215 into one gang task per layer.
+        24 inputs, 11 outputs.
+        """
+        assert residual.num_dims == 2
+        assert qkv_weight.num_dims == 2
+        assert oproj_weight.num_dims == 2
+        assert gate_up_weight.num_dims == 3
+        assert down_weight.num_dims == 3
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+
+        # QKV tiling (from type 214)
+        qkv_n_wgs = qkv_weight.dim(0)
+        assert qkv_n_wgs % 8 == 0
+        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
+        total_qkv_tiles_per_xcd = batch_size * qkv_n_wgs_per_xcd
+
+        has_sinks = 1 if sinks is not None else 0
+        q_workspace_stride = q_workspace.dim(1)
+        kv_cache_stride = num_kv_heads * head_dim
+
+        # O-PROJ tiling (from type 215)
+        oproj_n_wgs = oproj_weight.dim(0)
+        assert oproj_n_wgs % 8 == 0
+        oproj_n_wgs_per_xcd = oproj_n_wgs // 8
+        oproj_tiles_per_xcd = batch_size * oproj_n_wgs_per_xcd
+        oproj_output_stride = norm_scratch_post.dim(1)
+
+        # TopK tiling
+        router_output_size = router_weight.dim(0)
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8
+        total_topk_tiles = router_tile_n * 8
+        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
+
+        # MoE tiling (from type 187/215)
+        moe_num_experts = gate_up_weight.dim(0)
+        w13_wgs = gate_up_weight.dim(1)
+        w2_wgs = down_weight.dim(1)
+        num_topk = swiglu_out.dim(1)
+        max_activated = min(num_topk * batch_size, moe_num_experts)
+        PAD_MULTIPLE = 240
+
+        intermediate_size = swiglu_out.dim(2)
+
+        w13_tiles = batch_size * w13_wgs
+        w2_tiles = batch_size * w2_wgs
+        total_w13_real = max_activated * w13_tiles
+        total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
+        total_w2 = max_activated * w2_tiles
+        total_tiles_all = total_w13_padded + total_w2
+        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+
+        workers_per_xcd = self.num_workers // 8  # 30
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 24 inputs
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)         # [0]
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)              # [1]
+        tb_graph.new_input(norm_weight_pre, (-1, -1, -1), 0, True)       # [2]
+        tb_graph.new_input(norm_scratch_pre, (-1, -1, -1), 1, True)      # [3]
+        tb_graph.new_input(qkv_weight, (0, -1, -1), 1, True)            # [4]
+        tb_graph.new_input(qkv_bias, (1, -1, -1), 1, True)              # [5]
+        sinks_or_placeholder = sinks if sinks is not None else qkv_barrier
+        tb_graph.new_input(sinks_or_placeholder, (-1, -1, -1), -1, True) # [6]
+        tb_graph.new_input(qkv_barrier, (-1, -1, -1), -1, True)         # [7]
+        tb_graph.new_input(lse_acc, (-1, -1, -1), -1, True)             # [8]
+        tb_graph.new_input(oproj_weight, (0, -1, -1), 1, True)          # [9]
+        tb_graph.new_input(oproj_bias, (1, -1, -1), 1, True)            # [10]
+        tb_graph.new_input(norm_weight_post, (-1, -1, -1), 0, True)     # [11]
+        tb_graph.new_input(norm_scratch_post, (-1, -1, -1), 1, True)    # [12]
+        tb_graph.new_input(router_weight, (0, -1, -1), 1, True)         # [13]
+        tb_graph.new_input(router_bias, (1, -1, -1), 1, True)           # [14]
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)        # [15]
+        tb_graph.new_input(oproj_counters, (-1, -1, -1), 0, True)       # [16]
+        tb_graph.new_input(gate_up_weight, (-1, 1, -1), 2, True)        # [17]
+        tb_graph.new_input(down_weight, (-1, 1, -1), 2, True)           # [18]
+        tb_graph.new_input(w13_bias, (-1, -1, -1), -1, True)            # [19]
+        tb_graph.new_input(w2_bias, (-1, -1, -1), -1, True)             # [20]
+        tb_graph.new_input(moe_barrier, (-1, -1, -1), -1, True)         # [21]
+        tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)           # [22]
+        tb_graph.new_input(o_acc_f32, (-1, -1, -1), -1, True)           # [23]
+        # 11 outputs
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)            # [0]
+        tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)             # [1]
+        tb_graph.new_input(v_cache, (-1, -1, -1), -1, True)             # [2]
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)         # [3]
+        tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)               # [4]
+        tb_graph.new_input(attn_proj_out, (-1, -1, -1), -1, True)       # [5]
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)          # [6]
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)     # [7]
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)   # [8]
+        tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [9]
+        tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)   # [10]
+
+        self.kn_graph.customized(
+            [workspace_f32, residual, norm_weight_pre, norm_scratch_pre,
+             qkv_weight, qkv_bias, sinks_or_placeholder, qkv_barrier, lse_acc,
+             oproj_weight, oproj_bias, norm_weight_post, norm_scratch_post,
+             router_weight, router_bias, logits_scratch, oproj_counters,
+             gate_up_weight, down_weight, w13_bias, w2_bias,
+             moe_barrier, swiglu_out, o_acc_f32,
+             x_output, k_cache, v_cache, q_workspace, o_acc,
+             attn_proj_out, topk_weight, routing_indices,
+             active_expert_ids, routing_weight_moe, moe_workspace_f32],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_full_layer_fused_mi300",
+            [qkv_output_per_wg, qkv_n_wgs_per_xcd, total_qkv_tiles_per_xcd,
+             actual_hidden_dim, head_dim, num_q_per_kv, self.page_size,
+             kv_stride, q_ws_stride,
+             self.max_seq_length, num_kv_chunks, q_workspace_stride,
+             kv_cache_stride, num_kv_heads, sliding_window, has_sinks,
+             oproj_output_per_wg, oproj_output_stride, total_oproj_tiles,
+             num_experts, topk_k, router_tile_n, total_topk_tiles,
+             oproj_tiles_per_xcd, moe_total_tiles_per_xcd,
+             w13_output_per_wg, w2_output_per_wg,
+             intermediate_size, workers_per_xcd]
+        )
+
+    def gang_full_layer_with_lmhead_fused_layer(
+        self,
+        # QKV+Attn inputs (same as type 216)
+        workspace_f32: DTensor,
+        residual: DTensor,
+        norm_weight_pre: DTensor,
+        norm_scratch_pre: DTensor,
+        qkv_weight: DTensor,
+        qkv_bias: DTensor,
+        sinks: DTensor,
+        qkv_barrier: DTensor,
+        lse_acc: DTensor,
+        # O-proj+TopK inputs
+        oproj_weight: DTensor,
+        oproj_bias: DTensor,
+        norm_weight_post: DTensor,
+        norm_scratch_post: DTensor,
+        router_weight: DTensor,
+        router_bias: DTensor,
+        logits_scratch: DTensor,
+        oproj_counters: DTensor,
+        # MoE inputs
+        gate_up_weight: DTensor,
+        down_weight: DTensor,
+        w13_bias: DTensor,
+        w2_bias: DTensor,
+        moe_barrier: DTensor,
+        swiglu_out: DTensor,
+        o_acc_f32: DTensor,
+        # LM head inputs (4 extra)
+        lm_norm_weight: DTensor,
+        lm_norm_scratch: DTensor,
+        lm_mxfp4_weight: DTensor,
+        lm_bias: DTensor,
+        # Outputs (QKV+Attn)
+        x_output: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_workspace: DTensor,
+        o_acc: DTensor,
+        # Outputs (O-proj+TopK+MoE)
+        attn_proj_out: DTensor,
+        topk_weight: DTensor,
+        routing_indices: DTensor,
+        active_expert_ids: DTensor,
+        routing_weight_moe: DTensor,
+        moe_workspace_f32: DTensor,
+        # LM head outputs (2 extra)
+        lm_logits: DTensor,
+        argmax_output: DTensor,
+        # Parameters
+        actual_hidden_dim: int,
+        qkv_output_per_wg: int,
+        oproj_output_per_wg: int,
+        head_dim: int,
+        num_q_per_kv: int,
+        kv_stride: int,
+        q_ws_stride: int,
+        num_kv_chunks: int,
+        num_kv_heads: int,
+        num_experts: int,
+        topk_k: int,
+        lm_output_per_wg: int,
+        lm_output_stride: int,
+        sliding_window: int = 0,
+        w13_output_per_wg: int = 128,
+        w2_output_per_wg: int = 64,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Full-layer + LM head + argmax fused gang task (type 217).
+        28 inputs, 13 outputs, 33 params.
+        """
+        assert residual.num_dims == 2
+        assert self.target_cc in (94, 95), "Only supported on MI300/MI350"
+
+        batch_size = self.max_num_batched_tokens
+
+        # QKV tiling
+        qkv_n_wgs = qkv_weight.dim(0)
+        assert qkv_n_wgs % 8 == 0
+        qkv_n_wgs_per_xcd = qkv_n_wgs // 8
+        total_qkv_tiles_per_xcd = batch_size * qkv_n_wgs_per_xcd
+
+        has_sinks = 1 if sinks is not None else 0
+        q_workspace_stride = q_workspace.dim(1)
+        kv_cache_stride = num_kv_heads * head_dim
+
+        # O-PROJ tiling
+        oproj_n_wgs = oproj_weight.dim(0)
+        assert oproj_n_wgs % 8 == 0
+        oproj_tiles_per_xcd = batch_size * (oproj_n_wgs // 8)
+        oproj_output_stride = norm_scratch_post.dim(1)
+
+        # TopK tiling
+        router_output_size = router_weight.dim(0)
+        assert router_output_size % 8 == 0
+        router_tile_n = router_output_size // 8
+        total_topk_tiles = router_tile_n * 8
+        total_oproj_tiles = max(oproj_tiles_per_xcd, router_tile_n) * 8
+
+        # MoE tiling
+        moe_num_experts = gate_up_weight.dim(0)
+        w13_wgs = gate_up_weight.dim(1)
+        w2_wgs = down_weight.dim(1)
+        num_topk = swiglu_out.dim(1)
+        max_activated = min(num_topk * batch_size, moe_num_experts)
+        PAD_MULTIPLE = 240
+
+        intermediate_size = swiglu_out.dim(2)
+
+        w13_tiles = batch_size * w13_wgs
+        w2_tiles = batch_size * w2_wgs
+        total_w13_real = max_activated * w13_tiles
+        total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
+        total_w2 = max_activated * w2_tiles
+        total_tiles_all = total_w13_padded + total_w2
+        moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+
+        workers_per_xcd = self.num_workers // 8  # 30
+
+        # LM head tiling
+        lm_n_wgs = lm_mxfp4_weight.dim(0)
+        assert lm_n_wgs % 8 == 0
+        lm_n_wgs_per_xcd = lm_n_wgs // 8
+
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # 24 base inputs (same as type 216)
+        tb_graph.new_input(workspace_f32, (-1, -1, -1), 1, True)         # [0]
+        tb_graph.new_input(residual, (-1, -1, -1), 1, True)              # [1]
+        tb_graph.new_input(norm_weight_pre, (-1, -1, -1), 0, True)       # [2]
+        tb_graph.new_input(norm_scratch_pre, (-1, -1, -1), 1, True)      # [3]
+        tb_graph.new_input(qkv_weight, (0, -1, -1), 1, True)            # [4]
+        tb_graph.new_input(qkv_bias, (1, -1, -1), 1, True)              # [5]
+        sinks_or_placeholder = sinks if sinks is not None else qkv_barrier
+        tb_graph.new_input(sinks_or_placeholder, (-1, -1, -1), -1, True) # [6]
+        tb_graph.new_input(qkv_barrier, (-1, -1, -1), -1, True)         # [7]
+        tb_graph.new_input(lse_acc, (-1, -1, -1), -1, True)             # [8]
+        tb_graph.new_input(oproj_weight, (0, -1, -1), 1, True)          # [9]
+        tb_graph.new_input(oproj_bias, (1, -1, -1), 1, True)            # [10]
+        tb_graph.new_input(norm_weight_post, (-1, -1, -1), 0, True)     # [11]
+        tb_graph.new_input(norm_scratch_post, (-1, -1, -1), 1, True)    # [12]
+        tb_graph.new_input(router_weight, (0, -1, -1), 1, True)         # [13]
+        tb_graph.new_input(router_bias, (1, -1, -1), 1, True)           # [14]
+        tb_graph.new_input(logits_scratch, (1, -1, -1), 1, True)        # [15]
+        tb_graph.new_input(oproj_counters, (-1, -1, -1), 0, True)       # [16]
+        tb_graph.new_input(gate_up_weight, (-1, 1, -1), 2, True)        # [17]
+        tb_graph.new_input(down_weight, (-1, 1, -1), 2, True)           # [18]
+        tb_graph.new_input(w13_bias, (-1, -1, -1), -1, True)            # [19]
+        tb_graph.new_input(w2_bias, (-1, -1, -1), -1, True)             # [20]
+        tb_graph.new_input(moe_barrier, (-1, -1, -1), -1, True)         # [21]
+        tb_graph.new_input(swiglu_out, (-1, 2, -1), -1, True)           # [22]
+        tb_graph.new_input(o_acc_f32, (-1, -1, -1), -1, True)           # [23]
+        # 4 extra LM head inputs
+        tb_graph.new_input(lm_norm_weight, (-1, -1, -1), 0, True)       # [24]
+        tb_graph.new_input(lm_norm_scratch, (-1, -1, -1), 1, True)      # [25]
+        tb_graph.new_input(lm_mxfp4_weight, (0, -1, -1), 1, True)       # [26]
+        tb_graph.new_input(lm_bias, (1, -1, -1), 1, True)               # [27]
+        # 11 base outputs (same as type 216)
+        tb_graph.new_input(x_output, (-1, -1, -1), -1, True)            # [0]
+        tb_graph.new_input(k_cache, (-1, -1, -1), -1, True)             # [1]
+        tb_graph.new_input(v_cache, (-1, -1, -1), -1, True)             # [2]
+        tb_graph.new_input(q_workspace, (-1, -1, -1), -1, True)         # [3]
+        tb_graph.new_input(o_acc, (-1, -1, -1), -1, True)               # [4]
+        tb_graph.new_input(attn_proj_out, (-1, -1, -1), -1, True)       # [5]
+        tb_graph.new_input(topk_weight, (0, -1, -1), -1, True)          # [6]
+        tb_graph.new_input(routing_indices, (-1, -1, -1), -1, True)     # [7]
+        tb_graph.new_input(active_expert_ids, (-1, -1, -1), -1, True)   # [8]
+        tb_graph.new_input(routing_weight_moe, (-1, -1, -1), -1, True)  # [9]
+        tb_graph.new_input(moe_workspace_f32, (-1, -1, -1), -1, True)   # [10]
+        # 2 extra LM head outputs
+        tb_graph.new_input(lm_logits, (1, -1, -1), -1, True)            # [11]
+        tb_graph.new_input(argmax_output, (-1, -1, -1), -1, True)       # [12]
+
+        self.kn_graph.customized(
+            [workspace_f32, residual, norm_weight_pre, norm_scratch_pre,
+             qkv_weight, qkv_bias, sinks_or_placeholder, qkv_barrier, lse_acc,
+             oproj_weight, oproj_bias, norm_weight_post, norm_scratch_post,
+             router_weight, router_bias, logits_scratch, oproj_counters,
+             gate_up_weight, down_weight, w13_bias, w2_bias,
+             moe_barrier, swiglu_out, o_acc_f32,
+             lm_norm_weight, lm_norm_scratch, lm_mxfp4_weight, lm_bias,
+             x_output, k_cache, v_cache, q_workspace, o_acc,
+             attn_proj_out, topk_weight, routing_indices,
+             active_expert_ids, routing_weight_moe, moe_workspace_f32,
+             lm_logits, argmax_output],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gang_full_layer_with_lmhead_fused_mi300",
+            [qkv_output_per_wg, qkv_n_wgs_per_xcd, total_qkv_tiles_per_xcd,
+             actual_hidden_dim, head_dim, num_q_per_kv, self.page_size,
+             kv_stride, q_ws_stride,
+             self.max_seq_length, num_kv_chunks, q_workspace_stride,
+             kv_cache_stride, num_kv_heads, sliding_window, has_sinks,
+             oproj_output_per_wg, oproj_output_stride, total_oproj_tiles,
+             num_experts, topk_k, router_tile_n, total_topk_tiles,
+             oproj_tiles_per_xcd, moe_total_tiles_per_xcd,
+             w13_output_per_wg, w2_output_per_wg,
+             intermediate_size, workers_per_xcd,
+             lm_output_per_wg, lm_n_wgs_per_xcd,
+             lm_output_stride, actual_hidden_dim]
+        )
+
+    def gang_splitk_linear_res_bias_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        residual: DTensor,
+        workspace: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        tile_n: int,
+        output_stride: int,
+        k_splits: int = 4,
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Gang split-K linear with residual + fused bias_add in epilogue.
+        5 inputs (input, weight, residual, workspace, bias), 1 output."""
+        assert self.target_cc in (94, 95)
+        batch_size = self.max_num_batched_tokens
+        output_size = weight.dim(0)
+        assert output_size % 8 == 0
+        chunk_n = output_size // 8
+        assert chunk_n % tile_n == 0
+        n_tiles_per_xcd = chunk_n // tile_n
+        reduction_size = weight.dim(1) if weight.num_dims == 2 else input.dim(1)
+        assert reduction_size % k_splits == 0
+        total_tiles = n_tiles_per_xcd * k_splits
+        grid_dim = (8, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        tb_graph.new_input(workspace, (1, -1, -1), 1, True)
+        tb_graph.new_input(bias, (1, -1, -1), 1, True)  # bias: partition dim 1 (columns) by bid.x
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, residual, workspace, bias, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "gang_splitk_linear_res_bias_mi300",
+            [output_stride, tile_n, n_tiles_per_xcd, k_splits]
+        )
+
     def linear_silu_layer(
         self, input, weight, output, output_stride,
         tile_n=64, m_tiles=1, wgm=0, block_dim=(256, 1, 1)):
         """CU-task linear with fused SiLU+mul. Same kernel as gang version."""
         assert input.num_dims == 2 and weight.num_dims == 2 and output.num_dims == 2
-        assert self.target_cc == 94
+        assert self.target_cc in (94, 95)
         batch_size = self.max_num_batched_tokens
         gate_up_size = weight.dim(0)
         n_weight_tiles = gate_up_size // tile_n
@@ -1733,121 +3678,6 @@ class PersistentKernel:
         self.kn_graph.customized([input, weight, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "linear_silu_mi300",
             [output_stride, tile_n, m_tiles, m_per_tile, total_tiles, n_output_tiles, wgm])
-
-    def gang_linear_with_residual_n_tiling_layer(
-        self,
-        input: DTensor,
-        weight: DTensor,
-        residual: DTensor,
-        output: DTensor,
-        tile_n: int,
-        output_stride: int,
-        m_tiles: int = 1,
-        wgn: int = 0,
-        block_dim: tuple = (256, 1, 1),
-    ):
-        """Sister to gang_linear_with_residual_layer with N-fast tile order.
-        Used to isolate the L2 weight-reuse benefit of M-tiling for o_proj /
-        down_proj.
-        """
-        assert input.num_dims == 2
-        assert weight.num_dims == 2
-        assert residual.num_dims == 2
-        assert output.num_dims == 2
-        assert self.target_cc == 94, "Gang linear N-tiling only supported on MI300X"
-        batch_size = self.max_num_batched_tokens
-        output_size = weight.dim(0)
-        assert output_size % 8 == 0
-        chunk_n = output_size // 8
-        assert chunk_n % tile_n == 0
-        n_tiles_per_xcd = chunk_n // tile_n
-        assert batch_size % m_tiles == 0
-        m_per_tile = batch_size // m_tiles
-        total_tiles_per_xcd = n_tiles_per_xcd * m_tiles
-        grid_dim = (8, 1, 1)
-        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (-1, -1, -1), 1, True)
-        tb_graph.new_input(weight, (0, -1, -1), 1, True)
-        tb_graph.new_input(residual, (1, -1, -1), 1, True)
-        tb_graph.new_input(output, (1, -1, -1), -1, True)
-        self.kn_graph.customized([input, weight, residual, output], tb_graph)
-        # params: [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-        #          n_tiles_per_xcd, wgn]
-        self.kn_graph.register_task(
-            tb_graph, "gang_linear_res_n_tiling_mi300",
-            [output_stride, tile_n, m_tiles, m_per_tile, total_tiles_per_xcd,
-             n_tiles_per_xcd, wgn]
-        )
-
-    def gang_linear_msplit_layer(
-        self,
-        input: DTensor,
-        weight: DTensor,
-        output: DTensor,
-        tile_n: int,
-        output_stride: int,
-        m_tiles: int = 2,
-        block_dim: tuple = (256, 1, 1),
-    ):
-        """M-split gang linear: 8 XCDs, weight unpartitioned.
-        bid_x stored in metadata. n_group = bid_x % n_groups, m_tile = bid_x / n_groups.
-        n_groups = 8 // m_tiles. Each XCD handles 1 m_tile → zero weight sharing.
-        """
-        assert input.num_dims == 2
-        assert weight.num_dims == 2
-        assert output.num_dims == 2
-        assert self.target_cc == 94
-        output_size = weight.dim(0)
-        batch_size = self.max_num_batched_tokens
-        m_per_tile = batch_size // m_tiles
-        n_groups = 8 // m_tiles
-        assert output_size % (n_groups * tile_n) == 0
-        n_tiles_per_xcd = output_size // n_groups // tile_n
-        grid_dim = (8, 1, 1)
-        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (-1, -1, -1), 1, True)
-        tb_graph.new_input(weight, (-1, -1, -1), 1, True)
-        tb_graph.new_input(output, (-1, -1, -1), -1, True)
-        self.kn_graph.customized([input, weight, output], tb_graph)
-        self.kn_graph.register_task(
-            tb_graph, "gang_linear_msplit_mi300",
-            [output_stride, tile_n, n_groups, n_tiles_per_xcd, m_per_tile]
-        )
-
-    def gang_linear_with_residual_msplit_layer(
-        self,
-        input: DTensor,
-        weight: DTensor,
-        residual: DTensor,
-        output: DTensor,
-        tile_n: int,
-        output_stride: int,
-        m_tiles: int = 2,
-        block_dim: tuple = (256, 1, 1),
-    ):
-        """M-split gang linear with residual."""
-        assert input.num_dims == 2
-        assert weight.num_dims == 2
-        assert residual.num_dims == 2
-        assert output.num_dims == 2
-        assert self.target_cc == 94
-        output_size = weight.dim(0)
-        batch_size = self.max_num_batched_tokens
-        m_per_tile = batch_size // m_tiles
-        n_groups = 8 // m_tiles
-        assert output_size % (n_groups * tile_n) == 0
-        n_tiles_per_xcd = output_size // n_groups // tile_n
-        grid_dim = (8, 1, 1)
-        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (-1, -1, -1), 1, True)
-        tb_graph.new_input(weight, (-1, -1, -1), 1, True)
-        tb_graph.new_input(residual, (-1, -1, -1), 1, True)
-        tb_graph.new_input(output, (-1, -1, -1), -1, True)
-        self.kn_graph.customized([input, weight, residual, output], tb_graph)
-        self.kn_graph.register_task(
-            tb_graph, "gang_linear_res_msplit_mi300",
-            [output_stride, tile_n, n_groups, n_tiles_per_xcd, m_per_tile]
-        )
 
     def gang_linear_silu_layer(
         self,
@@ -1871,7 +3701,7 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
-        assert self.target_cc == 94, "Gang linear SiLU only supported on MI300X"
+        assert self.target_cc in (94, 95), "Gang linear SiLU only supported on MI300X"
         batch_size = self.max_num_batched_tokens
         gate_up_size = weight.dim(0)
         assert gate_up_size % 8 == 0
@@ -2068,7 +3898,7 @@ class PersistentKernel:
                 # self.kn_graph.register_task(tb_graph, "linear_cutlass_hopper")
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
-        elif self.target_cc == 80 or self.target_cc == 94:
+        elif self.target_cc == 80 or self.target_cc in (94, 95):
             # 94: MI300/ROCm – use sm_80-style "linear" (base PTX path)
             self.kn_graph.register_task(tb_graph, "linear")
         else:
@@ -2103,7 +3933,7 @@ class PersistentKernel:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper")
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper")
-        elif self.target_cc == 80 or self.target_cc == 94:
+        elif self.target_cc == 80 or self.target_cc in (94, 95):
             # 94: MI300/ROCm – use sm_80-style "linear_with_residual"
             self.kn_graph.register_task(tb_graph, "linear_with_residual")
         else:
@@ -2133,6 +3963,25 @@ class PersistentKernel:
         tb_graph.new_input(output, (1, -1, -1), -1, True)
         self.kn_graph.customized([input, buffer, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "allreduce", params)
+
+    def bias_add_layer(
+        self,
+        input: DTensor,
+        bias: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """Element-wise bias add: output = input + bias (broadcast across batch)."""
+        assert input.num_dims == 2  # (batch_size, size)
+        assert bias.num_dims == 2   # (1, size) - pre-unsqueezed
+        assert output.num_dims == 2 # (batch_size, size)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (1, -1, -1), 1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), 1, True)
+        self.kn_graph.customized([input, bias, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "bias_add_mi300")
 
     def silu_mul_layer(
         self,
@@ -2431,7 +4280,7 @@ class PersistentKernel:
 
         # Event fusion DISABLED to match NVIDIA implementation
         # Original event fusion code (AMD only) reduced events but didn't improve performance
-        # if self.target_cc == 94:  # AMD MI300
+        # if self.target_cc in (94, 95):  # AMD MI300
         #     from .event_fusion import fuse_events
         #     import json
         #     with open(json_file_path, "r") as f:
@@ -2451,7 +4300,7 @@ class PersistentKernel:
             shutil.copy(cuda_code_path, os.path.join(output_dir, f"test_rank{self.mpi_rank}.cu"))
             shutil.copy(json_file_path, os.path.join(output_dir, f"task_graph_rank{self.mpi_rank}.json"))
 
-        if self.target_cc == 94:
+        if self.target_cc in (94, 95):
             rocm_home = os.environ.get("ROCM_PATH", "/opt/rocm")
             cc = shutil.which("hipcc") or os.path.join(rocm_home, "bin", "hipcc")
             if not cc or not os.path.isfile(cc):
@@ -2583,7 +4432,7 @@ class PersistentKernel:
         self.launch_func = getattr(mod, "launch_func")
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
-        self.get_event_timing_func = getattr(mod, "get_event_timing_func")
+        self._set_rope_tables_func = getattr(mod, "set_rope_tables_func", None)
         print("Finished megakernel compilation...")
 
         #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]
@@ -2619,6 +4468,12 @@ class PersistentKernel:
 
         # self.call_func = getattr(mod, "call_func")
 
+    def set_rope_tables(self, cos_tensor: "torch.Tensor", sin_tensor: "torch.Tensor"):
+        """Set RoPE cos/sin tables in RuntimeConfig (call after compile)."""
+        assert self._is_compiled, "Must call compile() before set_rope_tables()"
+        assert self._set_rope_tables_func is not None
+        self._set_rope_tables_func(cos_tensor.data_ptr(), sin_tensor.data_ptr())
+
     def __call__(self, **kwargs):
         stream = kwargs.get("default_stream", None)
         if stream is None:
@@ -2638,9 +4493,6 @@ class PersistentKernel:
         else:
             raise ValueError("Invalid stream object")
         self.launch_func(stream_ptr)
-        # Read back event timing data if enabled
-        if int(os.environ.get("MPK_EVENT_TIMING", "0")) == 1:
-            self._read_event_timing()
         if self.profiler_tensor is not None:
             from .profiler_persistent import export_to_perfetto_trace
             
@@ -2656,124 +4508,6 @@ class PersistentKernel:
             raw_path = trace_name.replace(".perfetto-trace", ".pt")
             torch.save(self.profiler_tensor.cpu(), raw_path)
             print(f"Saved raw profiler tensor to {raw_path}")
-
-    def _read_event_timing(self):
-        """Read event timing buffer from GPU and print per-phase wall-clock timing."""
-        import numpy as np
-        import json
-
-        max_entries = 50000  # large enough
-        host_buf = np.zeros(max_entries * 2, dtype=np.uint64)
-        count = self.get_event_timing_func(host_buf.ctypes.data, max_entries)
-        if count == 0:
-            print("[EVENT_TIMING] No timing data recorded")
-            return
-
-        print(f"[EVENT_TIMING] {count} event firings recorded")
-
-        # Parse into (event_index, timestamp) pairs
-        entries = []
-        for i in range(count):
-            event_idx = int(host_buf[i * 2])
-            timestamp = int(host_buf[i * 2 + 1])
-            entries.append((event_idx, timestamp))
-
-        # Sort by timestamp
-        entries.sort(key=lambda x: x[1])
-
-        # Load task graph to map event_index -> task type
-        task_graph_path = os.path.join(os.path.dirname(__file__),
-                                        "..", "..", "..", "demo", "qwen3", "task_graph_0.json")
-        # Try multiple paths
-        for tg_path in [task_graph_path, "task_graph_0.json",
-                        os.path.join(os.getcwd(), "task_graph_0.json")]:
-            if os.path.exists(tg_path):
-                with open(tg_path) as f:
-                    tg = json.load(f)
-                break
-        else:
-            tg = None
-
-        TASK_TYPE_NAMES = {
-            101: "EMBED", 136: "GANG_LINEAR", 137: "GANG_LINEAR_RES",
-            138: "GANG_ATTN", 142: "GANG_SILU", 143: "GANG_RMSNORM",
-            110: "ARGMAX_P", 111: "ARGMAX_R", 120: "LINEAR",
-            147: "GANG_LIN_NT", 148: "GANG_LIN_RES_NT", 10: "BEGIN",
-        }
-
-        def get_event_task_type(event_idx):
-            if tg is None or event_idx >= len(tg["all_events"]):
-                return "UNKNOWN"
-            ev = tg["all_events"][event_idx]
-            if ev["first_task_id"] >= ev["last_task_id"]:
-                return "EMPTY"
-            tt = tg["all_tasks"][ev["first_task_id"]]["task_type"]
-            return TASK_TYPE_NAMES.get(tt, f"TYPE_{tt}")
-
-        # Group by iteration (detect iteration boundaries via event_idx pattern)
-        # Each iteration cycles through events 0..num_events-1
-        num_events = len(tg["all_events"]) if tg else 498
-
-        # Find iteration boundaries: event_idx 0 or 1 firing repeatedly
-        # Actually, just compute wall-clock between consecutive events
-        # and aggregate per event_idx
-
-        # Per-event timing across all iterations
-        from collections import defaultdict
-        event_durations = defaultdict(list)  # event_idx -> [durations]
-
-        for i in range(1, len(entries)):
-            prev_idx, prev_ts = entries[i - 1]
-            cur_idx, cur_ts = entries[i]
-            dur_us = (cur_ts - prev_ts) * 0.01  # 100MHz -> us
-            if dur_us > 0 and dur_us < 100000:  # sanity check: < 100ms
-                event_durations[cur_idx].append(dur_us)
-
-        # Print per-event summary
-        print(f"\n{'='*80}")
-        print("PER-EVENT WALL-CLOCK TIMING (barrier-to-barrier)")
-        print(f"{'='*80}")
-        print(f"{'Event':>5} {'TaskType':<20} {'Count':>6} {'Avg(us)':>10} {'Min(us)':>10} {'Max(us)':>10} {'Std(us)':>10}")
-        print("-" * 73)
-
-        total_avg = 0
-        type_totals = defaultdict(lambda: {"sum": 0, "count": 0})
-
-        for eidx in sorted(event_durations.keys()):
-            durs = event_durations[eidx]
-            if len(durs) < 2:
-                continue
-            # Skip first measurement (warmup)
-            durs = durs[1:]
-            task_type = get_event_task_type(eidx)
-            avg = sum(durs) / len(durs)
-            mn = min(durs)
-            mx = max(durs)
-            std = (sum((d - avg)**2 for d in durs) / len(durs)) ** 0.5
-            print(f"{eidx:>5} {task_type:<20} {len(durs):>6} {avg:>10.2f} {mn:>10.2f} {mx:>10.2f} {std:>10.2f}")
-            total_avg += avg
-            type_totals[task_type]["sum"] += avg
-            type_totals[task_type]["count"] += 1
-
-        print(f"\n{'='*80}")
-        print("PER-TYPE SUMMARY (sum of avg durations across all events)")
-        print(f"{'='*80}")
-        print(f"{'TaskType':<20} {'Events':>6} {'Total(us)':>12} {'Total(ms)':>10} {'%':>8}")
-        print("-" * 58)
-        for tt, s in sorted(type_totals.items(), key=lambda x: -x[1]["sum"]):
-            pct = s["sum"] / total_avg * 100 if total_avg > 0 else 0
-            print(f"{tt:<20} {s['count']:>6} {s['sum']:>12.1f} {s['sum']/1000:>10.3f} {pct:>7.1f}%")
-        print(f"{'TOTAL':<20} {'':>6} {total_avg:>12.1f} {total_avg/1000:>10.3f}")
-
-        # Save raw data for further analysis
-        timing_path = "event_timing.json"
-        timing_data = {
-            "entries": [(int(e), int(t)) for e, t in entries],
-            "num_events": num_events,
-        }
-        with open(timing_path, "w") as f:
-            json.dump(timing_data, f)
-        print(f"\nSaved raw event timing to {timing_path}")
 
     def __del__(self):
         if not self.__finalized__:

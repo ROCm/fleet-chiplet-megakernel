@@ -55,7 +55,8 @@ std::vector<dim3>
 #endif
       for (int dim : dims) {
         if (dim % y == 0) {
-          cands.push_back({static_cast<uint32_t>(x), static_cast<uint32_t>(dim / y), 1u});
+          cands.push_back(
+              {static_cast<uint32_t>(x), static_cast<uint32_t>(dim / y), 1u});
         }
       }
     }
@@ -75,7 +76,8 @@ std::vector<dim3>
     for (size_t x : dim_to_try) {
       for (size_t y : dim_to_try) {
         if (x >= y) {
-          cands.push_back({static_cast<uint32_t>(x), static_cast<uint32_t>(y), 1u});
+          cands.push_back(
+              {static_cast<uint32_t>(x), static_cast<uint32_t>(y), 1u});
         }
       }
     }

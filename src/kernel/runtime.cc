@@ -383,6 +383,7 @@ void register_mugraph(
               (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300) ||
               (task_type == TASK_KV_CACHE_UPDATE_MI300) ||
               (task_type == TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300) ||
+              (task_type == TASK_ATTENTION_SINK_MI300) ||
               (task_type == TASK_ATTN_SM100)) {
             // Note that we assume grid_dim.x corresponds to
             // the request dimension
@@ -397,15 +398,17 @@ void register_mugraph(
               task_type == TASK_MOE_W2_LINEAR_SM90 ||
               task_type == TASK_MOE_W13_LINEAR_MI300 ||
               task_type == TASK_MOE_W2_LINEAR_MI300 ||
+              task_type == TASK_MOE_W13_LINEAR_MXFP4_MI300 ||
+              task_type == TASK_MOE_W2_LINEAR_MXFP4_MI300 ||
+              task_type == TASK_MOE_W13_LINEAR_MXFP4_CK_MI300 ||
+              task_type == TASK_MOE_W2_LINEAR_MXFP4_CK_MI300 ||
               task_type == TASK_LINEAR_SILU_MI300) {
             task.task_metadata.expert_offset =
                 (int)((bid.y << 16) | (bid.x & 0xFFFF));
           }
           // Set gang task metadata: n_tile_count = tiles per XCD
           if (task_type == TASK_GANG_LINEAR_MI300 ||
-              task_type == TASK_GANG_LINEAR_N_TILING_MI300 ||
               task_type == TASK_GANG_LINEAR_RES_MI300 ||
-              task_type == TASK_GANG_LINEAR_RES_N_TILING_MI300 ||
               task_type == TASK_GANG_LINEAR_SILU_MI300 ||
               task_type == TASK_GANG_RMS_NORM_MI300 ||
               task_type == TASK_GANG_SPLITK_LINEAR_RES_MI300 ||
@@ -415,31 +418,61 @@ void register_mugraph(
               task_type == TASK_GANG_ATTN_MERGE_MI300 ||
               task_type == TASK_GANG_MOE_W13_LINEAR_MI300 ||
               task_type == TASK_GANG_MOE_W2_LINEAR_MI300 ||
-              task_type == TASK_GANG_LINEAR_MSPLIT_MI300 ||
-              task_type == TASK_GANG_LINEAR_RES_MSPLIT_MI300) {
+              task_type == TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 ||
+              task_type == TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 ||
+              task_type == TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 ||
+              task_type == TASK_GANG_MOE_FUSED_MXFP4_MI300 ||
+              task_type == TASK_GANG_LINEAR_BIAS_MI300 ||
+              task_type == TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300 ||
+              task_type == TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 ||
+              task_type == TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 ||
+              task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+              task_type == TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 ||
+              task_type ==
+                  TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+              task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
+              task_type ==
+                  TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
+              task_type ==
+                  TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+              task_type ==
+                  TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
+              task_type == TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300 ||
+              task_type == TASK_GANG_QKV_ATTN_FUSED_MI300 ||
+              task_type == TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 ||
+              task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
+              task_type == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
+              task_type == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
             auto it = graph.gang_task_tiles_per_xcd.find(op);
             assert(it != graph.gang_task_tiles_per_xcd.end() &&
                    "Gang task missing n_tiles_per_xcd");
             int tiles_per_xcd = it->second;
             task.task_metadata.n_tile_count = (uint16_t)tiles_per_xcd;
-            // M-split: store bid.x in _linear_reserved so kernel can derive
-            // n_group and m_tile. n_tile_start stays 0 (used by scheduler).
-            if (task_type == TASK_GANG_LINEAR_MSPLIT_MI300 ||
-                task_type == TASK_GANG_LINEAR_RES_MSPLIT_MI300) {
-              task.task_metadata.n_tile_start = 0;
-              task.task_metadata._linear_reserved = (int32_t)bid.x;
-            }
             // Gang attention: each XCD processes a different tile range
             // bid.x = XCD index (0..7)
-            else if (task_type == TASK_GANG_ATTN_SPLIT_KV_MI300 ||
+            if (task_type == TASK_GANG_ATTN_SPLIT_KV_MI300 ||
                 task_type == TASK_GANG_ATTN_MERGE_MI300) {
-              task.task_metadata.n_tile_start = (uint16_t)(bid.x * tiles_per_xcd);
+              task.task_metadata.n_tile_start =
+                  (uint16_t)(bid.x * tiles_per_xcd);
             } else if (task_type == TASK_GANG_KSPLIT_GEMM_MI300) {
               // K-split index = XCD index (bid.x)
               task.task_metadata.n_tile_start = (uint16_t)bid.x;
             } else if (task_type == TASK_GANG_KSPLIT_FINALIZE_MI300) {
               // Column offset for this XCD's partition
-              task.task_metadata.n_tile_start = (uint16_t)(bid.x * tiles_per_xcd);
+              task.task_metadata.n_tile_start =
+                  (uint16_t)(bid.x * tiles_per_xcd);
+            } else if (task_type ==
+                           TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300 ||
+                       task_type == TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 ||
+                       task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
+                       task_type ==
+                           TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
+                       task_type ==
+                           TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
+              // Encode XCD index in tile_idx so kernel can compute column
+              // offset tile_idx = bid.x * tiles_per_xcd + local_t
+              task.task_metadata.n_tile_start =
+                  (uint16_t)(bid.x * tiles_per_xcd);
             } else {
               task.task_metadata.n_tile_start = 0;
             }
@@ -454,7 +487,8 @@ void register_mugraph(
             task.task_metadata.merge_task_offset = bid.y;
           }
           // CK FMHA: grid_dim=(max_requests, num_kv_heads, num_kv_chunks)
-          // bid.x = request_id (set above), bid.y = kv_head_idx, bid.z = kv_chunk_idx
+          // bid.x = request_id (set above), bid.y = kv_head_idx, bid.z =
+          // kv_chunk_idx
           if (task_type == TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300) {
             task.task_metadata.kv_idx = bid.z;
             task.task_metadata.merge_task_offset = bid.y;
@@ -692,8 +726,10 @@ TaskGraphResult print_task_graph(
   tgbody.inc_indent();
   // HIP workaround: Include standard C++ headers BEFORE persistent_kernel.cuh
   // to avoid namespace conflicts with HIP's CUDA wrapper headers
-  // This ensures C++ headers are processed before HIP's cuda_wrappers try to include them
-  code.e("// Include standard C++ headers first (before persistent_kernel.cuh)");
+  // This ensures C++ headers are processed before HIP's cuda_wrappers try to
+  // include them
+  code.e(
+      "// Include standard C++ headers first (before persistent_kernel.cuh)");
   code.e("// This avoids namespace conflicts with HIP's CUDA wrapper headers");
   code.e("#include <vector>");
   code.e("#include <thread>");
@@ -701,8 +737,12 @@ TaskGraphResult print_task_graph(
   // Conditionally define MPK_USE_CK_FMHA if CK FMHA tasks are registered
   {
     TaskRegister *tr = TaskRegister::get_instance();
-    if (tr->all_task_variants.count(TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300) > 0 ||
-        tr->all_task_variants.count(TASK_GANG_ATTN_SPLIT_KV_MI300) > 0) {
+    if (tr->all_task_variants.count(
+            TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300) > 0 ||
+        tr->all_task_variants.count(TASK_GANG_ATTN_SPLIT_KV_MI300) > 0 ||
+        tr->all_task_variants.count(TASK_GANG_FULL_LAYER_FUSED_MI300) > 0 ||
+        tr->all_task_variants.count(
+            TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300) > 0) {
       code.e("#define MPK_USE_CK_FMHA 1");
     }
   }
@@ -1272,24 +1312,24 @@ TaskGraphResult print_task_graph(
                 sub_desc.tensor.dim[input_map.x] / bgraph.grid_dim.x;
             offset += block_size * bid.x * sub_desc.tensor.stride[input_map.x];
           } else if (input_map.x == 0) {
-            offset += static_cast<size_t>(fused_dim_off_subtensor) *
-                      sub_desc.tensor.stride[input_map.x];
+            offset +=
+                fused_dim_off_subtensor * sub_desc.tensor.stride[input_map.x];
           }
           if (input_map.y > 0) {
             size_t block_size =
                 sub_desc.tensor.dim[input_map.y] / bgraph.grid_dim.y;
             offset += block_size * bid.y * sub_desc.tensor.stride[input_map.y];
           } else if (input_map.y == 0) {
-            offset += static_cast<size_t>(fused_dim_off_subtensor) *
-                      sub_desc.tensor.stride[input_map.y];
+            offset +=
+                fused_dim_off_subtensor * sub_desc.tensor.stride[input_map.y];
           }
           if (input_map.z > 0) {
             size_t block_size =
                 sub_desc.tensor.dim[input_map.z] / bgraph.grid_dim.z;
             offset += block_size * bid.z * sub_desc.tensor.stride[input_map.z];
           } else if (input_map.z == 0) {
-            offset += static_cast<size_t>(fused_dim_off_subtensor) *
-                      sub_desc.tensor.stride[input_map.z];
+            offset +=
+                fused_dim_off_subtensor * sub_desc.tensor.stride[input_map.z];
           }
           tgbody.e("TensorDesc input$;", i);
           tgbody.e("input$.base_ptr = static_cast<char*>($) + $;",
@@ -1504,7 +1544,17 @@ TaskGraphResult print_task_graph(
       "TASK_MOE_TOPK_SOFTMAX_MI300";
   task_type_to_name[TASK_MOE_W13_LINEAR_MI300] = "TASK_MOE_W13_LINEAR_MI300";
   task_type_to_name[TASK_MOE_W2_LINEAR_MI300] = "TASK_MOE_W2_LINEAR_MI300";
+  task_type_to_name[TASK_MOE_W13_LINEAR_MXFP4_MI300] =
+      "TASK_MOE_W13_LINEAR_MXFP4_MI300";
+  task_type_to_name[TASK_MOE_W2_LINEAR_MXFP4_MI300] =
+      "TASK_MOE_W2_LINEAR_MXFP4_MI300";
+  task_type_to_name[TASK_MOE_W13_LINEAR_MXFP4_CK_MI300] =
+      "TASK_MOE_W13_LINEAR_MXFP4_CK_MI300";
+  task_type_to_name[TASK_MOE_W2_LINEAR_MXFP4_CK_MI300] =
+      "TASK_MOE_W2_LINEAR_MXFP4_CK_MI300";
   task_type_to_name[TASK_MOE_MUL_SUM_ADD_MI300] = "TASK_MOE_MUL_SUM_ADD_MI300";
+  task_type_to_name[TASK_SWIGLUOAI_MI300] = "TASK_SWIGLUOAI_MI300";
+  task_type_to_name[TASK_BIAS_ADD_MI300] = "TASK_BIAS_ADD_MI300";
   task_type_to_name[TASK_SPLITK_LINEAR_SWAPAB_HOPPER] =
       "TASK_SPLITK_LINEAR_SWAPAB_HOPPER";
   task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_SM100] =
@@ -1513,33 +1563,28 @@ TaskGraphResult print_task_graph(
       "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100";
   task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER] =
       "TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER";
-  task_type_to_name[TASK_SPLITK_LINEAR_MI300] =
-      "TASK_SPLITK_LINEAR_MI300";
+  task_type_to_name[TASK_SPLITK_LINEAR_MI300] = "TASK_SPLITK_LINEAR_MI300";
   task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_MI300] =
       "TASK_PAGED_ATTENTION_SPLIT_KV_MI300";
   task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300] =
       "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300";
-  task_type_to_name[TASK_SPLITK_REDUCE_MI300] =
-      "TASK_SPLITK_REDUCE_MI300";
+  task_type_to_name[TASK_SPLITK_REDUCE_MI300] = "TASK_SPLITK_REDUCE_MI300";
   task_type_to_name[TASK_SPLITK_LINEAR_RES_ATOMIC_MI300] =
       "TASK_SPLITK_LINEAR_RES_ATOMIC_MI300";
-  task_type_to_name[TASK_GANG_LINEAR_MI300] =
-      "TASK_GANG_LINEAR_MI300";
-  task_type_to_name[TASK_GANG_LINEAR_N_TILING_MI300] =
-      "TASK_GANG_LINEAR_N_TILING_MI300";
-  task_type_to_name[TASK_GANG_LINEAR_RES_MI300] =
-      "TASK_GANG_LINEAR_RES_MI300";
+  task_type_to_name[TASK_GANG_LINEAR_MI300] = "TASK_GANG_LINEAR_MI300";
+  task_type_to_name[TASK_GANG_LINEAR_RES_MI300] = "TASK_GANG_LINEAR_RES_MI300";
   task_type_to_name[TASK_LINEAR_SILU_MI300] = "TASK_LINEAR_SILU_MI300";
-  task_type_to_name[TASK_GANG_LINEAR_RES_N_TILING_MI300] =
-      "TASK_GANG_LINEAR_RES_N_TILING_MI300";
-  task_type_to_name[TASK_GANG_LINEAR_MSPLIT_MI300] =
-      "TASK_GANG_LINEAR_MSPLIT_MI300";
-  task_type_to_name[TASK_GANG_LINEAR_RES_MSPLIT_MI300] =
-      "TASK_GANG_LINEAR_RES_MSPLIT_MI300";
   task_type_to_name[TASK_GANG_LINEAR_SILU_MI300] =
       "TASK_GANG_LINEAR_SILU_MI300";
-  task_type_to_name[TASK_GANG_RMS_NORM_MI300] =
-      "TASK_GANG_RMS_NORM_MI300";
+  task_type_to_name[TASK_GANG_LINEAR_BIAS_MI300] =
+      "TASK_GANG_LINEAR_BIAS_MI300";
+  task_type_to_name[TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300] =
+      "TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300";
+  task_type_to_name[TASK_GANG_RMSNORM_LINEAR_BIAS_MI300] =
+      "TASK_GANG_RMSNORM_LINEAR_BIAS_MI300";
+  task_type_to_name[TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300] =
+      "TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300";
+  task_type_to_name[TASK_GANG_RMS_NORM_MI300] = "TASK_GANG_RMS_NORM_MI300";
   task_type_to_name[TASK_GANG_SPLITK_LINEAR_RES_MI300] =
       "TASK_GANG_SPLITK_LINEAR_RES_MI300";
   task_type_to_name[TASK_GANG_KSPLIT_GEMM_MI300] =
@@ -1552,12 +1597,50 @@ TaskGraphResult print_task_graph(
       "TASK_GANG_MOE_W13_LINEAR_MI300";
   task_type_to_name[TASK_GANG_MOE_W2_LINEAR_MI300] =
       "TASK_GANG_MOE_W2_LINEAR_MI300";
-  task_type_to_name[TASK_GANG_ATTN_MERGE_MI300] =
-      "TASK_GANG_ATTN_MERGE_MI300";
-  task_type_to_name[TASK_KV_CACHE_UPDATE_MI300] =
-      "TASK_KV_CACHE_UPDATE_MI300";
+  task_type_to_name[TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300] =
+      "TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300";
+  task_type_to_name[TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300] =
+      "TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300";
+  task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300] =
+      "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300";
+  task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300] =
+      "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300";
+  task_type_to_name[TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300] =
+      "TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300";
+  task_type_to_name[TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300] =
+      "TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300";
+  task_type_to_name[TASK_GANG_MOE_FUSED_MXFP4_MI300] =
+      "TASK_GANG_MOE_FUSED_MXFP4_MI300";
+  task_type_to_name[TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300] =
+      "TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300";
+  task_type_to_name[TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300] =
+      "TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300";
+  task_type_to_name[TASK_GANG_ATTN_MERGE_MI300] = "TASK_GANG_ATTN_MERGE_MI300";
+  task_type_to_name[TASK_KV_CACHE_UPDATE_MI300] = "TASK_KV_CACHE_UPDATE_MI300";
+  task_type_to_name[TASK_ATTENTION_SINK_MI300] = "TASK_ATTENTION_SINK_MI300";
   task_type_to_name[TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300] =
       "TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300";
+  task_type_to_name[TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300] =
+      "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300";
+  task_type_to_name
+      [TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300] =
+          "TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300";
+  task_type_to_name[TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300] =
+      "TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300";
+  task_type_to_name[TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300] =
+      "TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300";
+  task_type_to_name[TASK_MOE_RESIDUAL_ADD_F32_MI300] =
+      "TASK_MOE_RESIDUAL_ADD_F32_MI300";
+  task_type_to_name[TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300] =
+      "TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300";
+  task_type_to_name[TASK_GANG_QKV_ATTN_FUSED_MI300] =
+      "TASK_GANG_QKV_ATTN_FUSED_MI300";
+  task_type_to_name[TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300] =
+      "TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300";
+  task_type_to_name[TASK_GANG_FULL_LAYER_FUSED_MI300] =
+      "TASK_GANG_FULL_LAYER_FUSED_MI300";
+  task_type_to_name[TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300] =
+      "TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300";
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");
   code.e("                   RuntimeConfig const &runtime_config) {");
@@ -1566,9 +1649,7 @@ TaskGraphResult print_task_graph(
   for (auto const &task : task_register->all_task_variants) {
     // Skip gang tasks — they use _execute_gang_task with tile_idx parameter
     if (task.first == TASK_GANG_LINEAR_MI300 ||
-        task.first == TASK_GANG_LINEAR_N_TILING_MI300 ||
         task.first == TASK_GANG_LINEAR_RES_MI300 ||
-        task.first == TASK_GANG_LINEAR_RES_N_TILING_MI300 ||
         task.first == TASK_GANG_LINEAR_SILU_MI300 ||
         task.first == TASK_GANG_RMS_NORM_MI300 ||
         task.first == TASK_GANG_SPLITK_LINEAR_RES_MI300 ||
@@ -1578,9 +1659,32 @@ TaskGraphResult print_task_graph(
         task.first == TASK_GANG_ATTN_MERGE_MI300 ||
         task.first == TASK_GANG_MOE_W13_LINEAR_MI300 ||
         task.first == TASK_GANG_MOE_W2_LINEAR_MI300 ||
-        task.first == TASK_GANG_LINEAR_MSPLIT_MI300 ||
-        task.first == TASK_GANG_LINEAR_RES_MSPLIT_MI300)
+        task.first == TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 ||
+        task.first == TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 ||
+        task.first == TASK_GANG_MOE_FUSED_MXFP4_MI300 ||
+        task.first == TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300 ||
+        task.first == TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 ||
+        task.first == TASK_GANG_LINEAR_BIAS_MI300 ||
+        task.first == TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300 ||
+        task.first == TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 ||
+        task.first == TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 ||
+        task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+        task.first == TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 ||
+        task.first == TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+        task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
+        task.first ==
+            TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
+        task.first == TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300 ||
+        task.first ==
+            TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 ||
+        task.first == TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300 ||
+        task.first == TASK_GANG_QKV_ATTN_FUSED_MI300 ||
+        task.first == TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 ||
+        task.first == TASK_GANG_FULL_LAYER_FUSED_MI300 ||
+        task.first == TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 ||
+        task.first == TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
       continue;
+    }
     for (size_t variant_id = 0; variant_id < task.second.size(); variant_id++) {
       std::string cond = first_task ? "if" : "else if";
       assert(task_type_to_name.find(task.first) != task_type_to_name.end());
@@ -1605,9 +1709,7 @@ TaskGraphResult print_task_graph(
     bool first_gang = true;
     for (auto const &task : task_register->all_task_variants) {
       if (task.first != TASK_GANG_LINEAR_MI300 &&
-          task.first != TASK_GANG_LINEAR_N_TILING_MI300 &&
           task.first != TASK_GANG_LINEAR_RES_MI300 &&
-          task.first != TASK_GANG_LINEAR_RES_N_TILING_MI300 &&
           task.first != TASK_GANG_LINEAR_SILU_MI300 &&
           task.first != TASK_GANG_RMS_NORM_MI300 &&
           task.first != TASK_GANG_SPLITK_LINEAR_RES_MI300 &&
@@ -1617,15 +1719,40 @@ TaskGraphResult print_task_graph(
           task.first != TASK_GANG_ATTN_MERGE_MI300 &&
           task.first != TASK_GANG_MOE_W13_LINEAR_MI300 &&
           task.first != TASK_GANG_MOE_W2_LINEAR_MI300 &&
-          task.first != TASK_GANG_LINEAR_MSPLIT_MI300 &&
-          task.first != TASK_GANG_LINEAR_RES_MSPLIT_MI300)
+          task.first != TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 &&
+          task.first != TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 &&
+          task.first != TASK_GANG_MOE_FUSED_MXFP4_MI300 &&
+          task.first != TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300 &&
+          task.first != TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 &&
+          task.first != TASK_GANG_LINEAR_BIAS_MI300 &&
+          task.first != TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300 &&
+          task.first != TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 &&
+          task.first != TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 &&
+          task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 &&
+          task.first != TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 &&
+          task.first != TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 &&
+          task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 &&
+          task.first !=
+              TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 &&
+          task.first != TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300 &&
+          task.first !=
+              TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 &&
+          task.first != TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300 &&
+          task.first != TASK_GANG_QKV_ATTN_FUSED_MI300 &&
+          task.first != TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 &&
+          task.first != TASK_GANG_FULL_LAYER_FUSED_MI300 &&
+          task.first != TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 &&
+          task.first != TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300) {
         continue;
+      }
       for (size_t variant_id = 0; variant_id < task.second.size();
            variant_id++) {
         std::string cond = first_gang ? "if" : "else if";
         assert(task_type_to_name.find(task.first) != task_type_to_name.end());
         code.e("$ (task_desc->task_type == $ && task_desc->variant_id == $) {",
-               cond, task_type_to_name[task.first], variant_id);
+               cond,
+               task_type_to_name[task.first],
+               variant_id);
         code.e("$", task.second[variant_id]);
         code.e("}");
         first_gang = false;
@@ -1640,9 +1767,9 @@ TaskGraphResult print_task_graph(
   code.e("}");
 
   // Write json to output file
-  // std::ofstream out("task_graph.json");
-  // out << json_task_graph.dump(2);
-  // out.close();
+  std::ofstream out("task_graph.json");
+  out << json_task_graph.dump(2);
+  out.close();
   TaskGraphResult result;
   result.cuda_code = code.to_string();
   result.json_file = json_task_graph.dump(2);

@@ -32,8 +32,10 @@ using fp32 = float;
 // Q*K^T: uses 16x16x16 MFMA (Q_ROWS x KV_TILE x HEAD_DIM)
 using WarpGemmQK = ck_tile::WarpGemmMfmaBf16Bf16F32M16N16K16;
 
-// P*V: uses 16x16x16 MFMA with transposed C distribution for better output layout
-using WarpGemmPV = ck_tile::WarpGemmMfmaBf16Bf16F32M16N16K16TransposedCDistribution;
+// P*V: uses 16x16x16 MFMA with transposed C distribution for better output
+// layout
+using WarpGemmPV =
+    ck_tile::WarpGemmMfmaBf16Bf16F32M16N16K16TransposedCDistribution;
 
 // ============================================================================
 // MFMA vector types
@@ -87,19 +89,20 @@ struct AttentionConfig {
 
 // ============================================================================
 // Compute Q * K^T using MFMA
-// Computes scores[Q_ROWS, KV_TILE_SIZE] = Q[Q_ROWS, HEAD_DIM] @ K^T[HEAD_DIM, KV_TILE_SIZE]
+// Computes scores[Q_ROWS, KV_TILE_SIZE] = Q[Q_ROWS, HEAD_DIM] @ K^T[HEAD_DIM,
+// KV_TILE_SIZE]
 // ============================================================================
 template <typename Config>
-__device__ __forceinline__ void compute_qk_mfma(
-    const bf16* __restrict__ s_q,      // [Q_ROWS, HEAD_DIM]
-    const bf16* __restrict__ s_k,      // [KV_TILE_SIZE, HEAD_DIM]
-    float* __restrict__ s_scores,      // [Q_ROWS, KV_TILE_SIZE]
-    int q_rows,                         // actual number of Q rows
-    int curr_kv_len,                    // actual number of KV positions
-    float sm_scale,                     // softmax scale
-    int tile_start,                     // KV tile start position
-    int seq_len,                        // total sequence length
-    int num_tokens) {                   // number of new tokens
+__device__ __forceinline__ void
+    compute_qk_mfma(bf16 const *__restrict__ s_q, // [Q_ROWS, HEAD_DIM]
+                    bf16 const *__restrict__ s_k, // [KV_TILE_SIZE, HEAD_DIM]
+                    float *__restrict__ s_scores, // [Q_ROWS, KV_TILE_SIZE]
+                    int q_rows,                   // actual number of Q rows
+                    int curr_kv_len,  // actual number of KV positions
+                    float sm_scale,   // softmax scale
+                    int tile_start,   // KV tile start position
+                    int seq_len,      // total sequence length
+                    int num_tokens) { // number of new tokens
 
   constexpr int MFMA_M = Config::MFMA_M;
   constexpr int MFMA_N = Config::MFMA_N;
@@ -121,8 +124,8 @@ __device__ __forceinline__ void compute_qk_mfma(
     for (int tile_m = 0; tile_m < Q_TILES_M; tile_m++) {
       attn_float4 accum = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      // Iterate over HEAD_DIM in MFMA_K chunks
-      #pragma unroll
+// Iterate over HEAD_DIM in MFMA_K chunks
+#pragma unroll
       for (int tile_k = 0; tile_k < HEAD_TILES_K; tile_k++) {
         int k_base = tile_k * MFMA_K;
 
@@ -132,7 +135,7 @@ __device__ __forceinline__ void compute_qk_mfma(
 
         attn_bf16x4_union reg_q;
         if (q_row < q_rows) {
-          reg_q.u64 = *reinterpret_cast<const uint64_t*>(
+          reg_q.u64 = *reinterpret_cast<uint64_t const *>(
               &s_q[q_row * HEAD_DIM + q_col]);
         } else {
           reg_q.u64 = 0;
@@ -144,7 +147,7 @@ __device__ __forceinline__ void compute_qk_mfma(
 
         attn_bf16x4_union reg_k;
         if (k_row < curr_kv_len) {
-          reg_k.u64 = *reinterpret_cast<const uint64_t*>(
+          reg_k.u64 = *reinterpret_cast<uint64_t const *>(
               &s_k[k_row * HEAD_DIM + k_col]);
         } else {
           reg_k.u64 = 0;
@@ -161,7 +164,7 @@ __device__ __forceinline__ void compute_qk_mfma(
 
       if (out_col < curr_kv_len) {
         int kv_pos = tile_start + out_col;
-        #pragma unroll
+#pragma unroll
         for (int r = 0; r < 4; r++) {
           int out_row = out_row_base + r;
           if (out_row < q_rows) {
@@ -182,13 +185,14 @@ __device__ __forceinline__ void compute_qk_mfma(
 
 // ============================================================================
 // Compute P * V using MFMA
-// Computes O[Q_ROWS, HEAD_DIM] += P[Q_ROWS, KV_TILE_SIZE] @ V[KV_TILE_SIZE, HEAD_DIM]
+// Computes O[Q_ROWS, HEAD_DIM] += P[Q_ROWS, KV_TILE_SIZE] @ V[KV_TILE_SIZE,
+// HEAD_DIM]
 // ============================================================================
 template <typename Config>
 __device__ __forceinline__ void compute_pv_mfma(
-    const float* __restrict__ s_p,     // [Q_ROWS, KV_TILE_SIZE] attention probs
-    const bf16* __restrict__ s_v,      // [KV_TILE_SIZE, HEAD_DIM]
-    float* __restrict__ s_o,           // [Q_ROWS, HEAD_DIM] output accumulator
+    float const *__restrict__ s_p, // [Q_ROWS, KV_TILE_SIZE] attention probs
+    bf16 const *__restrict__ s_v,  // [KV_TILE_SIZE, HEAD_DIM]
+    float *__restrict__ s_o,       // [Q_ROWS, HEAD_DIM] output accumulator
     int q_rows,
     int curr_kv_len) {
 
@@ -217,7 +221,9 @@ __device__ __forceinline__ void compute_pv_mfma(
       // Iterate over KV_TILE in MFMA_K chunks
       for (int tile_k = 0; tile_k < KV_TILES_K; tile_k++) {
         int k_base = tile_k * MFMA_K;
-        if (k_base >= curr_kv_len) break;
+        if (k_base >= curr_kv_len) {
+          break;
+        }
 
         // Load P fragment (fp32 -> bf16 conversion needed)
         int p_row = tile_m * MFMA_M + (lane % 16);
@@ -225,9 +231,11 @@ __device__ __forceinline__ void compute_pv_mfma(
 
         attn_bf16x4_union reg_p;
         if (p_row < q_rows && p_col + 3 < KV_TILE_SIZE) {
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
-            float val = (p_col + i < curr_kv_len) ? s_p[p_row * KV_TILE_SIZE + p_col + i] : 0.0f;
+            float val = (p_col + i < curr_kv_len)
+                            ? s_p[p_row * KV_TILE_SIZE + p_col + i]
+                            : 0.0f;
             reg_p.u16[i] = __bfloat16_as_ushort(__float2bfloat16(val));
           }
         } else {
@@ -239,11 +247,11 @@ __device__ __forceinline__ void compute_pv_mfma(
         int v_col = tile_n * MFMA_N + (lane % 16);
 
         attn_bf16x4_union reg_v;
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < 4; i++) {
           int vr = v_row + i;
           if (vr < curr_kv_len) {
-            reg_v.u16[i] = reinterpret_cast<const unsigned short*>(
+            reg_v.u16[i] = reinterpret_cast<unsigned short const *>(
                 &s_v[vr * HEAD_DIM + v_col])[0];
           } else {
             reg_v.u16[i] = 0;
@@ -259,7 +267,7 @@ __device__ __forceinline__ void compute_pv_mfma(
       int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
       int out_col = tile_n * MFMA_N + (lane % 16);
 
-      #pragma unroll
+#pragma unroll
       for (int r = 0; r < 4; r++) {
         int out_row = out_row_base + r;
         if (out_row < q_rows && out_col < HEAD_DIM) {

@@ -13,6 +13,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 // this kernel merges the result of one KV head chunk back to the full KV
 // cache，
 // it taks the output of multitoken_paged_attention_task_impl_32_64_split_kv and
@@ -99,9 +101,9 @@ __device__ __forceinline__ void
         // int o_offset = (kv_idx * (MAX_TOKENS * NUM_QO_HEADS_PER_KV) + tok) *
         // HEAD_DIM +  head_partition * VAL_PER_THREAD + i;
 
-        int lse_offset =
-            head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
-            (first_token_pos + token_idx) * NUM_QO_GROUPS * NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
+        int lse_offset = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
+                         (first_token_pos + token_idx) * NUM_QO_GROUPS *
+                             NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
         // int lse_offset = merge_task_offset * NUM_QO_HEADS_PER_KV + head_idx +
         // kv_idx * NUM_QO_HEADS_PER_KV + token_idx * NUM_QO_GROUPS *
         // NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
@@ -119,8 +121,10 @@ __device__ __forceinline__ void
                    other_o * ptx_exp2(other_m - m_global);
       }
       T out_val = (T)__fdividef(o_global, d_global);
-      output_ptr[(first_token_pos + token_idx) * NUM_QO_GROUPS * NUM_QO_HEADS_PER_KV * HEAD_DIM +
-                 head_idx * HEAD_DIM + head_partition * VAL_PER_THREAD + i] = out_val;
+      output_ptr[(first_token_pos + token_idx) * NUM_QO_GROUPS *
+                     NUM_QO_HEADS_PER_KV * HEAD_DIM +
+                 head_idx * HEAD_DIM + head_partition * VAL_PER_THREAD + i] =
+          out_val;
     }
   }
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
@@ -132,8 +136,8 @@ __device__ __forceinline__ void
 #endif
 }
 
-// CK FMHA merge variant: reads float o_acc/lse_acc with interleaved kv_head layout
-// lse layout:  lse[token * (NUM_QO_GROUPS * NUM_KV_CHUNKS * QO_PER_KV)
+// CK FMHA merge variant: reads float o_acc/lse_acc with interleaved kv_head
+// layout lse layout:  lse[token * (NUM_QO_GROUPS * NUM_KV_CHUNKS * QO_PER_KV)
 //                  + kv_head * NUM_KV_CHUNKS * QO_PER_KV
 //                  + chunk * QO_PER_KV + head]
 // o layout:    same indexing * HEAD_DIM + d
@@ -145,7 +149,8 @@ template <typename T,
           int HEAD_DIM,
           int NUM_KV_CHUNKS,
           int KV_CHUNK_SIZE = 128,
-          int PAGE_SIZE = 4096>
+          int PAGE_SIZE = 4096,
+          bool WRITE_THROUGH = false>
 __device__ __forceinline__ void
     merge_splitkv_ck_fmha(float const *lse_ptr,
                           float const *o_ptr,
@@ -154,39 +159,70 @@ __device__ __forceinline__ void
                           int const *paged_kv_last_page_len_buffer_ptr,
                           int16_t request_id,
                           T *output_ptr,
-                          int kv_head_idx) {
+                          int kv_head_idx,
+                          void const *sinks_ptr = nullptr) {
 
   int const first_token_pos = qo_indptr_buffer_ptr[request_id];
   int const last_token_pos = qo_indptr_buffer_ptr[request_id + 1];
-  if (first_token_pos == last_token_pos) return;
+  if (first_token_pos == last_token_pos) {
+    return;
+  }
   int const num_tokens = last_token_pos - first_token_pos;
 
-
-  // Use NUM_KV_CHUNKS (template param) as the chunk count — the CK FMHA pipeline
-  // processes exactly NUM_KV_CHUNKS chunks worth of data into o_acc/lse_acc
+  // Use NUM_KV_CHUNKS (template param) as the chunk count — the CK FMHA
+  // pipeline processes exactly NUM_KV_CHUNKS chunks worth of data into
+  // o_acc/lse_acc
   constexpr int num_chunks = NUM_KV_CHUNKS;
 
-  // Full token stride matches CK FMHA's LSE_STRIDE = NUM_KV_HEADS * NUM_KV_CHUNKS * QO_PER_KV
-  constexpr int LSE_TOKEN_STRIDE = NUM_QO_GROUPS * NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
+  // Full token stride matches CK FMHA's LSE_STRIDE = NUM_KV_HEADS *
+  // NUM_KV_CHUNKS * QO_PER_KV
+  constexpr int LSE_TOKEN_STRIDE =
+      NUM_QO_GROUPS * NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
   // Offset to this kv_head's slice within one token
   int const lse_kv_offset = kv_head_idx * NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
   // Output stride (full width across all kv_heads)
-  constexpr int OUT_TOKEN_STRIDE = NUM_QO_GROUPS * NUM_QO_HEADS_PER_KV * HEAD_DIM;
+  constexpr int OUT_TOKEN_STRIDE =
+      NUM_QO_GROUPS * NUM_QO_HEADS_PER_KV * HEAD_DIM;
 
-  constexpr int THREADS_PER_TOKEN = 16;
+  // Use 32 threads per head to match work items (1 token * 8 heads = 8 groups =
+  // 256/32)
+  constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
   constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
 
   int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
   int group_id = threadIdx.x / THREADS_PER_TOKEN;
 
-#pragma unroll 1
+  // Optional sink correction (GPT-OSS): out *= 1 / (1 + exp(sink -
+  // LSE_natural)) Layout: sinks[num_q_heads] in bf16, indexed by
+  // kv_head_idx*NUM_QO_HEADS_PER_KV + head.
+  using __sink_bf16 = __hip_bfloat16;
+  __sink_bf16 const *d_sinks = reinterpret_cast<__sink_bf16 const *>(sinks_ptr);
+
+#pragma unroll
   for (int tok = group_id; tok < num_tokens * NUM_QO_HEADS_PER_KV;
        tok += num_groups) {
     int token_idx = tok / NUM_QO_HEADS_PER_KV;
     int head_idx = tok % NUM_QO_HEADS_PER_KV;
 
-#pragma unroll 1
+    // Load this head's sink once (independent of dim).
+    float sink_val_log2 = 0.0f;
+    if (sinks_ptr != nullptr) {
+      sink_val_log2 =
+          static_cast<float>(
+              d_sinks[kv_head_idx * NUM_QO_HEADS_PER_KV + head_idx]) *
+          1.44269504088896340736f; // convert sink from ln to log2
+    }
+
+    // Base output offset for this token+head (dims start here)
+    int out_offset_base = (first_token_pos + token_idx) * OUT_TOKEN_STRIDE +
+                          kv_head_idx * NUM_QO_HEADS_PER_KV * HEAD_DIM +
+                          head_idx * HEAD_DIM +
+                          thread_in_group * VAL_PER_THREAD;
+
+    // Compute all VAL_PER_THREAD dimensions
+    float out_vals[VAL_PER_THREAD];
+#pragma unroll
     for (int i = 0; i < VAL_PER_THREAD; ++i) {
       float m_global = -inf;
       float d_global = 1.f;
@@ -196,14 +232,15 @@ __device__ __forceinline__ void
         float m_prev = m_global, d_prev = d_global;
 
         int lse_linear = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
-            (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
-            lse_kv_offset;
+                         (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                         lse_kv_offset;
         int lse_offset = lse_linear;
-        int o_offset = lse_linear * HEAD_DIM +
-            thread_in_group * VAL_PER_THREAD + i;
+        int o_offset =
+            lse_linear * HEAD_DIM + thread_in_group * VAL_PER_THREAD + i;
 
         // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
-        float other_m = lse_ptr[lse_offset] * 1.44269504088896340736f, other_d = 1;
+        float other_m = lse_ptr[lse_offset] * 1.44269504088896340736f,
+              other_d = 1;
         m_global = max(m_prev, other_m);
         d_global = d_prev * ptx_exp2(m_prev - m_global) +
                    other_d * ptx_exp2(other_m - m_global);
@@ -211,12 +248,37 @@ __device__ __forceinline__ void
         o_global = o_global * ptx_exp2(m_prev - m_global) +
                    other_o * ptx_exp2(other_m - m_global);
       }
-      // Output: token * full_stride + kv_head_offset + head_within_group * HEAD_DIM + d
-      int out_offset = (first_token_pos + token_idx) * OUT_TOKEN_STRIDE +
-                 kv_head_idx * NUM_QO_HEADS_PER_KV * HEAD_DIM +
-                 head_idx * HEAD_DIM + thread_in_group * VAL_PER_THREAD + i;
-      T out_val = (T)__fdividef(o_global, d_global);
-      output_ptr[out_offset] = out_val;
+      float out_f = __fdividef(o_global, d_global);
+      if (sinks_ptr != nullptr) {
+        float lse_log2 = m_global + ptx_log2(d_global);
+        float diff = sink_val_log2 - lse_log2;
+        float correction = __fdividef(1.0f, 1.0f + ptx_exp2(diff));
+        out_f *= correction;
+      }
+      out_vals[i] = out_f;
+    }
+
+    // Write output: either write-through (st_wt) or regular global store
+    if constexpr (WRITE_THROUGH) {
+      // Pack pairs of bf16 into uint32 and write-through to HBM
+      static_assert(VAL_PER_THREAD % 2 == 0 || VAL_PER_THREAD == 1,
+                    "WRITE_THROUGH requires even VAL_PER_THREAD or 1");
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; i += 2) {
+        __hip_bfloat16 v0 = (__hip_bfloat16)out_vals[i];
+        __hip_bfloat16 v1 = (__hip_bfloat16)out_vals[i + 1];
+        uint32_t packed;
+        uint16_t lo, hi;
+        memcpy(&lo, &v0, 2);
+        memcpy(&hi, &v1, 2);
+        packed = lo | ((uint32_t)hi << 16);
+        st_wt_u32((void *)&output_ptr[out_offset_base + i], packed);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        output_ptr[out_offset_base + i] = (T)out_vals[i];
+      }
     }
   }
 }

@@ -237,8 +237,8 @@ TBSched Transpiler::get_threadblock_schedule(tb::Graph const &tb_graph) {
         // Decide whether or not to put the forloop accumulator in register
         // files
         size_t accum_numel = op->output_tensors.at(0).num_elements();
-        size_t num_thrs = static_cast<size_t>(tb_graph.block_dim.x) *
-                          tb_graph.block_dim.y * tb_graph.block_dim.z;
+        size_t num_thrs =
+            tb_graph.block_dim.x * tb_graph.block_dim.y * tb_graph.block_dim.z;
         size_t per_thr_accum_numel = accum_numel / num_thrs;
         // Use a simple heuristic to decide whether or not to put the forloop
         // accumulator in register files

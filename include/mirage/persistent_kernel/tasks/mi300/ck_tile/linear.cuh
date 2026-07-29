@@ -65,7 +65,8 @@ struct LinearConfig {
   static constexpr int OUTPUT_SIZE = OUTPUT_SIZE_;
   static constexpr int REDUCTION_SIZE = REDUCTION_SIZE_;
   static constexpr int TILE_K = TILE_K_;
-  static constexpr int OUTPUT_ATOM_SIZE = OUTPUT_ATOM_SIZE_ <= OUTPUT_SIZE ? OUTPUT_ATOM_SIZE_ : OUTPUT_SIZE;
+  static constexpr int OUTPUT_ATOM_SIZE =
+      OUTPUT_ATOM_SIZE_ <= OUTPUT_SIZE ? OUTPUT_ATOM_SIZE_ : OUTPUT_SIZE;
 
   // MFMA tile sizes
   static constexpr int MFMA_M = 16;
@@ -83,7 +84,7 @@ struct LinearConfig {
   static constexpr int NUM_WARPS = NUM_THREADS / 64;
 
   // Vectorized load sizes
-  static constexpr int VEC_SIZE = 8;  // 8 bf16 = 128 bits
+  static constexpr int VEC_SIZE = 8; // 8 bf16 = 128 bits
   static constexpr int INPUT_ELEMS = BATCH_SIZE * TILE_K;
   static constexpr int WEIGHT_ELEMS = TILE_K * OUTPUT_ATOM_SIZE;
   static constexpr int INPUT_VEC_LOADS = INPUT_ELEMS / VEC_SIZE;
@@ -94,11 +95,10 @@ struct LinearConfig {
 // Load input tile to shared memory with vectorized loads
 // ============================================================================
 template <typename T, typename Config>
-__device__ __forceinline__ void load_input_tile(
-    T* __restrict__ s_input,
-    const T* __restrict__ d_input,
-    int k_offset,
-    int tid) {
+__device__ __forceinline__ void load_input_tile(T *__restrict__ s_input,
+                                                T const *__restrict__ d_input,
+                                                int k_offset,
+                                                int tid) {
 
   constexpr int TILE_K = Config::TILE_K;
   constexpr int BATCH_SIZE = Config::BATCH_SIZE;
@@ -114,12 +114,13 @@ __device__ __forceinline__ void load_input_tile(
 
     linear_bf16x8_union vec_data;
     if (row < BATCH_SIZE && col + 7 < TILE_K) {
-      vec_data.u128 = *reinterpret_cast<const __uint128_t*>(
+      vec_data.u128 = *reinterpret_cast<__uint128_t const *>(
           &d_input[row * REDUCTION_SIZE + k_offset + col]);
     } else {
       vec_data.u128 = 0;
     }
-    *reinterpret_cast<__uint128_t*>(&s_input[row * TILE_K + col]) = vec_data.u128;
+    *reinterpret_cast<__uint128_t *>(&s_input[row * TILE_K + col]) =
+        vec_data.u128;
   }
 }
 
@@ -128,12 +129,11 @@ __device__ __forceinline__ void load_input_tile(
 // Weight is stored as [OUTPUT_SIZE, REDUCTION_SIZE]
 // ============================================================================
 template <typename T, typename Config>
-__device__ __forceinline__ void load_weight_tile(
-    T* __restrict__ s_weight,
-    const T* __restrict__ d_weight,
-    int k_offset,
-    int n_offset,
-    int tid) {
+__device__ __forceinline__ void load_weight_tile(T *__restrict__ s_weight,
+                                                 T const *__restrict__ d_weight,
+                                                 int k_offset,
+                                                 int n_offset,
+                                                 int tid) {
 
   constexpr int TILE_K = Config::TILE_K;
   constexpr int OUTPUT_ATOM_SIZE = Config::OUTPUT_ATOM_SIZE;
@@ -152,15 +152,16 @@ __device__ __forceinline__ void load_weight_tile(
     linear_bf16x8_union vec_data;
     // Weight layout: d_weight[out_col][k]
     if (k < TILE_K && global_col + 7 < OUTPUT_SIZE) {
-      #pragma unroll
+#pragma unroll
       for (int i = 0; i < 8; i++) {
-        vec_data.u16[i] = reinterpret_cast<const unsigned short*>(
+        vec_data.u16[i] = reinterpret_cast<unsigned short const *>(
             &d_weight[(global_col + i) * REDUCTION_SIZE + k_offset + k])[0];
       }
     } else {
       vec_data.u128 = 0;
     }
-    *reinterpret_cast<__uint128_t*>(&s_weight[k * OUTPUT_ATOM_SIZE + out_col]) = vec_data.u128;
+    *reinterpret_cast<__uint128_t *>(
+        &s_weight[k * OUTPUT_ATOM_SIZE + out_col]) = vec_data.u128;
   }
 }
 
@@ -169,9 +170,9 @@ __device__ __forceinline__ void load_weight_tile(
 // ============================================================================
 template <typename Config>
 __device__ __forceinline__ void compute_gemm_mfma(
-    const bf16* __restrict__ s_input,   // [BATCH_SIZE, TILE_K]
-    const bf16* __restrict__ s_weight,  // [TILE_K, OUTPUT_ATOM_SIZE]
-    float* __restrict__ s_output,       // [BATCH_SIZE, OUTPUT_ATOM_SIZE]
+    bf16 const *__restrict__ s_input,  // [BATCH_SIZE, TILE_K]
+    bf16 const *__restrict__ s_weight, // [TILE_K, OUTPUT_ATOM_SIZE]
+    float *__restrict__ s_output,      // [BATCH_SIZE, OUTPUT_ATOM_SIZE]
     int num_active_tokens,
     int lane,
     int warp_id) {
@@ -193,8 +194,8 @@ __device__ __forceinline__ void compute_gemm_mfma(
     for (int tile_m = 0; tile_m < TILES_M; tile_m++) {
       linear_float4 accum = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      // K-dimension loop within tile
-      #pragma unroll
+// K-dimension loop within tile
+#pragma unroll
       for (int k_iter = 0; k_iter < MFMA_K_ITERS; k_iter++) {
         int k_base = k_iter * MFMA_K;
 
@@ -204,7 +205,7 @@ __device__ __forceinline__ void compute_gemm_mfma(
 
         linear_bf16x4_union reg_a;
         if (a_row < BATCH_SIZE) {
-          reg_a.u64 = *reinterpret_cast<const uint64_t*>(
+          reg_a.u64 = *reinterpret_cast<uint64_t const *>(
               &s_input[a_row * TILE_K + a_col]);
         } else {
           reg_a.u64 = 0;
@@ -216,9 +217,9 @@ __device__ __forceinline__ void compute_gemm_mfma(
 
         linear_bf16x4_union reg_b;
         if (b_col < OUTPUT_ATOM_SIZE) {
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
-            reg_b.u16[i] = reinterpret_cast<const unsigned short*>(
+            reg_b.u16[i] = reinterpret_cast<unsigned short const *>(
                 &s_weight[(b_row + i) * OUTPUT_ATOM_SIZE + b_col])[0];
           }
         } else {
@@ -235,7 +236,7 @@ __device__ __forceinline__ void compute_gemm_mfma(
       int out_col = tile_n * MFMA_N + (lane % 16);
 
       if (out_col < OUTPUT_ATOM_SIZE) {
-        #pragma unroll
+#pragma unroll
         for (int r = 0; r < 4; r++) {
           int out_row = out_row_base + r;
           if (out_row < BATCH_SIZE && out_row < num_active_tokens) {

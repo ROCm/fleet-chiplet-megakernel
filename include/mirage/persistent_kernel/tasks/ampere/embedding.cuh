@@ -54,6 +54,13 @@ __device__ __forceinline__ void
 #pragma unroll
   for (int batch_idx = 0; batch_idx < BATCH_SIZE; batch_idx++) {
     int64_t wordIdx = input_ids[batch_idx];
+#ifdef EMBED_DEBUG
+    if (threadIdx.x == 0) {
+      printf("[EMBED] wordIdx=%lld output_ptr=%p\n",
+             (long long)wordIdx,
+             output_ptr);
+    }
+#endif
     if (wordIdx >= 0) {
 #pragma unroll
       for (int i = threadIdx.x; i < CHUNK_SIZE; i += blockDim.x) {
@@ -67,8 +74,16 @@ __device__ __forceinline__ void
         output[batch_idx * OUTPUT_DIM_SIZE + i] = T(0.0f);
       }
     }
+#ifdef EMBED_DEBUG
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float v0 = static_cast<float>(output[0]);
+      float v1 = static_cast<float>(output[1]);
+      float v2 = static_cast<float>(output[2]);
+      printf("[EMBED] output[0..2]: %f %f %f\n", v0, v1, v2);
+    }
+#endif
   }
-
 }
 
 } // namespace kernel

@@ -35,13 +35,14 @@ __device__ __forceinline__ void rms_norm(InputSmem smem_input,
   constexpr int ROTARY_PARTICIPATING_THREADS =
       (NUM_THREADS < HEAD_DIM ? NUM_THREADS : HEAD_DIM);
   // HIP: wavefront size is 64, tile size must be <= 64 and power of 2
-  constexpr int HIP_TILE_SIZE = (ROTARY_PARTICIPATING_THREADS > 64) ? 64 : ROTARY_PARTICIPATING_THREADS;
-  static_assert(HIP_TILE_SIZE <= 64 && (HIP_TILE_SIZE & (HIP_TILE_SIZE - 1)) == 0,
+  constexpr int HIP_TILE_SIZE =
+      (ROTARY_PARTICIPATING_THREADS > 64) ? 64 : ROTARY_PARTICIPATING_THREADS;
+  static_assert(HIP_TILE_SIZE <= 64 &&
+                    (HIP_TILE_SIZE & (HIP_TILE_SIZE - 1)) == 0,
                 "HIP tile size must be <= 64 and power of 2");
   auto block_group = cooperative_groups::this_thread_block();
   auto participating_group =
-      cooperative_groups::tiled_partition<HIP_TILE_SIZE>(
-          block_group);
+      cooperative_groups::tiled_partition<HIP_TILE_SIZE>(block_group);
 
   // smem_input: NUM_HEADS * (WINDOW_SIZE or CHUNK_SIZE), HEAD_DIM
   int warp_idx = warp_id();

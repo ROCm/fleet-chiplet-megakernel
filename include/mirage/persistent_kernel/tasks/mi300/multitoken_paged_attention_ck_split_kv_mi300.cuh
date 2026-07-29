@@ -65,8 +65,10 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     int kv_chunk_idx) {
 
   constexpr int NUM_QO_PER_KV = NUM_QO_HEADS / NUM_KV_HEADS;
-  constexpr int KV_TILE_SIZE = 64;  // Matches MI300 wavefront size for warp-parallel softmax
-  constexpr int MAX_PAGES_PER_REQUEST = (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
+  constexpr int KV_TILE_SIZE =
+      64; // Matches MI300 wavefront size for warp-parallel softmax
+  constexpr int MAX_PAGES_PER_REQUEST =
+      (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
   constexpr float log2e = 1.4426950408889634f;
   constexpr int Q_ROWS = MAX_TOKENS * NUM_QO_PER_KV;
 
@@ -77,10 +79,11 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
 
   // Number of MFMA tiles
   constexpr int Q_TILES_M = (Q_ROWS + MFMA_M - 1) / MFMA_M;
-  constexpr int KV_TILES_N = (KV_TILE_SIZE + MFMA_N - 1) / MFMA_N;  // 4 tiles = 4 warps
+  constexpr int KV_TILES_N =
+      (KV_TILE_SIZE + MFMA_N - 1) / MFMA_N; // 4 tiles = 4 warps
   constexpr int HEAD_TILES_K = HEAD_DIM / MFMA_K;
   constexpr int OUT_TILES_N = HEAD_DIM / MFMA_N;
-  constexpr int PV_TILES_K = (KV_TILE_SIZE + MFMA_K - 1) / MFMA_K;  // 4 tiles
+  constexpr int PV_TILES_K = (KV_TILE_SIZE + MFMA_K - 1) / MFMA_K; // 4 tiles
 
   float const sm_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM)) * log2e;
 
@@ -95,7 +98,7 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   int const last_page_pos = paged_kv_indptr_buffer_ptr[request_id + 1];
   int const num_pages = last_page_pos - first_page_pos;
   int const global_seq_len = (num_pages - 1) * PAGE_SIZE +
-                              paged_kv_last_page_len_buffer_ptr[request_id];
+                             paged_kv_last_page_len_buffer_ptr[request_id];
 
   // Split-KV partitioning: this block processes KV positions
   // [chunk_start, chunk_start + seq_len)
@@ -104,7 +107,6 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   if (seq_len <= 0) {
     return;
   }
-
 
   // Page indices in static shared memory
   __shared__ __align__(16) int page_indices[MAX_PAGES_PER_REQUEST];
@@ -117,8 +119,10 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
       reinterpret_cast<bf16 const *>(qkv_ptr) + first_token_pos * QKV_STRIDE;
   bf16 const *__restrict__ d_k = d_q + NUM_QO_PER_KV * HEAD_DIM;
   bf16 const *__restrict__ d_v = d_k + HEAD_DIM;
-  bf16 *__restrict__ d_paged_k_cache = reinterpret_cast<bf16 *>(paged_k_cache_ptr);
-  bf16 *__restrict__ d_paged_v_cache = reinterpret_cast<bf16 *>(paged_v_cache_ptr);
+  bf16 *__restrict__ d_paged_k_cache =
+      reinterpret_cast<bf16 *>(paged_k_cache_ptr);
+  bf16 *__restrict__ d_paged_v_cache =
+      reinterpret_cast<bf16 *>(paged_v_cache_ptr);
   bf16 *__restrict__ d_output =
       reinterpret_cast<bf16 *>(output_ptr) + first_token_pos * O_STRIDE;
 
@@ -129,12 +133,14 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   constexpr size_t S_Q_SIZE = sizeof(bf16) * Q_ROWS * HEAD_DIM;
 
   constexpr size_t S_KV_OFFSET = S_Q_OFFSET + S_Q_SIZE;
-  constexpr size_t S_KV_SIZE = sizeof(bf16) * KV_TILE_SIZE * HEAD_DIM;  // Shared K/V buffer
+  constexpr size_t S_KV_SIZE =
+      sizeof(bf16) * KV_TILE_SIZE * HEAD_DIM; // Shared K/V buffer
 
   constexpr size_t S_SCORES_OFFSET = S_KV_OFFSET + S_KV_SIZE;
   constexpr size_t S_SCORES_SIZE = sizeof(float) * Q_ROWS * KV_TILE_SIZE;
 
-  constexpr size_t S_REDUCE_OFFSET = ((S_SCORES_OFFSET + S_SCORES_SIZE + 15) & ~15);
+  constexpr size_t S_REDUCE_OFFSET =
+      ((S_SCORES_OFFSET + S_SCORES_SIZE + 15) & ~15);
   constexpr size_t S_REDUCE_SIZE = sizeof(float) * NUM_WARPS;
 
   constexpr size_t S_M_OFFSET = ((S_REDUCE_OFFSET + S_REDUCE_SIZE + 15) & ~15);
@@ -147,7 +153,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   constexpr size_t S_O_SIZE = sizeof(float) * Q_ROWS * HEAD_DIM;
 
   bf16 *s_q = reinterpret_cast<bf16 *>(smem + S_Q_OFFSET);
-  bf16 *s_kv = reinterpret_cast<bf16 *>(smem + S_KV_OFFSET);  // Shared K/V buffer
+  bf16 *s_kv =
+      reinterpret_cast<bf16 *>(smem + S_KV_OFFSET); // Shared K/V buffer
   float *s_scores = reinterpret_cast<float *>(smem + S_SCORES_OFFSET);
   float *s_reduce = reinterpret_cast<float *>(smem + S_REDUCE_OFFSET);
   float *s_m = reinterpret_cast<float *>(smem + S_M_OFFSET);
@@ -171,7 +178,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   constexpr int VEC_SIZE = 8;
   constexpr int HEAD_DIM_VECS = HEAD_DIM / VEC_SIZE;
   int total_q_vecs = num_tokens * NUM_QO_PER_KV * HEAD_DIM_VECS;
-  for (int vec_idx = threadIdx.x; vec_idx < total_q_vecs; vec_idx += NUM_THREADS) {
+  for (int vec_idx = threadIdx.x; vec_idx < total_q_vecs;
+       vec_idx += NUM_THREADS) {
     int row = vec_idx / HEAD_DIM_VECS;
     int vec_col = vec_idx % HEAD_DIM_VECS;
     int token = row / NUM_QO_PER_KV;
@@ -187,8 +195,12 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     bf16 const *q_weight = reinterpret_cast<bf16 const *>(q_norm_weight_ptr);
     for (int token = 0; token < num_tokens; token++) {
       int pos = global_seq_len - num_tokens + token;
-      bf16 const *cos_data = rope ? reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM : nullptr;
-      bf16 const *sin_data = rope ? reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM : nullptr;
+      bf16 const *cos_data =
+          rope ? reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM
+               : nullptr;
+      bf16 const *sin_data =
+          rope ? reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM
+               : nullptr;
       for (int head = 0; head < NUM_QO_PER_KV; head++) {
         int row = token * NUM_QO_PER_KV + head;
         bf16 *q_head = s_q + row * HEAD_DIM;
@@ -222,7 +234,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
 
         // Apply normalization
         for (int i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
-          float val = ck_tile::type_convert<float>(q_head[i]) * rms_rcp * ck_tile::type_convert<float>(q_weight[i]);
+          float val = ck_tile::type_convert<float>(q_head[i]) * rms_rcp *
+                      ck_tile::type_convert<float>(q_weight[i]);
           q_head[i] = ck_tile::type_convert<bf16>(val);
         }
         __syncthreads();
@@ -235,7 +248,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
             float c = ck_tile::type_convert<float>(cos_data[i]);
             float s_val = ck_tile::type_convert<float>(sin_data[i]);
             q_head[i] = ck_tile::type_convert<bf16>(v0 * c - v1 * s_val);
-            q_head[i + HEAD_DIM / 2] = ck_tile::type_convert<bf16>(v0 * s_val + v1 * c);
+            q_head[i + HEAD_DIM / 2] =
+                ck_tile::type_convert<bf16>(v0 * s_val + v1 * c);
           }
           __syncthreads();
         }
@@ -244,9 +258,12 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   } else if (rope) {
     for (int token = 0; token < num_tokens; token++) {
       int pos = global_seq_len - num_tokens + token;
-      bf16 const *cos_data = reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM;
-      bf16 const *sin_data = reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM;
-      for (int idx = threadIdx.x; idx < NUM_QO_PER_KV * HEAD_DIM / 2; idx += NUM_THREADS) {
+      bf16 const *cos_data =
+          reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM;
+      bf16 const *sin_data =
+          reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM;
+      for (int idx = threadIdx.x; idx < NUM_QO_PER_KV * HEAD_DIM / 2;
+           idx += NUM_THREADS) {
         int head = idx / (HEAD_DIM / 2);
         int d = idx % (HEAD_DIM / 2);
         int base = (token * NUM_QO_PER_KV + head) * HEAD_DIM;
@@ -255,7 +272,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         float c = ck_tile::type_convert<float>(cos_data[d]);
         float sv = ck_tile::type_convert<float>(sin_data[d]);
         s_q[base + d] = ck_tile::type_convert<bf16>(q0 * c - q1 * sv);
-        s_q[base + d + HEAD_DIM / 2] = ck_tile::type_convert<bf16>(q0 * sv + q1 * c);
+        s_q[base + d + HEAD_DIM / 2] =
+            ck_tile::type_convert<bf16>(q0 * sv + q1 * c);
       }
     }
     __syncthreads();
@@ -264,10 +282,15 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   bf16 const *k_weight = reinterpret_cast<bf16 const *>(k_norm_weight_ptr);
 
   // Debug: print processed Q values for comparison with CK FMHA path
-  if (threadIdx.x == 0 && request_id == 0 && kv_chunk_idx == 0 && global_seq_len <= 3) {
+  if (threadIdx.x == 0 && request_id == 0 && kv_chunk_idx == 0 &&
+      global_seq_len <= 3) {
     printf("BASELINE_Q: seqlen=%d num_tokens=%d s_q[0..3]=%f %f %f %f\n",
-           global_seq_len, num_tokens,
-           (float)s_q[0], (float)s_q[1], (float)s_q[2], (float)s_q[3]);
+           global_seq_len,
+           num_tokens,
+           (float)s_q[0],
+           (float)s_q[1],
+           (float)s_q[2],
+           (float)s_q[3]);
     // Print K cache values for comparison with CK FMHA
     for (int pos = 0; pos < global_seq_len - num_tokens && pos < 3; pos++) {
       int page_num = pos / PAGE_SIZE;
@@ -275,9 +298,13 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
       int page_idx = page_indices[page_num];
       int k_idx = (page_idx * PAGE_SIZE + page_offset) * KV_CACHE_STRIDE;
       printf("BASELINE_K_CACHE: seqlen=%d pos=%d page=%d k[0..3]=%f %f %f %f\n",
-             global_seq_len, pos, page_idx,
-             (float)d_paged_k_cache[k_idx], (float)d_paged_k_cache[k_idx+1],
-             (float)d_paged_k_cache[k_idx+2], (float)d_paged_k_cache[k_idx+3]);
+             global_seq_len,
+             pos,
+             page_idx,
+             (float)d_paged_k_cache[k_idx],
+             (float)d_paged_k_cache[k_idx + 1],
+             (float)d_paged_k_cache[k_idx + 2],
+             (float)d_paged_k_cache[k_idx + 3]);
     }
   }
 
@@ -293,7 +320,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     // Phase 1: Load K into s_kv
     // =========================================================================
     int total_kv_vecs = curr_iter_len * HEAD_DIM_VECS;
-    for (int vec_idx = threadIdx.x; vec_idx < total_kv_vecs; vec_idx += NUM_THREADS) {
+    for (int vec_idx = threadIdx.x; vec_idx < total_kv_vecs;
+         vec_idx += NUM_THREADS) {
       int row = vec_idx / HEAD_DIM_VECS;
       int vec_col = vec_idx % HEAD_DIM_VECS;
       int global_pos = tile_start + row;
@@ -304,8 +332,9 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         int page_offset = global_pos % PAGE_SIZE;
         int page_idx = page_indices[page_num];
         int src_idx = page_idx * PAGE_SIZE + page_offset;
-        vec_load_8(&s_kv[row * HEAD_DIM + vec_col * VEC_SIZE],
-                   &d_paged_k_cache[src_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE]);
+        vec_load_8(
+            &s_kv[row * HEAD_DIM + vec_col * VEC_SIZE],
+            &d_paged_k_cache[src_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE]);
       } else {
         // From QKV input (new tokens)
         int qkv_row = global_pos - (global_seq_len - num_tokens);
@@ -316,7 +345,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
 
     // Zero padding for remaining K rows
     for (int idx = threadIdx.x + curr_iter_len * HEAD_DIM;
-         idx < KV_TILE_SIZE * HEAD_DIM; idx += NUM_THREADS) {
+         idx < KV_TILE_SIZE * HEAD_DIM;
+         idx += NUM_THREADS) {
       s_kv[idx] = bf16(0.0f);
     }
     __syncthreads();
@@ -334,8 +364,12 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           int pos = first_new_token + k_tok;
           int local_row = local_start + k_tok;
           bf16 *k_head = s_kv + local_row * HEAD_DIM;
-          bf16 const *cos_data = rope ? reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM : nullptr;
-          bf16 const *sin_data = rope ? reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM : nullptr;
+          bf16 const *cos_data =
+              rope ? reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM
+                   : nullptr;
+          bf16 const *sin_data =
+              rope ? reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM
+                   : nullptr;
 
           // Compute sum of squares
           float sum_sq = 0.0f;
@@ -366,7 +400,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
 
           // Apply normalization
           for (int i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
-            float val = ck_tile::type_convert<float>(k_head[i]) * rms_rcp * ck_tile::type_convert<float>(k_weight[i]);
+            float val = ck_tile::type_convert<float>(k_head[i]) * rms_rcp *
+                        ck_tile::type_convert<float>(k_weight[i]);
             k_head[i] = ck_tile::type_convert<bf16>(val);
           }
           __syncthreads();
@@ -379,7 +414,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
               float c = ck_tile::type_convert<float>(cos_data[i]);
               float s_val = ck_tile::type_convert<float>(sin_data[i]);
               k_head[i] = ck_tile::type_convert<bf16>(v0 * c - v1 * s_val);
-              k_head[i + HEAD_DIM / 2] = ck_tile::type_convert<bf16>(v0 * s_val + v1 * c);
+              k_head[i + HEAD_DIM / 2] =
+                  ck_tile::type_convert<bf16>(v0 * s_val + v1 * c);
             }
             __syncthreads();
           }
@@ -388,31 +424,42 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         for (int k_tok = 0; k_tok < num_new_tokens; k_tok++) {
           int pos = first_new_token + k_tok;
           int local_row = local_start + k_tok;
-          bf16 const *cos_data = reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM;
-          bf16 const *sin_data = reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM;
+          bf16 const *cos_data =
+              reinterpret_cast<bf16 const *>(cos_ptr) + pos * HEAD_DIM;
+          bf16 const *sin_data =
+              reinterpret_cast<bf16 const *>(sin_ptr) + pos * HEAD_DIM;
           for (int d = threadIdx.x; d < HEAD_DIM / 2; d += NUM_THREADS) {
-            float k0 = ck_tile::type_convert<float>(s_kv[local_row * HEAD_DIM + d]);
-            float k1 = ck_tile::type_convert<float>(s_kv[local_row * HEAD_DIM + d + HEAD_DIM / 2]);
+            float k0 =
+                ck_tile::type_convert<float>(s_kv[local_row * HEAD_DIM + d]);
+            float k1 = ck_tile::type_convert<float>(
+                s_kv[local_row * HEAD_DIM + d + HEAD_DIM / 2]);
             float c = ck_tile::type_convert<float>(cos_data[d]);
             float s = ck_tile::type_convert<float>(sin_data[d]);
-            s_kv[local_row * HEAD_DIM + d] = ck_tile::type_convert<bf16>(k0 * c - k1 * s);
-            s_kv[local_row * HEAD_DIM + d + HEAD_DIM / 2] = ck_tile::type_convert<bf16>(k0 * s + k1 * c);
+            s_kv[local_row * HEAD_DIM + d] =
+                ck_tile::type_convert<bf16>(k0 * c - k1 * s);
+            s_kv[local_row * HEAD_DIM + d + HEAD_DIM / 2] =
+                ck_tile::type_convert<bf16>(k0 * s + k1 * c);
           }
         }
         __syncthreads();
       }
 
       // Debug: print processed K for new token
-      if (threadIdx.x == 0 && request_id == 0 && kv_chunk_idx == 0 && global_seq_len == 2) {
+      if (threadIdx.x == 0 && request_id == 0 && kv_chunk_idx == 0 &&
+          global_seq_len == 2) {
         int local_row = first_new_token - tile_start;
         printf("BASELINE_K_NEW: seqlen=%d pos=%d k[0..3]=%f %f %f %f\n",
-               global_seq_len, (int)first_new_token,
-               (float)s_kv[local_row * HEAD_DIM + 0], (float)s_kv[local_row * HEAD_DIM + 1],
-               (float)s_kv[local_row * HEAD_DIM + 2], (float)s_kv[local_row * HEAD_DIM + 3]);
+               global_seq_len,
+               (int)first_new_token,
+               (float)s_kv[local_row * HEAD_DIM + 0],
+               (float)s_kv[local_row * HEAD_DIM + 1],
+               (float)s_kv[local_row * HEAD_DIM + 2],
+               (float)s_kv[local_row * HEAD_DIM + 3]);
       }
       // Write processed K to cache
       int total_new_vecs = num_new_tokens * HEAD_DIM_VECS;
-      for (int vec_idx = threadIdx.x; vec_idx < total_new_vecs; vec_idx += NUM_THREADS) {
+      for (int vec_idx = threadIdx.x; vec_idx < total_new_vecs;
+           vec_idx += NUM_THREADS) {
         int token = vec_idx / HEAD_DIM_VECS;
         int vec_col = vec_idx % HEAD_DIM_VECS;
         int global_pos = first_new_token + token;
@@ -421,8 +468,9 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         int page_idx = page_indices[page_num];
         int dst_idx = page_idx * PAGE_SIZE + page_offset;
         int local_row = local_start + token;
-        vec_store_8(&d_paged_k_cache[dst_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE],
-                    &s_kv[local_row * HEAD_DIM + vec_col * VEC_SIZE]);
+        vec_store_8(
+            &d_paged_k_cache[dst_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE],
+            &s_kv[local_row * HEAD_DIM + vec_col * VEC_SIZE]);
       }
       __syncthreads();
     }
@@ -432,12 +480,12 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     // All 4 warps participate (KV_TILES_N = 4)
     // =========================================================================
     {
-      int tile_n = warp_idx;  // Each warp handles one 16-col KV tile
+      int tile_n = warp_idx; // Each warp handles one 16-col KV tile
 
       for (int tile_m = 0; tile_m < Q_TILES_M; tile_m++) {
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        #pragma unroll
+#pragma unroll
         for (int tile_k = 0; tile_k < HEAD_TILES_K; tile_k++) {
           int k_base = tile_k * MFMA_K;
 
@@ -446,9 +494,10 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           int q_col = k_base + (lane / 16) * 4;
 
           bf16 q_frag[4];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
-            q_frag[i] = (q_row < q_rows) ? s_q[q_row * HEAD_DIM + q_col + i] : bf16(0.0f);
+            q_frag[i] = (q_row < q_rows) ? s_q[q_row * HEAD_DIM + q_col + i]
+                                         : bf16(0.0f);
           }
 
           // Load K fragment from s_kv
@@ -456,37 +505,43 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           int k_col = k_base + (lane / 16) * 4;
 
           bf16 k_frag[4];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
-            k_frag[i] = (k_row < curr_iter_len) ? s_kv[k_row * HEAD_DIM + k_col + i] : bf16(0.0f);
+            k_frag[i] = (k_row < curr_iter_len)
+                            ? s_kv[k_row * HEAD_DIM + k_col + i]
+                            : bf16(0.0f);
           }
 
           // Execute MFMA
           mfma_bf16x4 a_vec, b_vec;
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
             a_vec[i] = ck_tile::bit_cast<short>(q_frag[i]);
             b_vec[i] = ck_tile::bit_cast<short>(k_frag[i]);
           }
 
           mfma_float4 c_vec = {acc[0], acc[1], acc[2], acc[3]};
-          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
-          acc[0] = c_vec[0]; acc[1] = c_vec[1]; acc[2] = c_vec[2]; acc[3] = c_vec[3];
+          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+              a_vec, b_vec, c_vec, 0, 0, 0);
+          acc[0] = c_vec[0];
+          acc[1] = c_vec[1];
+          acc[2] = c_vec[2];
+          acc[3] = c_vec[3];
         }
 
-        // Store scores with causal masking — directly to s_scores (no init needed)
-        // CRITICAL: Use global_seq_len for causal mask position
+        // Store scores with causal masking — directly to s_scores (no init
+        // needed) CRITICAL: Use global_seq_len for causal mask position
         int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
         int out_col = tile_n * MFMA_N + (lane % 16);
 
         if (out_col < curr_iter_len) {
-          #pragma unroll
+#pragma unroll
           for (int r = 0; r < 4; r++) {
             int out_row = out_row_base + r;
             if (out_row < q_rows) {
               int token_idx = out_row / NUM_QO_PER_KV;
               int q_pos = global_seq_len - num_tokens + token_idx;
-              int kv_pos = tile_start + out_col;  // tile_start is global
+              int kv_pos = tile_start + out_col; // tile_start is global
               float score = acc[r] * sm_scale;
               if (kv_pos > q_pos) {
                 score = -INFINITY;
@@ -497,7 +552,7 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         }
         // Write -INFINITY for out-of-bounds columns (padding)
         if (out_col >= curr_iter_len && out_col < KV_TILE_SIZE) {
-          #pragma unroll
+#pragma unroll
           for (int r = 0; r < 4; r++) {
             int out_row = out_row_base + r;
             if (out_row < q_rows) {
@@ -512,7 +567,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     // =========================================================================
     // Phase 3: Load V into s_kv (overwrites K) + write V to cache
     // =========================================================================
-    for (int vec_idx = threadIdx.x; vec_idx < total_kv_vecs; vec_idx += NUM_THREADS) {
+    for (int vec_idx = threadIdx.x; vec_idx < total_kv_vecs;
+         vec_idx += NUM_THREADS) {
       int row = vec_idx / HEAD_DIM_VECS;
       int vec_col = vec_idx % HEAD_DIM_VECS;
       int global_pos = tile_start + row;
@@ -523,8 +579,9 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         int page_offset = global_pos % PAGE_SIZE;
         int page_idx = page_indices[page_num];
         int src_idx = page_idx * PAGE_SIZE + page_offset;
-        vec_load_8(&s_kv[row * HEAD_DIM + vec_col * VEC_SIZE],
-                   &d_paged_v_cache[src_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE]);
+        vec_load_8(
+            &s_kv[row * HEAD_DIM + vec_col * VEC_SIZE],
+            &d_paged_v_cache[src_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE]);
       } else {
         // From QKV input (new tokens)
         int qkv_row = global_pos - (global_seq_len - num_tokens);
@@ -535,11 +592,13 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
 
     // Zero padding for remaining V rows
     for (int idx = threadIdx.x + curr_iter_len * HEAD_DIM;
-         idx < KV_TILE_SIZE * HEAD_DIM; idx += NUM_THREADS) {
+         idx < KV_TILE_SIZE * HEAD_DIM;
+         idx += NUM_THREADS) {
       s_kv[idx] = bf16(0.0f);
     }
 
-    // Write new V tokens to cache (can overlap with V load since different rows)
+    // Write new V tokens to cache (can overlap with V load since different
+    // rows)
     if (num_new_tokens > 0) {
       int local_start = first_new_token - tile_start;
       // Note: V doesn't need norm/RoPE, so we write directly from QKV input
@@ -551,7 +610,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     if (num_new_tokens > 0) {
       int local_start = first_new_token - tile_start;
       int total_new_vecs = num_new_tokens * HEAD_DIM_VECS;
-      for (int vec_idx = threadIdx.x; vec_idx < total_new_vecs; vec_idx += NUM_THREADS) {
+      for (int vec_idx = threadIdx.x; vec_idx < total_new_vecs;
+           vec_idx += NUM_THREADS) {
         int token = vec_idx / HEAD_DIM_VECS;
         int vec_col = vec_idx % HEAD_DIM_VECS;
         int global_pos = first_new_token + token;
@@ -560,8 +620,9 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
         int page_idx = page_indices[page_num];
         int dst_idx = page_idx * PAGE_SIZE + page_offset;
         int local_row = local_start + token;
-        vec_store_8(&d_paged_v_cache[dst_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE],
-                    &s_kv[local_row * HEAD_DIM + vec_col * VEC_SIZE]);
+        vec_store_8(
+            &d_paged_v_cache[dst_idx * KV_CACHE_STRIDE + vec_col * VEC_SIZE],
+            &s_kv[local_row * HEAD_DIM + vec_col * VEC_SIZE]);
       }
     }
 
@@ -617,24 +678,28 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     // =========================================================================
     // Phase 5: MFMA P × V computation (s_kv now holds V data)
     // =========================================================================
-    for (int out_tile = warp_idx; out_tile < OUT_TILES_N; out_tile += NUM_WARPS) {
+    for (int out_tile = warp_idx; out_tile < OUT_TILES_N;
+         out_tile += NUM_WARPS) {
       for (int tile_m = 0; tile_m < Q_TILES_M; tile_m++) {
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        #pragma unroll
+#pragma unroll
         for (int tile_k = 0; tile_k < PV_TILES_K; tile_k++) {
           int k_base = tile_k * MFMA_K;
-          if (k_base >= curr_iter_len) break;
+          if (k_base >= curr_iter_len) {
+            break;
+          }
 
           // Load P fragment (attention weights)
           int p_row = tile_m * MFMA_M + (lane % 16);
           int p_col = k_base + (lane / 16) * 4;
 
           bf16 p_frag[4];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
-            float val = (p_row < q_rows && p_col + i < curr_iter_len) ?
-                        s_scores[p_row * KV_TILE_SIZE + p_col + i] : 0.0f;
+            float val = (p_row < q_rows && p_col + i < curr_iter_len)
+                            ? s_scores[p_row * KV_TILE_SIZE + p_col + i]
+                            : 0.0f;
             p_frag[i] = ck_tile::type_convert<bf16>(val);
           }
 
@@ -643,30 +708,35 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           int v_col = out_tile * MFMA_N + (lane % 16);
 
           bf16 v_frag[4];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
             int vr = v_row + i;
-            v_frag[i] = (vr < curr_iter_len) ? s_kv[vr * HEAD_DIM + v_col] : bf16(0.0f);
+            v_frag[i] =
+                (vr < curr_iter_len) ? s_kv[vr * HEAD_DIM + v_col] : bf16(0.0f);
           }
 
           // Execute MFMA
           mfma_bf16x4 a_vec, b_vec;
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
             a_vec[i] = ck_tile::bit_cast<short>(p_frag[i]);
             b_vec[i] = ck_tile::bit_cast<short>(v_frag[i]);
           }
 
           mfma_float4 c_vec = {acc[0], acc[1], acc[2], acc[3]};
-          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
-          acc[0] = c_vec[0]; acc[1] = c_vec[1]; acc[2] = c_vec[2]; acc[3] = c_vec[3];
+          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+              a_vec, b_vec, c_vec, 0, 0, 0);
+          acc[0] = c_vec[0];
+          acc[1] = c_vec[1];
+          acc[2] = c_vec[2];
+          acc[3] = c_vec[3];
         }
 
         // Accumulate to output
         int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
         int out_col = out_tile * MFMA_N + (lane % 16);
 
-        #pragma unroll
+#pragma unroll
         for (int r = 0; r < 4; r++) {
           int out_row = out_row_base + r;
           if (out_row < q_rows && out_col < HEAD_DIM) {
@@ -680,7 +750,8 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
 
   // Final normalization and output with vectorized writes
   int total_out_vecs = num_tokens * NUM_QO_PER_KV * HEAD_DIM_VECS;
-  for (int vec_idx = threadIdx.x; vec_idx < total_out_vecs; vec_idx += NUM_THREADS) {
+  for (int vec_idx = threadIdx.x; vec_idx < total_out_vecs;
+       vec_idx += NUM_THREADS) {
     int row = vec_idx / HEAD_DIM_VECS;
     int vec_col = vec_idx % HEAD_DIM_VECS;
     int token = row / NUM_QO_PER_KV;
@@ -689,7 +760,7 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
     // Load 8 float values, normalize, convert to bf16, and store
     bf16 out_buf[8];
     float inv_d = 1.0f / s_d[row];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 8; i++) {
       float val = s_o[row * HEAD_DIM + vec_col * VEC_SIZE + i] * inv_d;
       out_buf[i] = ck_tile::type_convert<bf16>(val);
@@ -700,8 +771,9 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   }
 
   // Write LSE (log-sum-exp) values for the merge kernel
-  // LSE = log2(d) + m, where d is the sum of exponentiated scores and m is the max
-  // Layout matches A100: lse[head + token * NUM_KV_CHUNKS * NUM_QO_HEADS * NUM_QO_GROUPS]
+  // LSE = log2(d) + m, where d is the sum of exponentiated scores and m is the
+  // max Layout matches A100: lse[head + token * NUM_KV_CHUNKS * NUM_QO_HEADS *
+  // NUM_QO_GROUPS]
   float *lse_out = reinterpret_cast<float *>(lse_ptr);
   constexpr int LSE_TOKEN_STRIDE = NUM_KV_CHUNKS * NUM_QO_HEADS * NUM_QO_GROUPS;
   for (int row = threadIdx.x; row < q_rows; row += NUM_THREADS) {
@@ -712,12 +784,22 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
   }
 
   // Debug: compare o_acc and lse values with CK FMHA at early seqlens
-  if (threadIdx.x == 0 && request_id == 0 && kv_chunk_idx == 0 && global_seq_len <= 5) {
+  if (threadIdx.x == 0 && request_id == 0 && kv_chunk_idx == 0 &&
+      global_seq_len <= 5) {
     float inv_d0 = 1.0f / s_d[0];
-    float o0 = s_o[0] * inv_d0, o1 = s_o[1] * inv_d0, o2 = s_o[2] * inv_d0, o3 = s_o[3] * inv_d0;
+    float o0 = s_o[0] * inv_d0, o1 = s_o[1] * inv_d0, o2 = s_o[2] * inv_d0,
+          o3 = s_o[3] * inv_d0;
     float lse0 = ptx_log2(s_d[0]) + s_m[0];
-    printf("BASELINE_OUT: seqlen=%d o_norm[0..3]=%f %f %f %f lse_log2=%f m=%f d=%f\n",
-           global_seq_len, o0, o1, o2, o3, lse0, s_m[0], s_d[0]);
+    printf("BASELINE_OUT: seqlen=%d o_norm[0..3]=%f %f %f %f lse_log2=%f m=%f "
+           "d=%f\n",
+           global_seq_len,
+           o0,
+           o1,
+           o2,
+           o3,
+           lse0,
+           s_m[0],
+           s_d[0]);
   }
 }
 

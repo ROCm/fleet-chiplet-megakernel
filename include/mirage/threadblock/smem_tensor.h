@@ -131,7 +131,8 @@ struct alignas(16) STensor {
     using namespace mirage::type;
     size_t data_type_size = 1;
     switch (data_type) {
-      case DT_INT8: {
+      case DT_INT8:
+      case DT_UINT8: {
         data_type_size = 1;
         break;
       }
@@ -164,11 +165,11 @@ struct alignas(16) STensor {
   size_t num_elements() const {
     static_assert(MAX_TENSOR_DIMS <= 4);
     if (num_dims == 4) {
-      return static_cast<size_t>(dim[0]) * dim[1] * dim[2] * dim[3];
+      return dim[0] * dim[1] * dim[2] * dim[3];
     } else if (num_dims == 3) {
-      return static_cast<size_t>(dim[0]) * dim[1] * dim[2];
+      return dim[0] * dim[1] * dim[2];
     } else if (num_dims == 2) {
-      return static_cast<size_t>(dim[0]) * dim[1];
+      return dim[0] * dim[1];
     } else {
       return dim[0];
     }

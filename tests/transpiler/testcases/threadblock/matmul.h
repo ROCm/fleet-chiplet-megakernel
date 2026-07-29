@@ -179,7 +179,7 @@ ADD_TESTCASE(Testcase("tb_matmul", {"threadblock", "correctness", "perf"}, "thre
 			};
 			vector<float> A = half_vec2float_vec(Gen::ARange()({m, k}));
 			vector<float> B = half_vec2float_vec(Gen::ARange()({k, n}));
-			vector<half> C(static_cast<size_t>(m)*n);
+			vector<half> C(m*n);
 			for (int i = 0; i < m; ++i)
 				for (int j = 0; j < n; ++j) {
 					float sum = 0.0;

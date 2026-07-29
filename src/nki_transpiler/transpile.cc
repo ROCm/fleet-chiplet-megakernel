@@ -233,8 +233,7 @@ NKITranspiler::NKITranspiler(kernel::Graph const *_graph,
               threadblock::STensor st = stensor_inputs[0];
               st = tbg->square(st);
               size_t normalization_factor =
-                  static_cast<size_t>(st.dim[st.num_dims - 1]) *
-                  customized_op->bgraph.forloop_range;
+                  st.dim[st.num_dims - 1] * customized_op->bgraph.forloop_range;
               st = tbg->mul_scalar(st, (1.0f / normalization_factor));
               st = tbg->forloop_accum(st, TB_FORLOOP_ACCUM_NO_RED_OP);
               st = tbg->reduction(st, st.num_dims - 1);
