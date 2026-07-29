@@ -105,10 +105,10 @@ __forceinline__ __device__ float ptx_log2(float x) {
 static __device__ __forceinline__ int lane_id() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   // AMD: use native 64-thread wavefront
-  return threadIdx.x & 0x3f;  // 64-thread wavefront
+  return threadIdx.x & 0x3f; // 64-thread wavefront
 #else
   // CUDA: 32-thread warp
-  return threadIdx.x & 0x1f;  // 32-thread warp
+  return threadIdx.x & 0x1f; // 32-thread warp
 #endif
 }
 

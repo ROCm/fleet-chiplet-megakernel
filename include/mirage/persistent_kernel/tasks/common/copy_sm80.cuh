@@ -24,11 +24,13 @@ namespace kernel {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 // CUDA's __cvta_generic_to_shared returns a pointer that is cast to uint32_t
 // For HIP, we provide a compatibility function that returns uintptr_t
-// This allows static_cast<uint32_t> to work (truncating to 32 bits, which is fine for shared memory)
-__device__ __forceinline__ uintptr_t __cvta_generic_to_shared(void* ptr) {
+// This allows static_cast<uint32_t> to work (truncating to 32 bits, which is
+// fine for shared memory)
+__device__ __forceinline__ uintptr_t __cvta_generic_to_shared(void *ptr) {
   // For HIP, cast shared memory pointer to integer
-  // Note: This is a compatibility stub; PTX instructions (cp.async, ldmatrix) won't work on HIP
-  // Shared memory addresses are limited, so truncation to uint32_t is safe
+  // Note: This is a compatibility stub; PTX instructions (cp.async, ldmatrix)
+  // won't work on HIP Shared memory addresses are limited, so truncation to
+  // uint32_t is safe
   return reinterpret_cast<uintptr_t>(ptr);
 }
 
@@ -37,27 +39,28 @@ typedef int __attribute__((ext_vector_type(4))) int32x4_t_copy;
 typedef int __attribute__((ext_vector_type(2))) int32x2_t_copy;
 
 // Buffer load intrinsics
-__device__ int32x2_t_copy
-llvm_amdgcn_raw_buffer_load_i32x2_copy(int32x4_t_copy srsrc,
-                                        int voffset,
-                                        int soffset,
-                                        int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v2i32");
+__device__ int32x2_t_copy llvm_amdgcn_raw_buffer_load_i32x2_copy(
+    int32x4_t_copy srsrc,
+    int voffset,
+    int soffset,
+    int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v2i32");
 
-__device__ int32x4_t_copy
-llvm_amdgcn_raw_buffer_load_i32x4_copy(int32x4_t_copy srsrc,
-                                        int voffset,
-                                        int soffset,
-                                        int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+__device__ int32x4_t_copy llvm_amdgcn_raw_buffer_load_i32x4_copy(
+    int32x4_t_copy srsrc,
+    int voffset,
+    int soffset,
+    int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 
 // Helper to create buffer resource descriptor
 template <typename T>
-__device__ __forceinline__ int32x4_t_copy make_buffer_resource_copy(T const* ptr) {
+__device__ __forceinline__ int32x4_t_copy
+    make_buffer_resource_copy(T const *ptr) {
   int32x4_t_copy res;
   unsigned long addr = reinterpret_cast<unsigned long>(ptr);
   res[0] = static_cast<int>(addr & 0xFFFFFFFF);
   res[1] = static_cast<int>(addr >> 32);
-  res[2] = 0x7FFFFFFF;  // Max range
-  res[3] = 0x00027000;  // Buffer resource config for gfx9
+  res[2] = 0x7FFFFFFF; // Max range
+  res[3] = 0x00027000; // Buffer resource config for gfx9
   return res;
 }
 #endif
@@ -101,15 +104,18 @@ __device__ __forceinline__ void load_smem(T *smem_ptr, T const *gmem_ptr) {
 
   if constexpr (BYTES == 16) {
     // Vectorized 16-byte load using buffer_load_dwordx4
-    int32x4_t_copy data = llvm_amdgcn_raw_buffer_load_i32x4_copy(src_res, 0, 0, 0);
-    *reinterpret_cast<int32x4_t_copy*>(smem_ptr) = data;
+    int32x4_t_copy data =
+        llvm_amdgcn_raw_buffer_load_i32x4_copy(src_res, 0, 0, 0);
+    *reinterpret_cast<int32x4_t_copy *>(smem_ptr) = data;
   } else if constexpr (BYTES == 8) {
     // Vectorized 8-byte load using buffer_load_dwordx2
-    int32x2_t_copy data = llvm_amdgcn_raw_buffer_load_i32x2_copy(src_res, 0, 0, 0);
-    *reinterpret_cast<int32x2_t_copy*>(smem_ptr) = data;
+    int32x2_t_copy data =
+        llvm_amdgcn_raw_buffer_load_i32x2_copy(src_res, 0, 0, 0);
+    *reinterpret_cast<int32x2_t_copy *>(smem_ptr) = data;
   } else if constexpr (BYTES == 4) {
     // 4-byte load (single dword)
-    *reinterpret_cast<uint32_t*>(smem_ptr) = *reinterpret_cast<uint32_t const*>(gmem_ptr);
+    *reinterpret_cast<uint32_t *>(smem_ptr) =
+        *reinterpret_cast<uint32_t const *>(gmem_ptr);
   }
 #elif defined(CP_ASYNC_SM80_ENABLED)
   static_assert(BYTES == 4 || BYTES == 8 || BYTES == 16,
@@ -129,7 +135,8 @@ template <typename T, int BYTES = 16>
 __device__ __forceinline__ void
     load_smem_with_predict(T *smem_ptr, T const *gmem_ptr, bool pred) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
-  // HIP: Use CK-style buffer intrinsics for vectorized global loads with predicate
+  // HIP: Use CK-style buffer intrinsics for vectorized global loads with
+  // predicate
   static_assert(BYTES == 4 || BYTES == 8 || BYTES == 16,
                 "load_smem_with_predict only supports 4, 8, or 16 bytes");
   if (pred) {
@@ -138,15 +145,18 @@ __device__ __forceinline__ void
 
     if constexpr (BYTES == 16) {
       // Vectorized 16-byte load using buffer_load_dwordx4
-      int32x4_t_copy data = llvm_amdgcn_raw_buffer_load_i32x4_copy(src_res, 0, 0, 0);
-      *reinterpret_cast<int32x4_t_copy*>(smem_ptr) = data;
+      int32x4_t_copy data =
+          llvm_amdgcn_raw_buffer_load_i32x4_copy(src_res, 0, 0, 0);
+      *reinterpret_cast<int32x4_t_copy *>(smem_ptr) = data;
     } else if constexpr (BYTES == 8) {
       // Vectorized 8-byte load using buffer_load_dwordx2
-      int32x2_t_copy data = llvm_amdgcn_raw_buffer_load_i32x2_copy(src_res, 0, 0, 0);
-      *reinterpret_cast<int32x2_t_copy*>(smem_ptr) = data;
+      int32x2_t_copy data =
+          llvm_amdgcn_raw_buffer_load_i32x2_copy(src_res, 0, 0, 0);
+      *reinterpret_cast<int32x2_t_copy *>(smem_ptr) = data;
     } else if constexpr (BYTES == 4) {
       // 4-byte load (single dword)
-      *reinterpret_cast<uint32_t*>(smem_ptr) = *reinterpret_cast<uint32_t const*>(gmem_ptr);
+      *reinterpret_cast<uint32_t *>(smem_ptr) =
+          *reinterpret_cast<uint32_t const *>(gmem_ptr);
     }
   }
 #elif defined(CP_ASYNC_SM80_ENABLED)
@@ -168,8 +178,8 @@ __device__ __forceinline__ void ldsm_divergence(uint32_t smem_int_ptr,
                                                 uint32_t *R) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   // HIP: ldmatrix PTX not available; use plain loads
-  uint32_t const *p = reinterpret_cast<uint32_t const *>(
-      static_cast<uintptr_t>(smem_int_ptr));
+  uint32_t const *p =
+      reinterpret_cast<uint32_t const *>(static_cast<uintptr_t>(smem_int_ptr));
   R[0] = p[0];
   R[1] = p[1];
   R[2] = p[2];
@@ -187,9 +197,10 @@ template <typename T>
 __device__ __forceinline__ void ldsm(T *__restrict__ smem_ptr, uint32_t *R) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   // HIP: Emulate CUDA ldmatrix.sync.aligned.m8n8.x4.shared.b16
-  // CUDA ldmatrix loads a 16x16 matrix (in 8x8 tiles) with warp-wide cooperation
-  // Each thread provides a row address, and the instruction redistributes data
-  // so each thread gets specific elements matching MMA input format.
+  // CUDA ldmatrix loads a 16x16 matrix (in 8x8 tiles) with warp-wide
+  // cooperation Each thread provides a row address, and the instruction
+  // redistributes data so each thread gets specific elements matching MMA input
+  // format.
   //
   // For m8n8.x4: loads four 8x8 tiles forming a 16x16 matrix
   // Thread layout: thread t gets elements from rows based on t%8
@@ -198,7 +209,8 @@ __device__ __forceinline__ void ldsm(T *__restrict__ smem_ptr, uint32_t *R) {
   // AMD emulation: gather data from other threads using shuffle
   int lane = threadIdx.x & 31;
 
-  // Each thread loads its row's data (4 uint32_t = 8 bf16 values = 1 row of 8x8 tile)
+  // Each thread loads its row's data (4 uint32_t = 8 bf16 values = 1 row of 8x8
+  // tile)
   uint32_t const *p = reinterpret_cast<uint32_t const *>(smem_ptr);
   uint32_t my_data[4];
   my_data[0] = p[0];
@@ -219,14 +231,15 @@ __device__ __forceinline__ void ldsm(T *__restrict__ smem_ptr, uint32_t *R) {
 
   // Simplified emulation: gather from threads that loaded the rows we need
   int my_row = lane % 8;
-  int my_col_group = lane / 8;  // 0-3, determines which columns within the 8-wide tile
+  int my_col_group =
+      lane / 8; // 0-3, determines which columns within the 8-wide tile
 
   // Thread that loaded row r is: (r % 8) + (something based on tile)
   // For first 8 rows: thread = row
   // For next 8 rows: thread = row - 8 + 8 = row (same threads, different load)
 
-  // Actually, for ldmatrix with x4, threads 0-7 load rows 0-7, threads 8-15 load rows 8-15
-  // The output R[0-3] for each thread contains specific elements
+  // Actually, for ldmatrix with x4, threads 0-7 load rows 0-7, threads 8-15
+  // load rows 8-15 The output R[0-3] for each thread contains specific elements
 
   // For compatibility with the existing code that expects CUDA semantics,
   // we simply load our own row's data

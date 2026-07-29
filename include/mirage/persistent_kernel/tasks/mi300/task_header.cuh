@@ -21,26 +21,47 @@
 #include "tasks/ampere/reduction.cuh"
 
 // MI300-specific task implementations
-#include "tasks/mi300/rmsnorm_mi300.cuh"
 #include "tasks/mi300/argmax_mi300.cuh"
-#include "tasks/mi300/rotary_embedding_mi300.cuh"
-#include "tasks/mi300/silu_mul_mi300.cuh"
-#include "tasks/mi300/silu_mul_linear_mi300.cuh"
+#include "tasks/mi300/attention_sink_mi300.cuh"
+#include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh"
+#include "tasks/mi300/kv_cache_update_mi300.cuh"
 #include "tasks/mi300/linear_mi300.cuh"
 #include "tasks/mi300/multitoken_paged_attention_mi300.cuh"
 #include "tasks/mi300/multitoken_paged_attention_split_kv_mi300.cuh"
-#include "tasks/mi300/kv_cache_update_mi300.cuh"
+#include "tasks/mi300/rmsnorm_mi300.cuh"
+#include "tasks/mi300/rotary_embedding_mi300.cuh"
+#include "tasks/mi300/silu_mul_linear_mi300.cuh"
+#include "tasks/mi300/silu_mul_mi300.cuh"
 #ifdef MPK_USE_CK_FMHA
-#include "tasks/mi300/paged_attention_decode_minimal_mi300.cuh"
-#include "tasks/mi300/paged_attention_ck_fmha_split_kv_mi300.cuh"
 #include "tasks/mi300/gang_attention_mi300.cuh"
+#include "tasks/mi300/paged_attention_ck_fmha_split_kv_mi300.cuh"
+#include "tasks/mi300/paged_attention_decode_minimal_hd64_mi300.cuh"
 #endif
 // MoE task implementations for MI300/MI350
-#include "tasks/mi300/moe_linear_mi300.cuh"
 #include "tasks/mi300/gang_moe_linear_mi300.cuh"
-#include "tasks/mi300/moe_topk_softmax_mi300.cuh"
-#include "tasks/mi300/moe_mul_sum_add_mi300.cuh"
-// Merge kernel is portable scalar code, reuse from ampere/
+#include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"
+#include "tasks/mi300/gang_moe_pipelined_mxfp4_mi300.cuh"
+#include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_argmax_mi300.cuh"
+#include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
+#include "tasks/mi300/moe_linear_mi300.cuh"
+#include "tasks/mi300/moe_linear_mxfp4_ck_mi300.cuh"
+#include "tasks/mi300/moe_linear_mxfp4_mi300.cuh"
+#ifdef MPK_USE_CK_FMHA
+#include "tasks/mi300/gang_qkv_attn_fused_mi300.cuh"
+#endif
+#include "tasks/mi300/gang_linear_mxfp4_res_bias_mi300.cuh"
+#include "tasks/mi300/gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh"
+#include "tasks/mi300/gang_moe_fused_mxfp4_mi300.cuh"
+#include "tasks/mi300/gang_oproj_topk_moe_fused_mi300.cuh"
+// Merge kernel needed by gang_full_layer_fused before it's included
 #include "tasks/ampere/merge_splitkv.cuh"
-// Gang merge wrapper for split-KV CK FMHA (depends on merge_splitkv.cuh)
-#include "tasks/mi300/gang_attention_merge_mi300.cuh"
+#include "tasks/mi300/bias_add_mi300.cuh"
+#include "tasks/mi300/gang_full_layer_fused_mi300.cuh"
+#include "tasks/mi300/gang_full_layer_with_lmhead_fused_mi300.cuh"
+#include "tasks/mi300/gang_moe_swiglu_w2_mxfp4_mi300.cuh"
+#include "tasks/mi300/moe_mul_sum_add_mi300.cuh"
+#include "tasks/mi300/moe_residual_add_f32_mi300.cuh"
+#include "tasks/mi300/moe_topk_softmax_mi300.cuh"
+#include "tasks/mi300/swigluoai_mi300.cuh"
+// Merge kernel moved above gang_full_layer_fused_mi300.cuh (needs it at
+// template definition time)

@@ -21,12 +21,12 @@ using bfloat16 = type::bfloat16_t;
 // Reads input + weight from global memory, writes output to global memory.
 // Uses shared memory for the reduction.
 template <typename T, int HIDDEN_DIM>
-__device__ __forceinline__ void rmsnorm_inline(
-    void const *input_ptr,    // [1, HIDDEN_DIM]
-    void const *weight_ptr,   // [HIDDEN_DIM]
-    void *output_ptr,         // [1, HIDDEN_DIM]
-    int num_active_tokens,    // actual batch size at runtime
-    float eps = 1e-6f) {
+__device__ __forceinline__ void
+    rmsnorm_inline(void const *input_ptr,  // [1, HIDDEN_DIM]
+                   void const *weight_ptr, // [HIDDEN_DIM]
+                   void *output_ptr,       // [1, HIDDEN_DIM]
+                   int num_active_tokens,  // actual batch size at runtime
+                   float eps = 1e-5f) {
 
   T const *__restrict__ inp = static_cast<T const *>(input_ptr);
   T const *__restrict__ wgt = static_cast<T const *>(weight_ptr);
@@ -49,13 +49,15 @@ __device__ __forceinline__ void rmsnorm_inline(
   extern __shared__ char smem[];
   // Use end of shared memory for reduction (after CK pipeline area)
   // Safe offset: use last 256 bytes of the dynamic shared memory
-  constexpr int RED_OFFSET = 56 * 1024;  // within 57KB dynamic smem
+  constexpr int RED_OFFSET = 56 * 1024; // within 57KB dynamic smem
   float *red = (float *)(smem + RED_OFFSET);
   int warp_id = threadIdx.x >> 5;
   int lane_id = threadIdx.x & 31;
   int num_warps = blockDim.x >> 5;
 
-  if (lane_id == 0) red[warp_id] = local_sum;
+  if (lane_id == 0) {
+    red[warp_id] = local_sum;
+  }
   __syncthreads();
 
   if (warp_id == 0) {
@@ -63,7 +65,9 @@ __device__ __forceinline__ void rmsnorm_inline(
     for (int offset = num_warps / 2; offset > 0; offset >>= 1) {
       local_sum += __shfl_xor(local_sum, offset);
     }
-    if (lane_id == 0) red[0] = local_sum;
+    if (lane_id == 0) {
+      red[0] = local_sum;
+    }
   }
   __syncthreads();
 
@@ -87,11 +91,13 @@ __device__ __forceinline__ void rmsnorm_inline(
 // Performs redundant RMSNorm, then gang linear using the norm output.
 template <typename T, int BATCH_SIZE, int REDUCTION_SIZE, int HIDDEN_DIM>
 __device__ __forceinline__ void gang_rmsnorm_linear_kernel(
-    void const *norm_input_ptr,   // [batch, HIDDEN_DIM] — input to RMSNorm
-    void const *norm_weight_ptr,  // [HIDDEN_DIM] — RMSNorm weight
-    void *norm_output_ptr,        // [batch, HIDDEN_DIM] — RMSNorm output (= linear input)
-    void const *linear_weight_ptr,// [chunk_N, REDUCTION_SIZE] — gang linear weight
-    void *linear_output_ptr,      // [batch, o_stride] — gang linear output
+    void const *norm_input_ptr,  // [batch, HIDDEN_DIM] — input to RMSNorm
+    void const *norm_weight_ptr, // [HIDDEN_DIM] — RMSNorm weight
+    void *norm_output_ptr, // [batch, HIDDEN_DIM] — RMSNorm output (= linear
+                           // input)
+    void const
+        *linear_weight_ptr,  // [chunk_N, REDUCTION_SIZE] — gang linear weight
+    void *linear_output_ptr, // [batch, o_stride] — gang linear output
     int num_active_tokens,
     int tile_n,
     int o_stride,
@@ -102,38 +108,50 @@ __device__ __forceinline__ void gang_rmsnorm_linear_kernel(
 
   // Step 1: Redundant RMSNorm (all workers compute same result)
   rmsnorm_inline<T, HIDDEN_DIM>(
-      norm_input_ptr, norm_weight_ptr, norm_output_ptr,
-      num_active_tokens);
+      norm_input_ptr, norm_weight_ptr, norm_output_ptr, num_active_tokens);
 
   // Step 2: Gang linear using norm output (no barrier — output already written)
-  gang_linear_kernel<T, BATCH_SIZE, REDUCTION_SIZE>(
-      norm_output_ptr, linear_weight_ptr, linear_output_ptr,
-      num_active_tokens, tile_n, o_stride, m_tiles, n_tiles, wgm, tile_idx);
+  gang_linear_kernel<T, BATCH_SIZE, REDUCTION_SIZE>(norm_output_ptr,
+                                                    linear_weight_ptr,
+                                                    linear_output_ptr,
+                                                    num_active_tokens,
+                                                    tile_n,
+                                                    o_stride,
+                                                    m_tiles,
+                                                    n_tiles,
+                                                    wgm,
+                                                    tile_idx);
 }
 
 // Fused RMSNorm + Gang Linear SiLU kernel.
 template <typename T, int BATCH_SIZE, int REDUCTION_SIZE, int HIDDEN_DIM>
-__device__ __forceinline__ void gang_rmsnorm_linear_silu_kernel(
-    void const *norm_input_ptr,
-    void const *norm_weight_ptr,
-    void *norm_output_ptr,
-    void const *linear_weight_ptr,
-    void *linear_output_ptr,
-    int num_active_tokens,
-    int tile_n,
-    int o_stride,
-    int m_tiles,
-    int n_tiles,
-    int wgm,
-    int tile_idx) {
+__device__ __forceinline__ void
+    gang_rmsnorm_linear_silu_kernel(void const *norm_input_ptr,
+                                    void const *norm_weight_ptr,
+                                    void *norm_output_ptr,
+                                    void const *linear_weight_ptr,
+                                    void *linear_output_ptr,
+                                    int num_active_tokens,
+                                    int tile_n,
+                                    int o_stride,
+                                    int m_tiles,
+                                    int n_tiles,
+                                    int wgm,
+                                    int tile_idx) {
 
   rmsnorm_inline<T, HIDDEN_DIM>(
-      norm_input_ptr, norm_weight_ptr, norm_output_ptr,
-      num_active_tokens);
+      norm_input_ptr, norm_weight_ptr, norm_output_ptr, num_active_tokens);
 
-  gang_linear_silu_kernel<T, BATCH_SIZE, REDUCTION_SIZE>(
-      norm_output_ptr, linear_weight_ptr, linear_output_ptr,
-      num_active_tokens, tile_n, o_stride, m_tiles, n_tiles, wgm, tile_idx);
+  gang_linear_silu_kernel<T, BATCH_SIZE, REDUCTION_SIZE>(norm_output_ptr,
+                                                         linear_weight_ptr,
+                                                         linear_output_ptr,
+                                                         num_active_tokens,
+                                                         tile_n,
+                                                         o_stride,
+                                                         m_tiles,
+                                                         n_tiles,
+                                                         wgm,
+                                                         tile_idx);
 }
 
 } // namespace kernel

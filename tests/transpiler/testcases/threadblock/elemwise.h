@@ -152,8 +152,8 @@ ADD_TESTCASE(Testcase("tb_elemwise_correctness", {"threadblock", "correctness"},
 			float step1 = 1.0 / (float)numel;
 			vector<half> ret(numel);
 			for (size_t i = 0; i < numel; ++i) {
-				float i0 = (-1.0 + (double)i * step0);
-				float i1 = (1.0 + (double)i * step1);
+				float i0 = (-1.0 + (float)i * step0);
+				float i1 = (1.0 + (float)i * step1);
 				float o0 = exp((i0 + i1) / i1);
 				ret[i] = (half)o0;
 			}

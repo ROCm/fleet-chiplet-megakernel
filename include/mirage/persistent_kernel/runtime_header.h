@@ -35,9 +35,19 @@ constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 6 * 1024;
 constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 3 * 1024;
 #endif
 
-// AMD MI300 (gfx942) has up to 64KB LDS per workgroup by default
-// Can be increased to 128KB with dynamic LDS, but let's use conservative 60KB
-#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300) || (MPK_TARGET_CC == 94)
+// Layer index at fixed shared memory offset (last 4 bytes of extern
+// __shared__). Used by MoE barriers for monotonically increasing expected
+// values.
+constexpr int LAYER_IDX_SMEM_OFFSET_FROM_END = 4;
+
+// AMD LDS limits per GPU generation:
+// - MI300 (gfx942): 64KB LDS per workgroup, use conservative 60KB
+// - MI350 (gfx950): 160KB LDS per workgroup, use 155KB for LDS-resident weights
+#if (MPK_TARGET_CC == 95)
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    155 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300) ||            \
+    (MPK_TARGET_CC == 94)
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
     60 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
 #elif defined(MODE_ONLINE_NOTOKEN) || defined(MODE_MULTI_TURN)
@@ -82,8 +92,8 @@ unsigned long long int const EVENT_NVSHMEM_TAG = 0x1e00000000000000;
 unsigned long long int const EVENT_INVALID_ID = 0x7ffffffffffffffe;
 typedef unsigned long long int EventCounter;
 
-int const MAX_INPUTS_PER_TASK = 7;
-int const MAX_OUTPUTS_PER_TASK = 3;
+int const MAX_INPUTS_PER_TASK = 28;
+int const MAX_OUTPUTS_PER_TASK = 13;
 // Increased to 304 to support full CU utilization on AMD MI300X (304 CUs)
 // and NVIDIA Blackwell (160+ SMs which uses 144 workers)
 int const MAX_NUM_WORKERS = 304;
@@ -133,10 +143,6 @@ enum TaskType {
   TASK_GANG_SPLITK_LINEAR_RES_MI300 = 144,
   TASK_GANG_KSPLIT_GEMM_MI300 = 145,
   TASK_GANG_KSPLIT_FINALIZE_MI300 = 146,
-  TASK_GANG_LINEAR_N_TILING_MI300 = 147,
-  TASK_GANG_LINEAR_RES_N_TILING_MI300 = 148,
-  TASK_GANG_LINEAR_MSPLIT_MI300 = 183,
-  TASK_GANG_LINEAR_RES_MSPLIT_MI300 = 184,
   // MI300/MI350 MoE Tasks
   TASK_MOE_W13_LINEAR_MI300 = 170,
   TASK_MOE_W2_LINEAR_MI300 = 171,
@@ -144,6 +150,36 @@ enum TaskType {
   TASK_MOE_MUL_SUM_ADD_MI300 = 173,
   TASK_GANG_MOE_W13_LINEAR_MI300 = 174,
   TASK_GANG_MOE_W2_LINEAR_MI300 = 175,
+  TASK_SWIGLUOAI_MI300 = 176,
+  TASK_MOE_W13_LINEAR_MXFP4_MI300 = 177,
+  TASK_MOE_W2_LINEAR_MXFP4_MI300 = 178,
+  TASK_ATTENTION_SINK_MI300 = 179,
+  TASK_BIAS_ADD_MI300 = 180,
+  TASK_MOE_W13_LINEAR_MXFP4_CK_MI300 = 183,
+  TASK_MOE_W2_LINEAR_MXFP4_CK_MI300 = 184,
+  TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300 = 185,
+  TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300 = 186,
+  TASK_GANG_MOE_FUSED_MXFP4_MI300 = 187,
+  TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300 = 188,
+  TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300 = 189,
+  TASK_GANG_LINEAR_BIAS_MI300 = 190,
+  TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300 = 191,
+  TASK_GANG_RMSNORM_LINEAR_BIAS_MI300 = 192,
+  TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300 = 193,
+  TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300 = 194,
+  TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300 = 195,
+  TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300 = 196,
+  TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 = 197,
+  TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 = 198,
+  TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300 = 210,
+  TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300 = 211,
+  TASK_MOE_RESIDUAL_ADD_F32_MI300 = 212,
+  TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300 = 213,
+  TASK_GANG_QKV_ATTN_FUSED_MI300 = 214,
+  TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300 = 215,
+  TASK_GANG_FULL_LAYER_FUSED_MI300 = 216,
+  TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300 = 217,
+  TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300 = 218,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,
@@ -328,6 +364,8 @@ struct RuntimeConfig {
   int *paged_kv_indptr_buffer;  // Metadata for LLM serving (paged attention)
   int *paged_kv_indices_buffer; // Metadata for LLM serving (paged attention)
   int *paged_kv_last_page_len_buffer; // Metadata for LLM serving
+  void *rope_cos_ptr; // [max_seq_len, head_dim] bf16 cosine table for RoPE
+  void *rope_sin_ptr; // [max_seq_len, head_dim] bf16 sine table for RoPE
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
     defined(MODE_ONLINE_NOTOKEN)
   int *prompt_length;     // Metadata for online/offline serving
@@ -339,30 +377,75 @@ struct RuntimeConfig {
   int total_num_requests; // Metadata for LLM serving
 #endif
   void *profiler_buffer;
-  int profiling_num_iters;  // Number of iterations to run in profiling mode (0 = unlimited)
+  int profiling_num_iters; // Number of iterations to run in profiling mode (0 =
+                           // unlimited)
   bool split_worker_scheduler;
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
-  void *worker_log_buffer;  // device buffer: WorkerLogEntry[] for execute_worker debug
-  int *worker_log_count;    // device counter for log entries
+  void *worker_log_buffer; // device buffer: WorkerLogEntry[] for execute_worker
+                           // debug
+  int *worker_log_count;   // device counter for log entries
   // Per-XCD event counter replication for reduced cross-XCD polling contention
   // Each XCD has a local copy of event counters, updated by a leader worker
-  EventCounter *xcd_local_event_counters;  // [NUM_XCDS * num_events] - per-XCD counter copies
-  int *xcd_leader_worker;                   // [NUM_XCDS] - worker ID that is leader for each XCD (-1 if none)
-  int num_xcds;                             // Number of XCDs (8 for MI300X)
+  EventCounter *xcd_local_event_counters; // [NUM_XCDS * num_events] - per-XCD
+                                          // counter copies
+  int *xcd_leader_worker; // [NUM_XCDS] - worker ID that is leader for each XCD
+                          // (-1 if none)
+  int num_xcds;           // Number of XCDs (8 for MI300X)
   // Runtime XCD mapping: workers write their hardware XCD ID at startup,
   // schedulers read it to build XCD-aligned worker lists
-  int *worker_xcd_map;           // [num_workers] — worker_id → actual hardware XCD ID
-  int *worker_xcd_ready_count;   // atomic counter: workers increment after writing xcd_map
-  int *xcd_event_num_tasks;      // [num_xcds * num_events] — per-XCD per-event task count (set by scheduler)
+  int *worker_xcd_map; // [num_workers] — worker_id → actual hardware XCD ID
+  int *worker_xcd_ready_count; // atomic counter: workers increment after
+                               // writing xcd_map
+  int *xcd_event_num_tasks; // [num_xcds * num_events] — per-XCD per-event task
+                            // count (set by scheduler)
   // Combined kernel: dynamic role election — one scheduler per XCD
-  int *xcd_scheduler_claimed;    // [num_xcds] — atomicCAS to claim XCD as scheduler (-1 = unclaimed)
-  int *dynamic_worker_id_counter; // atomic counter for assigning worker IDs in combined kernel
+  int *xcd_scheduler_claimed;     // [num_xcds] — atomicCAS to claim XCD as
+                                  // scheduler (-1 = unclaimed)
+  int *dynamic_worker_id_counter; // atomic counter for assigning worker IDs in
+                                  // combined kernel
 #endif
-  // Per-event wall-clock timing: records s_memrealtime when each event fires
-  // (last worker to finish). Wall time between consecutive events = phase duration.
-  unsigned long long *event_timing_buffer;  // [max_entries * 2]: pairs of (event_index, timestamp)
-  int *event_timing_count;                  // atomic write position
-  int event_timing_max_entries;             // buffer capacity
+#ifdef MPK_PRECOMPUTED_DISPATCH
+  // Per-worker task queues (filled at runtime from XCD templates)
+  size_t
+      *precomp_queue; // [num_workers * precomp_max_tpw] — task position indices
+  int *precomp_queue_len;                 // [num_workers] — tasks per worker
+  int precomp_max_tpw;                    // queue stride (max tasks per worker)
+  unsigned long long *precomp_iter_ready; // device counter: scheduler bumps
+                                          // after prepare_next_batch
+  int *precomp_iter_xcd_release; // [8*16] per-XCD release flags (st_wt/ld_nt
+                                 // for fast cross-XCD)
+  int *precomp_terminate;        // device flag: 0=run, 1=exit
+  unsigned long long *precomp_dbg_tasks_done; // debug: host-mapped task counter
+  int *precomp_dbg_worker_state; // debug: [num_workers*4] = {task_pos,
+                                 // dep_event, tasks_done, stuck_count}
+  // Cross-XCD gang barrier: workers sync before executing gang tasks with
+  // internal barriers
+  unsigned long long
+      *precomp_gang_barrier; // [num_events] — per-trigger-event atomic counter
+  int *precomp_gang_dispatch_count; // [num_events] — total workers dispatched
+                                    // per gang event
+  // XCD-template queues: per-XCD-slot, per-rank task lists built on host.
+  // Workers discover hardware XCD at runtime and copy their template.
+  size_t *precomp_xcd_template;  // [8 * workers_per_xcd * precomp_max_tpw]
+  int *precomp_xcd_template_len; // [8 * workers_per_xcd]
+  int *precomp_xcd_rank_counter; // [8] — per-XCD atomic rank counter (device
+                                 // memory)
+  int precomp_workers_per_xcd;   // num_workers / 8
+  int *precomp_dbg_gang_phase;   // [num_workers] host-mapped: gang kernel phase
+                                 // tracking
+  // Multi-layer all-fused execution: one task processes all transformer layers
+  void **ml_input_table;      // [ml_num_layers * 24] per-layer input pointers
+  void **ml_output_table;     // [ml_num_layers * 11] per-layer output pointers
+  EventId *ml_trigger_events; // [ml_num_layers] per-layer trigger events
+  size_t *ml_task_positions;  // [ml_num_layers] per-layer task position indices
+  unsigned *ml_variant_ids;   // [ml_num_layers] per-layer variant_id
+  int *ml_barrier_arrive;     // [8 * 16] per-XCD arrival counters (cache-line
+                              // padded)
+  int *ml_barrier_global;     // [16] global arrival counter
+  int *ml_barrier_release;    // [8 * 16] per-XCD release flags
+  int ml_num_layers;          // 0 = disabled, 36 = enabled
+  int ml_workers_per_xcd;     // workers per XCD for barrier threshold
+#endif
 #ifdef MIRAGE_BACKEND_USE_ROCM
   hipStream_t worker_stream, scheduler_stream;
   hipEvent_t prepare_done_event;

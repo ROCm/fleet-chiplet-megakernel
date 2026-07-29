@@ -24,19 +24,21 @@ template <typename T,
           int REDUCTION_SIZE,
           int K_SPLITS>
 __device__ __forceinline__ void gang_ksplit_gemm_kernel(
-    void const *input_ptr,       // [batch, REDUCTION_SIZE] full
-    void const *weight_ptr,      // [N_total, REDUCTION_SIZE] full
-    void *workspace_ptr,         // [batch, N_total] float32 atomic target
+    void const *input_ptr,  // [batch, REDUCTION_SIZE] full
+    void const *weight_ptr, // [N_total, REDUCTION_SIZE] full
+    void *workspace_ptr,    // [batch, N_total] float32 atomic target
     int num_active_tokens,
     int tile_n,
-    int ws_stride,               // workspace stride (= N_total typically)
-    int n_tiles,                 // total N-tiles
-    int k_split_idx,             // 0..K_SPLITS-1, from bid.x
-    int tile_idx)                // N-tile index
+    int ws_stride,   // workspace stride (= N_total typically)
+    int n_tiles,     // total N-tiles
+    int k_split_idx, // 0..K_SPLITS-1, from bid.x
+    int tile_idx)    // N-tile index
 {
   using namespace ck_tile;
 
-  if (tile_idx >= n_tiles) return;
+  if (tile_idx >= n_tiles) {
+    return;
+  }
 
   constexpr int K_per_split = REDUCTION_SIZE / K_SPLITS;
   int k_offset = k_split_idx * K_per_split;
@@ -51,21 +53,24 @@ __device__ __forceinline__ void gang_ksplit_gemm_kernel(
   using BlockWarps = sequence<1, 4>;
   using WarpTile = sequence<16, 16, KPerBlock>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
-  using GemmTraits = TileGemmUniversalTraits<
-      true, false, true, false,
-      tensor_layout::gemm::RowMajor,
-      tensor_layout::gemm::ColumnMajor,
-      tensor_layout::gemm::RowMajor>;
+  using GemmTraits = TileGemmUniversalTraits<true,
+                                             false,
+                                             true,
+                                             false,
+                                             tensor_layout::gemm::RowMajor,
+                                             tensor_layout::gemm::ColumnMajor,
+                                             tensor_layout::gemm::RowMajor>;
   using Problem = GemmPipelineProblem<bf16, bf16, float, GemmShape, GemmTraits>;
-  using PipelinePolicy = GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
+  using PipelinePolicy =
+      GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
   using Pipeline = GemmPipelineAGmemBGmemCRegV2<Problem, PipelinePolicy>;
 
-  const bf16* d_input = reinterpret_cast<const bf16*>(
-      __uniform_addr(static_cast<T const*>(input_ptr)));
-  const bf16* d_weight = reinterpret_cast<const bf16*>(
-      __uniform_addr(static_cast<T const*>(weight_ptr) +
+  bf16 const *d_input = reinterpret_cast<bf16 const *>(
+      __uniform_addr(static_cast<T const *>(input_ptr)));
+  bf16 const *d_weight = reinterpret_cast<bf16 const *>(
+      __uniform_addr(static_cast<T const *>(weight_ptr) +
                      static_cast<size_t>(tile_idx) * tile_n * REDUCTION_SIZE));
-  float* d_ws = reinterpret_cast<float*>(__uniform_addr(workspace_ptr));
+  float *d_ws = reinterpret_cast<float *>(__uniform_addr(workspace_ptr));
   int ws_stride_u = __builtin_amdgcn_readfirstlane(ws_stride);
 
   extern __shared__ char smem[];
@@ -73,31 +78,35 @@ __device__ __forceinline__ void gang_ksplit_gemm_kernel(
   for (index_t mm = 0; mm < LoopM; mm++) {
     index_t m_offset = mm * MPerBlock;
     index_t m_size = (mm == LoopM - 1) ? (BATCH_SIZE - m_offset) : MPerBlock;
-    if (m_size <= 0) continue;
+    if (m_size <= 0) {
+      continue;
+    }
 
     auto a_view = make_naive_tensor_view<address_space_enum::global>(
         d_input + m_offset * REDUCTION_SIZE + k_offset,
         make_tuple(m_size, index_t(K_per_split)),
         make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
-        number<8>{}, number<1>{});
+        number<8>{},
+        number<1>{});
 
 #ifdef MPK_NT_WEIGHT_LOADS
-    auto b_view = make_naive_tensor_view<
-        address_space_enum::global,
-        memory_operation_enum::set,
-        static_cast<amd_buffer_coherence_enum>(18)>(
+    auto b_view =
+        make_naive_tensor_view<address_space_enum::global,
+                               memory_operation_enum::set,
+                               static_cast<amd_buffer_coherence_enum>(18)>(
 #else
     auto b_view = make_naive_tensor_view<address_space_enum::global>(
 #endif
-        d_weight + k_offset,
-        make_tuple(index_t(tile_n), index_t(K_per_split)),
-        make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
-        number<8>{}, number<1>{});
+            d_weight + k_offset,
+            make_tuple(index_t(tile_n), index_t(K_per_split)),
+            make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
+            number<8>{},
+            number<1>{});
 
-    auto a_win = make_tile_window(a_view,
-        make_tuple(number<MPerBlock>{}, number<KPerBlock>{}), {0, 0});
-    auto b_win = make_tile_window(b_view,
-        make_tuple(number<NPerBlock>{}, number<KPerBlock>{}), {0, 0});
+    auto a_win = make_tile_window(
+        a_view, make_tuple(number<MPerBlock>{}, number<KPerBlock>{}), {0, 0});
+    auto b_win = make_tile_window(
+        b_view, make_tuple(number<NPerBlock>{}, number<KPerBlock>{}), {0, 0});
 
     Pipeline pipeline;
     auto c_tile = pipeline(a_win, b_win, NumLoopK, smem);
@@ -108,22 +117,23 @@ __device__ __forceinline__ void gang_ksplit_gemm_kernel(
     index_t lane_id = threadIdx.x & 63;
     index_t tile_row = lane_id & 15;
     index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-    auto& c_buf = c_tile.get_thread_buffer();
+    auto &c_buf = c_tile.get_thread_buffer();
 
     index_t global_m = m_offset + tile_row;
     index_t global_n = tile_idx * tile_n + tile_col_base;
 
     if (global_m < BATCH_SIZE && tile_col_base + 3 < NPerBlock) {
       index_t base = global_m * ws_stride_u + global_n;
-      atomicAdd(&d_ws[base],     c_buf[0]);
+      atomicAdd(&d_ws[base], c_buf[0]);
       atomicAdd(&d_ws[base + 1], c_buf[1]);
       atomicAdd(&d_ws[base + 2], c_buf[2]);
       atomicAdd(&d_ws[base + 3], c_buf[3]);
     } else if (global_m < BATCH_SIZE) {
-      #pragma unroll
+#pragma unroll
       for (index_t i = 0; i < 4; i++) {
-        if (tile_col_base + i < NPerBlock)
+        if (tile_col_base + i < NPerBlock) {
           atomicAdd(&d_ws[global_m * ws_stride_u + global_n + i], c_buf[i]);
+        }
       }
     }
   }
@@ -134,30 +144,31 @@ __device__ __forceinline__ void gang_ksplit_gemm_kernel(
 // Each XCD handles its N-partition of the output (standard N-split).
 template <typename T, int BATCH_SIZE>
 __device__ __forceinline__ void gang_ksplit_finalize_kernel(
-    void *workspace_ptr,         // [batch, ws_stride] float32 — full workspace
-    void const *residual_ptr,    // [batch, o_stride] — XCD's N-partition
-    void *output_ptr,            // [batch, o_stride] — XCD's N-partition
-    int ws_stride,               // workspace stride (= full N)
-    int o_stride,                // output stride (= full N)
-    int n_cols,                  // columns this XCD finalizes
-    int n_col_offset,            // starting column for this XCD
-    int tile_idx)                // distributes work across workers
+    void *workspace_ptr,      // [batch, ws_stride] float32 — full workspace
+    void const *residual_ptr, // [batch, o_stride] — XCD's N-partition
+    void *output_ptr,         // [batch, o_stride] — XCD's N-partition
+    int ws_stride,            // workspace stride (= full N)
+    int o_stride,             // output stride (= full N)
+    int n_cols,               // columns this XCD finalizes
+    int n_col_offset,         // starting column for this XCD
+    int tile_idx)             // distributes work across workers
 {
-  float* d_ws = reinterpret_cast<float*>(__uniform_addr(workspace_ptr));
-  const bfloat16* res = reinterpret_cast<const bfloat16*>(
-      __uniform_addr(static_cast<T const*>(residual_ptr)));
-  bfloat16* out = reinterpret_cast<bfloat16*>(
-      __uniform_addr(static_cast<T*>(output_ptr)));
+  float *d_ws = reinterpret_cast<float *>(__uniform_addr(workspace_ptr));
+  bfloat16 const *res = reinterpret_cast<bfloat16 const *>(
+      __uniform_addr(static_cast<T const *>(residual_ptr)));
+  bfloat16 *out = reinterpret_cast<bfloat16 *>(
+      __uniform_addr(static_cast<T *>(output_ptr)));
   int ws_stride_u = __builtin_amdgcn_readfirstlane(ws_stride);
   int o_stride_u = __builtin_amdgcn_readfirstlane(o_stride);
   int n_col_offset_u = __builtin_amdgcn_readfirstlane(n_col_offset);
 
   // Each tile_idx handles a chunk of output elements
-  constexpr int ELEMS_PER_TILE = 512;  // ~2KB per tile
+  constexpr int ELEMS_PER_TILE = 512; // ~2KB per tile
   int start = tile_idx * ELEMS_PER_TILE;
   int total = BATCH_SIZE * n_cols;
 
-  for (int idx = start + (int)threadIdx.x; idx < min(start + ELEMS_PER_TILE, total);
+  for (int idx = start + (int)threadIdx.x;
+       idx < min(start + ELEMS_PER_TILE, total);
        idx += (int)blockDim.x) {
     int row = idx / n_cols;
     int col = idx % n_cols;

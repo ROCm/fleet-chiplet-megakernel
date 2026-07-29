@@ -187,7 +187,8 @@ public:
   void free_fingerprint(std::vector<STensor> const &tensors);
   size_t calculate_shared_memory_usage(TBOperator *new_op);
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
   KernelParams get_kernel_params();
   NewKernelParams get_new_kernel_params(bool fingerprint) const;
 #endif

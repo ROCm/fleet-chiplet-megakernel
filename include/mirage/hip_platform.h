@@ -17,17 +17,19 @@
 
 // Define HIP platform before any HIP headers are included
 // This MUST be defined before any HIP headers are included
-// Support both MIRAGE_BACKEND_USE_ROCM and MIRAGE_BACKEND_USE_HIP for compatibility
+// Support both MIRAGE_BACKEND_USE_ROCM and MIRAGE_BACKEND_USE_HIP for
+// compatibility
 #if defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
 #ifndef __HIP_PLATFORM_AMD__
 #define __HIP_PLATFORM_AMD__ 1
 #endif
-// For host code compilation (e.g. Cython with regular g++), ensure HIP types are available
-// HIP headers need __HIP_PLATFORM_AMD__ to be defined, which we've done above
-// Some HIP types might need additional defines - ensure they're available
+// For host code compilation (e.g. Cython with regular g++), ensure HIP types
+// are available HIP headers need __HIP_PLATFORM_AMD__ to be defined, which
+// we've done above Some HIP types might need additional defines - ensure
+// they're available
 #ifndef __HIP__
-  // When not using HIP compiler, ensure basic HIP types are available
-  // HIP headers should still work for host code, but we ensure platform is set
+// When not using HIP compiler, ensure basic HIP types are available
+// HIP headers should still work for host code, but we ensure platform is set
 #endif
 #endif
 

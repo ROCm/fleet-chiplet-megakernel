@@ -72,7 +72,7 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma(
   float const log2e = 1.4426950408889634f;
 
   int tid = threadIdx.x;
-  int lane = tid % 64;  // Lane within 64-thread AMD wavefront
+  int lane = tid % 64; // Lane within 64-thread AMD wavefront
   int wavefront_id = tid / 64;
 
   int const first_token_pos = qo_indptr_buffer_ptr[request_id];
@@ -115,9 +115,11 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma(
   constexpr size_t S_V_OFFSET = S_K_OFFSET + S_K_SIZE;
   constexpr size_t S_V_SIZE = S_K_SIZE;
   constexpr size_t S_QK_OFFSET = S_V_OFFSET + S_V_SIZE;
-  constexpr size_t S_QK_SIZE = sizeof(float) * MAX_TOKENS * NUM_QO_PER_KV * KV_TILE_SIZE;
+  constexpr size_t S_QK_SIZE =
+      sizeof(float) * MAX_TOKENS * NUM_QO_PER_KV * KV_TILE_SIZE;
   constexpr size_t S_O_OFFSET = S_QK_OFFSET + S_QK_SIZE;
-  constexpr size_t S_O_SIZE = sizeof(float) * MAX_TOKENS * NUM_QO_PER_KV * HEAD_DIM;
+  constexpr size_t S_O_SIZE =
+      sizeof(float) * MAX_TOKENS * NUM_QO_PER_KV * HEAD_DIM;
   constexpr size_t S_M_OFFSET = S_O_OFFSET + S_O_SIZE;
   constexpr size_t S_M_SIZE = sizeof(float) * MAX_TOKENS * NUM_QO_PER_KV;
   constexpr size_t S_L_OFFSET = S_M_OFFSET + S_M_SIZE;
@@ -246,7 +248,7 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma(
       for (int tile_m = 0; tile_m < TILES_M; tile_m++) {
         mfma_attn_float4 accum[MAX_TILES_PER_WAVE > 0 ? MAX_TILES_PER_WAVE : 1];
 
-        #pragma unroll
+#pragma unroll
         for (int t = 0; t < MAX_TILES_PER_WAVE; t++) {
           accum[t] = {0.0f, 0.0f, 0.0f, 0.0f};
         }
@@ -259,29 +261,31 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma(
           // Load Q fragment
           mfma_attn_bf16x4 reg_q;
           if (q_row < q_rows && q_col + 3 < HEAD_DIM) {
-            #pragma unroll
+#pragma unroll
             for (int i = 0; i < 4; i++) {
-              reg_q.u16[i] = reinterpret_cast<unsigned short*>(
+              reg_q.u16[i] = reinterpret_cast<unsigned short *>(
                   &s_q[q_row * HEAD_DIM + q_col])[i];
             }
           } else {
             reg_q.u16[0] = reg_q.u16[1] = reg_q.u16[2] = reg_q.u16[3] = 0;
           }
 
-          // Process N tiles
-          #pragma unroll
-          for (int local_tile = 0; local_tile < MAX_TILES_PER_WAVE; local_tile++) {
+// Process N tiles
+#pragma unroll
+          for (int local_tile = 0; local_tile < MAX_TILES_PER_WAVE;
+               local_tile++) {
             int tile_n = local_tile * 2 + wavefront_id;
             if (tile_n < TILES_N) {
-              int k_col = tile_n * MFMA_N + (lane % 16);  // KV position
-              int k_row = tile_k * MFMA_K + (lane / 16) * 4;  // HEAD_DIM
+              int k_col = tile_n * MFMA_N + (lane % 16);     // KV position
+              int k_row = tile_k * MFMA_K + (lane / 16) * 4; // HEAD_DIM
 
-              // Load K^T fragment (K is stored as [kv_len, HEAD_DIM], we need transpose)
+              // Load K^T fragment (K is stored as [kv_len, HEAD_DIM], we need
+              // transpose)
               mfma_attn_bf16x4 reg_k;
               if (k_col < kv_len && k_row + 3 < HEAD_DIM) {
-                #pragma unroll
+#pragma unroll
                 for (int i = 0; i < 4; i++) {
-                  reg_k.u16[i] = reinterpret_cast<unsigned short*>(
+                  reg_k.u16[i] = reinterpret_cast<unsigned short *>(
                       &s_k[k_col * HEAD_DIM + k_row])[i];
                 }
               } else {
@@ -295,21 +299,25 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma(
           }
         }
 
-        // Store QK results
-        #pragma unroll
-        for (int local_tile = 0; local_tile < MAX_TILES_PER_WAVE; local_tile++) {
+// Store QK results
+#pragma unroll
+        for (int local_tile = 0; local_tile < MAX_TILES_PER_WAVE;
+             local_tile++) {
           int tile_n = local_tile * 2 + wavefront_id;
-          if (tile_n >= TILES_N) continue;
+          if (tile_n >= TILES_N) {
+            continue;
+          }
 
           int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
           int out_col = tile_n * MFMA_N + (lane % 16);
 
           if (out_col < kv_len) {
-            #pragma unroll
+#pragma unroll
             for (int r = 0; r < 4; r++) {
               int out_row = out_row_base + r;
               if (out_row < q_rows) {
-                s_qk[out_row * KV_TILE_SIZE + out_col] = accum[local_tile][r] * sm_scale;
+                s_qk[out_row * KV_TILE_SIZE + out_col] =
+                    accum[local_tile][r] * sm_scale;
               }
             }
           }
@@ -329,8 +337,9 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma(
       float m_new = m_prev;
       for (int k = 0; k < kv_len; k++) {
         int k_pos = kv_start + k;
-        float score = (k_pos <= q_pos) ? s_qk[q_idx * KV_TILE_SIZE + k] : -INFINITY;
-        s_qk[q_idx * KV_TILE_SIZE + k] = score;  // Store masked score
+        float score =
+            (k_pos <= q_pos) ? s_qk[q_idx * KV_TILE_SIZE + k] : -INFINITY;
+        s_qk[q_idx * KV_TILE_SIZE + k] = score; // Store masked score
         m_new = fmaxf(m_new, score);
       }
 

@@ -51,17 +51,10 @@ wheelhouse/
 # Triton transpiler
 demo/mirage_search_checkpoint.json
 demo/*generated*
+benchmark/*generated*
 
 # Rust
 Cargo.lock
-
-# Local dev notes (not for public repo)
-CLAUDE.md
-
-# Stray build artifacts
-test-hip-amdgcn-*
-test-host-*
-test.cu-*.hipfb
 
 # Output files of runtime
 output/

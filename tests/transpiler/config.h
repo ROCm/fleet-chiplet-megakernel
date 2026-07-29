@@ -13,9 +13,8 @@ namespace env_config {
 
 // Create a directory if it does not exist
 inline void make_dir(std::string const &dir) {
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  if (ec) {
+  int ret_code = system(("mkdir -p " + dir).c_str());
+  if (ret_code != 0) {
     throw std::runtime_error("Failed to create directory: " + dir);
   }
 }

@@ -566,26 +566,27 @@ bool KNCustomizedOp::fingerprint(void) {
 #ifdef MIRAGE_FINGERPRINT_USE_ROCM
 // ROCm version - same as CUDA but uses HIP APIs
 // Include the same headers as CUDA version for threadblock types
-// Note: cutlass/matrix_coord.h is included via threadblock/cuda/input_loader.h and output_saver.h
-#include "mirage/threadblock/serializer/kernel_params.h"
-#include "mirage/threadblock/serializer/input_loader_serializer.h"
-#include "mirage/threadblock/serializer/forloop_accum_serializer.h"
-#include "mirage/threadblock/serializer/output_saver_serializer.h"
-#include "mirage/threadblock/serializer/matmul_serializer.h"
-#include "mirage/threadblock/serializer/element_unary_serializer.h"
-#include "mirage/threadblock/serializer/element_binary_serializer.h"
-#include "mirage/threadblock/serializer/reduction_serializer.h"
-#include "mirage/threadblock/serializer/rms_norm_serializer.h"
-#include "mirage/threadblock/serializer/concat_serializer.h"
-#include "mirage/threadblock/cuda/input_loader.h"
-#include "mirage/threadblock/cuda/forloop_accum.h"
-#include "mirage/threadblock/cuda/output_saver.h"
-#include "mirage/threadblock/cuda/matmul.h"
-#include "mirage/threadblock/cuda/element_unary.h"
+// Note: cutlass/matrix_coord.h is included via threadblock/cuda/input_loader.h
+// and output_saver.h
+#include "mirage/threadblock/cuda/concat.h"
 #include "mirage/threadblock/cuda/element_binary.h"
+#include "mirage/threadblock/cuda/element_unary.h"
+#include "mirage/threadblock/cuda/forloop_accum.h"
+#include "mirage/threadblock/cuda/input_loader.h"
+#include "mirage/threadblock/cuda/matmul.h"
+#include "mirage/threadblock/cuda/output_saver.h"
 #include "mirage/threadblock/cuda/reduction.h"
 #include "mirage/threadblock/cuda/rms_norm.h"
-#include "mirage/threadblock/cuda/concat.h"
+#include "mirage/threadblock/serializer/concat_serializer.h"
+#include "mirage/threadblock/serializer/element_binary_serializer.h"
+#include "mirage/threadblock/serializer/element_unary_serializer.h"
+#include "mirage/threadblock/serializer/forloop_accum_serializer.h"
+#include "mirage/threadblock/serializer/input_loader_serializer.h"
+#include "mirage/threadblock/serializer/kernel_params.h"
+#include "mirage/threadblock/serializer/matmul_serializer.h"
+#include "mirage/threadblock/serializer/output_saver_serializer.h"
+#include "mirage/threadblock/serializer/reduction_serializer.h"
+#include "mirage/threadblock/serializer/rms_norm_serializer.h"
 
 __global__ void compute_customizedop_fingerprint(
     mirage::threadblock::NewKernelParams new_params,
