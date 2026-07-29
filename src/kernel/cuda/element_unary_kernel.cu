@@ -104,12 +104,12 @@ __constant__ float CLAMP_MIN_MAX_DEVICE[2];
 
 __global__ void
     compute_elementunary_fingerprint(mirage::type::KNOperatorType type,
-                                    FPType *exp_lookup_table,
-                                    FPType *sqrt_p_lookup_table,
-                                    FPType *sqrt_q_lookup_table,
-                                    mirage::type::FPType *input_ptr,
-                                    mirage::type::FPType *output_ptr,
-                                    int num_elements) {
+                                     FPType *exp_lookup_table,
+                                     FPType *sqrt_p_lookup_table,
+                                     FPType *sqrt_q_lookup_table,
+                                     mirage::type::FPType *input_ptr,
+                                     mirage::type::FPType *output_ptr,
+                                     int num_elements) {
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   if (i < num_elements) {
     if (type == mirage::type::KN_EXP_OP) {

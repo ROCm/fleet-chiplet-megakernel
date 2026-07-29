@@ -88,8 +88,8 @@ ADD_TESTCASE(Testcase("tb_input_output", {"threadblock", "correctness", "perf"},
 				80
 			}
 		}, subcase.subcase_name, subcase.is_perf_test ? optional([=](const Subcase::RunResult &res) -> string {
-			size_t mem_read_vol = static_cast<size_t>(subcase.b)*subcase.m*subcase.n;
-			size_t mem_write_vol = static_cast<size_t>(subcase.b)*subcase.m*subcase.tile_n;
+			size_t mem_read_vol = subcase.b*subcase.m*subcase.n;
+			size_t mem_write_vol = subcase.b*subcase.m*subcase.tile_n;
 			float mem_bw_gBps = (mem_read_vol + mem_write_vol) * sizeof(half) / res.avg_time_ms / 1e6;
 			return "Mem BW (GB/s): " + std::to_string(mem_bw_gBps);
 		}) : nullopt);
@@ -118,7 +118,7 @@ ADD_TESTCASE(Testcase("tb_input_output", {"threadblock", "correctness", "perf"},
 
 		t.mark_output(output, {b, m, tile_n}, subcase.is_perf_test ? vector<half>{} : [&]() {
 			vector<half> input = Gen::ARange()({b, m, n});
-			vector<half> output(static_cast<size_t>(b)*m*tile_n);
+			vector<half> output(b*m*tile_n);
 			for (int b_i = 0; b_i < b; b_i++) {
 				for (int m_i = 0; m_i < m; m_i++) {
 					for (int n_i = 0; n_i < tile_n; n_i++) {

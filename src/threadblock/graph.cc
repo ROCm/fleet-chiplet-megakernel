@@ -41,7 +41,7 @@ Graph::Graph(dim3 _grid_dim,
   // A bgraph cannot have more than MAX_NUM_THREADBLOCKS_PER_KERNEL threadblocks
   // otherwise we don't have enough buffers in device memory for saving
   // fingerprints
-  assert(static_cast<size_t>(grid_dim.x) * grid_dim.y * grid_dim.z <=
+  assert(grid_dim.x * grid_dim.y * grid_dim.z <=
          mirage::config::MAX_NUM_THREADBLOCKS_PER_KERNEL);
   assert(reduction_dimx > 0);
 }
@@ -219,7 +219,8 @@ size_t Graph::calculate_shared_memory_usage(TBOperator *new_op) {
   return usage;
 }
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 NewKernelParams Graph::get_new_kernel_params(bool fingerprint) const {
   NewKernelParams params;
   params.num_operators = operators.size();

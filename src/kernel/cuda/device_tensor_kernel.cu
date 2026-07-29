@@ -107,9 +107,9 @@ mirage::cpu::CTensor DTensor::copy_fingerprint_to_ctensor() const {
   for (int gpu_id = 0; gpu_id < owner_op->kgraph->gpu_dim.x; gpu_id++) {
     ctensor.fp_ptr[gpu_id] = (mirage::type::FPType *)malloc(fingerprint_size());
     checkCUDA(hipMemcpy(ctensor.fp_ptr[gpu_id],
-                         dmm->fp_base_ptr[gpu_id] + fp_offset,
-                         fingerprint_size(),
-                         hipMemcpyDeviceToHost));
+                        dmm->fp_base_ptr[gpu_id] + fp_offset,
+                        fingerprint_size(),
+                        hipMemcpyDeviceToHost));
   }
   return ctensor;
 }
@@ -136,9 +136,9 @@ bool DTensor::has_same_fingerprint(mirage::cpu::CTensor const &ref) const {
   mirage::type::FPType *A = (mirage::type::FPType *)malloc(fingerprint_size());
   for (int gpu_id = 0; gpu_id < owner_op->kgraph->gpu_dim.x; gpu_id++) {
     checkCUDA(hipMemcpy(A,
-                         dmm->fp_base_ptr[gpu_id] + fp_offset,
-                         fingerprint_size(),
-                         hipMemcpyDeviceToHost));
+                        dmm->fp_base_ptr[gpu_id] + fp_offset,
+                        fingerprint_size(),
+                        hipMemcpyDeviceToHost));
     int num_elements = (int)this->num_elements();
     for (int i = 0; i < num_elements; i++) {
       if (A[i] != ref.fp_ptr[gpu_id][i]) {

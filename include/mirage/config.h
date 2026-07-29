@@ -49,30 +49,42 @@ int const NUM_WARPS_PER_GROUP = 4;
 int const NUM_THREADS_PER_GROUP = NUM_WARPS_PER_GROUP * NUM_THREADS_PER_WARP;
 constexpr int MAX_TMA_DESC_PER_TENSOR = 3;
 
-#if (defined(MIRAGE_BACKEND_USE_CUDA) && defined(MIRAGE_BACKEND_USE_NKI)) || \
-    (defined(MIRAGE_BACKEND_USE_CUDA) && (defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP))) || \
-    (defined(MIRAGE_BACKEND_USE_NKI) && (defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)))
+#if (defined(MIRAGE_BACKEND_USE_CUDA) && defined(MIRAGE_BACKEND_USE_NKI)) ||   \
+    (defined(MIRAGE_BACKEND_USE_CUDA) &&                                       \
+     (defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP))) || \
+    (defined(MIRAGE_BACKEND_USE_NKI) &&                                        \
+     (defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)))
 #error                                                                         \
     "Multiple backends are defined. Please define only one backend type (CUDA, ROCM, or NKI)."
 #elif defined(MIRAGE_BACKEND_USE_CUDA)
 size_t const MAX_DMEM_SIZE = (size_t)2 * 1024 * 1024 * 1024;    // 2 GB
 size_t const MAX_SMEM_SIZE = 96 * 1024;                         // 96 KB
 #elif defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
-// AMD MI300 (gfx942) has 192KB shared memory per CU, but we use conservative 64KB
-size_t const MAX_DMEM_SIZE = (size_t)2 * 1024 * 1024 * 1024;    // 2 GB
-size_t const MAX_SMEM_SIZE = 64 * 1024;                         // 64 KB
+// AMD LDS per workgroup (verified via hipDeviceProp_t::sharedMemPerBlock):
+//   MI300X (gfx942): 64 KB
+//   MI350X (gfx950): 160 KB
+// Use the larger 160 KB cap so the transpiler planner can consider larger
+// threadblock shapes on gfx950. Per-kernel __shared__ allocations and the
+// persistent-kernel runtime cap (MAX_DYNAMIC_SHARED_MEMORY_SIZE in
+// runtime_header.h) still gate actual usage per generation.
+size_t const MAX_DMEM_SIZE = (size_t)2 * 1024 * 1024 * 1024; // 2 GB
+size_t const MAX_SMEM_SIZE = 160 * 1024;                     // 160 KB (MI350X)
 #elif defined(MIRAGE_BACKEND_USE_NKI)
 size_t const MAX_DMEM_SIZE = (size_t)32 * 1024 * 1024 * 1024;    // 32 GB
 size_t const MAX_SMEM_SIZE = (size_t)24 * 1024 * 1024;           // 24 MB
 #else
-#error "Please define either MIRAGE_BACKEND_USE_CUDA, MIRAGE_BACKEND_USE_ROCM (or MIRAGE_BACKEND_USE_HIP), or MIRAGE_BACKEND_USE_NKI."
+#error                                                                         \
+    "Please define either MIRAGE_BACKEND_USE_CUDA, MIRAGE_BACKEND_USE_ROCM (or MIRAGE_BACKEND_USE_HIP), or MIRAGE_BACKEND_USE_NKI."
 #endif
 
 // Note that we actually save stensors' fingerprints on GPU device memory
 // so MAX_SMEM_FP_SIZE can be larger than MAX_SMEM_SIZE
-#if (defined(MIRAGE_FINGERPRINT_USE_CUDA) && defined(MIRAGE_FINGERPRINT_USE_CPU)) || \
-    (defined(MIRAGE_FINGERPRINT_USE_CUDA) && defined(MIRAGE_FINGERPRINT_USE_ROCM)) || \
-    (defined(MIRAGE_FINGERPRINT_USE_CPU) && defined(MIRAGE_FINGERPRINT_USE_ROCM))
+#if (defined(MIRAGE_FINGERPRINT_USE_CUDA) &&                                   \
+     defined(MIRAGE_FINGERPRINT_USE_CPU)) ||                                   \
+    (defined(MIRAGE_FINGERPRINT_USE_CUDA) &&                                   \
+     defined(MIRAGE_FINGERPRINT_USE_ROCM)) ||                                  \
+    (defined(MIRAGE_FINGERPRINT_USE_CPU) &&                                    \
+     defined(MIRAGE_FINGERPRINT_USE_ROCM))
 #error                                                                         \
     "Multiple fingerprint backends are defined. Please define only one fingerprint type."
 #elif defined(MIRAGE_FINGERPRINT_USE_CUDA)

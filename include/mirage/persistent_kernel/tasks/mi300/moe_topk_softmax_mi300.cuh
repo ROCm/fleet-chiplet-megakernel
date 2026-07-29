@@ -19,8 +19,8 @@
 
 #pragma once
 
-#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
 
 namespace kernel {
 
@@ -44,12 +44,12 @@ template <typename T,
           int WARPS_PER_CTA,
           int BYTES_PER_LDG>
 __device__ __forceinline__ void topk_softmax_mi300_task_impl(
-    void *__restrict__ input_ptr,              // [num_rows, NUM_EXPERTS]
-    void *__restrict__ output_ptr,             // [num_rows, k] (float weights)
+    void *__restrict__ input_ptr,  // [num_rows, NUM_EXPERTS]
+    void *__restrict__ output_ptr, // [num_rows, k] (float weights)
     int const num_rows,
     int const k,
-    void *__restrict__ routing_indices_ptr,    // [NUM_EXPERTS, num_rows] int32
-    void *__restrict__ active_expert_ids_ptr,  // [NUM_EXPERTS + 1] int32
+    void *__restrict__ routing_indices_ptr,   // [NUM_EXPERTS, num_rows] int32
+    void *__restrict__ active_expert_ids_ptr, // [NUM_EXPERTS + 1] int32
     int const start_expert,
     int const end_expert,
     bool const renormalize) {
@@ -58,7 +58,9 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
   int *active_expert_ids = static_cast<int *>(active_expert_ids_ptr);
 
-  // Initialize routing indices to 0 and active expert marks to -1
+  // Initialize routing indices to 0.
+  // active_expert_ids initialization is NOT needed: we write directly to
+  // active_expert_ids[0..k-1] during TopK and set the count after.
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
        expert += blockDim.x) {
     if (routing_indices != nullptr) {
@@ -66,12 +68,6 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
         routing_indices[expert * num_rows + row] = 0;
       }
     }
-    if (active_expert_ids != nullptr) {
-      active_expert_ids[expert - start_expert] = -1;
-    }
-  }
-  if (threadIdx.x == NUM_EXPERTS && active_expert_ids != nullptr) {
-    active_expert_ids[NUM_EXPERTS] = 0;
   }
   __syncthreads();
 
@@ -109,7 +105,8 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       int base = ldg * ELTS_PER_LDG;
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
       for (int e = 0; e < ELTS_PER_LDG; ++e) {
-        row_chunk[base + e] = static_cast<float>(thread_read_ptr[src_offset + e]);
+        row_chunk[base + e] =
+            static_cast<float>(thread_read_ptr[src_offset + e]);
       }
     }
 
@@ -134,7 +131,8 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     // Softmax
     float row_sum = 0.f;
     for (int ii = 0; ii < VPT; ++ii) {
-      row_chunk[ii] = expf(row_chunk[ii] - thread_max);
+      row_chunk[ii] = __builtin_amdgcn_exp2f((row_chunk[ii] - thread_max) *
+                                             1.4426950408889634f);
       row_sum += row_chunk[ii];
     }
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
@@ -145,88 +143,130 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       row_chunk[ii] *= inv_sum;
     }
 
-    // Fused Top-K selection
+    // Fused Top-K selection — Step 1 uses inline asm for branchless local
+    // argmax.
     int const start_col = first_elt;
     static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
     float row_sum_for_renorm = 0.f;
+    float topk_vals[8];
+
+    // Precompute expert column indices for branchless local argmax.
+    int col[VPT];
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
+      col[i] = start_col + i;
+    }
 
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      // Find local max
-      float max_val = row_chunk[0];
-      int expert = start_col;
-      for (int ldg = 0, col = start_col; ldg < LDG_PER_THREAD;
-           ++ldg, col += COLS_PER_GROUP_LDG) {
-        for (int ii = 0; ii < ELTS_PER_LDG; ++ii) {
-          float val = row_chunk[ldg * ELTS_PER_LDG + ii];
-          if (val > max_val) {
-            max_val = val;
-            expert = col + ii;
-          }
-        }
-      }
+      // ── Step 1: Branchless local argmax over VPT=8 elements ──
+      float max_val;
+      int expert;
+      asm volatile("v_mov_b32 %[mv], %[r0]\n"
+                   "v_mov_b32 %[ex], %[c0]\n"
+                   "v_cmp_gt_f32 vcc, %[r1], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r1], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c1], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r2], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r2], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c2], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r3], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r3], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c3], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r4], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r4], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c4], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r5], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r5], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c5], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r6], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r6], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c6], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r7], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r7], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c7], vcc\n"
+                   : [mv] "=&v"(max_val), [ex] "=&v"(expert)
+                   : [r0] "v"(row_chunk[0]),
+                     [r1] "v"(row_chunk[1]),
+                     [r2] "v"(row_chunk[2]),
+                     [r3] "v"(row_chunk[3]),
+                     [r4] "v"(row_chunk[4]),
+                     [r5] "v"(row_chunk[5]),
+                     [r6] "v"(row_chunk[6]),
+                     [r7] "v"(row_chunk[7]),
+                     [c0] "v"(col[0]),
+                     [c1] "v"(col[1]),
+                     [c2] "v"(col[2]),
+                     [c3] "v"(col[3]),
+                     [c4] "v"(col[4]),
+                     [c5] "v"(col[5]),
+                     [c6] "v"(col[6]),
+                     [c7] "v"(col[7])
+                   : "vcc");
 
-      // Argmax reduce across subgroup
+      // ── Step 2: Branchless argmax reduce across subgroup ──
+      // Uses __shfl_xor for cross-lane communication, inline asm for
+      // branchless compare+select (eliminates s_and_saveexec divergence).
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
         int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
-        if (other_max > max_val ||
-            (other_max == max_val && other_expert < expert)) {
-          max_val = other_max;
-          expert = other_expert;
-        }
+        asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
+                     "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
+                     "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
+                     : [mv] "+v"(max_val), [ex] "+v"(expert)
+                     : [om] "v"(other_max), [oe] "v"(other_expert)
+                     : "vcc");
       }
 
-      // Write top-k result
+      // ── Step 3: Write top-k result ──
       if (thread_group_idx == 0) {
         bool const node_uses = (expert >= start_expert && expert < end_expert);
         int const out_idx = k * thread_row + k_idx;
-        output[out_idx] = max_val;
+        st_wt_u32((void *)&output[out_idx], __float_as_uint(max_val));
+        topk_vals[k_idx] = max_val;
         row_sum_for_renorm += max_val;
 
         if (node_uses && routing_indices != nullptr) {
           int const local_expert = expert - start_expert;
-          routing_indices[local_expert * num_rows + thread_row] = k_idx + 1;
+          st_wt_u32(
+              (void *)&routing_indices[local_expert * num_rows + thread_row],
+              (unsigned)(k_idx + 1));
           if (active_expert_ids != nullptr) {
-            active_expert_ids[local_expert] = local_expert;
+            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
           }
         }
       }
 
-      // Blank out winner for next iteration
+      // ── Step 4: Branchless blanking of winner ──
+      // expert == col[i] matches exactly one thread + one element.
       if (k_idx + 1 < k) {
-        int const ldg_group = expert / COLS_PER_GROUP_LDG;
-        int const thread_to_clear = (expert / ELTS_PER_LDG) % THREADS_PER_ROW;
-        if (thread_group_idx == thread_to_clear) {
-          int const offset = expert % ELTS_PER_LDG;
-          row_chunk[ldg_group * ELTS_PER_LDG + offset] = -10000.f;
+        float const neg_inf = -10000.f;
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+          asm volatile("v_cmp_eq_u32 vcc, %[ex], %[ci]\n"
+                       "v_cndmask_b32 %[rc], %[rc], %[ni], vcc\n"
+                       : [rc] "+v"(row_chunk[i])
+                       : [ex] "v"(expert), [ci] "v"(col[i]), [ni] "v"(neg_inf)
+                       : "vcc");
         }
       }
     }
 
-    // Optional renormalization
+    // Optional renormalization (write-through stores, using cached values)
     if (renormalize && thread_group_idx == 0) {
       float inv = 1.f / row_sum_for_renorm;
       for (int k_idx = 0; k_idx < k; ++k_idx) {
         int const out_idx = k * thread_row + k_idx;
-        output[out_idx] *= inv;
+        st_wt_u32((void *)&output[out_idx],
+                  __float_as_uint(topk_vals[k_idx] * inv));
       }
     }
   }
   __syncthreads();
 
-  __syncthreads();
-
-  // Compact active expert marks into dense list
-  if (active_expert_ids != nullptr) {
-    for (int expert = start_expert + threadIdx.x; expert < end_expert;
-         expert += blockDim.x) {
-      int const local_expert = expert - start_expert;
-      int const mark = active_expert_ids[local_expert];
-      if (mark >= 0) {
-        int const pos = atomicAdd(active_expert_ids + NUM_EXPERTS, 1);
-        active_expert_ids[pos] = expert;
-      }
-    }
+  // Set active expert count (thread 0 only, single wavefront handles all rows
+  // for batch=1)
+  if (active_expert_ids != nullptr && threadIdx.x == 0) {
+    st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS], (unsigned)k);
   }
 }
 

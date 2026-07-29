@@ -49,16 +49,38 @@ event_name_list = {
     144: "TASK_GANG_SPLITK_LINEAR_RES_MI300",
     145: "TASK_GANG_KSPLIT_GEMM_MI300",
     146: "TASK_GANG_KSPLIT_FINALIZE_MI300",
-    147: "TASK_GANG_LINEAR_N_TILING_MI300",
-    148: "TASK_GANG_LINEAR_RES_N_TILING_MI300",
     170: "TASK_MOE_W13_LINEAR_MI300",
     171: "TASK_MOE_W2_LINEAR_MI300",
     172: "TASK_MOE_TOPK_SOFTMAX_MI300",
     173: "TASK_MOE_MUL_SUM_ADD_MI300",
     174: "TASK_GANG_MOE_W13_LINEAR_MI300",
     175: "TASK_GANG_MOE_W2_LINEAR_MI300",
-    176: "TASK_DEVICE_LINEAR_MI300",
-    177: "TASK_DEVICE_LINEAR_RES_MI300",
+    176: "TASK_SWIGLUOAI_MI300",
+    177: "TASK_MOE_W13_LINEAR_MXFP4_MI300",
+    178: "TASK_MOE_W2_LINEAR_MXFP4_MI300",
+    179: "TASK_ATTENTION_SINK_MI300",
+    180: "TASK_BIAS_ADD_MI300",
+    182: "TASK_LINEAR_SILU_MI300",
+    183: "TASK_MOE_W13_LINEAR_MXFP4_CK_MI300",
+    184: "TASK_MOE_W2_LINEAR_MXFP4_CK_MI300",
+    185: "TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300",
+    186: "TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300",
+    187: "TASK_GANG_MOE_FUSED_MXFP4_MI300",
+    188: "TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300",
+    189: "TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300",
+    190: "TASK_GANG_LINEAR_BIAS_MI300",
+    191: "TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300",
+    192: "TASK_GANG_RMSNORM_LINEAR_BIAS_MI300",
+    193: "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300",
+    194: "TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300",
+    195: "TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300",
+    196: "TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300",
+    197: "TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300",
+    198: "TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300",
+    210: "TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300",
+    211: "TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300",
+    212: "TASK_MOE_RESIDUAL_ADD_F32_MI300",
+    213: "TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300",
     150: "TASK_HOPPER_TASK_BEGIN",
     151: "TASK_LINEAR_WITH_RESIDUAL_HOPPER",
     152: "TASK_LINEAR_HOPPER",
@@ -73,7 +95,7 @@ event_name_list = {
     161: "TASK_MOE_W13_LINEAR_SM90",
     162: "TASK_MOE_W2_LINEAR_SM90",
     163: "TASK_SPLITK_LINEAR_SWAPAB_HOPPER",
-    198: "TASK_HOPPER_TASK_END",
+    # 198: "TASK_HOPPER_TASK_END",  # conflicts with KVUPD on AMD
     199: "TASK_NVSHMEM_COPY",
     200: "TASK_SCHD_TASKS",
     201: "TASK_SCHD_EVENTS",
@@ -99,6 +121,11 @@ class EventType(Enum):
     kBegin = 0
     kEnd = 1
     kInstant = 2
+    # FETCHED: emitted by the worker the moment it picks the task off its
+    # queue, BEFORE the dependency-wait. The gap between kFetched and kBegin
+    # is dep_wait + queue overhead; the gap between kBegin and kEnd is
+    # pure compute.
+    kFetched = 3
 
 
 def decode_tag(tag, num_blocks, num_groups):
@@ -161,5 +188,16 @@ def export_to_perfetto_trace(
             track.close(timestamp)
         elif event_type == EventType.kInstant.value:
             track.instant(timestamp, event)
+        elif event_type == EventType.kFetched.value:
+            # Render the fetch moment as a 0-duration tick on a side track
+            # so the gap to the following Begin is visually obvious as
+            # "worker grabbed task → worker started compute".
+            fetch_key = (block_idx, group_idx, event_idx, "fetch")
+            if fetch_key in track_map:
+                fetch_track = track_map[fetch_key]
+            else:
+                fetch_track = tid.create_track()
+                track_map[fetch_key] = fetch_track
+            fetch_track.instant(timestamp, "FETCH_" + event)
 
     tgen.flush()

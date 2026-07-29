@@ -523,7 +523,8 @@ namespace kernel {
 
 void Graph::generate_triton_program(char const *file_path) {
   // Triton code generation is currently only supported for CUDA
-  throw std::runtime_error("generate_triton_program is not supported for ROCm backend. Triton is CUDA-specific.");
+  throw std::runtime_error("generate_triton_program is not supported for ROCm "
+                           "backend. Triton is CUDA-specific.");
 }
 
 } // namespace kernel

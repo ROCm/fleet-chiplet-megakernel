@@ -35,7 +35,10 @@ union mfma_attn_opt_bf16x8 {
 
 // Portable float to bfloat16 conversion for HIP
 __device__ __forceinline__ unsigned short float_to_bf16_bits(float val) {
-  union { float f; unsigned int u; } bits;
+  union {
+    float f;
+    unsigned int u;
+  } bits;
   bits.f = val;
   // Round to nearest even
   unsigned int rounding_bias = ((bits.u >> 16) & 1) + 0x7FFF;
@@ -74,8 +77,9 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
     float k_eps) {
 
   constexpr int NUM_QO_PER_KV = NUM_QO_HEADS / NUM_KV_HEADS;
-  constexpr int KV_TILE_SIZE = 32;  // KV tile for attention computation
-  constexpr int MAX_PAGES_PER_REQUEST = (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
+  constexpr int KV_TILE_SIZE = 32; // KV tile for attention computation
+  constexpr int MAX_PAGES_PER_REQUEST =
+      (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE;
   constexpr float log2e = 1.4426950408889634f;
   constexpr int Q_ROWS = MAX_TOKENS * NUM_QO_PER_KV;
 
@@ -85,9 +89,10 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
   constexpr int MFMA_K = 16;
 
   // Number of MFMA tiles
-  constexpr int Q_TILES_M = (Q_ROWS + MFMA_M - 1) / MFMA_M;  // Tiles for Q rows
-  constexpr int KV_TILES_N = (KV_TILE_SIZE + MFMA_N - 1) / MFMA_N;  // Tiles for KV positions
-  constexpr int HEAD_TILES_K = HEAD_DIM / MFMA_K;  // Tiles for head dimension
+  constexpr int Q_TILES_M = (Q_ROWS + MFMA_M - 1) / MFMA_M; // Tiles for Q rows
+  constexpr int KV_TILES_N =
+      (KV_TILE_SIZE + MFMA_N - 1) / MFMA_N;       // Tiles for KV positions
+  constexpr int HEAD_TILES_K = HEAD_DIM / MFMA_K; // Tiles for head dimension
 
   float const sm_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM)) * log2e;
 
@@ -125,7 +130,12 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
 
   extern __shared__ char smem[];
 
-  // Shared memory layout - optimized for 64KB LDS
+  // Shared memory layout. LDS budget is per-generation:
+  //   MI300X (gfx942): 64 KB per workgroup
+  //   MI350X (gfx950): 160 KB per workgroup
+  // The actual cap is enforced at launch via MAX_DYNAMIC_SHARED_MEMORY_SIZE
+  // (runtime_header.h) and at graph build via task_register.cc's lds_limit
+  // computed from hipDeviceProp_t::sharedMemPerBlock.
   constexpr size_t ALIGN = 128;
   constexpr size_t S_Q_SIZE = sizeof(T) * Q_ROWS * HEAD_DIM;
   constexpr size_t S_K_SIZE = sizeof(T) * KV_TILE_SIZE * HEAD_DIM;
@@ -176,12 +186,12 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
       int token = row / NUM_QO_PER_KV;
       int head = row % NUM_QO_PER_KV;
       mfma_attn_opt_bf16x8 vec;
-      #pragma unroll
+#pragma unroll
       for (int i = 0; i < 8; i++) {
-        vec.u16[i] = reinterpret_cast<unsigned short const*>(
+        vec.u16[i] = reinterpret_cast<unsigned short const *>(
             &d_q[token * QKV_STRIDE + head * HEAD_DIM + col + i])[0];
       }
-      *reinterpret_cast<__uint128_t*>(&s_q[row * HEAD_DIM + col]) = vec.u128;
+      *reinterpret_cast<__uint128_t *>(&s_q[row * HEAD_DIM + col]) = vec.u128;
     }
   }
   __syncthreads();
@@ -192,7 +202,8 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
       int pos = seq_len - num_tokens + token;
       T const *cos_data = reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM;
       T const *sin_data = reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM;
-      for (int idx = tid; idx < NUM_QO_PER_KV * HEAD_DIM / 2; idx += NUM_THREADS) {
+      for (int idx = tid; idx < NUM_QO_PER_KV * HEAD_DIM / 2;
+           idx += NUM_THREADS) {
         int head = idx / (HEAD_DIM / 2);
         int d = idx % (HEAD_DIM / 2);
         int base = (token * NUM_QO_PER_KV + head) * HEAD_DIM;
@@ -229,21 +240,21 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
           int page_offset = global_pos % PAGE_SIZE;
           int page_idx = page_indices[page_num];
           int src_idx = page_idx * PAGE_SIZE + page_offset;
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 8; i++) {
-            vec_k.u16[i] = reinterpret_cast<unsigned short const*>(
+            vec_k.u16[i] = reinterpret_cast<unsigned short const *>(
                 &d_paged_k_cache[src_idx * KV_CACHE_STRIDE + col + i])[0];
-            vec_v.u16[i] = reinterpret_cast<unsigned short const*>(
+            vec_v.u16[i] = reinterpret_cast<unsigned short const *>(
                 &d_paged_v_cache[src_idx * KV_CACHE_STRIDE + col + i])[0];
           }
         } else {
           // From QKV input
           int qkv_row = global_pos - (seq_len - num_tokens);
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 8; i++) {
-            vec_k.u16[i] = reinterpret_cast<unsigned short const*>(
+            vec_k.u16[i] = reinterpret_cast<unsigned short const *>(
                 &d_k[qkv_row * QKV_STRIDE + col + i])[0];
-            vec_v.u16[i] = reinterpret_cast<unsigned short const*>(
+            vec_v.u16[i] = reinterpret_cast<unsigned short const *>(
                 &d_v[qkv_row * QKV_STRIDE + col + i])[0];
           }
         }
@@ -251,8 +262,8 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
         vec_k.u128 = 0;
         vec_v.u128 = 0;
       }
-      *reinterpret_cast<__uint128_t*>(&s_k[row * HEAD_DIM + col]) = vec_k.u128;
-      *reinterpret_cast<__uint128_t*>(&s_v[row * HEAD_DIM + col]) = vec_v.u128;
+      *reinterpret_cast<__uint128_t *>(&s_k[row * HEAD_DIM + col]) = vec_k.u128;
+      *reinterpret_cast<__uint128_t *>(&s_v[row * HEAD_DIM + col]) = vec_v.u128;
     }
     __syncthreads();
 
@@ -266,15 +277,19 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
       for (int kv_idx = 0; kv_idx < num_new_tokens; kv_idx++) {
         int pos = first_new_token + kv_idx;
         int local_row = local_start + kv_idx;
-        T const *cos_data = reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM;
-        T const *sin_data = reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM;
+        T const *cos_data =
+            reinterpret_cast<T const *>(cos_ptr) + pos * HEAD_DIM;
+        T const *sin_data =
+            reinterpret_cast<T const *>(sin_ptr) + pos * HEAD_DIM;
         for (int d = tid; d < HEAD_DIM / 2; d += NUM_THREADS) {
           float k0 = static_cast<float>(s_k[local_row * HEAD_DIM + d]);
-          float k1 = static_cast<float>(s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2]);
+          float k1 =
+              static_cast<float>(s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2]);
           float c = static_cast<float>(cos_data[d]);
           float s = static_cast<float>(sin_data[d]);
           s_k[local_row * HEAD_DIM + d] = static_cast<T>(k0 * c - k1 * s);
-          s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2] = static_cast<T>(k0 * s + k1 * c);
+          s_k[local_row * HEAD_DIM + d + HEAD_DIM / 2] =
+              static_cast<T>(k0 * s + k1 * c);
         }
       }
       __syncthreads();
@@ -289,8 +304,10 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
         int page_idx = page_indices[page_num];
         int dst_idx = page_idx * PAGE_SIZE + page_offset;
         int local_row = local_start + token;
-        d_paged_k_cache[dst_idx * KV_CACHE_STRIDE + col] = s_k[local_row * HEAD_DIM + col];
-        d_paged_v_cache[dst_idx * KV_CACHE_STRIDE + col] = s_v[local_row * HEAD_DIM + col];
+        d_paged_k_cache[dst_idx * KV_CACHE_STRIDE + col] =
+            s_k[local_row * HEAD_DIM + col];
+        d_paged_v_cache[dst_idx * KV_CACHE_STRIDE + col] =
+            s_v[local_row * HEAD_DIM + col];
       }
       __syncthreads();
     }
@@ -306,36 +323,37 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
     // Q: [Q_ROWS, HEAD_DIM], K^T: [HEAD_DIM, KV_TILE_SIZE]
     // =========================================================================
     if (wavefront_id < KV_TILES_N) {
-      int tile_n = wavefront_id;  // Each wavefront handles one KV tile column
+      int tile_n = wavefront_id; // Each wavefront handles one KV tile column
 
       for (int tile_m = 0; tile_m < Q_TILES_M; tile_m++) {
         mfma_attn_opt_float4 accum = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        // Iterate over HEAD_DIM in MFMA_K chunks
-        #pragma unroll
+// Iterate over HEAD_DIM in MFMA_K chunks
+#pragma unroll
         for (int tile_k = 0; tile_k < HEAD_TILES_K; tile_k++) {
           int k_base = tile_k * MFMA_K;
 
-          // Load Q fragment: Q[tile_m*16 + (lane%16), k_base + (lane/16)*4 : +4]
+          // Load Q fragment: Q[tile_m*16 + (lane%16), k_base + (lane/16)*4 :
+          // +4]
           int q_row = tile_m * MFMA_M + (lane % 16);
           int q_col = k_base + (lane / 16) * 4;
 
           mfma_attn_opt_bf16x4 reg_q;
           if (q_row < q_rows) {
-            reg_q.u64 = *reinterpret_cast<uint64_t const*>(
+            reg_q.u64 = *reinterpret_cast<uint64_t const *>(
                 &s_q[q_row * HEAD_DIM + q_col]);
           } else {
             reg_q.u64 = 0;
           }
 
-          // Load K^T fragment: K[tile_n*16 + (lane%16), k_base + (lane/16)*4 : +4]
-          // K is stored as [KV_TILE_SIZE, HEAD_DIM], we need K^T
-          int k_row = tile_n * MFMA_N + (lane % 16);  // KV position
-          int k_col = k_base + (lane / 16) * 4;  // HEAD_DIM
+          // Load K^T fragment: K[tile_n*16 + (lane%16), k_base + (lane/16)*4 :
+          // +4] K is stored as [KV_TILE_SIZE, HEAD_DIM], we need K^T
+          int k_row = tile_n * MFMA_N + (lane % 16); // KV position
+          int k_col = k_base + (lane / 16) * 4;      // HEAD_DIM
 
           mfma_attn_opt_bf16x4 reg_k;
           if (k_row < curr_iter_len) {
-            reg_k.u64 = *reinterpret_cast<uint64_t const*>(
+            reg_k.u64 = *reinterpret_cast<uint64_t const *>(
                 &s_k[k_row * HEAD_DIM + k_col]);
           } else {
             reg_k.u64 = 0;
@@ -351,7 +369,7 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
 
         if (out_col < curr_iter_len) {
           int kv_pos = tile_start + out_col;
-          #pragma unroll
+#pragma unroll
           for (int r = 0; r < 4; r++) {
             int out_row = out_row_base + r;
             if (out_row < q_rows) {
@@ -378,7 +396,9 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
       float m_local = -INFINITY;
       for (int kc = 0; kc < curr_iter_len; kc++) {
         float score = s_scores[qr * KV_TILE_SIZE + kc];
-        if (score > m_local) m_local = score;
+        if (score > m_local) {
+          m_local = score;
+        }
       }
 
       // Online softmax update
@@ -395,7 +415,7 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
       float d_local = 0.0f;
       for (int kc = 0; kc < curr_iter_len; kc++) {
         float attn = ptx_exp2(s_scores[qr * KV_TILE_SIZE + kc] - m_new);
-        s_scores[qr * KV_TILE_SIZE + kc] = attn;  // Store attention probs
+        s_scores[qr * KV_TILE_SIZE + kc] = attn; // Store attention probs
         d_local += attn;
       }
 
@@ -408,7 +428,7 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
     // MFMA: Compute P * V -> output [Q_ROWS x HEAD_DIM]
     // P: [Q_ROWS, KV_TILE_SIZE], V: [KV_TILE_SIZE, HEAD_DIM]
     // =========================================================================
-    constexpr int HEAD_TILES_N = HEAD_DIM / MFMA_N;  // Output tiles
+    constexpr int HEAD_TILES_N = HEAD_DIM / MFMA_N; // Output tiles
     constexpr int PV_TILES_K = (KV_TILE_SIZE + MFMA_K - 1) / MFMA_K;
 
     // Each wavefront handles different output tiles
@@ -416,7 +436,9 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
 
     for (int tile_idx = 0; tile_idx < tiles_per_warp; tile_idx++) {
       int out_tile = wavefront_id * tiles_per_warp + tile_idx;
-      if (out_tile >= HEAD_TILES_N) break;
+      if (out_tile >= HEAD_TILES_N) {
+        break;
+      }
 
       for (int tile_m = 0; tile_m < Q_TILES_M; tile_m++) {
         mfma_attn_opt_float4 accum = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -424,14 +446,16 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
         // Iterate over KV dimension in MFMA_K chunks
         for (int tile_k = 0; tile_k < PV_TILES_K; tile_k++) {
           int k_base = tile_k * MFMA_K;
-          if (k_base >= curr_iter_len) break;
+          if (k_base >= curr_iter_len) {
+            break;
+          }
 
           // Load P fragment (fp32 attention probs -> bf16)
           int p_row = tile_m * MFMA_M + (lane % 16);
           int p_col = k_base + (lane / 16) * 4;
 
           mfma_attn_opt_bf16x4 reg_p;
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
             float val = 0.0f;
             if (p_row < q_rows && p_col + i < curr_iter_len) {
@@ -445,11 +469,11 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
           int v_col = out_tile * MFMA_N + (lane % 16);
 
           mfma_attn_opt_bf16x4 reg_v;
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < 4; i++) {
             int vr = v_row + i;
             if (vr < curr_iter_len) {
-              reg_v.u16[i] = reinterpret_cast<unsigned short const*>(
+              reg_v.u16[i] = reinterpret_cast<unsigned short const *>(
                   &s_v[vr * HEAD_DIM + v_col])[0];
             } else {
               reg_v.u16[i] = 0;
@@ -464,7 +488,7 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
         int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
         int out_col = out_tile * MFMA_N + (lane % 16);
 
-        #pragma unroll
+#pragma unroll
         for (int r = 0; r < 4; r++) {
           int out_row = out_row_base + r;
           if (out_row < q_rows && out_col < HEAD_DIM) {
@@ -477,7 +501,8 @@ __device__ __forceinline__ void multitoken_paged_attention_mfma_opt(
   }
 
   // Final normalization and output with vectorized stores
-  for (int idx = tid; idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM; idx += NUM_THREADS) {
+  for (int idx = tid; idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM;
+       idx += NUM_THREADS) {
     int row = idx / HEAD_DIM;
     int col = idx % HEAD_DIM;
     int token = row / NUM_QO_PER_KV;

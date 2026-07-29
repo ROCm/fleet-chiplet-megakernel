@@ -582,18 +582,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(2, 1, TASK_SPLITK_LINEAR_MI300, variant_id);
   } else if (name == "gang_linear_mi300") {
-    assert(params.size() == 7 && "gang_linear_mi300 needs [o_stride, tile_n, m_tiles, m_per_tile, total_tiles, n_tiles, wgm]");
+    assert(params.size() == 7 &&
+           "gang_linear_mi300 needs [o_stride, tile_n, m_tiles, m_per_tile, "
+           "total_tiles, n_tiles, wgm]");
     int variant_id = task_register->register_gang_linear_mi300_task(
         customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(2, 1, TASK_GANG_LINEAR_MI300, variant_id);
-    gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
-  } else if (name == "gang_linear_n_tiling_mi300") {
-    assert(params.size() == 7 && "gang_linear_n_tiling_mi300 needs [o_stride, tile_n, m_tiles, m_per_tile, total_tiles, n_tiles, wgn]");
-    int variant_id = task_register->register_gang_linear_n_tiling_mi300_task(
-        customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(2, 1, TASK_GANG_LINEAR_N_TILING_MI300, variant_id);
+    task_config[op] = std::make_tuple(2, 1, TASK_GANG_LINEAR_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
   } else if (name == "gang_linear_res_mi300") {
     assert(params.size() == 7);
@@ -602,27 +596,184 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(3, 1, TASK_GANG_LINEAR_RES_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
-  } else if (name == "gang_linear_res_n_tiling_mi300") {
-    assert(params.size() == 7 && "gang_linear_res_n_tiling_mi300 needs [o_stride, tile_n, m_tiles, m_per_tile, total_tiles, n_tiles, wgn]");
-    int variant_id = task_register->register_gang_linear_res_n_tiling_mi300_task(
+  } else if (name == "gang_linear_bias_mi300") {
+    assert(params.size() == 7 &&
+           "gang_linear_bias_mi300 needs [o_stride, tile_n, m_tiles, "
+           "m_per_tile, total_tiles, n_tiles, wgm]");
+    int variant_id = task_register->register_gang_linear_bias_mi300_task(
         customized->bgraph, params);
     task_config[op] =
-        std::make_tuple(3, 1, TASK_GANG_LINEAR_RES_N_TILING_MI300, variant_id);
+        std::make_tuple(3, 1, TASK_GANG_LINEAR_BIAS_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
-  } else if (name == "gang_linear_msplit_mi300") {
-    assert(params.size() == 5);
-    int variant_id = task_register->register_gang_linear_msplit_mi300_task(
+  } else if (name == "gang_splitk_linear_res_bias_mi300") {
+    assert(params.size() == 4 &&
+           "gang_splitk_linear_res_bias_mi300 needs [o_stride, tile_n, "
+           "n_tiles_per_xcd, k_splits]");
+    int variant_id =
+        task_register->register_gang_splitk_linear_res_bias_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_GANG_SPLITK_LINEAR_RES_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2] * params[3]; // n_tiles × k_splits
+  } else if (name == "gang_rmsnorm_linear_bias_mi300") {
+    assert(params.size() == 8 &&
+           "gang_rmsnorm_linear_bias_mi300 needs [o_stride, tile_n, m_tiles, "
+           "m_per_tile, total_tiles, n_tiles, wgm, actual_hidden_dim]");
+    int variant_id =
+        task_register->register_gang_rmsnorm_linear_bias_mi300_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_GANG_RMSNORM_LINEAR_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
+  } else if (name == "gang_rmsnorm_linear_bias_topk_mi300") {
+    assert(params.size() == 11 &&
+           "gang_rmsnorm_linear_bias_topk_mi300 needs 11 params");
+    int variant_id =
+        task_register->register_gang_rmsnorm_linear_bias_topk_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        7, 3, TASK_GANG_RMSNORM_LINEAR_BIAS_TOPK_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[4]; // total_tiles_per_xcd (m*n)
+  } else if (name == "gang_rmsnorm_linear_mxfp4_bias_mi300") {
+    assert(
+        params.size() == 5 &&
+        "gang_rmsnorm_linear_mxfp4_bias_mi300 needs [o_stride, output_per_wg, "
+        "n_wgs_per_xcd, total_tiles_per_xcd, actual_hidden_dim]");
+    int variant_id =
+        task_register->register_gang_rmsnorm_linear_mxfp4_bias_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
+  } else if (name == "gang_rmsnorm_linear_mxfp4_bias_argmax_mi300") {
+    assert(params.size() == 5 &&
+           "gang_rmsnorm_linear_mxfp4_bias_argmax_mi300 needs [o_stride, "
+           "output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd, "
+           "actual_hidden_dim]");
+    int variant_id =
+        task_register
+            ->register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
+                customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 2, TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
+  } else if (name == "gang_mulsumradd_rmsnorm_linear_mxfp4_bias_mi300") {
+    assert(params.size() == 7 &&
+           "gang_mulsumradd_rmsnorm_linear_mxfp4_bias_mi300 needs [o_stride, "
+           "output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd, "
+           "actual_hidden_dim, num_topk, input_stride]");
+    int variant_id =
+        task_register
+            ->register_gang_mulsumradd_rmsnorm_linear_mxfp4_bias_mi300_task(
+                customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        7, 2, TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
+  } else if (name == "gang_rmsnorm_linear_mxfp4_bias_kvupd_mi300") {
+    assert(params.size() == 9);
+    int variant_id =
+        task_register->register_gang_rmsnorm_linear_mxfp4_bias_kvupd_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 3, TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_mi300") {
+    assert(params.size() == 11);
+    int variant_id =
+        task_register
+            ->register_gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_mi300_task(
+                customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        7,
+        4,
+        TASK_GANG_MULSUMRADD_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300,
+        variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_resaddf32_rmsnorm_linear_mxfp4_bias_mi300") {
+    assert(params.size() == 5 &&
+           "gang_resaddf32_rmsnorm_linear_mxfp4_bias_mi300 needs [o_stride, "
+           "output_per_wg, n_wgs_per_xcd, total_tiles_per_xcd, "
+           "actual_hidden_dim]");
+    int variant_id =
+        task_register
+            ->register_gang_resaddf32_rmsnorm_linear_mxfp4_bias_mi300_task(
+                customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        6, 2, TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
+  } else if (name == "gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_mi300") {
+    assert(params.size() == 9);
+    int variant_id =
+        task_register
+            ->register_gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_mi300_task(
+                customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        6,
+        4,
+        TASK_GANG_RESADDF32_RMSNORM_LINEAR_MXFP4_BIAS_KVUPD_MI300,
+        variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "moe_residual_add_f32_mi300") {
+    assert(params.size() == 1);
+    int variant_id = task_register->register_moe_residual_add_f32_mi300_task(
         customized->bgraph, params);
     task_config[op] =
-        std::make_tuple(2, 1, TASK_GANG_LINEAR_MSPLIT_MI300, variant_id);
-    gang_task_tiles_per_xcd[op] = params[3]; // n_tiles_per_xcd
-  } else if (name == "gang_linear_res_msplit_mi300") {
-    assert(params.size() == 5);
-    int variant_id = task_register->register_gang_linear_res_msplit_mi300_task(
+        std::make_tuple(2, 1, TASK_MOE_RESIDUAL_ADD_F32_MI300, variant_id);
+  } else if (name == "gang_linear_mxfp4_res_bias_mi300") {
+    assert(params.size() == 4 &&
+           "gang_linear_mxfp4_res_bias_mi300 needs [o_stride, output_per_wg, "
+           "n_wgs_per_xcd, total_tiles_per_xcd]");
+    int variant_id =
+        task_register->register_gang_linear_mxfp4_res_bias_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        4, 1, TASK_GANG_LINEAR_MXFP4_RES_BIAS_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
+  } else if (name == "gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300") {
+    assert(params.size() == 10 &&
+           "gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300 needs 10 params");
+    int variant_id =
+        task_register
+            ->register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task(
+                customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        10, 4, TASK_GANG_LINEAR_MXFP4_RES_BIAS_RMSNORM_TOPK_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] =
+        params[9]; // total_tiles_per_xcd (max of oproj/topk)
+  } else if (name == "gang_oproj_topk_moe_fused_mi300") {
+    assert(params.size() == 16 &&
+           "gang_oproj_topk_moe_fused_mi300 needs 16 params");
+    int variant_id =
+        task_register->register_gang_oproj_topk_moe_fused_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        16, 6, TASK_GANG_OPROJ_TOPK_MOE_FUSED_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[15]; // workers_per_xcd (30)
+  } else if (name == "gang_full_layer_fused_mi300") {
+    assert(params.size() == 29 &&
+           "gang_full_layer_fused_mi300 needs 29 params");
+    int variant_id = task_register->register_gang_full_layer_fused_mi300_task(
         customized->bgraph, params);
     task_config[op] =
-        std::make_tuple(3, 1, TASK_GANG_LINEAR_RES_MSPLIT_MI300, variant_id);
-    gang_task_tiles_per_xcd[op] = params[3]; // n_tiles_per_xcd
+        std::make_tuple(24, 11, TASK_GANG_FULL_LAYER_FUSED_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[28]; // workers_per_xcd (30)
+  } else if (name == "gang_full_layer_with_lmhead_fused_mi300") {
+    assert(params.size() == 33 &&
+           "gang_full_layer_with_lmhead_fused_mi300 needs 33 params");
+    int variant_id =
+        task_register->register_gang_full_layer_with_lmhead_fused_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        28, 13, TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[28]; // workers_per_xcd (30)
+  } else if (name == "gang_qkv_attn_fused_mi300") {
+    assert(params.size() == 16 && "gang_qkv_attn_fused_mi300 needs 16 params");
+    int variant_id = task_register->register_gang_qkv_attn_fused_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(9, 5, TASK_GANG_QKV_ATTN_FUSED_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] =
+        params[2]; // total_qkv_tiles_per_xcd (last worker does attn inline)
   } else if (name == "gang_ksplit_gemm_mi300") {
     assert(params.size() == 4);
     int variant_id = task_register->register_gang_ksplit_gemm_mi300_task(
@@ -638,19 +789,21 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(2, 1, TASK_GANG_KSPLIT_FINALIZE_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // finalize tiles per XCD
   } else if (name == "gang_splitk_linear_res_mi300") {
-    assert(params.size() == 4 && "gang_splitk_linear_res_mi300 needs [o_stride, tile_n, n_tiles_per_xcd, k_splits]");
+    assert(params.size() == 4 &&
+           "gang_splitk_linear_res_mi300 needs [o_stride, tile_n, "
+           "n_tiles_per_xcd, k_splits]");
     int variant_id = task_register->register_gang_splitk_linear_res_mi300_task(
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(4, 1, TASK_GANG_SPLITK_LINEAR_RES_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2] * params[3]; // n_tiles × k_splits
   } else if (name == "gang_rmsnorm_mi300") {
-    assert(params.size() == 1 && "gang_rmsnorm_mi300 needs [batch_size]");
+    assert(params.size() == 0);
     int variant_id = task_register->register_gang_rmsnorm_mi300_task(
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(2, 1, TASK_GANG_RMS_NORM_MI300, variant_id);
-    gang_task_tiles_per_xcd[op] = params[0]; // 1 tile per batch row
+    gang_task_tiles_per_xcd[op] = 1; // 1 RMSNorm per XCD
   } else if (name == "gang_linear_silu_mi300") {
     assert(params.size() == 7);
     int variant_id = task_register->register_gang_linear_silu_mi300_task(
@@ -666,7 +819,7 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(7, 3, TASK_GANG_ATTN_SPLIT_KV_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[7]; // total_work_items_per_xcd
   } else if (name == "gang_attn_merge_mi300") {
-    assert(params.size() == 8);
+    assert(params.size() == 7);
     int variant_id = task_register->register_gang_attn_merge_mi300_task(
         customized->bgraph, params);
     task_config[op] =
@@ -678,8 +831,9 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     task_config[op] =
         std::make_tuple(2, 1, TASK_SPLITK_REDUCE_MI300, variant_id);
   } else if (name == "splitk_linear_res_atomic_mi300") {
-    int variant_id = task_register->register_splitk_linear_res_atomic_mi300_task(
-        customized->bgraph, params);
+    int variant_id =
+        task_register->register_splitk_linear_res_atomic_mi300_task(
+            customized->bgraph, params);
     task_config[op] =
         std::make_tuple(5, 1, TASK_SPLITK_LINEAR_RES_ATOMIC_MI300, variant_id);
   } else if (name == "splitk_linear_swapAB_hopper") {
@@ -745,6 +899,19 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_moe_silu_mul_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 1, TASK_SILU_MUL, variant_id);
+  } else if (name == "moe_swigluoai") {
+    int variant_id =
+        task_register->register_moe_swigluoai_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_SWIGLUOAI_MI300, variant_id);
+  } else if (name == "bias_add_mi300") {
+    int variant_id =
+        task_register->register_bias_add_mi300_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_BIAS_ADD_MI300, variant_id);
+  } else if (name == "attention_sink_mi300") {
+    int variant_id = task_register->register_attention_sink_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_ATTENTION_SINK_MI300, variant_id);
   } else if (name == "moe_w2_linear_sm100") {
     int variant_id = task_register->register_moe_linear_sm100_task(
         customized->bgraph, params, false /*w13_linear*/);
@@ -773,8 +940,8 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_paged_attention_split_kv_mi300_task(
             customized->bgraph, params);
-    task_config[op] = std::make_tuple(
-        7, 2, TASK_PAGED_ATTENTION_SPLIT_KV_MI300, variant_id);
+    task_config[op] =
+        std::make_tuple(7, 2, TASK_PAGED_ATTENTION_SPLIT_KV_MI300, variant_id);
   } else if (name == "paged_attention_split_kv_merge_mi300") {
     int variant_id =
         task_register->register_paged_attention_split_kv_merge_mi300_task(
@@ -784,23 +951,28 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   }
   // MI300 CK FMHA batch-independent tasks
   else if (name == "kv_cache_update_mi300") {
-    int variant_id =
-        task_register->register_kv_cache_update_mi300_task(
-            customized->bgraph, params);
-    task_config[op] = std::make_tuple(
-        7, 1, TASK_KV_CACHE_UPDATE_MI300, variant_id);
+    int variant_id = task_register->register_kv_cache_update_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(7, 1, TASK_KV_CACHE_UPDATE_MI300, variant_id);
   } else if (name == "paged_attention_ck_fmha_split_kv_mi300") {
     int variant_id =
         task_register->register_paged_attention_ck_fmha_split_kv_mi300_task(
             customized->bgraph, params);
+    // Inputs: 3 (q_workspace, k_cache, v_cache) or 4 (+ sinks for GPT-OSS)
+    int num_inputs = (int)customized->bgraph.operators.size() - 2;
+    assert(num_inputs == 3 || num_inputs == 4);
     task_config[op] = std::make_tuple(
-        3, 2, TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300, variant_id);
+        num_inputs, 2, TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300, variant_id);
   } else if (name == "paged_attention_ck_fmha_merge_mi300") {
     int variant_id =
         task_register->register_paged_attention_ck_fmha_merge_mi300_task(
             customized->bgraph, params);
+    // Inputs: 2 (lse, o_partial) or 3 (+ sinks for GPT-OSS attention sinks)
+    int num_inputs = (int)customized->bgraph.operators.size() - 1;
+    assert(num_inputs == 2 || num_inputs == 3);
     task_config[op] = std::make_tuple(
-        2, 1, TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300, variant_id);
+        num_inputs, 1, TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300, variant_id);
   }
   // MI300/MI350 MoE tasks
   else if (name == "moe_topk_softmax_mi300") {
@@ -812,29 +984,91 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_moe_linear_mi300_task(
         customized->bgraph, params, true /*w13_linear*/);
     task_config[op] =
-        std::make_tuple(4, 1, TASK_MOE_W13_LINEAR_MI300, variant_id);
+        std::make_tuple(5, 1, TASK_MOE_W13_LINEAR_MI300, variant_id);
   } else if (name == "moe_w2_linear_mi300") {
     int variant_id = task_register->register_moe_linear_mi300_task(
         customized->bgraph, params, false /*w13_linear*/);
     task_config[op] =
-        std::make_tuple(4, 1, TASK_MOE_W2_LINEAR_MI300, variant_id);
+        std::make_tuple(5, 1, TASK_MOE_W2_LINEAR_MI300, variant_id);
+  } else if (name == "moe_w13_linear_mxfp4_mi300") {
+    assert(params.size() == 1);
+    int variant_id = task_register->register_moe_linear_mxfp4_mi300_task(
+        customized->bgraph, params, true /*w13_linear*/);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_MOE_W13_LINEAR_MXFP4_MI300, variant_id);
+  } else if (name == "moe_w2_linear_mxfp4_mi300") {
+    assert(params.size() == 1);
+    int variant_id = task_register->register_moe_linear_mxfp4_mi300_task(
+        customized->bgraph, params, false /*w13_linear*/);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_MOE_W2_LINEAR_MXFP4_MI300, variant_id);
+  } else if (name == "moe_w13_linear_mxfp4_ck_mi300") {
+    assert(params.size() == 1);
+    int variant_id = task_register->register_moe_linear_mxfp4_ck_mi300_task(
+        customized->bgraph, params, true /*w13_linear*/);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_MOE_W13_LINEAR_MXFP4_CK_MI300, variant_id);
+  } else if (name == "moe_w2_linear_mxfp4_ck_mi300") {
+    assert(params.size() == 1);
+    int variant_id = task_register->register_moe_linear_mxfp4_ck_mi300_task(
+        customized->bgraph, params, false /*w13_linear*/);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_MOE_W2_LINEAR_MXFP4_CK_MI300, variant_id);
   } else if (name == "linear_silu_mi300") {
     assert(params.size() == 7);
-    int variant_id = task_register->register_linear_silu_mi300_task(customized->bgraph, params);
+    int variant_id = task_register->register_linear_silu_mi300_task(
+        customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_LINEAR_SILU_MI300, variant_id);
   } else if (name == "gang_moe_w13_linear_mi300") {
     assert(params.size() == 3);
     int variant_id = task_register->register_gang_moe_w13_linear_mi300_task(
         customized->bgraph, params);
     task_config[op] =
-        std::make_tuple(4, 1, TASK_GANG_MOE_W13_LINEAR_MI300, variant_id);
+        std::make_tuple(5, 1, TASK_GANG_MOE_W13_LINEAR_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
   } else if (name == "gang_moe_w2_linear_mi300") {
     assert(params.size() == 3);
     int variant_id = task_register->register_gang_moe_w2_linear_mi300_task(
         customized->bgraph, params);
     task_config[op] =
-        std::make_tuple(4, 1, TASK_GANG_MOE_W2_LINEAR_MI300, variant_id);
+        std::make_tuple(5, 1, TASK_GANG_MOE_W2_LINEAR_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_w13_linear_mxfp4_mi300") {
+    assert(params.size() == 4);
+    int variant_id = task_register->register_gang_moe_linear_mxfp4_mi300_task(
+        customized->bgraph, params, true);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_w2_linear_mxfp4_mi300") {
+    assert(params.size() == 4);
+    int variant_id = task_register->register_gang_moe_linear_mxfp4_mi300_task(
+        customized->bgraph, params, false);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_GANG_MOE_W2_LINEAR_MXFP4_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_fused_mxfp4_mi300") {
+    assert(params.size() == 4);
+    int variant_id = task_register->register_gang_moe_fused_mxfp4_mi300_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(8, 3, TASK_GANG_MOE_FUSED_MXFP4_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_swiglu_w2_mxfp4_mi300") {
+    assert(params.size() == 4);
+    int variant_id =
+        task_register->register_gang_moe_swiglu_w2_mxfp4_mi300_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_GANG_MOE_SWIGLU_W2_MXFP4_MI300, variant_id);
+    gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
+  } else if (name == "gang_moe_w13_swiglu_mxfp4_mi300") {
+    assert(params.size() == 4);
+    int variant_id =
+        task_register->register_gang_moe_w13_swiglu_mxfp4_mi300_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_GANG_MOE_W13_SWIGLU_MXFP4_MI300, variant_id);
     gang_task_tiles_per_xcd[op] = params[2]; // total_tiles_per_xcd
   } else if (name == "moe_mul_sum_add_mi300") {
     int variant_id = task_register->register_moe_mul_sum_add_mi300_task(

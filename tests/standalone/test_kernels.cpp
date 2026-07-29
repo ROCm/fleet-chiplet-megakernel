@@ -4,12 +4,12 @@
  * Tests both linear (GEMM) and attention kernels
  */
 
-#include <hip/hip_runtime.h>
-#include <iostream>
-#include <vector>
 #include <chrono>
 #include <cmath>
+#include <hip/hip_runtime.h>
+#include <iostream>
 #include <random>
+#include <vector>
 
 // CK Tile includes for AMD
 #include "ck_tile/core.hpp"
@@ -20,14 +20,14 @@ using bf16 = ck_tile::bf16_t;
 // ============================================================================
 // Configuration
 // ============================================================================
-constexpr int BATCH_SIZE = 8;           // Number of tokens
-constexpr int HEAD_DIM = 128;           // Head dimension
-constexpr int NUM_QO_HEADS = 8;         // Number of QO heads
-constexpr int NUM_KV_HEADS = 1;         // Number of KV heads (GQA)
-constexpr int HIDDEN_SIZE = 4096;       // Hidden size
+constexpr int BATCH_SIZE = 8;            // Number of tokens
+constexpr int HEAD_DIM = 128;            // Head dimension
+constexpr int NUM_QO_HEADS = 8;          // Number of QO heads
+constexpr int NUM_KV_HEADS = 1;          // Number of KV heads (GQA)
+constexpr int HIDDEN_SIZE = 4096;        // Hidden size
 constexpr int INTERMEDIATE_SIZE = 14336; // MLP intermediate size
-constexpr int SEQ_LEN = 2048;           // Sequence length for attention
-constexpr int PAGE_SIZE = 16;           // Page size for paged attention
+constexpr int SEQ_LEN = 2048;            // Sequence length for attention
+constexpr int PAGE_SIZE = 16;            // Page size for paged attention
 
 constexpr int NUM_WARMUP = 5;
 constexpr int NUM_ITERS = 100;
@@ -45,7 +45,7 @@ constexpr int NUM_ITERS = 100;
     }                                                                          \
   } while (0)
 
-void fill_random_bf16(bf16* data, size_t n) {
+void fill_random_bf16(bf16 *data, size_t n) {
   std::random_device rd;
   std::mt19937 gen(rd());
   std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
@@ -63,20 +63,20 @@ using WarpGemmBf16_32x32x8 = ck_tile::WarpGemmMfmaBf16Bf16F32M32N32K8;
 // ============================================================================
 // Simple Linear kernel using CK Tile warp GEMM
 // ============================================================================
-__global__ void linear_kernel_ck(
-    const bf16* __restrict__ input,    // [BATCH, HIDDEN]
-    const bf16* __restrict__ weight,   // [OUT, HIDDEN]
-    bf16* __restrict__ output,         // [BATCH, OUT]
-    int batch_size,
-    int hidden_size,
-    int output_size) {
+__global__ void
+    linear_kernel_ck(bf16 const *__restrict__ input,  // [BATCH, HIDDEN]
+                     bf16 const *__restrict__ weight, // [OUT, HIDDEN]
+                     bf16 *__restrict__ output,       // [BATCH, OUT]
+                     int batch_size,
+                     int hidden_size,
+                     int output_size) {
 
   // Use CK Tile's warp GEMM
   using WarpGemm = WarpGemmBf16_16x16x16;
 
-  constexpr int MFMA_M = WarpGemm::kM;  // 16
-  constexpr int MFMA_N = WarpGemm::kN;  // 16
-  constexpr int MFMA_K = WarpGemm::kK;  // 16
+  constexpr int MFMA_M = WarpGemm::kM; // 16
+  constexpr int MFMA_N = WarpGemm::kN; // 16
+  constexpr int MFMA_K = WarpGemm::kK; // 16
 
   int warp_id = threadIdx.x / 64;
   int lane_id = threadIdx.x % 64;
@@ -117,13 +117,12 @@ __global__ void linear_kernel_ck(
 // ============================================================================
 // Reference implementations for validation
 // ============================================================================
-void linear_reference(
-    const bf16* input,
-    const bf16* weight,
-    bf16* output,
-    int batch_size,
-    int hidden_size,
-    int output_size) {
+void linear_reference(bf16 const *input,
+                      bf16 const *weight,
+                      bf16 *output,
+                      int batch_size,
+                      int hidden_size,
+                      int output_size) {
 
   for (int b = 0; b < batch_size; b++) {
     for (int o = 0; o < output_size; o++) {
@@ -141,7 +140,7 @@ void linear_reference(
 // ============================================================================
 // Main test function
 // ============================================================================
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   std::cout << "=== AMD MI300 Kernel Performance Test ===" << std::endl;
   std::cout << "Configuration:" << std::endl;
   std::cout << "  BATCH_SIZE: " << BATCH_SIZE << std::endl;
@@ -161,9 +160,12 @@ int main(int argc, char** argv) {
   hipDeviceProp_t props;
   HIP_CHECK(hipGetDeviceProperties(&props, 0));
   std::cout << "Using device: " << props.name << std::endl;
-  std::cout << "  Compute capability: " << props.major << "." << props.minor << std::endl;
-  std::cout << "  Total memory: " << props.totalGlobalMem / (1024*1024) << " MB" << std::endl;
-  std::cout << "  Shared memory per block: " << props.sharedMemPerBlock << " bytes" << std::endl;
+  std::cout << "  Compute capability: " << props.major << "." << props.minor
+            << std::endl;
+  std::cout << "  Total memory: " << props.totalGlobalMem / (1024 * 1024)
+            << " MB" << std::endl;
+  std::cout << "  Shared memory per block: " << props.sharedMemPerBlock
+            << " bytes" << std::endl;
   std::cout << std::endl;
 
   // =========================================================================
@@ -192,12 +194,22 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipMalloc(&d_output, output_size * sizeof(bf16)));
 
     // Copy to device
-    HIP_CHECK(hipMemcpy(d_input, h_input.data(), input_size * sizeof(bf16), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_weight, h_weight.data(), weight_size * sizeof(bf16), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_input,
+                        h_input.data(),
+                        input_size * sizeof(bf16),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_weight,
+                        h_weight.data(),
+                        weight_size * sizeof(bf16),
+                        hipMemcpyHostToDevice));
 
     // Compute reference
-    linear_reference(h_input.data(), h_weight.data(), h_ref_output.data(),
-                     BATCH_SIZE, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+    linear_reference(h_input.data(),
+                     h_weight.data(),
+                     h_ref_output.data(),
+                     BATCH_SIZE,
+                     HIDDEN_SIZE,
+                     INTERMEDIATE_SIZE);
 
     // Launch kernel
     dim3 grid((BATCH_SIZE + 15) / 16, 1, 1);
@@ -205,8 +217,12 @@ int main(int argc, char** argv) {
 
     // Warmup
     for (int i = 0; i < NUM_WARMUP; i++) {
-      linear_kernel_ck<<<grid, block>>>(d_input, d_weight, d_output,
-                                         BATCH_SIZE, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+      linear_kernel_ck<<<grid, block>>>(d_input,
+                                        d_weight,
+                                        d_output,
+                                        BATCH_SIZE,
+                                        HIDDEN_SIZE,
+                                        INTERMEDIATE_SIZE);
     }
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -217,8 +233,12 @@ int main(int argc, char** argv) {
 
     HIP_CHECK(hipEventRecord(start));
     for (int i = 0; i < NUM_ITERS; i++) {
-      linear_kernel_ck<<<grid, block>>>(d_input, d_weight, d_output,
-                                         BATCH_SIZE, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+      linear_kernel_ck<<<grid, block>>>(d_input,
+                                        d_weight,
+                                        d_output,
+                                        BATCH_SIZE,
+                                        HIDDEN_SIZE,
+                                        INTERMEDIATE_SIZE);
     }
     HIP_CHECK(hipEventRecord(stop));
     HIP_CHECK(hipEventSynchronize(stop));

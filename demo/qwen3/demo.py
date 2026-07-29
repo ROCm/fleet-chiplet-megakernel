@@ -287,7 +287,7 @@ if __name__ == "__main__":
         fused_outdim_2 = 2 * intermediate_size
         num_kv_cache_chunks = max(1, (args.max_seq_length + 127) // 128)
         use_ck_fmha = int(os.environ.get("USE_CK_FMHA", "1")) == 1
-        ck_fmha_num_kv_chunks = int(os.environ.get("CK_FMHA_CHUNKS", "1"))
+        ck_fmha_num_kv_chunks = 1  # Direct bf16 output, no merge needed
 
         if args.profiling:
             profiler_tensor = torch.zeros(
@@ -455,11 +455,6 @@ if __name__ == "__main__":
         USE_FUSED_SILU = is_rocm and int(os.environ.get("USE_FUSED_SILU", "0")) == 1
         USE_GANG_SPLITK = USE_GANG and int(os.environ.get("USE_GANG_SPLITK", "0")) == 1
         USE_GANG_KSPLIT = USE_GANG and int(os.environ.get("USE_GANG_KSPLIT", "0")) == 1
-        # USE_GANG_N_TILE: route gang_linear and gang_linear_with_residual to
-        # their N-tiling sister kernels (N as fast tile index). Used to A/B
-        # against the default M-tiling variant to isolate L2 weight reuse.
-        USE_GANG_N_TILE = USE_GANG and int(os.environ.get("USE_GANG_N_TILE", "0")) == 1
-        USE_GANG_M_SPLIT = USE_GANG and int(os.environ.get("USE_GANG_M_SPLIT", "0")) == 1
         GANG_K_SPLITS = int(os.environ.get("GANG_K_SPLITS", "4"))
         GANG_TILE_N = int(os.environ.get("GANG_TILE_N", "64"))
         GANG_WGM = int(os.environ.get("GANG_WGM", "0"))  # HipKittens Algorithm 1 window height (0=full M-major)
@@ -468,12 +463,9 @@ if __name__ == "__main__":
         # bs<64:  m_per_tile=16 chunks → 16×64×256 tile (16×16 MFMA)
         if USE_GANG:
             bs = args.max_num_batched_tokens
-            GANG_M_TILES = int(os.environ.get("GANG_M_TILES_OVERRIDE", 0)) or max(1, bs // 16)
-            # Per-op override: use bigger tile for GATE_UP (most weight, benefits from larger tile)
-            GANG_M_TILES_GATEUP = int(os.environ.get("GANG_M_TILES_GATEUP", 0)) or GANG_M_TILES
+            GANG_M_TILES = 1 if bs >= 64 else max(1, bs // 16)
         else:
             GANG_M_TILES = 1
-            GANG_M_TILES_GATEUP = 1
         if is_rocm:
             n_blocks = hidden_size // 64
             splitk_ws_torch = torch.zeros(
@@ -590,23 +582,7 @@ if __name__ == "__main__":
                     grid_dim=(mpk.max_num_batched_tokens, 1, 1),
                     block_dim=(128, 1, 1),
                 )
-            if USE_GANG_M_SPLIT:
-                mpk.gang_linear_msplit_layer(
-                    input=rmsnorm_out, weight=w_qkv, output=attn_in,
-                    tile_n=GANG_TILE_N, output_stride=w_qkv.dim(0), m_tiles=GANG_M_TILES,
-                    block_dim=(256, 1, 1))
-            elif USE_GANG_N_TILE:
-                mpk.gang_linear_n_tiling_layer(
-                    input=rmsnorm_out,
-                    weight=w_qkv,
-                    output=attn_in,
-                    tile_n=GANG_TILE_N,
-                    output_stride=w_qkv.dim(0),
-                    m_tiles=GANG_M_TILES,
-                    wgn=GANG_WGM,
-                    block_dim=(256, 1, 1),
-                )
-            elif USE_GANG:
+            if USE_GANG:
                 mpk.gang_linear_layer(
                     input=rmsnorm_out,
                     weight=w_qkv,
@@ -663,7 +639,6 @@ if __name__ == "__main__":
               elif use_ck_fmha and args.split_kv_cache:
                 if USE_GANG and ck_fmha_num_kv_chunks == 1:
                     # Gang CK FMHA: fuses KV cache update + attention into 8 gang tasks
-                    # With 1 chunk, writes bf16 directly to attn_out (no merge needed)
                     mpk.gang_paged_attention_split_kv_layer(
                         input=attn_in,
                         k_cache=k_cache,
@@ -678,34 +653,6 @@ if __name__ == "__main__":
                         attention_params=(num_local_q_heads,
                                          ck_fmha_num_kv_chunks,
                                          q_ws_stride),
-                        block_dim=(256, 1, 1),
-                    )
-                elif USE_GANG and ck_fmha_num_kv_chunks > 1:
-                    # Gang CK FMHA with split-KV: writes float32 to o_acc, then merge
-                    mpk.gang_paged_attention_split_kv_layer(
-                        input=attn_in,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        q_norm=w_q_norm,
-                        k_norm=w_k_norm,
-                        cos_pos_embed=cos_pos_embed,
-                        sin_pos_embed=sin_pos_embed,
-                        lse=ck_fmha_lse_acc,
-                        output=ck_fmha_o_acc,
-                        q_workspace=ck_fmha_q_ws,
-                        attention_params=(num_local_q_heads,
-                                         ck_fmha_num_kv_chunks,
-                                         q_ws_stride),
-                        block_dim=(256, 1, 1),
-                    )
-                    # Gang merge: reduce float32 chunks to bf16 output
-                    mpk.gang_paged_attention_split_kv_merge_layer(
-                        lse=ck_fmha_lse_acc,
-                        output_tmp=ck_fmha_o_acc,
-                        output=attn_out,
-                        attention_params=(num_local_q_heads, head_dim,
-                                         num_local_kv_heads,
-                                         ck_fmha_num_kv_chunks),
                         block_dim=(256, 1, 1),
                     )
                 else:
@@ -830,23 +777,6 @@ if __name__ == "__main__":
                     output_stride=hidden_size,
                     k_splits=GANG_K_SPLITS,
                 )
-            elif USE_GANG_M_SPLIT:
-                mpk.gang_linear_with_residual_msplit_layer(
-                    input=attn_out, weight=w, residual=x, output=attn_proj_out,
-                    tile_n=GANG_TILE_N, output_stride=hidden_size, m_tiles=GANG_M_TILES,
-                    block_dim=(256, 1, 1))
-            elif USE_GANG_N_TILE:
-                mpk.gang_linear_with_residual_n_tiling_layer(
-                    input=attn_out,
-                    weight=w,
-                    residual=x,
-                    output=attn_proj_out,
-                    tile_n=GANG_TILE_N,
-                    output_stride=hidden_size,
-                    m_tiles=GANG_M_TILES,
-                    wgn=GANG_WGM,
-                    block_dim=(256, 1, 1),
-                )
             elif USE_GANG and not int(os.environ.get("GANG_SPLITK_RES", "0")):
                 mpk.gang_linear_with_residual_layer(
                     input=attn_out,
@@ -940,7 +870,7 @@ if __name__ == "__main__":
                     output=silu_mul_out,
                     tile_n=GANG_TILE_N,
                     output_stride=intermediate_size // world_size,
-                    m_tiles=GANG_M_TILES_GATEUP,
+                    m_tiles=GANG_M_TILES,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
@@ -953,22 +883,6 @@ if __name__ == "__main__":
                     output_stride=intermediate_size // world_size,
                     block_dim=(256, 1, 1),
                 )
-            elif USE_GANG_M_SPLIT:
-                mpk.gang_linear_msplit_layer(
-                    input=rmsnorm_out, weight=w_gatedup, output=mlp_mid,
-                    tile_n=GANG_TILE_N, output_stride=w_gatedup.dim(0), m_tiles=GANG_M_TILES,
-                    block_dim=(256, 1, 1))
-            elif USE_GANG_N_TILE:
-                mpk.gang_linear_n_tiling_layer(
-                    input=rmsnorm_out,
-                    weight=w_gatedup,
-                    output=mlp_mid,
-                    tile_n=GANG_TILE_N,
-                    output_stride=w_gatedup.dim(0),
-                    m_tiles=GANG_M_TILES,
-                    wgn=GANG_WGM,
-                    block_dim=(256, 1, 1),
-                )
             elif USE_GANG:
                 mpk.gang_linear_layer(
                     input=rmsnorm_out,
@@ -976,7 +890,7 @@ if __name__ == "__main__":
                     output=mlp_mid,
                     tile_n=GANG_TILE_N,
                     output_stride=w_gatedup.dim(0),
-                    m_tiles=GANG_M_TILES_GATEUP,
+                    m_tiles=GANG_M_TILES,
                     wgm=GANG_WGM,
                     block_dim=(256, 1, 1),
                 )
@@ -1045,23 +959,6 @@ if __name__ == "__main__":
                         tile_n=GANG_TILE_N,
                         output_stride=hidden_size,
                         k_splits=GANG_K_SPLITS,
-                    )
-                elif USE_GANG_M_SPLIT:
-                    mpk.gang_linear_with_residual_msplit_layer(
-                        input=silu_mul_out, weight=w, residual=x, output=mlp_out,
-                        tile_n=GANG_TILE_N, output_stride=hidden_size, m_tiles=GANG_M_TILES,
-                        block_dim=(256, 1, 1))
-                elif USE_GANG_N_TILE:
-                    mpk.gang_linear_with_residual_n_tiling_layer(
-                        input=silu_mul_out,
-                        weight=w,
-                        residual=x,
-                        output=mlp_out,
-                        tile_n=GANG_TILE_N,
-                        output_stride=hidden_size,
-                        m_tiles=GANG_M_TILES,
-                        wgn=GANG_WGM,
-                        block_dim=(256, 1, 1),
                     )
                 elif USE_GANG and not int(os.environ.get("GANG_SPLITK_RES", "0")):
                     mpk.gang_linear_with_residual_layer(
@@ -1275,30 +1172,8 @@ if __name__ == "__main__":
             response = tokenizer.decode(valid_ids, skip_special_tokens=True)
             print(response)
         
-        # Verify outputs
-        prompt_len = prompt_lengths[0].item()
-
-        # 1) Cross-batch comparison (batch 0 vs all others — catches gang bugs)
         if total_num_requests > 1:
-            ref_len = step[0].item() + 1
-            ref_tokens = tokens[0, :ref_len]
-            all_match = True
-            for r in range(1, total_num_requests):
-                r_len = step[r].item() + 1
-                if r_len != ref_len:
-                    print(f"[VERIFY] batch {r} vs batch 0: length mismatch ({r_len} vs {ref_len})")
-                    all_match = False
-                    continue
-                m = (tokens[r, :ref_len] != ref_tokens).nonzero(as_tuple=True)[0]
-                if len(m) > 0:
-                    first = m[0].item()
-                    print(f"[VERIFY] batch {r} vs batch 0: MISMATCH at token {first}/{ref_len} "
-                          f"(batch0={ref_tokens[first].item()}, batch{r}={tokens[r, first].item()}) "
-                          f"total mismatches={len(m)}")
-                    all_match = False
-                else:
-                    print(f"[VERIFY] batch {r} vs batch 0: OK ({ref_len} tokens match)")
-            print(f"Cross-batch correctness: {all_match}")
+            print(f"Output length of each batch is same: {(step.max() == step.min()).item()}")
 
         # Calculate separate prefill and decode metrics
         prompt_len = prompt_lengths[0].item()

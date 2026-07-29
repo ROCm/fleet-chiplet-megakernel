@@ -15,21 +15,22 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 #include "mirage/vector_types.h"
 
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_elementbinary_op_parameters(int const *params,
-                                             int &param_idx,
-                                             int3 &input1_shape,
-                                             int3 &input2_shape,
-                                             int &input1_smem_offset,
-                                             int &input2_smem_offset,
-                                             int &output_smem_offset) {
+CUTLASS_HOST_DEVICE inline void
+    deserialize_elementbinary_op_parameters(int const *params,
+                                            int &param_idx,
+                                            int3 &input1_shape,
+                                            int3 &input2_shape,
+                                            int &input1_smem_offset,
+                                            int &input2_smem_offset,
+                                            int &output_smem_offset) {
   input1_shape.x = params[param_idx++];
   input1_shape.y = params[param_idx++];
   input1_shape.z = params[param_idx++];

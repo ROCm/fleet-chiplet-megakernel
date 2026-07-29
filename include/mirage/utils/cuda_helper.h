@@ -172,8 +172,7 @@ ActivationType get_matmul_activation_type(TBOperatorType const *operator_types,
   return ACT_NONE;
 }
 
-CUTLASS_HOST_DEVICE inline
-int get_reduction_dim(TBOperatorType type) {
+CUTLASS_HOST_DEVICE inline int get_reduction_dim(TBOperatorType type) {
   if (type >= TB_REDUCTION_0_TO_DIMX_OP && type <= TB_REDUCTION_2_TO_DIMX_OP) {
     return type - TB_REDUCTION_0_TO_DIMX_OP;
   } else if (type >= TB_REDUCTION_0_OP && type <= TB_REDUCTION_2_OP) {

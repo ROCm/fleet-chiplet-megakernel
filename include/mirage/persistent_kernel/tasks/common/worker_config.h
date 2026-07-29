@@ -20,25 +20,26 @@
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 // AMD MI300 uses 256 threads with native 64-thread wavefronts
 constexpr int NUM_THREADS = 256;
-constexpr int NUM_THREADS_PER_WARP = 64;  // Native AMD wavefront size
-constexpr int NUM_WARPS = 4;  // 256 / 64 = 4 wavefronts
+constexpr int NUM_THREADS_PER_WARP = 64; // Native AMD wavefront size
+constexpr int NUM_WARPS = 4;             // 256 / 64 = 4 wavefronts
 #elif defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL)
 // Hopper and Blackwell use 256 threads with 32-thread warps
 constexpr int NUM_THREADS = 256;
 constexpr int NUM_THREADS_PER_WARP = 32;
-constexpr int NUM_WARPS = 8;  // 256 / 32 = 8 warps
+constexpr int NUM_WARPS = 8; // 256 / 32 = 8 warps
 #else
 // Ampere uses 128 threads with 32-thread warps
 constexpr int NUM_THREADS = 128;
 constexpr int NUM_THREADS_PER_WARP = 32;
-constexpr int NUM_WARPS = 4;  // 128 / 32 = 4 warps
+constexpr int NUM_WARPS = 4; // 128 / 32 = 4 warps
 #endif
 constexpr int WARPGROUP_WARPS = 4;
 
 constexpr float inf = 5e4;
 // TODO: only setting this for Hopper can have compilation issues on blackwell
 // and presumably ampere
-#if defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL) || defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+#if defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL) ||         \
+    defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 constexpr int WORKER_NUM_THREADS = 256;   // Grace Hopper/AMD MI300 setting
 constexpr int CONSUMER_NUM_THREADS = 128; // Grace Hopper setting
 #endif

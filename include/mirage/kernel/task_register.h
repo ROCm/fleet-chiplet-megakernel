@@ -89,77 +89,120 @@ public:
   int register_paged_attention_split_kv_hopper_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 split-K linear
-  int register_splitk_linear_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_splitk_reduce_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+  int register_splitk_linear_mi300_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
+  int register_splitk_reduce_mi300_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   int register_splitk_linear_res_atomic_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 cross-XCD K-split GEMM + finalize
-  int register_gang_ksplit_gemm_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_ksplit_finalize_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+  int register_gang_ksplit_gemm_mi300_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_gang_ksplit_finalize_mi300_task(threadblock::Graph const &bgraph,
+                                               std::vector<int> const &params);
   // MI300 gang split-K linear with residual
   int register_gang_splitk_linear_res_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 gang RMSNorm (redundant per XCD for XCD-local event path)
-  int register_gang_rmsnorm_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+  int register_gang_rmsnorm_mi300_task(threadblock::Graph const &bgraph,
+                                       std::vector<int> const &params);
   // MI300 gang linear (horizontal fusion)
-  int register_gang_linear_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_linear_res_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  // MI300 gang linear with N-fast tile iteration (sister to gang_linear; for
-  // isolating L2 weight-reuse benefit of M-tiling)
-  int register_gang_linear_n_tiling_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_linear_res_n_tiling_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_linear_msplit_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_linear_res_msplit_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_linear_silu_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_linear_silu_mi300_task(threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_gang_linear_mi300_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_gang_linear_res_mi300_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
+  int register_gang_linear_silu_mi300_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_linear_silu_mi300_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  // MI300 gang linear with bias (fused bias_add into epilogue)
+  int register_gang_linear_bias_mi300_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  // MI300 gang split-K linear with residual + bias
+  int register_gang_splitk_linear_res_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused RMSNorm + gang linear + bias
+  int register_gang_rmsnorm_linear_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused RMSNorm + gang linear + bias + TopK softmax
+  int register_gang_rmsnorm_linear_bias_topk_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused RMSNorm + MXFP4 gang linear + bias
+  int register_gang_rmsnorm_linear_mxfp4_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused MulSumAdd + RMSNorm + MXFP4 gang linear + bias
+  int register_gang_mulsumradd_rmsnorm_linear_mxfp4_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused RMSNorm + MXFP4 gang linear + KV cache update (layer 0)
+  int register_gang_rmsnorm_linear_mxfp4_bias_kvupd_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused MulSumAdd + RMSNorm + MXFP4 gang linear + KV cache update
+  // (layers 1+)
+  int register_gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused ResAddF32 + RMSNorm + MXFP4 gang linear + bias (layers 1+, no
+  // W2 MulSumAdd)
+  int register_gang_resaddf32_rmsnorm_linear_mxfp4_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused ResAddF32 + RMSNorm + MXFP4 gang linear + KV cache update
+  // (layers 1+)
+  int register_gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 MoE residual add from f32 workspace (last layer)
+  int register_moe_residual_add_f32_mi300_task(threadblock::Graph const &bgraph,
+                                               std::vector<int> const &params);
+  // MI300 MXFP4 gang linear with residual + bias
+  int register_gang_linear_mxfp4_res_bias_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused MXFP4 O-proj + RMSNorm + Router + TopK
+  int register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused O-PROJ+TopK+MoE (task 213+187 combined)
+  int register_gang_oproj_topk_moe_fused_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 fused QKV + Attention (ResAddF32+RMSNorm+QKV+KVUpdate → barrier → CK
+  // FMHA)
+  int register_gang_qkv_attn_fused_mi300_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params);
+  // MI300 full-layer fused (QKV+Attn+O-proj+TopK+MoE in one gang task)
+  int register_gang_full_layer_fused_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_gang_full_layer_with_lmhead_fused_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 gang MoE linear
-  int register_gang_moe_w13_linear_mi300_task(
+  int register_gang_moe_w13_linear_mi300_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params);
+  int register_gang_moe_w2_linear_mi300_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  // MI300 gang MoE linear MXFP4
+  int register_gang_moe_linear_mxfp4_mi300_task(
       threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_moe_w2_linear_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+      std::vector<int> const &params,
+      bool w13_linear);
+  // MI300 gang MoE fused W13+SwiGLU+W2 MXFP4
+  int register_gang_moe_fused_mxfp4_mi300_task(threadblock::Graph const &bgraph,
+                                               std::vector<int> const &params);
+  // MI300 gang MoE fused SwiGLU+W2 MXFP4 (no barrier)
+  int register_gang_moe_swiglu_w2_mxfp4_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MI300 gang MoE W13 MXFP4 with SwiGLU fused into epilogue
+  int register_gang_moe_w13_swiglu_mxfp4_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 gang attention (horizontal fusion)
-  int register_gang_attn_split_kv_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
-  int register_gang_attn_merge_mi300_task(
-      threadblock::Graph const &bgraph,
-      std::vector<int> const &params);
+  int register_gang_attn_split_kv_mi300_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  int register_gang_attn_merge_mi300_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
   // MI300 split-KV tasks
   int register_paged_attention_split_kv_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_paged_attention_split_kv_merge_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MI300 CK FMHA batch-independent tasks
-  int register_kv_cache_update_mi300_task(
-      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_kv_cache_update_mi300_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
   int register_paged_attention_ck_fmha_split_kv_mi300_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_paged_attention_ck_fmha_merge_mi300_task(
@@ -170,6 +213,12 @@ public:
   int register_moe_linear_mi300_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params,
                                      bool w13_linear);
+  int register_moe_linear_mxfp4_mi300_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params,
+                                           bool w13_linear);
+  int register_moe_linear_mxfp4_ck_mi300_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params,
+                                              bool w13_linear);
   int register_moe_mul_sum_add_mi300_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
   // SM100 tasks
@@ -196,6 +245,12 @@ public:
                                      bool w13_linear);
   int register_moe_silu_mul_task(threadblock::Graph const &bgraph,
                                  std::vector<int> const &params);
+  int register_moe_swigluoai_task(threadblock::Graph const &bgraph,
+                                  std::vector<int> const &params);
+  int register_bias_add_mi300_task(threadblock::Graph const &bgraph,
+                                   std::vector<int> const &params);
+  int register_attention_sink_mi300_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
   int register_moe_mul_sum_add_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
   int register_paged_attention_split_kv_sm100_task(

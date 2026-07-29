@@ -19,13 +19,14 @@
 // to tile one expert's GEMM, then move to the next expert. This eliminates
 // L2 thrashing caused by concurrent expert weight loads on the same XCD.
 //
-// Dispatch: 8 gang tasks (1 per XCD), each with flattened tile_idx encoding:
-//   tile_idx = expert_local_idx * TILES_PER_EXPERT + tile_within_expert
-//   ae_idx = xcd_id + expert_local_idx * 8  (round-robin XCD assignment)
+// Dispatch: 8 gang tasks (1 per XCD), tiles spread across all XCDs:
+//   global_tile = tile_idx * 8 + xcd_id  (interleaved round-robin)
+//   expert_idx = global_tile / TILES_PER_EXPERT
 //   tile_within_expert → (m_tile, n_tile)
 //
 // Workers stride through [0, n_tile_count) via the gang dispatch loop,
-// naturally staying in sync on the same expert since tiles_per_expert > workers_per_xcd.
+// naturally staying in sync on the same expert since tiles_per_expert >
+// workers_per_xcd.
 
 #pragma once
 
@@ -36,7 +37,7 @@ namespace kernel {
 __device__ __forceinline__ int _gang_moe_get_xcd_id() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
   int xcd_id;
-  asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID, 0, 16)" : "=s"(xcd_id));
   return xcd_id;
 #else
   return 0;
@@ -56,22 +57,22 @@ template <typename T,
           int NUM_TOPK,
           int TILES_PER_EXPERT,
           int N_TILES>
-__device__ __noinline__ void
-    gang_moe_w13_linear_kernel(void const *input_ptr,
-                                void const *weight_ptr,
-                                void const *routing_ptr,
-                                void const *mask_ptr,
-                                void *output_ptr,
-                                int tile_idx) {
+__device__ __noinline__ void gang_moe_w13_linear_kernel(void const *input_ptr,
+                                                        void const *weight_ptr,
+                                                        void const *routing_ptr,
+                                                        void const *mask_ptr,
+                                                        void const *bias_ptr,
+                                                        void *output_ptr,
+                                                        int tile_idx) {
   using namespace ck_tile;
 
-  // Tile sizes: 16x64x256 (small tile for bs <= 16)
+  // Tile sizes: 16x64xK (small tile for bs <= 16)
   constexpr index_t MPerBlock = 16;
   constexpr index_t NPerBlock = 64;
-  constexpr index_t KPerBlock = 256;
+  constexpr index_t KPerBlock = (REDUCTION_SIZE % 256 == 0) ? 256 : 128;
   constexpr index_t NumLoopK = REDUCTION_SIZE / KPerBlock;
   static_assert(REDUCTION_SIZE % KPerBlock == 0,
-                "W13 REDUCTION_SIZE must be divisible by KPerBlock=256");
+                "W13 REDUCTION_SIZE must be divisible by KPerBlock");
 
   constexpr index_t MWarp = 1;
   constexpr index_t NWarp = 4;
@@ -81,52 +82,58 @@ __device__ __noinline__ void
   using WarpTile = sequence<MPerBlock, NPerBlock / NWarp, KPerBlock>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
 
-  using GemmTraits = TileGemmUniversalTraits<
-      true, false, true, false,
-      tensor_layout::gemm::RowMajor,
-      tensor_layout::gemm::ColumnMajor,
-      tensor_layout::gemm::RowMajor>;
+  using GemmTraits = TileGemmUniversalTraits<true,
+                                             false,
+                                             true,
+                                             false,
+                                             tensor_layout::gemm::RowMajor,
+                                             tensor_layout::gemm::ColumnMajor,
+                                             tensor_layout::gemm::RowMajor>;
 
   using Problem = GemmPipelineProblem<bf16, bf16, float, GemmShape, GemmTraits>;
-  using PipelinePolicy = GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
+  using PipelinePolicy =
+      GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
   using Pipeline = GemmPipelineAGmemBGmemCRegV2<Problem, PipelinePolicy>;
 
-  // Get XCD ID from hardware register
+  // Get XCD ID for flat global tile distribution
   int xcd_id = _gang_moe_get_xcd_id();
 
   int const *__restrict__ d_mask = static_cast<int const *>(mask_ptr);
   int const num_activated_experts = d_mask[NUM_EXPERTS];
 
-  // Decode flat tile_idx into expert and tile position
-  int expert_local_idx = tile_idx / TILES_PER_EXPERT;
-  int tile_within_expert = tile_idx % TILES_PER_EXPERT;
-
-  // Round-robin XCD assignment: XCD i gets activated experts i, i+8, i+16, ...
-  int ae_idx = xcd_id + expert_local_idx * 8;
-  if (ae_idx >= num_activated_experts) return;
-
-  int expert_id = d_mask[ae_idx];
+  // Flat global tile distribution across all 8 XCDs
+  int global_tile = tile_idx * 8 + xcd_id;
+  int total_tiles = num_activated_experts * TILES_PER_EXPERT;
+  if (global_tile >= total_tiles) {
+    return;
+  }
+  int expert_idx = global_tile / TILES_PER_EXPERT;
+  int tile_within_expert = global_tile % TILES_PER_EXPERT;
+  int expert_id = d_mask[expert_idx];
 
   // Decode tile position
   constexpr index_t M_TILES = (BATCH_SIZE + MPerBlock - 1) / MPerBlock;
   int m_tile = tile_within_expert / N_TILES;
   int n_tile = tile_within_expert % N_TILES;
-  if (m_tile >= M_TILES) return;  // out of bounds for M dimension
+  if (m_tile >= M_TILES) {
+    return; // out of bounds for M dimension
+  }
 
   bf16 const *__restrict__ d_input = static_cast<bf16 const *>(input_ptr);
   bf16 const *__restrict__ d_weight = static_cast<bf16 const *>(weight_ptr);
   bf16 *__restrict__ d_output = static_cast<bf16 *>(output_ptr);
   int const *__restrict__ d_routing = static_cast<int const *>(routing_ptr);
+  bf16 const *__restrict__ d_bias = static_cast<bf16 const *>(bias_ptr);
 
   // Input A: offset to M-tile
   index_t m_offset = m_tile * MPerBlock;
   bf16 const *a_base = d_input + static_cast<size_t>(m_offset) * REDUCTION_SIZE;
 
   // Weight B: expert's weight slice, offset to N-tile
-  bf16 const *expert_weight = d_weight +
-      static_cast<int64_t>(expert_id) * OUTPUT_STRIDE * REDUCTION_SIZE;
-  bf16 const *b_base = expert_weight +
-      static_cast<size_t>(n_tile) * NPerBlock * REDUCTION_SIZE;
+  bf16 const *expert_weight = d_weight + static_cast<int64_t>(expert_id) *
+                                             OUTPUT_STRIDE * REDUCTION_SIZE;
+  bf16 const *b_base =
+      expert_weight + static_cast<size_t>(n_tile) * NPerBlock * REDUCTION_SIZE;
 
   // Routing indices for this expert
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
@@ -150,33 +157,32 @@ __device__ __noinline__ void
       number<1>{});
 
 #ifdef MPK_NT_WEIGHT_LOADS
-  auto b_tensor_view = make_naive_tensor_view<
-      address_space_enum::global,
-      memory_operation_enum::set,
-      static_cast<amd_buffer_coherence_enum>(18)>(
+  auto b_tensor_view =
+      make_naive_tensor_view<address_space_enum::global,
+                             memory_operation_enum::set,
+                             static_cast<amd_buffer_coherence_enum>(18)>(
 #else
   auto b_tensor_view = make_naive_tensor_view<address_space_enum::global>(
 #endif
-      b_base,
-      make_tuple(n_size, index_t(REDUCTION_SIZE)),
-      make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
-      number<8>{},
-      number<1>{});
+          b_base,
+          make_tuple(n_size, index_t(REDUCTION_SIZE)),
+          make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
+          number<8>{},
+          number<1>{});
 
-  auto a_tile_window = make_tile_window(
-      a_tensor_view,
-      make_tuple(number<MPerBlock>{}, number<KPerBlock>{}),
-      {0, 0});
+  auto a_tile_window =
+      make_tile_window(a_tensor_view,
+                       make_tuple(number<MPerBlock>{}, number<KPerBlock>{}),
+                       {0, 0});
 
-  auto b_tile_window = make_tile_window(
-      b_tensor_view,
-      make_tuple(number<NPerBlock>{}, number<KPerBlock>{}),
-      {0, 0});
+  auto b_tile_window =
+      make_tile_window(b_tensor_view,
+                       make_tuple(number<NPerBlock>{}, number<KPerBlock>{}),
+                       {0, 0});
 
   // Run CK pipeline GEMM
   Pipeline pipeline;
-  auto c_block_tile = pipeline(a_tile_window, b_tile_window,
-                               NumLoopK, smem);
+  auto c_block_tile = pipeline(a_tile_window, b_tile_window, NumLoopK, smem);
   block_sync_lds();
 
   // ---- Epilogue: scatter-write results using routing indices ----
@@ -196,27 +202,30 @@ __device__ __noinline__ void
       int const topk_slot = route_val - 1;
 
       if (global_n_base + 3 < OUTPUT_SIZE) {
-        bf16 *out_addr = d_output +
-            global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-            topk_slot * OUTPUT_STRIDE +
-            global_n_base;
+        bf16 *out_addr = d_output + global_m * (NUM_TOPK * OUTPUT_STRIDE) +
+                         topk_slot * OUTPUT_STRIDE + global_n_base;
+        bf16 const *bias_addr =
+            d_bias + expert_id * OUTPUT_STRIDE + global_n_base;
 
+        uint64_t bias_packed = *reinterpret_cast<uint64_t const *>(bias_addr);
+        bf16 const *bv = reinterpret_cast<bf16 const *>(&bias_packed);
         uint64_t out_packed;
         bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
-        out[0] = type_convert<bf16>(c_buf[0]);
-        out[1] = type_convert<bf16>(c_buf[1]);
-        out[2] = type_convert<bf16>(c_buf[2]);
-        out[3] = type_convert<bf16>(c_buf[3]);
+        out[0] = type_convert<bf16>(c_buf[0] + type_convert<float>(bv[0]));
+        out[1] = type_convert<bf16>(c_buf[1] + type_convert<float>(bv[1]));
+        out[2] = type_convert<bf16>(c_buf[2] + type_convert<float>(bv[2]));
+        out[3] = type_convert<bf16>(c_buf[3] + type_convert<float>(bv[3]));
         *reinterpret_cast<uint64_t *>(out_addr) = out_packed;
       } else if (global_m < BATCH_SIZE) {
-        #pragma unroll
+#pragma unroll
         for (index_t i = 0; i < 4; i++) {
           index_t global_n = global_n_base + i;
           if (global_n < OUTPUT_SIZE) {
+            float bval = type_convert<float>(
+                d_bias[expert_id * OUTPUT_STRIDE + global_n]);
             d_output[global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-                     topk_slot * OUTPUT_STRIDE +
-                     global_n] =
-                type_convert<bf16>(c_buf[i]);
+                     topk_slot * OUTPUT_STRIDE + global_n] =
+                type_convert<bf16>(c_buf[i] + bval);
           }
         }
       }
@@ -241,13 +250,13 @@ template <typename T,
           int NUM_TOPK,
           int TILES_PER_EXPERT,
           int N_TILES>
-__device__ __noinline__ void
-    gang_moe_w2_linear_kernel(void const *input_ptr,
-                               void const *weight_ptr,
-                               void const *routing_ptr,
-                               void const *mask_ptr,
-                               void *output_ptr,
-                               int tile_idx) {
+__device__ __noinline__ void gang_moe_w2_linear_kernel(void const *input_ptr,
+                                                       void const *weight_ptr,
+                                                       void const *routing_ptr,
+                                                       void const *mask_ptr,
+                                                       void const *bias_ptr,
+                                                       void *output_ptr,
+                                                       int tile_idx) {
   using namespace ck_tile;
 
   // W2 uses KPerBlock=128 since K (e.g. 1408) may not divide 256
@@ -266,14 +275,17 @@ __device__ __noinline__ void
   using WarpTile = sequence<MPerBlock, NPerBlock / NWarp, KPerBlock>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
 
-  using GemmTraits = TileGemmUniversalTraits<
-      true, false, true, false,
-      tensor_layout::gemm::RowMajor,
-      tensor_layout::gemm::ColumnMajor,
-      tensor_layout::gemm::RowMajor>;
+  using GemmTraits = TileGemmUniversalTraits<true,
+                                             false,
+                                             true,
+                                             false,
+                                             tensor_layout::gemm::RowMajor,
+                                             tensor_layout::gemm::ColumnMajor,
+                                             tensor_layout::gemm::RowMajor>;
 
   using Problem = GemmPipelineProblem<bf16, bf16, float, GemmShape, GemmTraits>;
-  using PipelinePolicy = GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
+  using PipelinePolicy =
+      GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
   using Pipeline = GemmPipelineAGmemBGmemCRegV2<Problem, PipelinePolicy>;
 
   int xcd_id = _gang_moe_get_xcd_id();
@@ -281,47 +293,51 @@ __device__ __noinline__ void
   int const *__restrict__ d_mask = static_cast<int const *>(mask_ptr);
   int const num_activated_experts = d_mask[NUM_EXPERTS];
 
-  // Decode flat tile_idx
-  // For W2, tile space = N_TILES * BATCH_SIZE (one N-tile per token)
-  // tile_within_expert encodes (token_idx, n_tile)
-  int expert_local_idx = tile_idx / TILES_PER_EXPERT;
-  int tile_within_expert = tile_idx % TILES_PER_EXPERT;
-
-  int ae_idx = xcd_id + expert_local_idx * 8;
-  if (ae_idx >= num_activated_experts) return;
-
-  int expert_id = d_mask[ae_idx];
+  // Flat global tile distribution across all 8 XCDs
+  int global_tile = tile_idx * 8 + xcd_id;
+  int total_tiles = num_activated_experts * TILES_PER_EXPERT;
+  if (global_tile >= total_tiles) {
+    return;
+  }
+  int expert_idx = global_tile / TILES_PER_EXPERT;
+  int tile_within_expert = global_tile % TILES_PER_EXPERT;
+  int expert_id = d_mask[expert_idx];
 
   // For W2: tiles_per_expert = N_TILES * BATCH_SIZE
   // Decode: token_idx and n_tile
   int w2_tok = tile_within_expert / N_TILES;
   int n_tile = tile_within_expert % N_TILES;
-  if (w2_tok >= BATCH_SIZE) return;
+  if (w2_tok >= BATCH_SIZE) {
+    return;
+  }
 
   bf16 const *__restrict__ d_input = static_cast<bf16 const *>(input_ptr);
   bf16 const *__restrict__ d_weight = static_cast<bf16 const *>(weight_ptr);
   bf16 *__restrict__ d_output = static_cast<bf16 *>(output_ptr);
   int const *__restrict__ d_routing = static_cast<int const *>(routing_ptr);
+  bf16 const *__restrict__ d_bias = static_cast<bf16 const *>(bias_ptr);
 
   // Routing indices for this expert
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
   // Check routing — skip if this token doesn't use this expert
   int const route_val = expert_routing[w2_tok];
-  if (route_val == 0) return;
+  if (route_val == 0) {
+    return;
+  }
   int const topk_slot = route_val - 1;
 
   // Input A: input[w2_tok, topk_slot, :] — one token at a time
-  bf16 const *a_base = d_input +
-      static_cast<size_t>(w2_tok) * (NUM_TOPK * REDUCTION_SIZE) +
+  bf16 const *a_base =
+      d_input + static_cast<size_t>(w2_tok) * (NUM_TOPK * REDUCTION_SIZE) +
       static_cast<size_t>(topk_slot) * REDUCTION_SIZE;
 
   // Weight B: expert's weight slice, offset to N-tile
-  bf16 const *expert_weight = d_weight +
-      static_cast<int64_t>(expert_id) * OUTPUT_STRIDE * REDUCTION_SIZE;
+  bf16 const *expert_weight = d_weight + static_cast<int64_t>(expert_id) *
+                                             OUTPUT_STRIDE * REDUCTION_SIZE;
   index_t n_offset = n_tile * NPerBlock;
-  bf16 const *b_base = expert_weight +
-      static_cast<size_t>(n_offset) * REDUCTION_SIZE;
+  bf16 const *b_base =
+      expert_weight + static_cast<size_t>(n_offset) * REDUCTION_SIZE;
 
   index_t n_size = (n_offset + NPerBlock <= OUTPUT_SIZE)
                        ? NPerBlock
@@ -338,32 +354,31 @@ __device__ __noinline__ void
       number<1>{});
 
 #ifdef MPK_NT_WEIGHT_LOADS
-  auto b_tensor_view = make_naive_tensor_view<
-      address_space_enum::global,
-      memory_operation_enum::set,
-      static_cast<amd_buffer_coherence_enum>(18)>(
+  auto b_tensor_view =
+      make_naive_tensor_view<address_space_enum::global,
+                             memory_operation_enum::set,
+                             static_cast<amd_buffer_coherence_enum>(18)>(
 #else
   auto b_tensor_view = make_naive_tensor_view<address_space_enum::global>(
 #endif
-      b_base,
-      make_tuple(n_size, index_t(REDUCTION_SIZE)),
-      make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
-      number<8>{},
-      number<1>{});
+          b_base,
+          make_tuple(n_size, index_t(REDUCTION_SIZE)),
+          make_tuple(index_t(REDUCTION_SIZE), index_t(1)),
+          number<8>{},
+          number<1>{});
 
-  auto a_tile_window = make_tile_window(
-      a_tensor_view,
-      make_tuple(number<MPerBlock>{}, number<KPerBlock>{}),
-      {0, 0});
+  auto a_tile_window =
+      make_tile_window(a_tensor_view,
+                       make_tuple(number<MPerBlock>{}, number<KPerBlock>{}),
+                       {0, 0});
 
-  auto b_tile_window = make_tile_window(
-      b_tensor_view,
-      make_tuple(number<NPerBlock>{}, number<KPerBlock>{}),
-      {0, 0});
+  auto b_tile_window =
+      make_tile_window(b_tensor_view,
+                       make_tuple(number<NPerBlock>{}, number<KPerBlock>{}),
+                       {0, 0});
 
   Pipeline pipeline;
-  auto c_block_tile = pipeline(a_tile_window, b_tile_window,
-                               NumLoopK, smem);
+  auto c_block_tile = pipeline(a_tile_window, b_tile_window, NumLoopK, smem);
   block_sync_lds();
 
   // ---- Epilogue: write result for this token ----
@@ -378,27 +393,31 @@ __device__ __noinline__ void
   // Only row 0 has valid data (M=1 GEMM)
   if (tile_row == 0) {
     if (global_n_base + 3 < OUTPUT_SIZE) {
-      bf16 *out_addr = d_output +
-          static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
-          static_cast<size_t>(topk_slot) * OUTPUT_STRIDE +
-          global_n_base;
+      bf16 *out_addr =
+          d_output + static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
+          static_cast<size_t>(topk_slot) * OUTPUT_STRIDE + global_n_base;
+      bf16 const *bias_addr =
+          d_bias + expert_id * OUTPUT_STRIDE + global_n_base;
 
+      uint64_t bias_packed = *reinterpret_cast<uint64_t const *>(bias_addr);
+      bf16 const *bv = reinterpret_cast<bf16 const *>(&bias_packed);
       uint64_t out_packed;
       bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
-      out[0] = type_convert<bf16>(c_buf[0]);
-      out[1] = type_convert<bf16>(c_buf[1]);
-      out[2] = type_convert<bf16>(c_buf[2]);
-      out[3] = type_convert<bf16>(c_buf[3]);
+      out[0] = type_convert<bf16>(c_buf[0] + type_convert<float>(bv[0]));
+      out[1] = type_convert<bf16>(c_buf[1] + type_convert<float>(bv[1]));
+      out[2] = type_convert<bf16>(c_buf[2] + type_convert<float>(bv[2]));
+      out[3] = type_convert<bf16>(c_buf[3] + type_convert<float>(bv[3]));
       *reinterpret_cast<uint64_t *>(out_addr) = out_packed;
     } else {
-      #pragma unroll
+#pragma unroll
       for (index_t i = 0; i < 4; i++) {
         index_t global_n = global_n_base + i;
         if (global_n < OUTPUT_SIZE) {
+          float bval =
+              type_convert<float>(d_bias[expert_id * OUTPUT_STRIDE + global_n]);
           d_output[static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
-                   static_cast<size_t>(topk_slot) * OUTPUT_STRIDE +
-                   global_n] =
-              type_convert<bf16>(c_buf[i]);
+                   static_cast<size_t>(topk_slot) * OUTPUT_STRIDE + global_n] =
+              type_convert<bf16>(c_buf[i] + bval);
         }
       }
     }

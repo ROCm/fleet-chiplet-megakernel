@@ -23,7 +23,8 @@
 #include "mirage/hip_platform.h"
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
-// rocblas_helper provides cutlass::Array, cutlass::half_t, cutlass::fast_exp_op, etc.
+// rocblas_helper provides cutlass::Array, cutlass::half_t,
+// cutlass::fast_exp_op, etc.
 #include "mirage/utils/rocblas_helper.h"
 #endif
 
@@ -54,7 +55,7 @@ namespace mirage {
   do {                                                                         \
     std::stringstream _error;                                                  \
     if (status != 0) {                                                         \
-      _error << "HIP failure: " << status;                                    \
+      _error << "HIP failure: " << status;                                     \
       FatalError(_error.str());                                                \
     }                                                                          \
   } while (0)
@@ -179,8 +180,7 @@ ActivationType get_matmul_activation_type(TBOperatorType const *operator_types,
   return ACT_NONE;
 }
 
-CUTLASS_HOST_DEVICE inline
-int get_reduction_dim(TBOperatorType type) {
+CUTLASS_HOST_DEVICE inline int get_reduction_dim(TBOperatorType type) {
   if (type >= TB_REDUCTION_0_TO_DIMX_OP && type <= TB_REDUCTION_2_TO_DIMX_OP) {
     return type - TB_REDUCTION_0_TO_DIMX_OP;
   } else if (type >= TB_REDUCTION_0_OP && type <= TB_REDUCTION_2_OP) {

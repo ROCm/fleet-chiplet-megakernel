@@ -15,19 +15,20 @@
 
 #pragma once
 
-#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) || defined(MIRAGE_BACKEND_USE_HIP)
+#if defined(MIRAGE_BACKEND_USE_CUDA) || defined(MIRAGE_BACKEND_USE_ROCM) ||    \
+    defined(MIRAGE_BACKEND_USE_HIP)
 
 namespace mirage {
 namespace threadblock {
 
-CUTLASS_HOST_DEVICE inline
-void deserialize_reduction_op_parameters(int const *params,
-                                         int &param_idx,
-                                         int &output_num_elements,
-                                         int &reduction_degree,
-                                         int &inner_range,
-                                         int &input_smem_offset,
-                                         int &output_smem_offset) {
+CUTLASS_HOST_DEVICE inline void
+    deserialize_reduction_op_parameters(int const *params,
+                                        int &param_idx,
+                                        int &output_num_elements,
+                                        int &reduction_degree,
+                                        int &inner_range,
+                                        int &input_smem_offset,
+                                        int &output_smem_offset) {
   output_num_elements = params[param_idx++];
   reduction_degree = params[param_idx++];
   inner_range = params[param_idx++];
