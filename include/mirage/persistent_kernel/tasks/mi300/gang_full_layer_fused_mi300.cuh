@@ -168,18 +168,18 @@ __device__ __noinline__ void
   // use.
   int routing_expected = ld_nt_s32(routing_ready) + 1;
   int attn_release_expected = ld_nt_s32(&attn_release[xcd_id * 16]) + 1;
+  // Snapshot the QKV epoch BEFORE any worker can bump it, so attention workers
+  // that do not participate in the QKV GEMM still know which epoch to wait for.
+  int qkv_epoch_expected =
+      __atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) + 1;
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 1: QKV GEMM
   // ══════════════════════════════════════════════════════════════════
   if (xcd_rank < total_qkv_tiles_per_xcd) {
-    // Snapshot qkv_expected BEFORE QKV GEMM (which may atomicAdd to epoch).
-    // Only tid==0 uses it, but read is cheap and avoids shared-var broadcast.
-    int qkv_expected;
-    if (tid == 0) {
-      qkv_expected =
-          __atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) + 1;
-    }
+    // qkv_epoch_expected was snapshotted above, before any worker could bump
+    // the epoch, so it is valid here too.
+    int const qkv_expected = qkv_epoch_expected;
 
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
@@ -245,11 +245,35 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _fused_t0b = __builtin_amdgcn_s_memrealtime();
 #endif
+  } // end Phase 1/2: QKV GEMM + QKV barrier
 
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 3: Parallel attention chunks
-    // Workers 0..(NUM_KV_CHUNKS-1) each run one chunk
-    // ══════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════
+  // Phase 3: Parallel attention chunks
+  // Workers 0..(NUM_KV_CHUNKS-1) each run one chunk.
+  //
+  // NOTE: this block is deliberately NOT nested inside the Phase 1 QKV guard.
+  // It used to be, which capped the usable chunk count at
+  // total_qkv_tiles_per_xcd (10 for GPT-OSS 120B): with NUM_KV_CHUNKS > 10 only
+  // 10 workers ever reached the chunk barrier, the
+  // `(s_chunk_prev % NUM_KV_CHUNKS) == NUM_KV_CHUNKS-1` merge condition never
+  // fired, and the megakernel deadlocked. Attention chunks are now served by
+  // any of the workers_per_xcd (30) workers on this XCD.
+  //
+  // Non-QKV workers (xcd_rank >= total_qkv_tiles_per_xcd) skipped the Phase 2
+  // epoch wait above, so they must wait for QKV to land before reading K/V.
+  if (xcd_rank >= total_qkv_tiles_per_xcd && xcd_rank < NUM_KV_CHUNKS) {
+    if (tid == 0) {
+      while (__atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) <
+             qkv_epoch_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    __syncthreads();
+    asm volatile("buffer_inv" ::: "memory");
+  }
+
+  {
     if (xcd_rank < NUM_KV_CHUNKS) {
       int kv_chunk_idx = xcd_rank;
       using bf16_t = __hip_bfloat16;

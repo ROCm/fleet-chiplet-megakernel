@@ -984,18 +984,40 @@ if __name__ == "__main__":
         # required code paths exist in paged_attention_decode_minimal_hd64_mi300.cuh
         # (chunk-aware partition) and merge_splitkv.cuh (with optional sinks).
         #
-        # Runtime selector based on max-seq-length (measured 2026-05-03 on MI350):
-        #   seq <= 1024  -> chunks=8   (mean 3.404→3.470 ms)
-        #   seq >= 2048  -> chunks=16  (mean 3.529→3.766 ms; chunks=8 is 4-13% slower)
-        # Override with CK_FMHA_NUM_KV_CHUNKS env var.
+        # Chunks are claimed by xcd_rank inside the fused full-layer gang task
+        # (gang_full_layer_fused_mi300.cuh: `if (xcd_rank < NUM_KV_CHUNKS)`), so
+        # NUM_KV_CHUNKS must never exceed the workers available on one XCD --
+        # otherwise the chunk barrier never reaches NUM_KV_CHUNKS-1, the merge
+        # never fires, and the megakernel deadlocks.
+        #
+        # Attention time per chunk is proportional to seqlen/NUM_KV_CHUNKS, so
+        # scale chunks with sequence length to keep decode latency flat. The
+        # decode kernel already stamps LSE=-inf for chunks that get no KV tiles,
+        # so over-provisioning chunks at short seqlen is safe (just wasteful).
+        #
+        # KV_TILE=64 in paged_attention_decode_minimal_hd64_mi300.cuh; aim for
+        # >=2 tiles per chunk so a chunk is worth its merge overhead.
+        _nw, _ = mi.get_configurations_from_gpu(rank)
+        MAX_KV_CHUNKS = _nw // 8  # workers per XCD (240/8 = 30 on MI350)
         _env_chunks = os.environ.get("CK_FMHA_NUM_KV_CHUNKS")
         if _env_chunks is not None:
             ck_fmha_num_kv_chunks = int(_env_chunks)
         else:
-            ck_fmha_num_kv_chunks = 8 if args.max_seq_length <= 1024 else 16
+            _kv_tiles = max(1, (args.max_seq_length + 63) // 64)
+            ck_fmha_num_kv_chunks = max(8, min(MAX_KV_CHUNKS, _kv_tiles // 2))
         assert ck_fmha_num_kv_chunks >= 1
         use_split_attn_chunks = (ck_fmha_num_kv_chunks > 1)
         fuse_full_layer = os.environ.get("FUSE_FULL_LAYER", "1") == "1"
+        if fuse_full_layer and ck_fmha_num_kv_chunks > MAX_KV_CHUNKS:
+            raise ValueError(
+                f"CK_FMHA_NUM_KV_CHUNKS={ck_fmha_num_kv_chunks} exceeds the "
+                f"{MAX_KV_CHUNKS} workers per XCD available to claim chunks in "
+                f"the fused full-layer gang task; the split-KV merge would "
+                f"never fire and the kernel would hang."
+            )
+        print(f"[CFG] max_seq_length={args.max_seq_length} "
+              f"ck_fmha_num_kv_chunks={ck_fmha_num_kv_chunks} "
+              f"(max {MAX_KV_CHUNKS})")
         fuse_tail = os.environ.get("FUSE_TAIL", "0") == "1"
 
         if args.profiling:
