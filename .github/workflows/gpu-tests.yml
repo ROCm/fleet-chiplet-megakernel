@@ -1,8 +1,9 @@
 name: "GPU Tests"
+# NOTE: manual-trigger only. Same CUDA-only problem as build-test.yml -- it
+# provisions an NVIDIA runner and builds with nvcc, which the HIP-only
+# CMakeLists.txt cannot satisfy. Restore the push trigger once a ROCm runner is
+# available.
 on:
-  push:
-    branches:
-      - "main"
   workflow_dispatch:
 
 concurrency:

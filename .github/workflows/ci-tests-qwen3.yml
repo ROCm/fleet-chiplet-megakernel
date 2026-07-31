@@ -1,7 +1,10 @@
 name: mpk-qwen-ci
+# NOTE: manual-trigger only. This job needs a self-hosted NVIDIA A100 runner
+# and a hardcoded HF_HOME (/home/haojia/hf_cache) inherited from the upstream
+# Mirage project; neither is available here, so it sits queued forever on every
+# PR. Restore the push/pull_request triggers once an equivalent AMD runner is
+# wired up and HF_HOME points somewhere valid.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 concurrency:

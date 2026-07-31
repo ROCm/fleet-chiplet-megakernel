@@ -1,10 +1,12 @@
 name: "Build Test"
 
+# NOTE: manual-trigger only. This job builds with CUDA on a stock ubuntu-22.04
+# runner, but CMakeLists.txt is HIP-only (it hard-fails when USE_CUDA is set)
+# and config.cmake sets USE_ROCM=ON, which needs /opt/rocm -- not present on
+# GitHub-hosted runners. It therefore cannot pass as written. Restore the
+# pull_request/push triggers once a ROCm runner is available or the CUDA
+# backend is supported again.
 on:
-  pull_request:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 concurrency:
