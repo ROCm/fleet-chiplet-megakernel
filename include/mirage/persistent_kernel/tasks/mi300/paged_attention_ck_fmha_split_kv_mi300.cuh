@@ -19,6 +19,7 @@
 // NOTE: include order matters. tile_fmha_traits.hpp pulls in
 // block_attention_quant_scale_enum.hpp, which the splitkv pipeline headers
 // below require but do not include themselves. Do not alphabetize this block.
+// clang-format off
 #include "ck_tile/core.hpp"
 #include "ck_tile/ops/fmha/pipeline/tile_fmha_shape.hpp"
 #include "ck_tile/ops/fmha/pipeline/tile_fmha_traits.hpp"
@@ -29,6 +30,7 @@
 #include "ck_tile/ops/fmha/block/page_block_navigator.hpp"
 #include "ck_tile/ops/fmha/block/variants.hpp"
 #include "ck_tile/ops/epilogue/default_2d_epilogue.hpp"
+// clang-format on
 
 #ifndef CK_TILE_FMHA_FWD_FAST_EXP2
 #define CK_TILE_FMHA_FWD_FAST_EXP2 1

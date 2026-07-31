@@ -20,6 +20,7 @@
 // directly (e.g. attention_sink_mi300.cuh needs bf16/__hip_bfloat16,
 // kv_cache_update_mi300.cuh needs vec_load_8/vec_store_8). Do not alphabetize.
 
+// clang-format off
 // Generic tasks reused from ampere/ (platform-independent)
 #include "tasks/ampere/embedding.cuh"
 #include "tasks/ampere/identity.cuh"
@@ -68,4 +69,6 @@
 #include "tasks/mi300/moe_residual_add_f32_mi300.cuh"
 #include "tasks/mi300/swigluoai_mi300.cuh"
 #include "tasks/mi300/bias_add_mi300.cuh"
-// Merge kernel moved above gang_full_layer_fused_mi300.cuh (needs it at template definition time)
+// clang-format on
+// Merge kernel moved above gang_full_layer_fused_mi300.cuh (needs it at
+// template definition time)
