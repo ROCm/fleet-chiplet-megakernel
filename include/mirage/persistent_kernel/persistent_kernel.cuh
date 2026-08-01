@@ -3438,6 +3438,40 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                (int)td.task_type);
       }
 
+      // Validate the tables before upload. The layer loop dereferences every
+      // slot it reloads, so a null here is a nil-address GPU fault with no
+      // usable backtrace -- catching it on the host names the exact slot.
+      {
+        int null_in = 0, null_out = 0;
+        for (int L = 0; L < ml_layers; L++) {
+          for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
+            int base = (xcd * ml_layers + L) * ML_N_IN;
+            for (int i = 0; i < ML_N_IN; i++) {
+              if (h_input_table[base + i] == nullptr) {
+                if (null_in < 8) {
+                  printf("[MPK] ML_NULL_IN layer=%d xcd=%d idx=%d\n", L, xcd, i);
+                }
+                null_in++;
+              }
+            }
+            int obase = (xcd * ml_layers + L) * ML_N_OUT;
+            for (int i = 0; i < ML_N_OUT; i++) {
+              if (h_output_table[obase + i] == nullptr) {
+                if (null_out < 8) {
+                  printf(
+                      "[MPK] ML_NULL_OUT layer=%d xcd=%d idx=%d\n", L, xcd, i);
+                }
+                null_out++;
+              }
+            }
+          }
+        }
+        printf("[MPK] ML table validation: %d null inputs, %d null outputs\n",
+               null_in,
+               null_out);
+        fflush(stdout);
+      }
+
       // === Compact task graph: remove layers 1..35 tasks and inter-layer
       // events === Collect tasks and events to remove
       std::set<size_t> tasks_to_remove; // positions in all_tasks
