@@ -377,6 +377,11 @@ def get_compile_command(
         if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
             flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
+        if int(os.environ.get("MPK_NIL_TRIPWIRE", "0")) == 1:
+            # Breadcrumbs in pinned host memory + SIGABRT dump, to attribute
+            # the nil-address memory fault. Off by default: the per-layer
+            # writes cost a little and only matter while chasing that bug.
+            flags = flags + ["-DMPK_NIL_TRIPWIRE"]
         if int(os.environ.get("TRACE_MOE", "0")) == 1:
             flags = flags + ["-DMPK_TRACE_MOE_DISPATCH"]
         if int(os.environ.get("EMBED_DEBUG", "0")) == 1:
