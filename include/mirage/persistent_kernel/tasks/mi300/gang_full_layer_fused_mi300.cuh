@@ -164,12 +164,52 @@ __device__ __noinline__ void
 
   // All threads independently compute expected values (ld_nt is uniform).
   // Eliminates shared variables and __syncthreads broadcast.
-  // attn_expected and qkv_expected are only used by tid==0, computed inline at
-  // use.
+  //
+  // These snapshots are "current value + 1". That is only correct if this
+  // worker is guaranteed to read *before* this layer's producer bumps the
+  // counter. All 36 layers run inside a single task (see the ml loop in
+  // persistent_kernel.cuh) with only a per-block __syncthreads between them,
+  // so workers skew freely -- bounded only by barriers they mutually arrive
+  // at. The ordering therefore comes from the Phase 2 barrier below, which
+  // every worker on this XCD arrives at before either producer can run:
+  //
+  //   attn_release[x] is written by the last XCD to reach the attn_global
+  //   barrier, and routing_ready[1+x] by the worker that completes TopK
+  //   (gated on total_topk_tiles across all 8 XCDs). Both are downstream of
+  //   every XCD's Phase 2 barrier, so both happen after this worker arrives
+  //   there, hence after these loads.
+  //
+  // This is why Phase 2 must be joined by *all* workers_per_xcd and not just
+  // the QKV/attention workers. Narrowing it lets a worker that arrives
+  // nowhere before Phase 7b fall a full layer behind, read an already-bumped
+  // counter, and then wait for a bump this layer never produces -- while the
+  // layer that would produce it waits on that worker's MoE tiles. That is a
+  // real deadlock, and it was an intermittent one because it needs a
+  // full-layer skew to occur.
   int routing_expected = ld_nt_s32(routing_ready) + 1;
   int attn_release_expected = ld_nt_s32(&attn_release[xcd_id * 16]) + 1;
-  // Snapshot the QKV epoch BEFORE any worker can bump it, so attention workers
-  // that do not participate in the QKV GEMM still know which epoch to wait for.
+
+  // Every worker on this XCD takes part in the QKV epoch barrier. The
+  // dispatcher gives this task exactly workers_per_xcd tiles per XCD (see
+  // gang_task_tiles_per_xcd = params[28] in graph.cc), one per worker, so
+  // ranks 0..workers_per_xcd-1 each arrive exactly once. Workers with no QKV
+  // tile of their own arrive immediately and add no latency -- the barrier
+  // still clears when the slowest QKV worker arrives.
+  int const qkv_epoch_participants = workers_per_xcd;
+
+  // Snapshot the QKV epoch before arriving at the barrier.
+  //
+  // This read is safe because the epoch bump is gated on *every* participant
+  // having arrived (see the modular test below), and every participant
+  // snapshots before it arrives. So no bump for this layer can land between
+  // this load and this worker's arrival, and E+1 is always the epoch this
+  // layer will reach.
+  //
+  // Do not narrow the participant set: a worker that waits on the epoch but
+  // never arrives has no such ordering, can read an already-bumped value, and
+  // will then wait for an epoch that this layer never reaches. Narrowing it
+  // also breaks the ordering the routing_ready/attn_release snapshots above
+  // depend on.
   int qkv_epoch_expected =
       __atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) + 1;
 
@@ -177,10 +217,6 @@ __device__ __noinline__ void
   // Phase 1: QKV GEMM
   // ══════════════════════════════════════════════════════════════════
   if (xcd_rank < total_qkv_tiles_per_xcd) {
-    // qkv_epoch_expected was snapshotted above, before any worker could bump
-    // the epoch, so it is valid here too.
-    int const qkv_expected = qkv_epoch_expected;
-
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -213,10 +249,31 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
 #endif
+  } // end Phase 1: QKV GEMM
 
-    // ══════════════════════════════════════════════════════════════════
-    // Phase 2: QKV barrier — epoch-based, all QKV workers wait
-    // ══════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════
+  // Phase 2: QKV barrier — epoch-based
+  //
+  // Arrived at by every worker on this XCD: the QKV GEMM workers, the
+  // attention-chunk workers, and the MoE-only workers beyond both. Workers
+  // with no QKV tile arrive immediately and then wait here for the GEMM to
+  // land before reading K/V in Phase 3.
+  //
+  // This is the single point in the layer that every worker on the XCD passes
+  // through, which is what makes it the layer's skew bound. Two things depend
+  // on that:
+  //
+  //   1. Every waiter must also arrive, or its epoch snapshot is unordered
+  //      against the bump and it can wait forever (see qkv_epoch_expected).
+  //   2. It pins every worker to this layer before any of them can reach the
+  //      attn_release / routing_ready producers, which is what makes those
+  //      two "+1" snapshots well-defined (see the note above them).
+  //
+  // The arrival count is qkv_epoch_participants (= workers_per_xcd), not
+  // total_qkv_tiles_per_xcd -- the modular test only fires when the arrival
+  // count matches the number of workers that actually arrive.
+  // ══════════════════════════════════════════════════════════════════
+  if (xcd_rank < qkv_epoch_participants) {
     __shared__ int s_prev;
     if (tid == 0) {
       s_prev = atom_add_release_gpu_s32(
@@ -224,28 +281,28 @@ __device__ __noinline__ void
     }
     __syncthreads();
 
-    if ((s_prev % total_qkv_tiles_per_xcd) == total_qkv_tiles_per_xcd - 1) {
-      // Last QKV worker: bump epoch (no reset needed — modular check)
+    if ((s_prev % qkv_epoch_participants) == qkv_epoch_participants - 1) {
+      // Last worker to arrive: bump epoch (no reset needed — modular check)
       if (tid == 0) {
         atom_add_release_gpu_s32(&qkv_epoch[xcd_id * 16], 1);
       }
     }
 
-    // All QKV workers poll epoch (L2 coherent, per-XCD only)
+    // All participants poll epoch (L2 coherent, per-XCD only)
     if (tid == 0) {
       while (__atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) <
-             qkv_expected) {
+             qkv_epoch_expected) {
         __builtin_amdgcn_s_sleep(1);
       }
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
     __syncthreads();
     asm volatile("buffer_inv" ::: "memory");
+  }
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
-    _fused_t0b = __builtin_amdgcn_s_memrealtime();
+  _fused_t0b = __builtin_amdgcn_s_memrealtime();
 #endif
-  } // end Phase 1/2: QKV GEMM + QKV barrier
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 3: Parallel attention chunks
@@ -258,21 +315,6 @@ __device__ __noinline__ void
   // `(s_chunk_prev % NUM_KV_CHUNKS) == NUM_KV_CHUNKS-1` merge condition never
   // fired, and the megakernel deadlocked. Attention chunks are now served by
   // any of the workers_per_xcd (30) workers on this XCD.
-  //
-  // Non-QKV workers (xcd_rank >= total_qkv_tiles_per_xcd) skipped the Phase 2
-  // epoch wait above, so they must wait for QKV to land before reading K/V.
-  if (xcd_rank >= total_qkv_tiles_per_xcd && xcd_rank < NUM_KV_CHUNKS) {
-    if (tid == 0) {
-      while (__atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) <
-             qkv_epoch_expected) {
-        __builtin_amdgcn_s_sleep(1);
-      }
-      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    }
-    __syncthreads();
-    asm volatile("buffer_inv" ::: "memory");
-  }
-
   {
     if (xcd_rank < NUM_KV_CHUNKS) {
       int kv_chunk_idx = xcd_rank;
