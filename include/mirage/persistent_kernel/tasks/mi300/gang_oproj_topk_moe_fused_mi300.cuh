@@ -117,6 +117,25 @@ __device__ __attribute__((always_inline)) void
   __syncthreads();
   int expected = s_routing_expected;
 
+  // Publish the layer counter for the MoE W13->W2 barrier, which reads it from
+  // this fixed LDS offset and releases with layer_idx + 1. Its d_barrier is
+  // monotonic and never reset, so this must advance once per layer for the
+  // whole run or the barrier stops gating after the first layer.
+  //
+  // The routing epoch is that counter: bumped exactly once per layer by the
+  // TopK completer, never reset, and identical for every worker here because
+  // it is read before Phase 1 signals it.
+  {
+    constexpr int LAYER_IDX_SMEM_OFF =
+        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
+    extern __shared__ char _oproj_moe_smem[];
+    if (tid == 0) {
+      *reinterpret_cast<int *>(&_oproj_moe_smem[LAYER_IDX_SMEM_OFF]) = expected;
+    }
+  }
+  __syncthreads();
+
   // ── Phase 1: O-PROJ + RMSNorm + Router + TopK ──
   // Need max(oproj_tiles_per_xcd, router_tile_n) workers: O-proj may need
   // fewer tiles than TopK experts when OUTPUT_PER_WG is large.

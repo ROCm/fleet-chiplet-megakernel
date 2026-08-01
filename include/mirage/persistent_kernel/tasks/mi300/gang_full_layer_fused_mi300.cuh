@@ -121,17 +121,9 @@ __device__ __noinline__ void
   // previous iteration) can persist in vL1 across gang task boundaries.
   asm volatile("buffer_inv" ::: "memory");
 
-  {
-    constexpr int LAYER_IDX_SMEM_OFF =
-        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
-        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
-    extern __shared__ char _layer_smem_init[];
-    if (tid == 0) {
-      int *p = reinterpret_cast<int *>(&_layer_smem_init[LAYER_IDX_SMEM_OFF]);
-      *p = 0;
-    }
-  }
-  __syncthreads();
+  // NOTE: the layer counter that the MoE W13->W2 barrier derives its release
+  // value from is published further down, once qkv_epoch_expected is known.
+  // See the LAYER_IDX_SMEM_OFF store just before Phase 1.
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t0 = __builtin_amdgcn_s_memrealtime();
@@ -212,6 +204,38 @@ __device__ __noinline__ void
   // depend on.
   int qkv_epoch_expected =
       __atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) + 1;
+
+  // Publish the layer counter the MoE W13->W2 barrier keys off.
+  //
+  // That barrier derives its release value as layer_idx + 1
+  // (gang_moe_fused_mxfp4_mi300.cuh), and its d_barrier is monotonic -- never
+  // reset. So layer_idx must be monotonic across the whole run, not per-layer.
+  // This slot used to be stored as 0 on every entry, which made release_val
+  // permanently 1: after the very first layer wrote 1, the barrier was already
+  // satisfied for every later layer, so W2 workers stopped waiting for their
+  // own layer's W13 and could read swiglu_out before it was written. The tile
+  // ordering (all W13 tiles precede all W2 tiles, padded so every worker
+  // starts on W13) usually hid it, but nothing enforced it.
+  //
+  // qkv_epoch_expected is exactly the counter needed: the QKV epoch is bumped
+  // once per layer, never reset, and counts (iterations * num_layers + layer).
+  // Every worker on this XCD computes the same value -- that is guaranteed by
+  // the Phase 2 barrier below, which is also what makes the snapshot valid.
+  // Producer and consumer of the MoE barrier can sit on different XCDs, but
+  // all XCDs stay on the same layer: the attn_global and TopK barriers are
+  // cross-XCD, so no XCD can start layer L+1 until every XCD finished layer L,
+  // and per-XCD epochs therefore advance in lockstep.
+  {
+    constexpr int LAYER_IDX_SMEM_OFF =
+        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END;
+    extern __shared__ char _layer_smem_init[];
+    if (tid == 0) {
+      *reinterpret_cast<int *>(&_layer_smem_init[LAYER_IDX_SMEM_OFF]) =
+          qkv_epoch_expected;
+    }
+  }
+  __syncthreads();
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 1: QKV GEMM

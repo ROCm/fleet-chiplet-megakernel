@@ -2207,6 +2207,24 @@ if __name__ == "__main__":
         ):
             _fwd_times[int(_m.group(1))] = float(_m.group(2))
 
+        # The device-side per-iter ring holds FWDPASS_LOG_MAX (8192) samples.
+        # Longer runs drop the tail, and since per-iter latency grows with
+        # sequence length, averaging only what survived understates the real
+        # number. [FWD_PASS_TOTAL] is accumulated over every iteration, so
+        # prefer it whenever samples were dropped.
+        _fwd_dropped = 0
+        _fwd_total_avg = None
+        _fwd_total_iters = 0
+        _m_tot = re.search(
+            r"\[FWD_PASS_TOTAL\] iters=(\d+) total_ms=[\d.]+ "
+            r"avg_ms=([\d.]+) dropped=(\d+)",
+            _captured,
+        )
+        if _m_tot:
+            _fwd_total_iters = int(_m_tot.group(1))
+            _fwd_total_avg = float(_m_tot.group(2))
+            _fwd_dropped = int(_m_tot.group(3))
+
         #print("tokens.shape = ", tokens.shape, flush=True)
         #print("All tokens:", tokens[0].tolist())
         #print("Step:", step.tolist())
@@ -2307,6 +2325,15 @@ if __name__ == "__main__":
                                and _it - 1 <= total_iterations]
             print(f"  Decode per-iter range: min={min(_decode_samples):.3f}ms "
                   f"max={max(_decode_samples):.3f}ms")
+        if _fwd_dropped > 0:
+            print("-" * 80)
+            print(f"  NOTE: device per-iter ring overflowed — {_fwd_dropped} of "
+                  f"{_fwd_total_iters} samples dropped. The prefill/decode "
+                  f"splits above cover only the first "
+                  f"{_fwd_total_iters - _fwd_dropped} iterations and understate "
+                  f"latency (per-iter grows with seq len).")
+            print(f"  All-iteration device average: {_fwd_total_avg:.3f}ms/iter "
+                  f"over {_fwd_total_iters} iters")
         print("=" * 80)
 
         # === Verification: compare Mirage intermediates with PyTorch reference ===

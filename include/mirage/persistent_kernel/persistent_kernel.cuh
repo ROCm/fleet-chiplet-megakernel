@@ -843,12 +843,25 @@ __device__ __forceinline__ int _span_stage_for_task(int task_type,
 }
 #endif
 
-// Deferred FWD_PASS log: store per-iteration timing, print at termination
+// Deferred FWD_PASS log: store per-iteration timing, print at termination.
+//
+// The ring is bounded, so runs longer than FWDPASS_LOG_MAX iterations cannot
+// keep every sample. They must not silently keep only the *first* window
+// either: per-iter latency grows with sequence length, so truncating to the
+// first 8k iterations biased every reported average downward at long seq len
+// (a 49k run reported the latency of its cheapest 8k iterations). Instead the
+// totals below accumulate over *all* iterations, and g_fwdpass_dropped records
+// how many per-iteration samples did not fit, so a consumer can tell a
+// complete trace from a partial one.
 #define FWDPASS_LOG_MAX 8192
 __device__ int g_fwdpass_count;
 __device__ unsigned long long
     g_fwdpass_time_ns[FWDPASS_LOG_MAX];           // iter duration
 __device__ int g_fwdpass_tokens[FWDPASS_LOG_MAX]; // num_active_tokens
+// Untruncated aggregates: cover every iteration regardless of ring capacity.
+__device__ int g_fwdpass_dropped;
+__device__ unsigned long long g_fwdpass_total_ns;
+__device__ int g_fwdpass_total_iters;
 
 __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                                int assigned_worker_id = -1) {
@@ -2666,10 +2679,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         // Store per-iteration timing (deferred print at termination)
         if (prev_end_of_graph_clk != 0) {
           int idx = end_of_graph_count; // 1-based after first iter
+          unsigned long long dur = iter_end_clk - prev_end_of_graph_clk;
+          // Aggregates first: these must cover every iteration, including the
+          // ones past the end of the ring.
+          g_fwdpass_total_ns += dur;
+          g_fwdpass_total_iters++;
           if (idx < FWDPASS_LOG_MAX) {
-            g_fwdpass_time_ns[idx] = iter_end_clk - prev_end_of_graph_clk;
+            g_fwdpass_time_ns[idx] = dur;
             g_fwdpass_tokens[idx] = num_active_tokens;
             g_fwdpass_count = end_of_graph_count + 1;
+          } else {
+            g_fwdpass_dropped++;
           }
         }
         prev_end_of_graph_clk = iter_end_clk;
@@ -2695,6 +2715,18 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    (double)g_fwdpass_time_ns[i] / 1000000.0,
                    g_fwdpass_tokens[i]);
           }
+          // Untruncated summary. dropped>0 means the per-iter lines above are
+          // only the first FWDPASS_LOG_MAX iterations and must not be averaged
+          // as if they were the whole run -- use total_ms/iters instead.
+          printf("[FWD_PASS_TOTAL] iters=%d total_ms=%.3f avg_ms=%.3f "
+                 "dropped=%d\n",
+                 g_fwdpass_total_iters,
+                 (double)g_fwdpass_total_ns / 1000000.0,
+                 g_fwdpass_total_iters > 0
+                     ? (double)g_fwdpass_total_ns / 1000000.0 /
+                           (double)g_fwdpass_total_iters
+                     : 0.0,
+                 g_fwdpass_dropped);
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,
           // [4]=after_compute, [2]=after_barrier
