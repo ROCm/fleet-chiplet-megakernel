@@ -1069,6 +1069,28 @@ topk_barrier :
 
     if (tid == 0) {
       // Signal routing release for fused wrapper (if present).
+      //
+      // The fence is required, not an optimization. The consumers of this
+      // release are MoE workers on *other* XCDs (see the Phase 7b poll in
+      // gang_full_layer_fused_mi300.cuh), and what they read after it are
+      // active_expert_ids and routing_indices -- written just above by all
+      // 256 threads of this block with ordinary st_wt stores.
+      //
+      // __syncthreads alone only orders those stores within this block; it
+      // says nothing about when they become visible to another XCD's L2. The
+      // release flags below go out via st_wt (write-through, bypassing L2),
+      // so without a GPU-scope fence the flag can land in HBM ahead of the
+      // routing data it advertises. A remote MoE worker then passes the
+      // barrier and reads a stale active_expert_ids -- including a stale
+      // count at [NUM_EXPERTS] -- and derives its expert weight base and
+      // barrier slot from it. That is exactly the wild-address shape of the
+      // nil-address fault.
+      //
+      // The sibling path already documents this contract: see
+      // gang_oproj_topk_moe_fused_mi300.cuh, "TopK worker wrote per-XCD flags
+      // via st_wt after threadfence_gpu". The comment above was written for a
+      // fence that was never actually here.
+      threadfence_gpu();
       if (routing_ready_ptr) {
         int epoch = ld_nt_s32(routing_ready_ptr) + 1;
         st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
