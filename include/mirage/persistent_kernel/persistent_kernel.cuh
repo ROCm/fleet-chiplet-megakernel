@@ -74,6 +74,33 @@ __device__ int g_oproj_inner_iters;      // total iterations accumulated
 __device__ int g_oproj_inner_reset_flag; // CAS flag for per-iter reset
 #endif
 
+#ifdef MPK_NIL_TRIPWIRE
+// Sub-phase breadcrumbs from inside the gang task kernels.
+//
+// The outer loop's breadcrumb only resolves to "somewhere inside
+// _execute_gang_task", which is the whole layer. These let a task kernel name
+// the phase it was in. Declared before task_header.cuh so the task kernels can
+// see them; the pointer is published by the worker loop (every block stores
+// the same value, so the race is benign).
+//
+// A worker block's slot index is blockIdx.x: worker_id defaults to blockIdx.x
+// for every block that runs the worker loop.
+__device__ unsigned long long *g_tw_dev;
+
+__device__ __forceinline__ void
+    mpk_tw_sub(int sub, unsigned long long aux, int tid) {
+  if (tid == 0 && g_tw_dev != nullptr) {
+    unsigned long long *b =
+        g_tw_dev + MPK_TW_HDR + blockIdx.x * MPK_TW_PER_WORKER;
+    b[4] = (unsigned long long)sub;
+    b[5] = aux;
+  }
+}
+#define MPK_TW_SUB(sub, aux) mpk_tw_sub((sub), (unsigned long long)(aux), tid)
+#else
+#define MPK_TW_SUB(sub, aux) ((void)0)
+#endif
+
 #if defined(MIRAGE_GRACE_HOPPER)
 #include "tasks/hopper/task_header.cuh"
 #elif defined(MIRAGE_GRACE_BLACKWELL)
@@ -907,6 +934,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
   int const worker_id =
       (assigned_worker_id >= 0) ? assigned_worker_id : blockIdx.x;
+#ifdef MPK_NIL_TRIPWIRE
+  // Hand the tripwire buffer to the task kernels, which take input/output
+  // pointer arrays rather than the RuntimeConfig and so cannot reach it.
+  // Every block stores the same value, so the write race is benign.
+  // MPK_TW_SUB indexes by blockIdx.x, which equals worker_id here (nothing
+  // passes assigned_worker_id), and MPK_TW_SLOTS covers 256 blocks.
+  if (threadIdx.x == 0) {
+    g_tw_dev = config.tripwire;
+  }
+  __syncthreads();
+#endif
   worker_queues[0] = config.worker_queues[worker_id];
   worker_queue_ids[0] = worker_id;
   int num_worker_queues = 1;
@@ -1867,6 +1905,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 b[0] = (unsigned long long)ml;
                 b[1] = 100; // phase: entering layer execution
                 b[3] = (unsigned long long)task_desc->input_ptrs[0];
+                // Decode iteration: distinguishes "faults on the very first
+                // pass" from "faults after hundreds of clean ones". The host
+                // only sees that it died within a second of launch, which at
+                // ~2.5 ms/iter is anywhere in the first few hundred.
+                b[6] = (unsigned long long)pc_iter;
               }
 #endif
 
@@ -3236,16 +3279,18 @@ static int g_dbg_num_xcds = 0;
 // address space: kernel writes reach host RAM as they happen and survive
 // the abort, and a SIGABRT handler prints them.
 //
-// Layout: 4 header slots, then MPK_TW_PER_WORKER slots per worker.
-//   [0] global write counter (how many breadcrumbs were dropped at all)
-//   [1] last layer index any worker entered
-//   [2] last task type any worker dispatched
-//   [3] reserved
+// Layout: MPK_TW_HDR unused header slots, then MPK_TW_PER_WORKER per worker.
 // Per worker w, base = MPK_TW_HDR + w * MPK_TW_PER_WORKER:
 //   [base+0] last layer this worker entered
-//   [base+1] last phase marker
+//   [base+1] outer phase marker (100 layer entry, 200 gang tile, 300 non-gang)
 //   [base+2] last tile_idx
 //   [base+3] the pointer this worker was about to dereference
+//   [base+4] sub-phase inside the fused layer kernel (see MPK_TW_SUB calls:
+//            1 entry, 10 QKV, 20 QKV barrier, 30 attn, 40 chunk barrier,
+//            50 merge, 60 cross-XCD barrier, 70 O-proj/TopK, 75 TopK wait,
+//            80 MoE, 90 kernel exit)
+//   [base+5] sub-phase aux value (meaning depends on the sub-phase)
+//   [base+6] decode iteration (pc_iter)
 static unsigned long long *g_tw_host = nullptr;
 static int g_tw_num_workers = 0;
 static bool g_tw_handler_installed = false;
@@ -3272,10 +3317,14 @@ static void tripwire_dump(int sig) {
       continue; // worker never wrote a breadcrumb
     }
     fprintf(stderr,
-            "  w%-3d layer=%llu phase=%llu tile=%llu ptr=0x%llx%s\n",
+            "  w%-3d it=%llu layer=%llu phase=%llu sub=%llu aux=%llu "
+            "tile=%llu ptr=0x%llx%s\n",
             w,
+            b[6],
             b[0],
             b[1],
+            b[4],
+            b[5],
             b[2],
             b[3],
             b[3] == 0 ? "   <-- NULL" : "");
@@ -3324,10 +3373,14 @@ static void tripwire_snapshot_loop() {
           continue;
         }
         fprintf(f,
-                "w%-3d layer=%llu phase=%llu tile=%llu ptr=0x%llx%s\n",
+                "w%-3d it=%llu layer=%llu phase=%llu sub=%llu aux=%llu "
+                "tile=%llu ptr=0x%llx%s\n",
                 w,
+                b[6],
                 b[0],
                 b[1],
+                b[4],
+                b[5],
                 b[2],
                 b[3],
                 b[3] == 0 ? "   <-- NULL" : "");
