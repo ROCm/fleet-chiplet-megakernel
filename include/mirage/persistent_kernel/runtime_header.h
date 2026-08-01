@@ -94,6 +94,11 @@ typedef unsigned long long int EventCounter;
 
 int const MAX_INPUTS_PER_TASK = 28;
 int const MAX_OUTPUTS_PER_TASK = 13;
+
+// Nil-address tripwire buffer geometry (see MPK_NIL_TRIPWIRE).
+#define MPK_TW_HDR 4
+#define MPK_TW_PER_WORKER 4
+#define MPK_TW_SLOTS (MPK_TW_HDR + 256 * MPK_TW_PER_WORKER)
 // Increased to 304 to support full CU utilization on AMD MI300X (304 CUs)
 // and NVIDIA Blackwell (160+ SMs which uses 144 workers)
 int const MAX_NUM_WORKERS = 304;
@@ -418,6 +423,10 @@ struct RuntimeConfig {
   unsigned long long *precomp_dbg_tasks_done; // debug: host-mapped task counter
   int *precomp_dbg_worker_state; // debug: [num_workers*4] = {task_pos,
                                  // dep_event, tasks_done, stuck_count}
+  // Nil-address fault tripwire: pinned host memory mapped for device access,
+  // so breadcrumbs survive the abort that a memory fault triggers. Null
+  // unless built with MPK_NIL_TRIPWIRE. See persistent_kernel.cuh.
+  unsigned long long *tripwire;
   // Cross-XCD gang barrier: workers sync before executing gang tasks with
   // internal barriers
   unsigned long long

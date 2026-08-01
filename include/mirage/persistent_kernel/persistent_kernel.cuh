@@ -26,6 +26,7 @@
 #include <nvshmemx.h>
 #endif
 #include <chrono>
+#include <csignal>
 #include <set>
 #include <thread>
 #include <unistd.h>
@@ -1850,11 +1851,37 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 }
                 __syncthreads();
               }
+#ifdef MPK_NIL_TRIPWIRE
+              // Breadcrumb: which layer this worker reached, and whether the
+              // pointer set it is about to hand to the kernel contains a null.
+              // Written to pinned host memory so it survives an abort.
+              // Deliberately only plain stores to this worker's own slots: no
+              // scan over the pointer set (the host-side table validation
+              // already covers nulls there) and no global atomics on the hot
+              // path. An earlier version scanned all 35 pointers per layer and
+              // cost 4.5x -- enough to perturb timing and hide the very race
+              // it was meant to catch, the same way rocgdb does.
+              if (threadIdx.x == 0 && config.tripwire != nullptr) {
+                unsigned long long *b = config.tripwire + MPK_TW_HDR +
+                                        worker_id * MPK_TW_PER_WORKER;
+                b[0] = (unsigned long long)ml;
+                b[1] = 100; // phase: entering layer execution
+                b[3] = (unsigned long long)task_desc->input_ptrs[0];
+              }
+#endif
 
               // Execute this layer
               int my_tiles = 0;
               for (int t = block_xcd_local_rank; t < ml_n_tile_count;
                    t += block_workers_on_xcd) {
+#ifdef MPK_NIL_TRIPWIRE
+                if (threadIdx.x == 0 && config.tripwire != nullptr) {
+                  unsigned long long *b = config.tripwire + MPK_TW_HDR +
+                                          worker_id * MPK_TW_PER_WORKER;
+                  b[2] = (unsigned long long)(ml_n_tile_start + t);
+                  b[1] = 200; // phase: inside gang tile execution
+                }
+#endif
                 _execute_gang_task(task_desc, config, ml_n_tile_start + t);
                 my_tiles++;
               }
@@ -2076,6 +2103,17 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           g_span_first_start[_ss] = __builtin_amdgcn_s_memrealtime();
           __threadfence();
         }
+      }
+#endif
+#ifdef MPK_NIL_TRIPWIRE
+      // Breadcrumb for the non-gang path, so a fault outside the multi-layer
+      // loop is still attributable to a worker and a task type.
+      if (threadIdx.x == 0 && config.tripwire != nullptr) {
+        unsigned long long *b =
+            config.tripwire + MPK_TW_HDR + worker_id * MPK_TW_PER_WORKER;
+        b[1] = 300; // phase: non-gang _execute_task
+        b[2] = (unsigned long long)task_desc->task_type;
+        b[3] = (unsigned long long)task_desc->input_ptrs[0];
       }
 #endif
       _execute_task(task_desc, config);
@@ -3190,6 +3228,128 @@ static int g_dbg_num_events = 0;
 static int g_dbg_num_xcds = 0;
 #endif
 
+#ifdef MPK_NIL_TRIPWIRE
+// ── Tripwire for the nil-address GPU memory fault ────────────────────────
+// The fault aborts the process. Device printf output is lost, and the GPU
+// coredump ROCm writes carries no wavefront state, so the usual channels
+// tell us nothing. This buffer is pinned host memory mapped into the GPU
+// address space: kernel writes reach host RAM as they happen and survive
+// the abort, and a SIGABRT handler prints them.
+//
+// Layout: 4 header slots, then MPK_TW_PER_WORKER slots per worker.
+//   [0] global write counter (how many breadcrumbs were dropped at all)
+//   [1] last layer index any worker entered
+//   [2] last task type any worker dispatched
+//   [3] reserved
+// Per worker w, base = MPK_TW_HDR + w * MPK_TW_PER_WORKER:
+//   [base+0] last layer this worker entered
+//   [base+1] last phase marker
+//   [base+2] last tile_idx
+//   [base+3] the pointer this worker was about to dereference
+static unsigned long long *g_tw_host = nullptr;
+static int g_tw_num_workers = 0;
+static bool g_tw_handler_installed = false;
+
+// Async-signal-safe-ish dump. fprintf from a fatal handler is not strictly
+// legal, but the process is aborting anyway and getting the data out matters
+// more than standards purity here.
+static void tripwire_dump(int sig) {
+  if (g_tw_host == nullptr) {
+    _exit(134);
+  }
+  fprintf(stderr, "\n===== MPK NIL TRIPWIRE (signal %d) =====\n", sig);
+  // Per-worker breadcrumbs only; there is no global header counter, since
+  // maintaining one would mean a device-wide atomic on the hot path.
+  // What matters is the spread: if one worker is on a different layer from
+  // the rest, or holds a null ptr, that names the culprit.
+  int printed = 0;
+  unsigned long long min_layer = ~0ull, max_layer = 0;
+  int nulls = 0;
+  for (int w = 0; w < g_tw_num_workers; w++) {
+    unsigned long long const *b =
+        g_tw_host + MPK_TW_HDR + w * MPK_TW_PER_WORKER;
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) {
+      continue; // worker never wrote a breadcrumb
+    }
+    fprintf(stderr,
+            "  w%-3d layer=%llu phase=%llu tile=%llu ptr=0x%llx%s\n",
+            w,
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[3] == 0 ? "   <-- NULL" : "");
+    if (b[3] == 0) {
+      nulls++;
+    }
+    if (b[0] < min_layer) {
+      min_layer = b[0];
+    }
+    if (b[0] > max_layer) {
+      max_layer = b[0];
+    }
+    printed++;
+  }
+  fprintf(stderr,
+          "(%d workers left breadcrumbs; layer span %llu..%llu; %d null ptrs)\n",
+          printed,
+          printed ? min_layer : 0,
+          max_layer,
+          nulls);
+  fprintf(stderr, "===== END TRIPWIRE =====\n");
+  fflush(stderr);
+  // Restore default disposition and re-raise so the exit status is unchanged.
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+// Snapshot the breadcrumbs to disk on a timer.
+//
+// The signal handler alone is not enough: the ROCm runtime installs its own
+// SIGABRT disposition after we arm ours, so on a real memory fault the
+// process dies without our handler ever running (observed). A file on disk
+// survives regardless of who wins the signal-handler race, and the fault
+// aborts within ~1s of launch, so a short interval catches it.
+static volatile bool g_tw_snap_stop = false;
+static std::thread g_tw_snap_thread;
+
+static void tripwire_snapshot_loop() {
+  while (!g_tw_snap_stop) {
+    FILE *f = fopen("/tmp/mpk_tripwire.txt", "w");
+    if (f != nullptr) {
+      for (int w = 0; w < g_tw_num_workers; w++) {
+        unsigned long long const *b =
+            g_tw_host + MPK_TW_HDR + w * MPK_TW_PER_WORKER;
+        if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) {
+          continue;
+        }
+        fprintf(f,
+                "w%-3d layer=%llu phase=%llu tile=%llu ptr=0x%llx%s\n",
+                w,
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[3] == 0 ? "   <-- NULL" : "");
+      }
+      fclose(f);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+static void install_tripwire_handler() {
+  if (g_tw_handler_installed) {
+    return;
+  }
+  signal(SIGABRT, tripwire_dump);
+  signal(SIGSEGV, tripwire_dump);
+  g_tw_snap_thread = std::thread(tripwire_snapshot_loop);
+  g_tw_snap_thread.detach();
+  g_tw_handler_installed = true;
+}
+#endif
+
 // meta_tensors[0]: seq_length
 // meta_tensors[1]: tokens
 // meta_tensors[2]: input_tokens
@@ -3891,6 +4051,39 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       global_runtime_config.precomp_dbg_worker_state = nullptr;
       g_dbg_h_worker_state = nullptr;
       g_dbg_num_workers = num_workers;
+
+#ifdef MPK_NIL_TRIPWIRE
+      // Tripwire for the nil-address memory fault. Backed by *pinned host*
+      // memory, not device memory: the fault aborts the process, so anything
+      // living only in VRAM (and device printf, and the GPU coredump) is
+      // gone by the time we could read it. Writes from the kernel land in
+      // host RAM over PCIe as they happen, so whatever the last worker wrote
+      // before the fault is still there for the SIGABRT handler to print.
+      (void)hipHostMalloc(reinterpret_cast<void **>(&g_tw_host),
+                          MPK_TW_SLOTS * sizeof(unsigned long long),
+                          hipHostMallocMapped | hipHostMallocNonCoherent);
+      if (g_tw_host != nullptr) {
+        for (int i = 0; i < MPK_TW_SLOTS; i++) {
+          g_tw_host[i] = 0;
+        }
+        unsigned long long *tw_dev = nullptr;
+        (void)hipHostGetDevicePointer(
+            reinterpret_cast<void **>(&tw_dev), g_tw_host, 0);
+        global_runtime_config.tripwire = tw_dev;
+        g_tw_num_workers = num_workers;
+        install_tripwire_handler();
+        printf("[MPK] nil tripwire armed: host=%p dev=%p slots=%d\n",
+               (void *)g_tw_host,
+               (void *)tw_dev,
+               MPK_TW_SLOTS);
+      } else {
+        global_runtime_config.tripwire = nullptr;
+        printf("[MPK] nil tripwire: hipHostMalloc FAILED, not armed\n");
+      }
+      fflush(stdout);
+#else
+      global_runtime_config.tripwire = nullptr;
+#endif
 
       // Clear host debug pointers (no longer host-mapped)
       g_dbg_h_iter_ready = nullptr;
