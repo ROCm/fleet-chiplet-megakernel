@@ -96,8 +96,10 @@ int const MAX_INPUTS_PER_TASK = 28;
 int const MAX_OUTPUTS_PER_TASK = 13;
 
 // Nil-address tripwire buffer geometry (see MPK_NIL_TRIPWIRE).
+// Per worker: [0] layer  [1] outer phase  [2] tile  [3] input_ptrs[0]
+//             [4] fused-kernel sub-phase  [5] sub-phase aux value
 #define MPK_TW_HDR 4
-#define MPK_TW_PER_WORKER 4
+#define MPK_TW_PER_WORKER 8
 #define MPK_TW_SLOTS (MPK_TW_HDR + 256 * MPK_TW_PER_WORKER)
 // Increased to 304 to support full CU utilization on AMD MI300X (304 CUs)
 // and NVIDIA Blackwell (160+ SMs which uses 144 workers)

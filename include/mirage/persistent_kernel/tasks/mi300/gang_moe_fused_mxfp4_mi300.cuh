@@ -33,7 +33,34 @@
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // reuse type defs + helpers
 #include "tasks/mi300/swigluoai_mi300.cuh"             // fast_swigluoai()
 
+#if defined(MPK_NIL_TRIPWIRE) && defined(MPK_TW_SUB)
+// Resolve *where inside* the MoE kernel a worker was when it died.
+//
+// The fused layer's MPK_TW_SUB(80, moe_t) only resolves to "somewhere in the
+// MoE tile", which spans W13, the per-expert W13->W2 barrier, and W2. The
+// nil-address fault lands somewhere in there, and at that resolution a worker
+// that faulted is indistinguishable from one merely parked at the barrier.
+//
+// aux carries the decoded tile identity, because every address this kernel
+// computes is derived from it -- expert_id indexes the weight bases and the
+// barrier, and the w13/w2 split decides which pointer set is live:
+//   [15:0] global_tile  [23:16] expert_idx  [31:24] expert_id
+//   [39:32] num_activated_experts  [40] is_w2
+#define MOE_TW_AUX()                                                           \
+  (((unsigned long long)(unsigned short)global_tile) |                         \
+   (((unsigned long long)(unsigned char)expert_idx) << 16) |                   \
+   (((unsigned long long)(unsigned char)expert_id) << 24) |                    \
+   (((unsigned long long)(unsigned char)num_activated_experts) << 32) |        \
+   (((unsigned long long)(is_w2 ? 1 : 0)) << 40))
+#define MOE_DBG_SUBPHASE(code) MPK_TW_SUB((code), MOE_TW_AUX())
+// Pre-decode marker: expert_id/is_w2 do not exist yet, so pass aux explicitly.
+// Distinguishes a fault in the routing-mask read itself from one in the
+// compute that follows it.
+#define MOE_DBG_ENTRY(code, aux) MPK_TW_SUB((code), (aux))
+#else
 #define MOE_DBG_SUBPHASE(code) ((void)0)
+#define MOE_DBG_ENTRY(code, aux) ((void)0)
+#endif
 
 namespace kernel {
 
@@ -125,6 +152,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       240; // Required: see PAD_MULTIPLE investigation in memory
 
   int xcd_id = _gang_moe_get_xcd_id();
+  // Marker 1000: about to read the routing mask. Everything downstream --
+  // expert_id, the weight base pointers, the barrier slot -- derives from it.
+  MOE_DBG_ENTRY(1000, (unsigned long long)tile_idx);
   int num_activated_experts = d_mask[NUM_EXPERTS];
 #ifdef MPK_MOE_SINGLE_EXPERT
   num_activated_experts = min(num_activated_experts, 1);
@@ -159,6 +189,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int tok_idx = phase_tile / n_wgs;
   int wg_idx = phase_tile % n_wgs;
 
+  // Marker 1001: tile decoded, expert_id read. If num_activated_experts or
+  // expert_id is out of range here, every pointer built below is wild --
+  // this is the marker that separates "bad routing input" from "bad compute".
+  MOE_DBG_ENTRY(1001,
+                ((unsigned long long)(unsigned short)global_tile) |
+                    (((unsigned long long)(unsigned char)expert_idx) << 16) |
+                    (((unsigned long long)(unsigned char)
+                          num_activated_experts)
+                     << 32) |
+                    (((unsigned long long)(is_w2 ? 1 : 0)) << 40));
   int expert_id = d_mask[expert_idx];
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
