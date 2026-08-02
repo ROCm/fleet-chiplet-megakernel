@@ -1874,13 +1874,23 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
               if (ml > 0) {
-                int ml_in_base = (xcd_id * config.ml_num_layers + ml) * 24;
-                int ml_out_base = (xcd_id * config.ml_num_layers + ml) * 11;
-                for (int i = threadIdx.x; i < 24; i += blockDim.x) {
+                // Widths must match the host-side ML_N_IN / ML_N_OUT that
+                // built these tables (see the multi-layer scan), or the
+                // strides disagree and every layer past 0 reads the wrong
+                // slots. Both sides key off the TaskDesc capacity so the
+                // LM-head variant's input_ptrs[24..27] / output_ptrs[12] get
+                // refreshed too.
+                int ml_in_base =
+                    (xcd_id * config.ml_num_layers + ml) * MAX_INPUTS_PER_TASK;
+                int ml_out_base =
+                    (xcd_id * config.ml_num_layers + ml) * MAX_OUTPUTS_PER_TASK;
+                for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
+                     i += blockDim.x) {
                   task_desc->input_ptrs[i] =
                       config.ml_input_table[ml_in_base + i];
                 }
-                for (int i = threadIdx.x; i < 11; i += blockDim.x) {
+                for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
+                     i += blockDim.x) {
                   task_desc->output_ptrs[i] =
                       config.ml_output_table[ml_out_base + i];
                 }
@@ -3589,8 +3599,17 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 #ifdef MPK_FUSED_LAYER_BATCHING
   {
     constexpr int NUM_XCDS_ML = 8;
-    constexpr int ML_N_IN = 24;
-    constexpr int ML_N_OUT = 11;
+    // Must cover every slot the fused layer kernels read, not just the ones
+    // the plain variant uses. The LM-head variant
+    // (TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300, FUSE_TAIL=1) reads
+    // input_ptrs[24..27] and output_ptrs[12] -- see
+    // gang_full_layer_with_lmhead_fused_mi300.cuh. These were 24 and 11,
+    // sized for the plain variant, so with FUSE_TAIL=1 the ml loop would
+    // refresh only the first 24/11 slots and leave the LM-head pointers
+    // holding layer 0's values for every later layer. Sizing to the TaskDesc
+    // capacity keeps this correct for any variant.
+    constexpr int ML_N_IN = MAX_INPUTS_PER_TASK;   // 28
+    constexpr int ML_N_OUT = MAX_OUTPUTS_PER_TASK; // 13
     int n_tasks_pre = (int)all_tasks.size();
     int n_events_pre = (int)all_events.size();
 
