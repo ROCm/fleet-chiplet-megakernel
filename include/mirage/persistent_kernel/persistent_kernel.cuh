@@ -187,12 +187,61 @@ __device__ __forceinline__ void
     int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
     __atomic_store_n(&b[0], a0, __ATOMIC_RELAXED);
     __atomic_store_n(&b[1], a1, __ATOMIC_RELAXED);
-    __atomic_store_n(&b[2], a2, __ATOMIC_RELAXED);
-    __atomic_store_n(&b[3], a3, __ATOMIC_RELAXED);
+    // b[2] and b[3] belong to the per-wave masks below -- not written here.
+    (void)a2;
+    (void)a3;
   }
 }
 #define MPK_WS_WAIT_AUX(a0, a1, a2, a3)                                        \
   mpk_ws_wait_aux((a0), (a1), (a2), (a3), tid)
+
+// Per-wave exit mark for a *thread-divergent* poll.
+//
+// Every other tracer here is tid==0 only, which is enough while a barrier is
+// entered and left by the whole block together. The MoE W13->W2 poll is not:
+// it deliberately has each thread test the release flag on its own with no
+// __syncthreads, so tid 0 can clear the poll and run on while other waves of
+// the same block are still spinning. From tid 0's slot that is invisible --
+// it reports a straight-line mark past the barrier while the block as a whole
+// is still stuck at it, which is exactly how the gx_1 capture looked.
+//
+// One relaxed store per wave, into the aux quarter's low bits: wave w sets
+// bit w when it leaves the poll. A block whose waves all exited reads 0xf.
+// Anything less names the waves that never got the release.
+__device__ __forceinline__ void mpk_ws_wave_exit(int wave, int tid) {
+  if ((tid & 63) == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    __atomic_fetch_or(&b[3], 1 << (wave & 31), __ATOMIC_RELAXED);
+  }
+}
+// Each wave clears its OWN bit in both masks. Doing it this way instead of
+// "tid 0 zeroes the word, then __syncthreads" matters: adding a __syncthreads
+// to a region whose whole point is that it is thread-divergent changes the
+// control flow being measured. The ix_1 capture is not trustworthy for that
+// reason. Per-wave clears race with nothing, and need no barrier.
+__device__ __forceinline__ void mpk_ws_wave_clear(int wave, int tid) {
+  if ((tid & 63) == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    __atomic_fetch_and(&b[2], ~(1 << (wave & 31)), __ATOMIC_RELAXED);
+    __atomic_fetch_and(&b[3], ~(1 << (wave & 31)), __ATOMIC_RELAXED);
+  }
+}
+#define MPK_WS_WAVE_EXIT(wave) mpk_ws_wave_exit((wave), tid)
+#define MPK_WS_WAVE_CLEAR(wave) mpk_ws_wave_clear((wave), tid)
+
+// Same per-wave mask, one slot over, for arrival at a __syncthreads.
+//
+// hx_2 showed the W13->W2 poll mask at 0xf -- every wave cleared the barrier
+// -- with the block still parked at mark 8303, i.e. inside the FP8 quant.
+// The only thing in that function that can block is its trailing
+// __syncthreads, so the question becomes which wave fails to reach it.
+__device__ __forceinline__ void mpk_ws_wave_sync(int wave, int tid) {
+  if ((tid & 63) == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    __atomic_fetch_or(&b[2], 1 << (wave & 31), __ATOMIC_RELAXED);
+  }
+}
+#define MPK_WS_WAVE_SYNC(wave) mpk_ws_wave_sync((wave), tid)
 
 // Straight-line progress mark, for code that is not a spin loop.
 //
@@ -5131,10 +5180,64 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
                         "watch[bid=%d obs=%d exp=%d spins=%d]\n",
                         w, wphase, pn, fx, fl, bid, obs, exp_, spins);
-                if (bid >= 800 && bid < 900) {
-                  // a0 = raw arrival counter, a2 = W13_TILES. If a0 is an
-                  // exact multiple of a2 every producer arrived and the
-                  // release value is the bug; otherwise arrivals were lost.
+                // Per-wave exit mask for the MoE W13->W2 poll. That poll is
+                // thread-divergent by construction (each thread tests the
+                // release flag on its own, no __syncthreads), so waves of one
+                // block leave it independently. tid 0 leaving is NOT the block
+                // leaving: gx_1 showed w30 reporting a straight-line mark past
+                // the barrier (8303, inside the quant's trailing
+                // __syncthreads) while the block was still short by 2. A mask
+                // below 0xf names the waves that never saw the release.
+                if (fp == 80) {
+                  int smask = a2 & 0xf;
+                  fprintf(stderr,
+                          "        quant sync mask=0x%x (%s)\n",
+                          smask,
+                          smask == 0xf
+                              ? "all 4 waves reached the quant __syncthreads"
+                              : "waves missing -- note NSUBBLOCKS(96) < "
+                                "blockDim(256), so waves 1..3 do fewer or "
+                                "zero loop trips and legitimately arrive "
+                                "early; only a mask frozen across dumps is "
+                                "evidence");
+                  int mask = a3 & 0xf;
+                  fprintf(stderr,
+                          "        wave exit mask=0x%x (%s)\n",
+                          mask,
+                          mask == 0xf
+                              ? "all 4 waves cleared the W13->W2 poll"
+                              : (mask == 0
+                                     ? "no wave cleared it"
+                                     : "<== BLOCK SPLIT ACROSS THE BARRIER: "
+                                       "some waves cleared, others still "
+                                       "spinning -- the cleared waves are "
+                                       "parked in the next __syncthreads"));
+                }
+                // spins == 0 means the poll cleared on its very first load
+                // without ever ticking, so obs/exp and the aux below are
+                // leftovers from an earlier layer and must not be read as this
+                // worker's current state. An in-task worker with spins == 0 is
+                // stuck somewhere *past* its last barrier, not at one -- which
+                // is exactly what the fx_8 capture showed after the cache-line
+                // split, and what the aux misreported as a lost fan-out.
+                if (spins == 0) {
+                  fprintf(stderr,
+                          "        (watch slot STALE: last barrier cleared on "
+                          "its first load -- this worker is stuck past it, "
+                          "read the mark, not obs/exp)\n");
+                }
+                // a2/a3 are the per-wave masks now, so the slot-spread
+                // decoding below no longer applies. Keep the arrival counter,
+                // which still lives in a0.
+                if (spins > 0 && bid >= 800 && bid < 900) {
+                  fprintf(stderr,
+                          "        MoE arrivals=%d (arrivals%%46=%d) "
+                          "expert_id=%d\n",
+                          a0, a0 % 46, a1);
+                }
+                if (false) {
+                  // a0 = raw arrival counter. If a0 is an exact multiple of
+                  // W13_TILES every producer arrived and the release fired.
                   // a2 packs (slots_at_or_past_expected)*1e6 + (max-min)
                   // across the 8 per-XCD release slots of this expert; a3 is
                   // the min. All 8 are written by one producer in one loop, so
@@ -5170,6 +5273,11 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   case 8200: mn = "MoE W13 compute"; break;
                   case 8201: mn = "MoE W13 done, at barrier"; break;
                   case 8300: mn = "MoE W2 entry"; break;
+                  case 8302: mn = "MoE W2: cleared W13->W2 barrier"; break;
+                  case 8303: mn = "MoE W2: FP8 quant"; break;
+                  case 8304: mn = "MoE W2: drain HBM loads"; break;
+                  case 8305: mn = "MoE W2: MFMA loop"; break;
+                  case 8306: mn = "MoE W2: epilogue"; break;
                 }
                 fprintf(stderr,
                         "    w%d NOT POLLING: mark %d (%s) tile=%d"

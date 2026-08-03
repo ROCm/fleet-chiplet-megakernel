@@ -524,7 +524,7 @@ __device__ __attribute__((noinline)) void
         unsigned short const *res_addr = &d_residual[res_idx_pf];
         asm volatile("global_load_dwordx2 %0, %2, off\n"
                      "global_load_dwordx2 %1, %3, off"
-                     : "=v"(pf_bias), "=v"(pf_res)
+                     : "=&v"(pf_bias), "=&v"(pf_res)
                      : "v"(bias_addr), "v"(res_addr)
                      : "memory");
       }
