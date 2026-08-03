@@ -307,7 +307,19 @@ struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
         trigger_event(t.trigger_event), dependent_event(t.dependent_event),
+        input_ptrs{}, output_ptrs{},
+#ifdef MPK_ENABLE_TMA
+        input_tma_desc_ptrs{}, output_tma_desc_ptrs{},
+#endif
         task_metadata(t.task_metadata) {
+    // The pointer arrays are value-initialized above, not just the first
+    // num_inputs/num_outputs entries. The whole TaskDesc is memcpy'd to the
+    // GPU and, for the fused layer path, copied into a *reused* shared-memory
+    // slot -- so any slot this constructor skips carried indeterminate host
+    // stack bytes into device memory, and on the device it aliases whatever
+    // the previous task left behind. Consumers index by slot, not by count
+    // (see the ml pointer-table build in persistent_kernel.cuh, which snapshots
+    // all MAX_* slots), so "past num_outputs" is not the same as "never read".
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
     }
@@ -327,7 +339,13 @@ struct alignas(16) TaskDesc {
     }
 #endif
   }
-  __host__ __device__ TaskDesc() {
+  __host__ __device__ TaskDesc()
+      : input_ptrs{}, output_ptrs{}
+#ifdef MPK_ENABLE_TMA
+        ,
+        input_tma_desc_ptrs{}, output_tma_desc_ptrs{}
+#endif
+  {
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;

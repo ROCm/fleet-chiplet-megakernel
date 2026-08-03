@@ -25,6 +25,7 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #endif
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <set>
@@ -1925,6 +1926,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 
               // Execute this layer
               int my_tiles = 0;
+              // Publish the layer index into the worker-state phase slot.
+              //
+              // ws[3] was set to 11 once at gang entry and then never touched
+              // again for the whole task. Since all 36 layers run inside this
+              // one task, every worker reported phase=11 for the entire run
+              // and a hang dump showed "240 workers at gang entry" no matter
+              // which layer they were actually stuck in -- the counter could
+              // not distinguish a worker on layer 0 from one on layer 35.
+              // Encoding the layer makes the dump localize the stall.
+              if (threadIdx.x == 0 &&
+                  config.precomp_dbg_worker_state != nullptr) {
+                int *ws = config.precomp_dbg_worker_state + worker_id * 4;
+                __atomic_store_n(&ws[3], 40000 + ml, __ATOMIC_RELAXED);
+              }
               for (int t = block_xcd_local_rank; t < ml_n_tile_count;
                    t += block_workers_on_xcd) {
 #ifdef MPK_NIL_TRIPWIRE
@@ -3671,15 +3686,32 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       }
 
       // Validate the tables before upload. The layer loop dereferences every
-      // slot it reloads, so a null here is a nil-address GPU fault with no
-      // usable backtrace -- catching it on the host names the exact slot.
+      // slot the kernel reads, so a null there is a nil-address GPU fault with
+      // no usable backtrace -- catching it on the host names the exact slot.
+      //
+      // Only the slots the task type actually declares are checked. The tables
+      // are sized to the TaskDesc capacity so the LM-head variant's higher
+      // slots get refreshed, but the plain variant declares 24 inputs / 11
+      // outputs (see task_config in graph.cc), and slots past its count are
+      // legitimately null -- TaskDesc value-initializes them. Flagging those
+      // would report 1152/576 "nulls" on a perfectly healthy graph and train
+      // the reader to ignore this line.
       {
-        int null_in = 0, null_out = 0;
+        int null_in = 0, null_out = 0, unused_in = 0, unused_out = 0;
         for (int L = 0; L < ml_layers; L++) {
+          bool is_lmhead =
+              all_tasks[fused_layer_positions[L]].task_type ==
+              TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
+          int used_in = is_lmhead ? 28 : 24;
+          int used_out = is_lmhead ? 13 : 11;
           for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
             int base = (xcd * ml_layers + L) * ML_N_IN;
             for (int i = 0; i < ML_N_IN; i++) {
               if (h_input_table[base + i] == nullptr) {
+                if (i >= used_in) {
+                  unused_in++;
+                  continue;
+                }
                 if (null_in < 8) {
                   printf("[MPK] ML_NULL_IN layer=%d xcd=%d idx=%d\n", L, xcd, i);
                 }
@@ -3689,6 +3721,10 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
             int obase = (xcd * ml_layers + L) * ML_N_OUT;
             for (int i = 0; i < ML_N_OUT; i++) {
               if (h_output_table[obase + i] == nullptr) {
+                if (i >= used_out) {
+                  unused_out++;
+                  continue;
+                }
                 if (null_out < 8) {
                   printf(
                       "[MPK] ML_NULL_OUT layer=%d xcd=%d idx=%d\n", L, xcd, i);
@@ -3698,9 +3734,12 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
             }
           }
         }
-        printf("[MPK] ML table validation: %d null inputs, %d null outputs\n",
+        printf("[MPK] ML table validation: %d null inputs, %d null outputs "
+               "(%d/%d null in undeclared slots, expected)\n",
                null_in,
-               null_out);
+               null_out,
+               unused_in,
+               unused_out);
         fflush(stdout);
       }
 
@@ -4119,10 +4158,41 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                        0,
                        sizeof(unsigned long long));
 
-      // Debug worker state — disabled for performance
+      // Debug worker state — off by default (the per-task relaxed stores cost
+      // a little on the hot path), opt in with MPK_WORKER_STATE=1 to make the
+      // host poll loop dump where every worker is parked when it hangs.
+      //
+      // Host-mapped, not device memory: on a hang the kernel never returns, so
+      // the host must be able to read this while the kernel is still spinning.
       global_runtime_config.precomp_dbg_worker_state = nullptr;
       g_dbg_h_worker_state = nullptr;
       g_dbg_num_workers = num_workers;
+      {
+        char const *ws_env = getenv("MPK_WORKER_STATE");
+        if (ws_env != nullptr && atoi(ws_env) != 0) {
+          size_t ws_bytes = (size_t)num_workers * 4 * sizeof(int);
+          int *ws_host = nullptr;
+          if (hipHostMalloc(reinterpret_cast<void **>(&ws_host),
+                            ws_bytes,
+                            hipHostMallocMapped | hipHostMallocNonCoherent) ==
+                  hipSuccess &&
+              ws_host != nullptr) {
+            memset(ws_host, 0, ws_bytes);
+            int *ws_dev = nullptr;
+            if (hipHostGetDevicePointer(reinterpret_cast<void **>(&ws_dev),
+                                        ws_host,
+                                        0) == hipSuccess) {
+              g_dbg_h_worker_state = ws_host;
+              global_runtime_config.precomp_dbg_worker_state = ws_dev;
+              fprintf(stderr,
+                      "[HOST_DBG] worker-state tracing ON (%d workers)\n",
+                      num_workers);
+            } else {
+              (void)hipHostFree(ws_host);
+            }
+          }
+        }
+      }
 
 #ifdef MPK_NIL_TRIPWIRE
       // Tripwire for the nil-address memory fault. Backed by *pinned host*
@@ -4542,36 +4612,92 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         global_runtime_config.precomp_terminate) {
       hipStream_t dbg_stream;
       (void)hipStreamCreate(&dbg_stream);
-      for (int dbg_i = 0; dbg_i < 30; dbg_i++) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        unsigned long long ir = 0;
-        int term = 0;
-        unsigned long long td = 0;
-        (void)hipMemcpyAsync(&ir,
-                             global_runtime_config.precomp_iter_ready,
-                             sizeof(unsigned long long),
-                             hipMemcpyDeviceToHost,
-                             dbg_stream);
-        (void)hipMemcpyAsync(&term,
-                             global_runtime_config.precomp_terminate,
-                             sizeof(int),
-                             hipMemcpyDeviceToHost,
-                             dbg_stream);
-        if (global_runtime_config.precomp_dbg_tasks_done) {
-          (void)hipMemcpyAsync(&td,
-                               global_runtime_config.precomp_dbg_tasks_done,
+      // The device-memory poll runs on its own detached thread.
+      //
+      // This is not premature generality: when the kernel hangs, the ROCm
+      // runtime wedges with it, and hipMemcpyAsync/hipStreamSynchronize below
+      // block forever *even on a private stream*. Running them inline is what
+      // made this instrumentation useless on the one case it exists for -- the
+      // hung 32k run printed "Starting poll loop..." and then not one line
+      // more, because it never got past the first sync to reach the dump.
+      //
+      // The worker-state and event-counter buffers are pinned host memory, so
+      // the dumps below need no runtime call and keep printing regardless.
+      // dev_polls staying at 0 is itself the signal that HIP is stuck.
+      static std::atomic<unsigned long long> dbg_a_ir{0};
+      static std::atomic<int> dbg_a_term{0};
+      static std::atomic<unsigned long long> dbg_a_td{0};
+      static std::atomic<unsigned long long> dbg_a_polls{0};
+      static std::atomic<bool> dbg_a_stop{false};
+      // Detached, and every object it touches has static storage duration --
+      // a thread blocked in HIP outlives this scope and must not dangle.
+      std::thread([dbg_stream]() {
+        while (!dbg_a_stop.load(std::memory_order_relaxed)) {
+          unsigned long long ir = 0;
+          int term = 0;
+          unsigned long long td = 0;
+          (void)hipMemcpyAsync(&ir,
+                               global_runtime_config.precomp_iter_ready,
                                sizeof(unsigned long long),
                                hipMemcpyDeviceToHost,
                                dbg_stream);
+          (void)hipMemcpyAsync(&term,
+                               global_runtime_config.precomp_terminate,
+                               sizeof(int),
+                               hipMemcpyDeviceToHost,
+                               dbg_stream);
+          if (global_runtime_config.precomp_dbg_tasks_done) {
+            (void)hipMemcpyAsync(&td,
+                                 global_runtime_config.precomp_dbg_tasks_done,
+                                 sizeof(unsigned long long),
+                                 hipMemcpyDeviceToHost,
+                                 dbg_stream);
+          }
+          (void)hipStreamSynchronize(dbg_stream);
+          dbg_a_ir.store(ir, std::memory_order_relaxed);
+          dbg_a_term.store(term, std::memory_order_relaxed);
+          dbg_a_td.store(td, std::memory_order_relaxed);
+          dbg_a_polls.fetch_add(1, std::memory_order_relaxed);
+          if (term) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        (void)hipStreamSynchronize(dbg_stream);
-        fprintf(
-            stderr,
-            "[HOST_DBG] t=%ds iter_ready=%llu terminate=%d tasks_done=%llu\n",
-            dbg_i + 1,
-            ir,
-            term,
-            td);
+      }).detach();
+      // A 32k run takes minutes, so the original 30-tick (30s) bound stopped
+      // watching long before the interesting window: a hang at iteration
+      // ~20000 produced no dump at all, because the loop had already exited
+      // into the blocking stream sync below. Poll until the kernel actually
+      // reports terminate (the `if (term) break` at the bottom), bounded only
+      // by a generous ceiling so a wedged run still exits the loop and lets
+      // the enclosing `timeout` reap it.
+      int const dbg_max_ticks = 900;
+      for (int dbg_i = 0; dbg_i < dbg_max_ticks; dbg_i++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        unsigned long long ir = dbg_a_ir.load(std::memory_order_relaxed);
+        int term = dbg_a_term.load(std::memory_order_relaxed);
+        unsigned long long td = dbg_a_td.load(std::memory_order_relaxed);
+        unsigned long long polls =
+            dbg_a_polls.load(std::memory_order_relaxed);
+        // dev_polls is normally 0 for the whole run -- a healthy 32k run shows
+        // 0 at every tick. hipMemcpyAsync does not complete while the
+        // persistent kernel occupies the GPU, even on a private stream, so
+        // iter_ready/terminate/tasks_done stay 0 and mean nothing until the
+        // kernel exits. Do NOT read dev_polls=0 as a hang.
+        //
+        // The real liveness signal is the per-worker `done` counter in the
+        // dump below: it lives in pinned host memory and advances even while
+        // HIP is blocked. Frozen `done` across ticks = actually stuck.
+        if (dbg_i % 30 == 0 || term) {
+          fprintf(stderr,
+                  "[HOST_DBG] t=%ds iter_ready=%llu terminate=%d "
+                  "tasks_done=%llu dev_polls=%llu (0 is normal; watch `done`)\n",
+                  dbg_i + 1,
+                  ir,
+                  term,
+                  td,
+                  polls);
+        }
         // Dump per-worker state + summary
         if (g_dbg_h_worker_state && dbg_i >= 2) {
           int phase_hist[4] = {};
@@ -4582,6 +4708,37 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                 // 3=w2poll(3001) 4=w2polldone(3002)
                                 // 5=w2quant(3003) 6=w2lds(3004) 7=w2mfma(3005)
           int moe_epilogue = 0; // 3006
+          // Liveness first, so the verbose decision below can use it.
+          //
+          // Comparing each worker's `done` against the previous tick is the
+          // only reliable progress test here (see the dev_polls note above).
+          // Tracked per-worker, not as an aggregate, so one frozen straggler
+          // among 239 live workers cannot hide.
+          static std::vector<int> prev_done;
+          static int stall_ticks = 0;
+          int frozen = 0;
+          bool have_prev = ((int)prev_done.size() == g_dbg_num_workers);
+          {
+            std::vector<int> cur_done(g_dbg_num_workers);
+            for (int w = 0; w < g_dbg_num_workers; w++) {
+              cur_done[w] = __atomic_load_n(&g_dbg_h_worker_state[w * 4 + 2],
+                                            __ATOMIC_RELAXED);
+            }
+            if (have_prev) {
+              for (int w = 0; w < g_dbg_num_workers; w++) {
+                if (cur_done[w] == prev_done[w]) {
+                  frozen++;
+                }
+              }
+              stall_ticks = (frozen == g_dbg_num_workers) ? stall_ticks + 1 : 0;
+            }
+            prev_done.swap(cur_done);
+          }
+          // Now that the loop runs for the whole kernel rather than 30s, the
+          // per-worker lines would be ~32 lines/sec of healthy-run noise and
+          // would bury the failure. Print them only while a stall is building
+          // or on a periodic checkpoint.
+          bool verbose = (stall_ticks >= 1) || (dbg_i % 30 == 0);
           for (int w = 0; w < g_dbg_num_workers; w++) {
             int *ws = g_dbg_h_worker_state + w * 4;
             int tpos = __atomic_load_n(&ws[0], __ATOMIC_RELAXED);
@@ -4591,20 +4748,36 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             int sc = phase / 100000;
             int moe_xcd = (phase / 10000) % 10;
             int moe_tile = phase % 10000;
-            if (w < 32 || sc == 3001) {
-              fprintf(stderr,
-                      "  w%d: pos=%d dep=%d done=%d phase=%d (sc=%d xcd=%d "
-                      "tile=%d)\n",
-                      w,
-                      tpos,
-                      dep,
-                      done,
-                      phase,
-                      sc,
-                      moe_xcd,
-                      moe_tile);
+            if (verbose && (w < 32 || sc == 3001)) {
+              // 40000+ml is the multi-layer marker written in the ml loop.
+              // Print it as a layer number rather than a raw phase, since
+              // "which layer" is the whole point of that encoding.
+              if (phase >= 40000 && phase < 40000 + 1024) {
+                fprintf(stderr,
+                        "  w%d: pos=%d dep=%d done=%d layer=%d\n",
+                        w,
+                        tpos,
+                        dep,
+                        done,
+                        phase - 40000);
+              } else {
+                fprintf(stderr,
+                        "  w%d: pos=%d dep=%d done=%d phase=%d (sc=%d xcd=%d "
+                        "tile=%d)\n",
+                        w,
+                        tpos,
+                        dep,
+                        done,
+                        phase,
+                        sc,
+                        moe_xcd,
+                        moe_tile);
+              }
             }
-            if (phase >= 1200 && phase < 300100000) {
+            // Exclude the 40000+ml multi-layer marker: it means "executing
+            // layer ml", which is normal progress, not a stuck gang tile.
+            if (phase >= 1200 && phase < 300100000 &&
+                !(phase >= 40000 && phase < 40000 + 1024)) {
               phase_gang_stuck++;
             }
             if (sc == 2000) {
@@ -4642,6 +4815,16 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
               phase_hist[3]++;
             }
           }
+          if (have_prev && (verbose || stall_ticks >= 1)) {
+            fprintf(stderr,
+                    "  progress: %d/%d workers advanced since last tick%s\n",
+                    g_dbg_num_workers - frozen,
+                    g_dbg_num_workers,
+                    stall_ticks >= 2 ? "   *** STALLED: no worker has advanced "
+                                       "for 3+ ticks ***"
+                                     : "");
+          }
+          if (verbose) {
           fprintf(stderr,
                   "  phases: spinning=%d dep_done=%d signaling=%d sig_done=%d "
                   "gang_tile=%d gang_entry=%d",
@@ -4672,6 +4855,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             }
           }
           fprintf(stderr, "\n");
+          } // verbose
         }
         // Dump event counters to diagnose which events haven't fired
         if (g_dbg_h_event_counters && dbg_i == 5) {
@@ -4731,7 +4915,11 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           break;
         }
       }
-      (void)hipStreamDestroy(dbg_stream);
+      dbg_a_stop.store(true, std::memory_order_relaxed);
+      // Deliberately leaking dbg_stream: the poll thread is detached and may
+      // still be blocked inside HIP on it. Destroying the stream out from
+      // under it would turn a diagnosable hang into a use-after-free. This
+      // path only runs under MPK_WORKER_STATE debug builds.
     }
 #endif
     (void)cudaStreamSynchronize(global_runtime_config.worker_stream);
