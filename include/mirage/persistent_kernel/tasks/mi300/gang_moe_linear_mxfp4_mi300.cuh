@@ -194,11 +194,18 @@ __device__ __forceinline__ void
     // Combine amaxes from 4 sub-blocks sharing the same 128-element
     // super-block. Threads sb, sb+1, sb+2, sb+3 are consecutive lanes in the
     // same wave. Use __shfl to read each neighbor's amax (4 reads, 3 fmaxf).
+    //
+    // The partner index is clamped for the same reason as in the NT variant
+    // below: NSUBBLOCKS = REDUCTION_SIZE/32 need not be a multiple of 4, so
+    // the tail super-block would otherwise reduce against lanes whose loop
+    // condition failed and whose `amax` register was never written.
     int base_lane = lane_id & ~3; // round down to group of 4
+    int const sb_first = sb - sub_idx;
+    int const n_valid = min(4, (NSUBBLOCKS - 1) - sb_first + 1);
     float a0 = __shfl(amax, base_lane);
-    float a1 = __shfl(amax, base_lane + 1);
-    float a2 = __shfl(amax, base_lane + 2);
-    float a3 = __shfl(amax, base_lane + 3);
+    float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));
+    float a2 = __shfl(amax, base_lane + min(2, n_valid - 1));
+    float a3 = __shfl(amax, base_lane + min(3, n_valid - 1));
     float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
 
     // Compute E8M0 scale
@@ -255,15 +262,32 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
     uint32_t const *base_ptr = src32 + base / 2;
 
     // 4 wide NT loads (64 bytes = 32 bf16)
+    //
+    // The outputs MUST be early-clobber ("=&v"). This is one asm block with
+    // four separate instructions, so the compiler is free to allocate an
+    // output register on top of an input it believes is dead after the
+    // block -- and it does: without the '&' it emits
+    //     global_load_dwordx4 v[4:7],   v[4:5],  ...
+    //     global_load_dwordx4 v[8:11],  v[6:7],  ...
+    //     global_load_dwordx4 v[12:15], v[8:9],  ...
+    //     global_load_dwordx4 v[16:19], v[10:11],...
+    // where the first load's destination overwrites the address operands of
+    // the next three before they issue. Those loads then use whatever the
+    // returned data happened to be as an address. A wild address that never
+    // completes leaves the wave parked on the s_waitcnt vmcnt(0) below
+    // forever, which hangs the __syncthreads at the end of this function and
+    // through it the whole block -- the captured deadlock is exactly that:
+    // wave 0 missing from the quant sync mask (0xe) while every wave had
+    // already cleared the W13->W2 barrier (0xf).
     uint32_t dw[16];
     asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1 nt\n"
                  "global_load_dwordx4 %1, %5, off sc0 sc1 nt\n"
                  "global_load_dwordx4 %2, %6, off sc0 sc1 nt\n"
                  "global_load_dwordx4 %3, %7, off sc0 sc1 nt"
-                 : "=v"(*(i32x4_t *)&dw[0]),
-                   "=v"(*(i32x4_t *)&dw[4]),
-                   "=v"(*(i32x4_t *)&dw[8]),
-                   "=v"(*(i32x4_t *)&dw[12])
+                 : "=&v"(*(i32x4_t *)&dw[0]),
+                   "=&v"(*(i32x4_t *)&dw[4]),
+                   "=&v"(*(i32x4_t *)&dw[8]),
+                   "=&v"(*(i32x4_t *)&dw[12])
                  : "v"(base_ptr),
                    "v"(base_ptr + 4),
                    "v"(base_ptr + 8),
@@ -283,12 +307,23 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
       amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
     }
 
-    // Combine amaxes from 4 sub-blocks via shuffle
+    // Combine amaxes across the 4 sub-blocks of this 128-element super-block.
+    //
+    // NSUBBLOCKS is REDUCTION_SIZE/32 and is NOT guaranteed to be a multiple
+    // of 4: for the W2 path REDUCTION_SIZE = INTERMEDIATE_SIZE = 2880, giving
+    // NSUBBLOCKS = 90. The last super-block therefore has only 2 real
+    // sub-blocks (sb 88, 89), but the shuffles below still read lanes for
+    // sb 90 and 91 -- threads whose loop condition failed, so their `amax`
+    // is an uninitialized register. Clamping the partner index to the last
+    // valid sub-block makes the reduction read only lanes that ran.
     int base_lane = lane_id & ~3;
+    int const sb_first = sb - sub_idx;         // first sb of this super-block
+    int const sb_last = NSUBBLOCKS - 1;        // last sb that actually runs
+    int const n_valid = min(4, sb_last - sb_first + 1);
     float a0 = __shfl(amax, base_lane);
-    float a1 = __shfl(amax, base_lane + 1);
-    float a2 = __shfl(amax, base_lane + 2);
-    float a3 = __shfl(amax, base_lane + 3);
+    float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));
+    float a2 = __shfl(amax, base_lane + min(2, n_valid - 1));
+    float a3 = __shfl(amax, base_lane + min(3, n_valid - 1));
     float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
 
     // Compute E8M0 scale
@@ -321,6 +356,11 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
       s_tok_scales[super_blk] = se;
     }
   }
+  // Record that this wave finished its strided share and is entering the
+  // block-wide sync. If a stall shows a mask below 0xf here, the missing
+  // wave never got out of the loop above -- almost certainly stuck on the
+  // vmcnt(0) that drains its NT loads of d_swiglu_out.
+  MPK_WS_WAVE_SYNC(tid >> 6);
   __syncthreads();
 }
 
@@ -457,15 +497,18 @@ __device__ __forceinline__ void
     uint32_t const *base_ptr = src32 + base / 2;
 
     // 4 wide NT loads (64 bytes = 32 bf16) instead of 16 individual dword loads
+    // Early-clobber outputs are required here for the same reason as in
+    // _gang_wave_parallel_fp8_quant_nt: without '&' the allocator puts the
+    // first load's destination on top of the later loads' address registers.
     uint32_t dw[16];
     asm volatile("global_load_dwordx4 %0, %4, off sc0 sc1 nt\n"
                  "global_load_dwordx4 %1, %5, off sc0 sc1 nt\n"
                  "global_load_dwordx4 %2, %6, off sc0 sc1 nt\n"
                  "global_load_dwordx4 %3, %7, off sc0 sc1 nt"
-                 : "=v"(*(i32x4_t *)&dw[0]),
-                   "=v"(*(i32x4_t *)&dw[4]),
-                   "=v"(*(i32x4_t *)&dw[8]),
-                   "=v"(*(i32x4_t *)&dw[12])
+                 : "=&v"(*(i32x4_t *)&dw[0]),
+                   "=&v"(*(i32x4_t *)&dw[4]),
+                   "=&v"(*(i32x4_t *)&dw[8]),
+                   "=&v"(*(i32x4_t *)&dw[12])
                  : "v"(base_ptr),
                    "v"(base_ptr + 4),
                    "v"(base_ptr + 8),

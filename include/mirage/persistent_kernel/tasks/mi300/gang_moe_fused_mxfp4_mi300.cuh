@@ -1361,6 +1361,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // Barrier id encodes the expert so the dump can tell which of the 4
     // activated experts never got its W13 release (see MPK_WS_WAIT_BEGIN).
     MPK_WS_WAIT_BEGIN(800 + expert_idx, expected);
+    // Each wave clears its own bits in both masks before it starts spinning,
+    // so what the dump reads describes this poll and not an earlier one. No
+    // __syncthreads here on purpose -- this poll is deliberately divergent.
+    MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
     while ((_obs = ld_nt_s32(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
@@ -1385,23 +1389,31 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             _mx = _v;
           }
         }
+        // a3 is now the per-wave exit mask (MPK_WS_WAVE_EXIT), so fold _mn
+        // into a2 instead of overwriting it.
         MPK_WS_WAIT_AUX(
             ld_nt_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
             expert_id,
             _n_ok * 1000000 + (_mx - _mn),
-            _mn);
+            -1);
       }
       _spins++;
       __builtin_amdgcn_s_sleep(1);
     }
+    // This wave's threads all cleared the release. Record it: the poll is
+    // per-thread with no __syncthreads, so waves leave independently and a
+    // block can be split across the barrier.
+    MPK_WS_WAVE_EXIT(warp_id);
   }
   MOE_DBG_SUBPHASE(3002);
+  MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
 
   // No buffer_inv needed — NT loads bypass L2 entirely.
 
   // FP8 quant of SwiGLU output — writes to LDS[0..W2_K+scales]
   // buffer_load_lds writes to LDS[W2_OFF..] — no conflict, both in flight.
   MOE_DBG_SUBPHASE(3003);
+  MPK_WS_MARK(8303, global_tile); // W2: FP8 quant of SwiGLU output
   {
     unsigned short const *w2_input_base =
         d_swiglu_out + tok_idx * (NUM_TOPK * INTERMEDIATE_SIZE) +
@@ -1413,6 +1425,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Drain ALL pending HBM loads: buffer_load_lds (weight) + scale loads
   // Weight loads were issued before barrier poll, should be done by now.
   MOE_DBG_SUBPHASE(3004);
+  MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
   {
@@ -1436,6 +1449,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     g_subphase_scratch[6] = __builtin_amdgcn_s_memrealtime();
 #endif
   MOE_DBG_SUBPHASE(3005);
+  MPK_WS_MARK(8305, global_tile); // W2: MFMA loop
   // LDS-based MFMA loop: weights already in LDS, compiler pipelines ds_reads.
   // Assembly shows lgkmcnt(7)/lgkmcnt(1) interleaving — much better than
   // the HBM path's vmcnt(0) stalls before every MFMA group.
@@ -1475,7 +1489,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
         asm volatile("global_load_dword %0, %2, off\n"
                      "global_load_dwordx2 %1, %3, off"
-                     : "=v"(pf_rw), "=v"(pf_bias)
+                     : "=&v"(pf_rw), "=&v"(pf_bias)
                      : "v"(rw_ptr), "v"(bias_ptr)
                      : "memory");
       }
@@ -1586,6 +1600,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       }
 
       MOE_DBG_SUBPHASE(3006);
+      MPK_WS_MARK(8306, global_tile); // W2: epilogue
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
         unsigned bt0 = (pf_bias.x & 0xFFFFu) << 16;
@@ -1797,7 +1812,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
           asm volatile("global_load_dword %0, %2, off\n"
                        "global_load_dwordx2 %1, %3, off"
-                       : "=v"(pf_rw), "=v"(pf_bias)
+                       : "=&v"(pf_rw), "=&v"(pf_bias)
                        : "v"(rw_ptr), "v"(bias_ptr)
                        : "memory");
         }
