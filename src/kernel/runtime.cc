@@ -349,7 +349,13 @@ void register_mugraph(
                                      : desc.stride[d + 1] *
                                            output_ops[0]->dtensor.dim[d + 1];
               }
-              task.inputs[task.num_outputs++] = desc;
+              // Was task.inputs[task.num_outputs++]: wrote the output
+              // descriptor into the *input* array, indexed by the output
+              // counter. With num_inputs==2 from the loop above and
+              // num_outputs==0 here, that clobbered inputs[0] and left
+              // outputs[0] unset, so TASK_REDUCE got a null output pointer and
+              // a corrupted first input.
+              task.outputs[task.num_outputs++] = desc;
               all_tasks.push_back(task);
               // Update current task map
               cur_task_map[bid] = all_tasks.size() - 1;

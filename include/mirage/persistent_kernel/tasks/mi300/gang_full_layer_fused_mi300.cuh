@@ -390,7 +390,29 @@ __device__ __noinline__ void
       // Phase 4: Chunk barrier — CROC last-chunk-worker runs merge
       // ══════════════════════════════════════════════════════════════════
       MPK_TW_SUB(40, kv_chunk_idx);
+      // Flush this chunk's o_acc/lse_acc partials before arriving.
+      //
+      // The chunk kernel writes its partials with ordinary stores, which may
+      // still be sitting in this CU's write buffer / vL1 when the atomic
+      // below retires. atom_add_release_gpu_s32 orders *this thread's* prior
+      // writes, but tid 0 is not the thread that wrote most of this chunk's
+      // partials -- the other 255 threads did, and __syncthreads is a
+      // block-execution barrier, not a memory-visibility one to other CUs.
+      // Without this, the merging worker (a *different* block, possibly a
+      // different CU) can read a partially-written o_acc/lse_acc slot.
+      //
+      // The result is silent numerical corruption, not a crash: merge weights
+      // each chunk by exp2(lse - m_global), so a stale/torn lse reads as
+      // garbage magnitude. A torn lse that lands large makes m_global huge and
+      // drives every other chunk's weight to zero; one that lands as raw
+      // uninitialized bits can be NaN, which propagates through the whole
+      // attention output. That is the seq-len-dependent part: at 512 tokens
+      // ntiles=32 so 14 of 30 chunks exit early via the empty-chunk path and
+      // never race, while at 32k ntiles=2048 gives every one of the 30 chunks
+      // real work to write, so the window is open on all of them every layer.
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
+      threadfence_gpu();
       __shared__ int s_chunk_prev;
       if (tid == 0) {
         s_chunk_prev = atom_add_release_gpu_s32(&chunk_barrier[xcd_id * 16], 1);
@@ -399,6 +421,11 @@ __device__ __noinline__ void
 
       if ((s_chunk_prev % NUM_KV_CHUNKS) == NUM_KV_CHUNKS - 1) {
         // Last chunk worker: run merge (no reset needed — modular check)
+        // Acquire the partials the other chunks released above. buffer_inv
+        // drops stale vL1 lines so the merge reads what they actually wrote
+        // rather than this CU's cached copy from a previous layer.
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        asm volatile("buffer_inv" ::: "memory");
 
         // ══════════════════════════════════════════════════════════════════
         // Phase 5: Merge (write-through fused) + signal

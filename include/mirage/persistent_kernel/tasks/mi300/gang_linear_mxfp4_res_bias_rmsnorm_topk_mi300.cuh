@@ -1081,10 +1081,12 @@ topk_barrier :
       // release flags below go out via st_wt (write-through, bypassing L2),
       // so without a GPU-scope fence the flag can land in HBM ahead of the
       // routing data it advertises. A remote MoE worker then passes the
-      // barrier and reads a stale active_expert_ids -- including a stale
-      // count at [NUM_EXPERTS] -- and derives its expert weight base and
-      // barrier slot from it. That is exactly the wild-address shape of the
-      // nil-address fault.
+      // barrier and reads a stale active_expert_ids / routing_indices.
+      //
+      // Impact is silent numerical corruption, not a crash: every stale value
+      // is still in range (the count at [NUM_EXPERTS] is the compile-time
+      // constant k=4 on every layer, expert ids stay in [0,128), route_val in
+      // [0,4]). A token gets routed through a previous layer's expert.
       //
       // The sibling path already documents this contract: see
       // gang_oproj_topk_moe_fused_mi300.cuh, "TopK worker wrote per-XCD flags
