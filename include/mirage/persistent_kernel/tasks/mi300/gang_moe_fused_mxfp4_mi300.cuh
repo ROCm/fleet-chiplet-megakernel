@@ -18,6 +18,20 @@
 // Single gang task replaces separate W13+SwiGLU and W2 tasks.
 // Uses in-kernel atomicAdd barrier between phases (no extra event dispatch).
 //
+// Barrier layout, per expert (see MOE_BAR_* below).
+//
+// Every slot gets its own 64-byte cache line. That is not padding for
+// performance -- it is required for correctness. The release fan-out uses
+// st_wt (sc0 sc1), which bypasses L2 and lands in HBM, while the arrival
+// counter is an ordinary L2-resident atomic read-modify-write. If the two
+// share a line, the L2 copy still holding the *old* release values can be
+// written back over the fresh write-through data, silently reverting slots
+// that were already released, and the W2 workers for that expert then wait
+// forever on a release that did happen. The sibling barrier in
+// gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh has always spaced its
+// slots this way; this one packed all eight releases plus the counter into a
+// single line, which is the deadlock captured at 32k.
+//
 // Phase-ordered tile encoding (all W13 before all W2):
 //   global_tile ∈ [0, num_activated * W13_TILES):  W13+SwiGLU phase
 //   global_tile ∈ [num_activated * W13_TILES, total):  W2 phase
@@ -63,6 +77,16 @@
 #endif
 
 namespace kernel {
+
+// Per-expert MoE barrier geometry. One 64-byte line per slot (see the layout
+// note at the top of this file): 8 per-XCD release flags then the arrival
+// counter, so 9 lines used out of 10 reserved per expert.
+//   [xcd * MOE_BAR_LINE]         per-XCD release flag  (st_wt, HBM)
+//   [MOE_BAR_COUNTER_SLOT * ..]  global arrival count  (atomic, L2)
+constexpr int MOE_BAR_LINE = 16;         // int32 per cache line
+constexpr int MOE_BAR_COUNTER_SLOT = 8;  // line index of the arrival counter
+constexpr int MOE_BAR_SLOTS = 10;        // lines reserved per expert
+constexpr int MOE_BAR_STRIDE = MOE_BAR_SLOTS * MOE_BAR_LINE; // ints per expert
 
 template <int BATCH_SIZE,
           int INTERMEDIATE_SIZE,
@@ -167,6 +191,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int total_w2 = num_activated_experts * W2_TILES;
   int total_tiles = total_w13 + total_w2;
   if (global_tile >= total_tiles) {
+    MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
     return;
   }
 
@@ -177,6 +202,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     phase_tile = global_tile % W13_TILES;
     // Padding tile: expert_idx beyond activated range → skip
     if (expert_idx >= num_activated_experts) {
+      MPK_WS_MARK(8101, global_tile); // exit: W13 padding tile
       return;
     }
   } else {
@@ -203,11 +229,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
   if (tok_idx >= BATCH_SIZE) {
+    MPK_WS_MARK(8102, global_tile); // exit: token out of batch
     return;
   }
 
   int route_val = expert_routing[tok_idx];
   if (route_val == 0) {
+    MPK_WS_MARK(8103, global_tile); // exit: token not routed here
     return;
   }
   int topk_slot = route_val - 1;
@@ -221,6 +249,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // ══════════════════════════════════════════════════════════════════════════
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
+    MPK_WS_MARK(8200, global_tile); // W13 compute
     // Shared memory layout: FP8 quantized tokens + scales
     uint8_t *s_tok_fp8 = (uint8_t *)_fused_smem;
     uint8_t *s_tok_scales = s_tok_fp8 + W13_K;
@@ -1091,11 +1120,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // ──────────────────────────────── Uses layer index from shared memory for
     // monotonically increasing release
     MOE_DBG_SUBPHASE(2001);
-    constexpr int HIER_STRIDE = 16;
+    MPK_WS_MARK(8201, global_tile); // W13 done, arriving at barrier
     if (tid == 0) {
-      int base = expert_id * HIER_STRIDE;
-      // Single global arrival (all W13 tiles increment one counter)
-      int prev_global = atom_add_release_gpu_s32(&d_barrier[base + 8], 1);
+      int base = expert_id * MOE_BAR_STRIDE;
+      // Single global arrival (all W13 tiles increment one counter).
+      //
+      // The counter must NOT share a cache line with the release slots below.
+      // The release fan-out uses st_wt (sc0 sc1), which bypasses L2 and writes
+      // straight to HBM, while this atomic is an L2-resident read-modify-write
+      // on the same 64-byte line. When both are in flight on the same line the
+      // L2 copy -- still holding the *old* release values -- is written back
+      // over the fresh write-through data, silently reverting slots that were
+      // already released. The captured deadlock is exactly that: every producer
+      // had arrived (arrivals % W13_TILES == 0, so the release did fire) yet
+      // the per-XCD slots of one expert held *different* epochs, which is
+      // impossible if the eight stores from one producer all survived.
+      // COUNTER_OFF puts the counter on the next line.
+      int prev_global = atom_add_release_gpu_s32(
+          &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
       if ((prev_global % W13_TILES) == W13_TILES - 1) {
         // Last W13 arrival: write per-XCD release = layer_idx + 1
         constexpr int LAYER_IDX_SMEM_OFF =
@@ -1105,7 +1147,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
         for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&d_barrier[base + x], (unsigned)release_val);
+          st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
+                    (unsigned)release_val);
         }
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       }
@@ -1129,6 +1172,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   uint8_t *s_tok_scales = s_tok_fp8 + W2_K;
 
   MOE_DBG_SUBPHASE(3000);
+  MPK_WS_MARK(8300, global_tile); // W2 entry
   // Weight pointers — depend only on expert_id/wg_idx, available before barrier
   uint8_t const *expert_weight =
       W_down + static_cast<int64_t>(expert_id) * W2_EXPERT_BYTES;
@@ -1164,8 +1208,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MOE_DBG_SUBPHASE(3001);
   // All threads independently read layer_idx from LDS (uniform value).
   // Eliminates shared variable and __syncthreads broadcast.
-  constexpr int HIER_STRIDE = 16;
-  int base = expert_id * HIER_STRIDE;
+  int base = expert_id * MOE_BAR_STRIDE;
   int w2_expected;
   {
     constexpr int LAYER_IDX_SMEM_OFF =
@@ -1315,7 +1358,40 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Eliminates tid==0 + __syncthreads — each thread confirms barrier itself.
   {
     int expected = w2_expected;
-    while (ld_nt_s32(&d_barrier[base + xcd_id]) < expected) {
+    // Barrier id encodes the expert so the dump can tell which of the 4
+    // activated experts never got its W13 release (see MPK_WS_WAIT_BEGIN).
+    MPK_WS_WAIT_BEGIN(800 + expert_idx, expected);
+    int _obs;
+    int _spins = 0;
+    while ((_obs = ld_nt_s32(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
+           expected) {
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      // Refresh the discriminating values on the same cadence as the tick:
+      // the raw arrival counter (whether it sits on a multiple of W13_TILES
+      // separates "release fired but was lost" from "arrivals never landed"),
+      // and how many of the 8 per-XCD slots agree. All 8 are written by one
+      // producer in one loop, so any spread means releases are being lost.
+      if ((_spins & (MPK_WS_WAIT_REFRESH - 1)) == 0) {
+        int _n_ok = 0, _mn = 0x7fffffff, _mx = -0x7fffffff;
+        for (int _x = 0; _x < 8; _x++) {
+          int _v = ld_nt_s32(&d_barrier[base + _x * MOE_BAR_LINE]);
+          if (_v >= expected) {
+            _n_ok++;
+          }
+          if (_v < _mn) {
+            _mn = _v;
+          }
+          if (_v > _mx) {
+            _mx = _v;
+          }
+        }
+        MPK_WS_WAIT_AUX(
+            ld_nt_s32(&d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
+            expert_id,
+            _n_ok * 1000000 + (_mx - _mn),
+            _mn);
+      }
+      _spins++;
       __builtin_amdgcn_s_sleep(1);
     }
   }

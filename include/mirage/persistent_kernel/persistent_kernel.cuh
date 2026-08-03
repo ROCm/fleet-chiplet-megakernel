@@ -25,9 +25,11 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #endif
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <map>
 #include <set>
 #include <thread>
 #include <unistd.h>
@@ -101,6 +103,126 @@ __device__ __forceinline__ void
 #else
 #define MPK_TW_SUB(sub, aux) ((void)0)
 #endif
+
+// Intra-layer phase breadcrumb for the worker-state dump.
+//
+// The 40000+ml marker says which layer a stalled worker is in, but a layer
+// spans eight phases and several cross-XCD barriers, so it cannot say which
+// barrier is holding. MPK_TW_SUB resolves that, but only under
+// MPK_NIL_TRIPWIRE, which costs enough to perturb the timing of the very
+// race being chased. This writes the same sub-phase code into the existing
+// worker-state slot, so MPK_WORKER_STATE alone gets intra-layer resolution:
+// a single relaxed store by tid 0, no atomics and no extra buffers.
+//
+// Encoded as 50000000 + xcd*100000 + phase*1000 + layer%1000, so one int
+// carries all three. The XCD matters because every barrier here is either
+// per-XCD (the QKV epoch) or cross-XCD (attn_global, MoE W13->W2), and
+// telling those apart is exactly what identifies the blocking worker.
+__device__ int *g_ws_dev;
+
+__device__ __forceinline__ void
+    mpk_ws_phase(int phase, int layer, int xcd, int tid) {
+  if (tid == 0 && g_ws_dev != nullptr) {
+    __atomic_store_n(&g_ws_dev[blockIdx.x * 4 + 3],
+                     50000000 + xcd * 100000 + phase * 1000 + (layer % 1000),
+                     __ATOMIC_RELAXED);
+  }
+}
+#define MPK_WS_PHASE(phase, layer, xcd)                                        \
+  mpk_ws_phase((phase), (layer), (xcd), tid)
+
+// Barrier watch: what a spinning worker is actually waiting *for*.
+//
+// MPK_WS_PHASE names the phase, which narrows a stall to a barrier, but not
+// to a cause. Every barrier here is a "poll until counter >= expected" loop,
+// and the two ways it hangs are indistinguishable from the phase alone:
+// either the producer never arrived (observed < expected, and the shortfall
+// says how many arrivals are missing), or the waiter computed an expected
+// value the producer will never reach (observed >= expected but the load is
+// reading a stale cache line, or expected ran ahead by a full epoch). This
+// records observed/expected so the dump can tell those apart.
+//
+// Lives in the second half of the worker-state buffer -- 4 more ints per
+// worker at [num_workers*4 + blockIdx.x*4] -- to avoid widening RuntimeConfig
+// for a debug-only path. Slots: 0 = barrier id, 1 = last observed value,
+// 2 = expected value, 3 = spin iterations.
+//
+// Cost in a healthy run is two relaxed stores per barrier entry: the observed
+// value is refreshed only once every MPK_WS_WAIT_REFRESH spins, and these
+// polls clear in far fewer than that, so the loop body itself stays untouched.
+__device__ int g_ws_nworkers;
+#define MPK_WS_WAIT_REFRESH 4096
+
+__device__ __forceinline__ void
+    mpk_ws_wait_begin(int barrier_id, int expected, int tid) {
+  if (tid == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
+    __atomic_store_n(&b[0], barrier_id, __ATOMIC_RELAXED);
+    __atomic_store_n(&b[2], expected, __ATOMIC_RELAXED);
+    __atomic_store_n(&b[3], 0, __ATOMIC_RELAXED);
+  }
+}
+
+__device__ __forceinline__ void
+    mpk_ws_wait_tick(int observed, int spins, int tid) {
+  if (tid == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
+    __atomic_store_n(&b[1], observed, __ATOMIC_RELAXED);
+    __atomic_store_n(&b[3], spins, __ATOMIC_RELAXED);
+  }
+}
+
+// Third quarter of the buffer: four barrier-specific auxiliary values.
+//
+// observed/expected says a release is missing but not why. For the MoE
+// W13->W2 barrier the discriminating value is the raw arrival counter: the
+// release fires on (prev % W13_TILES) == W13_TILES-1, on a counter that is
+// never reset and is shared by every layer that activates the expert. If the
+// counter is sitting on a multiple of W13_TILES the arrivals all landed and
+// the release value is wrong; if it is not, arrivals were lost in some earlier
+// layer and the modular boundary has been permanently skewed past.
+__device__ __forceinline__ void
+    mpk_ws_wait_aux(int a0, int a1, int a2, int a3, int tid) {
+  if (tid == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 8 + blockIdx.x * 4;
+    __atomic_store_n(&b[0], a0, __ATOMIC_RELAXED);
+    __atomic_store_n(&b[1], a1, __ATOMIC_RELAXED);
+    __atomic_store_n(&b[2], a2, __ATOMIC_RELAXED);
+    __atomic_store_n(&b[3], a3, __ATOMIC_RELAXED);
+  }
+}
+#define MPK_WS_WAIT_AUX(a0, a1, a2, a3)                                        \
+  mpk_ws_wait_aux((a0), (a1), (a2), (a3), tid)
+
+// Straight-line progress mark, for code that is not a spin loop.
+//
+// The barrier watch only sees workers parked in a poll. A worker stuck
+// *between* polls -- inside MoE compute, say -- registers nowhere, which is
+// exactly the state the first captured deadlock left its two blockers in.
+// This writes the same slots with spins = -1 so the host can tell a mark from
+// a barrier and print the last code the worker got past.
+// One store, not four. These fire per MoE tile -- several times per worker
+// per layer -- and g_ws_dev is pinned *host* memory, so every store is a PCIe
+// write. The four-store version cost 2.3x (6.99 vs 3.01 ms/token), which is
+// far past the point where the instrumentation perturbs the race it is meant
+// to catch. Packed as code*100000 + aux%100000, written to the spins slot as
+// a negative so the host can distinguish it from a poll count.
+__device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
+  if (tid == 0 && g_ws_dev != nullptr) {
+    int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
+    __atomic_store_n(&b[3], -(code * 100000 + (aux % 100000)), __ATOMIC_RELAXED);
+  }
+}
+#define MPK_WS_MARK(code, aux) mpk_ws_mark((code), (aux), tid)
+
+#define MPK_WS_WAIT_BEGIN(barrier_id, expected)                                \
+  mpk_ws_wait_begin((barrier_id), (expected), tid)
+#define MPK_WS_WAIT_TICK(observed, spins)                                      \
+  do {                                                                         \
+    if (((spins) & (MPK_WS_WAIT_REFRESH - 1)) == 0) {                          \
+      mpk_ws_wait_tick((observed), (spins), tid);                              \
+    }                                                                          \
+  } while (0)
 
 #if defined(MIRAGE_GRACE_HOPPER)
 #include "tasks/hopper/task_header.cuh"
@@ -878,12 +1000,16 @@ __device__ __forceinline__ int _span_stage_for_task(int task_type,
 // keep every sample. They must not silently keep only the *first* window
 // either: per-iter latency grows with sequence length, so truncating to the
 // first 8k iterations biased every reported average downward at long seq len
-// (a 49k run reported the latency of its cheapest 8k iterations). Instead the
-// totals below accumulate over *all* iterations, and g_fwdpass_dropped records
-// how many per-iteration samples did not fit, so a consumer can tell a
-// complete trace from a partial one.
+// (a 49k run reported the latency of its cheapest 8k iterations).
+//
+// The ring therefore stride-decimates: when it fills it compacts in place,
+// keeping every 2nd sample and doubling the stride. Coverage stays uniform
+// across the entire run at any length, which is what makes latency-vs-seqlen
+// reconstructible. g_fwdpass_stride is the current decimation factor; the
+// totals accumulate over every iteration regardless.
 #define FWDPASS_LOG_MAX 8192
 __device__ int g_fwdpass_count;
+__device__ int g_fwdpass_stride = 1;
 __device__ unsigned long long
     g_fwdpass_time_ns[FWDPASS_LOG_MAX];           // iter duration
 __device__ int g_fwdpass_tokens[FWDPASS_LOG_MAX]; // num_active_tokens
@@ -946,6 +1072,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   }
   __syncthreads();
 #endif
+  // Same publication for the worker-state phase breadcrumb (see MPK_WS_PHASE).
+  // Indexed by blockIdx.x, matching the 4-int-per-worker dump layout.
+  if (threadIdx.x == 0) {
+    g_ws_dev = config.precomp_dbg_worker_state;
+    // Stride to the barrier-watch half of the buffer (see MPK_WS_WAIT_BEGIN).
+    g_ws_nworkers = config.num_workers;
+  }
+  __syncthreads();
   worker_queues[0] = config.worker_queues[worker_id];
   worker_queue_ids[0] = worker_id;
   int num_worker_queues = 1;
@@ -2790,12 +2924,38 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           // ones past the end of the ring.
           g_fwdpass_total_ns += dur;
           g_fwdpass_total_iters++;
-          if (idx < FWDPASS_LOG_MAX) {
-            g_fwdpass_time_ns[idx] = dur;
-            g_fwdpass_tokens[idx] = num_active_tokens;
-            g_fwdpass_count = end_of_graph_count + 1;
+          // Stride-decimate rather than truncate.
+          //
+          // The old code kept iterations 0..8191 and dropped every one after,
+          // which is precisely backwards for this workload: per-iter latency
+          // GROWS with sequence length, so the discarded tail is the only part
+          // that shows the scaling. A 32k run reported the average of its
+          // cheapest 8k iterations and looked flat no matter how badly the
+          // tail degraded.
+          //
+          // Instead, once the ring fills, halve the resolution and compact:
+          // keep every 2nd sample, then every 4th, and so on. The ring then
+          // spans the whole run at uniform stride for any length, and the
+          // recorded token count lets the host reconstruct latency-vs-seqlen.
+          if (idx / g_fwdpass_stride < FWDPASS_LOG_MAX) {
+            if (idx % g_fwdpass_stride == 0) {
+              g_fwdpass_time_ns[idx / g_fwdpass_stride] = dur;
+              g_fwdpass_tokens[idx / g_fwdpass_stride] = num_active_tokens;
+              g_fwdpass_count = idx / g_fwdpass_stride + 1;
+            }
           } else {
-            g_fwdpass_dropped++;
+            // Ring full at this stride: compact in place, doubling the stride.
+            for (int i = 0; i * 2 + 1 < FWDPASS_LOG_MAX; i++) {
+              g_fwdpass_time_ns[i] = g_fwdpass_time_ns[i * 2];
+              g_fwdpass_tokens[i] = g_fwdpass_tokens[i * 2];
+            }
+            g_fwdpass_stride *= 2;
+            g_fwdpass_count = FWDPASS_LOG_MAX / 2;
+            if (idx % g_fwdpass_stride == 0) {
+              g_fwdpass_time_ns[idx / g_fwdpass_stride] = dur;
+              g_fwdpass_tokens[idx / g_fwdpass_stride] = num_active_tokens;
+              g_fwdpass_count = idx / g_fwdpass_stride + 1;
+            }
           }
         }
         prev_end_of_graph_clk = iter_end_clk;
@@ -2814,12 +2974,40 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                  iteration_num,
                  (double)(prep_done_clk - iter_end_clk) / 1000.0);
 #endif
-          // Dump deferred FWD_PASS log (after timing, before terminate)
+          // Dump deferred FWD_PASS log (after timing, before terminate).
+          // iter is reconstructed from the decimation stride.
           for (int i = 1; i < g_fwdpass_count && i < FWDPASS_LOG_MAX; i++) {
             printf("[FWD_PASS] iter=%d time_ms=%.3f num_active_tokens=%d\n",
-                   i,
+                   i * g_fwdpass_stride,
                    (double)g_fwdpass_time_ns[i] / 1000000.0,
                    g_fwdpass_tokens[i]);
+          }
+          // Latency-vs-sequence-position curve.
+          //
+          // This is the number that actually answers "does per-token latency
+          // stay flat as the sequence grows". The run average cannot: it
+          // blends a cheap 2 ms iteration at position 0 with an expensive one
+          // at position 32k and reports something in between, which hides
+          // exactly the scaling behaviour being measured. Deciles over the
+          // decimated ring now span the whole run.
+          if (g_fwdpass_count > 10) {
+            printf("[FWD_PASS_CURVE] latency by sequence position (decile):\n");
+            for (int d = 0; d < 10; d++) {
+              int lo = 1 + (int)((long long)(g_fwdpass_count - 1) * d / 10);
+              int hi = 1 + (int)((long long)(g_fwdpass_count - 1) * (d + 1) / 10);
+              unsigned long long sum = 0;
+              int n = 0;
+              for (int i = lo; i < hi && i < FWDPASS_LOG_MAX; i++) {
+                sum += g_fwdpass_time_ns[i];
+                n++;
+              }
+              if (n > 0) {
+                printf("[FWD_PASS_CURVE]   pos~%6d  avg_ms=%.3f  (n=%d)\n",
+                       lo * g_fwdpass_stride,
+                       (double)sum / (double)n / 1000000.0,
+                       n);
+              }
+            }
           }
           // Untruncated summary. dropped>0 means the per-iter lines above are
           // only the first FWDPASS_LOG_MAX iterations and must not be averaged
@@ -4170,7 +4358,12 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       {
         char const *ws_env = getenv("MPK_WORKER_STATE");
         if (ws_env != nullptr && atoi(ws_env) != 0) {
-          size_t ws_bytes = (size_t)num_workers * 4 * sizeof(int);
+          // Three thirds: [0, num_workers*4) is the per-worker phase state,
+          // [num_workers*4, num_workers*8) is the barrier watch written by
+          // MPK_WS_WAIT_BEGIN / MPK_WS_WAIT_TICK, and
+          // [num_workers*8, num_workers*12) is the per-barrier aux written by
+          // MPK_WS_WAIT_AUX.
+          size_t ws_bytes = (size_t)num_workers * 12 * sizeof(int);
           int *ws_host = nullptr;
           if (hipHostMalloc(reinterpret_cast<void **>(&ws_host),
                             ws_bytes,
@@ -4701,6 +4894,15 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         // Dump per-worker state + summary
         if (g_dbg_h_worker_state && dbg_i >= 2) {
           int phase_hist[4] = {};
+          // Fused-layer phase histogram over ALL workers, not just the 32
+          // printed individually. A stall where 239 workers sit on one barrier
+          // and a single straggler sits elsewhere is invisible in a 32-worker
+          // sample, and that straggler is the one holding the barrier.
+          // Indexed by (phase-50000)/100; also track min/max layer to expose
+          // cross-worker layer skew, which is the real deadlock signature.
+          std::map<int, int> fl_phase_hist;
+          std::map<int, int> fl_px_hist; // key = phase*10 + xcd
+          int fl_layer_min = 1 << 30, fl_layer_max = -1;
           int dep_hist[256] = {};
           int phase_gang_stuck = 0;
           int phase_gang_entry = 0;
@@ -4752,7 +4954,33 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
               // 40000+ml is the multi-layer marker written in the ml loop.
               // Print it as a layer number rather than a raw phase, since
               // "which layer" is the whole point of that encoding.
-              if (phase >= 40000 && phase < 40000 + 1024) {
+              if (phase >= 50000000 && phase < 51000000) {
+                // 50000000 + xcd*100000 + phase*1000 + layer%1000.
+                int fx = (phase - 50000000) / 100000;
+                int fp = ((phase - 50000000) / 1000) % 100;
+                int fl = (phase - 50000000) % 1000;
+                char const *pn = "?";
+                switch (fp) {
+                  case 20: pn = "P2-qkv-epoch"; break;
+                  case 30: pn = "P3-attn-chunk"; break;
+                  case 40: pn = "P4-chunk-barrier"; break;
+                  case 50: pn = "P5-merge"; break;
+                  case 60: pn = "P6-attn-xcd-barrier"; break;
+                  case 70: pn = "P7-oproj"; break;
+                  case 75: pn = "P7b-routing-poll"; break;
+                  case 80: pn = "P8-moe"; break;
+                  case 90: pn = "P9-layer-done"; break;
+                }
+                fprintf(stderr,
+                        "  w%d: pos=%d dep=%d done=%d xcd=%d epoch=%d %s\n",
+                        w,
+                        tpos,
+                        dep,
+                        done,
+                        fx,
+                        fl,
+                        pn);
+              } else if (phase >= 40000 && phase < 40000 + 1024) {
                 fprintf(stderr,
                         "  w%d: pos=%d dep=%d done=%d layer=%d\n",
                         w,
@@ -4776,8 +5004,24 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             }
             // Exclude the 40000+ml multi-layer marker: it means "executing
             // layer ml", which is normal progress, not a stuck gang tile.
+            if (phase >= 50000000 && phase < 51000000) {
+              int fp = ((phase - 50000000) / 1000) % 100;
+              int fx = (phase - 50000000) / 100000;
+              int fl = (phase - 50000000) % 1000;
+              fl_phase_hist[fp]++;
+              // Per-(phase,XCD) tally: a barrier stall shows as one XCD short
+              // of its expected arrivals while the others are complete.
+              fl_px_hist[fp * 10 + fx]++;
+              if (fl < fl_layer_min) {
+                fl_layer_min = fl;
+              }
+              if (fl > fl_layer_max) {
+                fl_layer_max = fl;
+              }
+            }
             if (phase >= 1200 && phase < 300100000 &&
-                !(phase >= 40000 && phase < 40000 + 1024)) {
+                !(phase >= 40000 && phase < 40000 + 1024) &&
+                !(phase >= 50000000 && phase < 51000000)) {
               phase_gang_stuck++;
             }
             if (sc == 2000) {
@@ -4824,7 +5068,211 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                        "for 3+ ticks ***"
                                      : "");
           }
+          // Barrier watch. Only meaningful once the run is actually wedged --
+          // in a healthy run these slots hold whatever barrier each worker
+          // last cleared, which is noise. On a stall it is the whole answer:
+          // observed vs expected separates "the producer never arrived"
+          // (observed short by N) from "this waiter expects an epoch the
+          // producer will never reach" (observed >= expected, i.e. the poll
+          // should have cleared and the load is reading a stale line).
+          if (stall_ticks >= 2) {
+            // key = barrier_id, value = (count, min observed, expected,
+            // max spins) aggregated over workers still spinning.
+            std::map<int, std::array<long long, 5>> bw;
+            // The watch slots are last-write-wins and are never cleared on
+            // exit, so a worker that finished its layer long ago still shows
+            // whatever mark it passed on the way out. Reading them without
+            // cross-checking the live phase is how the first capture produced
+            // 56 "blockers" that were all idle at the scheduler (phase == -1)
+            // while the one worker actually inside the layer went unprinted.
+            // Only a worker whose phase says it is still executing can be
+            // holding anything, so gate every watch read on that.
+            for (int w = 0; w < g_dbg_num_workers; w++) {
+              int wphase =
+                  __atomic_load_n(&g_dbg_h_worker_state[w * 4 + 3],
+                                  __ATOMIC_RELAXED);
+              bool in_task = (wphase >= 0);
+              int *b = g_dbg_h_worker_state + g_dbg_num_workers * 4 + w * 4;
+              int bid = __atomic_load_n(&b[0], __ATOMIC_RELAXED);
+              int obs = __atomic_load_n(&b[1], __ATOMIC_RELAXED);
+              int exp_ = __atomic_load_n(&b[2], __ATOMIC_RELAXED);
+              int spins = __atomic_load_n(&b[3], __ATOMIC_RELAXED);
+              if (!in_task) {
+                continue; // idle at the scheduler; its watch slot is stale
+              }
+              // Whatever this worker's watch slot says, it is genuinely still
+              // inside the task -- print the live phase too, since that is the
+              // ground truth the watch slot has to be read against.
+              {
+                char const *pn = "?";
+                int fx = -1, fp = -1, fl = -1;
+                if (wphase >= 50000000 && wphase < 51000000) {
+                  fx = (wphase - 50000000) / 100000;
+                  fp = ((wphase - 50000000) / 1000) % 100;
+                  fl = (wphase - 50000000) % 1000;
+                  switch (fp) {
+                    case 20: pn = "P2-qkv-epoch"; break;
+                    case 30: pn = "P3-attn-chunk"; break;
+                    case 40: pn = "P4-chunk-barrier"; break;
+                    case 50: pn = "P5-merge"; break;
+                    case 60: pn = "P6-attn-xcd-barrier"; break;
+                    case 70: pn = "P7-oproj"; break;
+                    case 75: pn = "P7b-routing-poll"; break;
+                    case 80: pn = "P8-moe"; break;
+                    case 90: pn = "P9-layer-done"; break;
+                  }
+                }
+                int *a = g_dbg_h_worker_state + g_dbg_num_workers * 8 + w * 4;
+                int a0 = __atomic_load_n(&a[0], __ATOMIC_RELAXED);
+                int a1 = __atomic_load_n(&a[1], __ATOMIC_RELAXED);
+                int a2 = __atomic_load_n(&a[2], __ATOMIC_RELAXED);
+                int a3 = __atomic_load_n(&a[3], __ATOMIC_RELAXED);
+                fprintf(stderr,
+                        "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
+                        "watch[bid=%d obs=%d exp=%d spins=%d]\n",
+                        w, wphase, pn, fx, fl, bid, obs, exp_, spins);
+                if (bid >= 800 && bid < 900) {
+                  // a0 = raw arrival counter, a2 = W13_TILES. If a0 is an
+                  // exact multiple of a2 every producer arrived and the
+                  // release value is the bug; otherwise arrivals were lost.
+                  // a2 packs (slots_at_or_past_expected)*1e6 + (max-min)
+                  // across the 8 per-XCD release slots of this expert; a3 is
+                  // the min. All 8 are written by one producer in one loop, so
+                  // spread != 0 means the fan-out writes are being lost.
+                  int n_ok = a2 / 1000000;
+                  int spread = a2 % 1000000;
+                  fprintf(stderr,
+                          "        MoE aux: arrivals=%d (arrivals%%46=%d) "
+                          "expert_id=%d slots_ok=%d/8 spread=%d min=%d %s\n",
+                          a0, a0 % 46, a1, n_ok, spread, a3,
+                          spread != 0
+                              ? "<== SLOTS DISAGREE: release fan-out lost"
+                              : (a0 % 46 == 0
+                                     ? "<== all arrived, all slots equal: "
+                                       "release VALUE is stale"
+                                     : "<== arrivals missing"));
+                }
+              }
+              // spins == -1 is a straight-line mark (MPK_WS_MARK), not a poll:
+              // the worker is running, and the code says where. Print those
+              // separately -- on a total stall they are the blockers, since a
+              // worker that is not in any poll is the one everyone waits on.
+              if (spins < 0) {
+                int mcode = (-spins) / 100000;
+                int maux = (-spins) % 100000;
+                char const *mn = "?";
+                switch (mcode) {
+                  case 8000: mn = "MoE tile loop"; break;
+                  case 8100: mn = "MoE exit: past tile range"; break;
+                  case 8101: mn = "MoE exit: W13 padding tile"; break;
+                  case 8102: mn = "MoE exit: token out of batch"; break;
+                  case 8103: mn = "MoE exit: token not routed"; break;
+                  case 8200: mn = "MoE W13 compute"; break;
+                  case 8201: mn = "MoE W13 done, at barrier"; break;
+                  case 8300: mn = "MoE W2 entry"; break;
+                }
+                fprintf(stderr,
+                        "    w%d NOT POLLING: mark %d (%s) tile=%d"
+                        "   <== running, not blocked; everyone else waits on "
+                        "this\n",
+                        w,
+                        mcode,
+                        mn,
+                        maux);
+                continue;
+              }
+              // spins==0 means this worker cleared its last barrier without
+              // ever ticking; it is not waiting, so it is not the blocker.
+              if (spins == 0) {
+                continue;
+              }
+              auto it = bw.find(bid);
+              if (it == bw.end()) {
+                bw[bid] = {1, obs, exp_, spins, w};
+              } else {
+                it->second[0]++;
+                if (obs < it->second[1]) {
+                  it->second[1] = obs;
+                }
+                if (spins > it->second[3]) {
+                  it->second[3] = spins;
+                  it->second[4] = w;
+                }
+              }
+            }
+            if (!bw.empty()) {
+              fprintf(stderr, "  *** BARRIER WATCH (workers still spinning) "
+                              "***\n");
+              for (auto const &kv : bw) {
+                char const *bn = "?";
+                int bid = kv.first;
+                if (bid >= 800 && bid < 900) {
+                  bn = "MoE-W13->W2";
+                } else if (bid == 20) {
+                  bn = "P2-qkv-epoch";
+                } else if (bid == 60) {
+                  bn = "P6-attn-xcd";
+                } else if (bid == 75) {
+                  bn = "P7b-routing";
+                }
+                fprintf(stderr,
+                        "    barrier %d (%s%s%d): %lld workers spinning, "
+                        "observed=%lld expected=%lld short_by=%lld "
+                        "max_spins=%lld (w%lld)%s\n",
+                        bid,
+                        bn,
+                        bid >= 800 && bid < 900 ? " expert " : "",
+                        bid >= 800 && bid < 900 ? bid - 800 : 0,
+                        kv.second[0],
+                        kv.second[1],
+                        kv.second[2],
+                        kv.second[2] - kv.second[1],
+                        kv.second[3],
+                        kv.second[4],
+                        kv.second[1] >= kv.second[2]
+                            ? "   <== STALE READ: observed >= expected, the "
+                              "poll should have cleared"
+                            : "");
+              }
+            }
+          }
           if (verbose) {
+          if (!fl_phase_hist.empty()) {
+            fprintf(stderr, "  fused-layer phases (all %d workers):",
+                    g_dbg_num_workers);
+            for (auto const &kv : fl_phase_hist) {
+              char const *pn = "?";
+              switch (kv.first) {
+                case 20: pn = "P2-qkv-epoch"; break;
+                case 30: pn = "P3-attn-chunk"; break;
+                case 40: pn = "P4-chunk-barrier"; break;
+                case 50: pn = "P5-merge"; break;
+                case 60: pn = "P6-attn-xcd-barrier"; break;
+                case 70: pn = "P7-oproj"; break;
+                case 75: pn = "P7b-routing-poll"; break;
+                case 80: pn = "P8-moe"; break;
+                case 90: pn = "P9-layer-done"; break;
+              }
+              fprintf(stderr, " %s=%d", pn, kv.second);
+            }
+            fprintf(stderr, "  epoch=[%d..%d]%s\n", fl_layer_min,
+                    fl_layer_max,
+                    fl_layer_min != fl_layer_max
+                        ? "  *** EPOCH SKEW: workers on different layers ***"
+                        : "");
+            // Per-XCD breakdown. Each XCD runs 30 workers, so a phase that
+            // shows fewer than 30 on some XCD is missing arrivals there --
+            // that XCD is the one holding a per-XCD barrier.
+            for (auto const &kv : fl_phase_hist) {
+              fprintf(stderr, "    phase %d per-xcd:", kv.first);
+              for (int x = 0; x < 8; x++) {
+                auto it = fl_px_hist.find(kv.first * 10 + x);
+                fprintf(stderr, " x%d=%d", x,
+                        it == fl_px_hist.end() ? 0 : it->second);
+              }
+              fprintf(stderr, "\n");
+            }
+          }
           fprintf(stderr,
                   "  phases: spinning=%d dep_done=%d signaling=%d sig_done=%d "
                   "gang_tile=%d gang_entry=%d",
