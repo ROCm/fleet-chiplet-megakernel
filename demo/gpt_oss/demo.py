@@ -1183,10 +1183,17 @@ if __name__ == "__main__":
             fuse_qkv_attn = True
         if fuse_qkv_attn:
             qkv_attn_barrier = make_tensor("qkv_attn_barrier", (16,), torch_dtype=torch.int32)
-        # Hierarchical barrier for fused W13+W2 kernel [16*E int32]:
-        # Per expert (1 cache line = 64 bytes):
-        #   [0..7]: xcd_arrive[8], [8]: global_arrive, [9]: w2_done
-        moe_fused_barrier = make_tensor("moe_fused_barrier", (16 * num_experts,), torch_dtype=torch.int32)
+        # Hierarchical barrier for fused W13+W2 kernel [160*E int32].
+        # Per expert, 10 slots of one 64-byte cache line (16 int32) each:
+        #   [x*16] for x in 0..7: per-XCD release flag (st_wt, bypasses L2)
+        #   [8*16]: global_arrive (atomic, lives in L2)
+        #   [9*16]: reserved
+        # The one-line-per-slot spacing is required, not padding: an L2-resident
+        # atomic sharing a line with write-through release flags can write the
+        # stale L2 copy back over them, reverting releases that already
+        # happened and deadlocking the W2 workers for that expert. See the
+        # layout note in gang_moe_fused_mxfp4_mi300.cuh (MOE_BAR_*).
+        moe_fused_barrier = make_tensor("moe_fused_barrier", (160 * num_experts,), torch_dtype=torch.int32)
         # W13+SwiGLU fused output: [bs, top_k, padded_intermediate]
         # (SwiGLU is fused into W13 epilogue — no separate mlp_mid buffer)
         swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))

@@ -301,6 +301,7 @@ __device__ __noinline__ void
   // count matches the number of workers that actually arrive.
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(20, qkv_epoch_expected);
+  MPK_WS_PHASE(20, qkv_epoch_expected, xcd_id);
   if (xcd_rank < qkv_epoch_participants) {
     __shared__ int s_prev;
     if (tid == 0) {
@@ -317,9 +318,14 @@ __device__ __noinline__ void
     }
 
     // All participants poll epoch (L2 coherent, per-XCD only)
+    MPK_WS_WAIT_BEGIN(20, qkv_epoch_expected);
     if (tid == 0) {
-      while (__atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) <
-             qkv_epoch_expected) {
+      int _obs;
+      int _spins = 0;
+      while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
+                                     __ATOMIC_RELAXED)) < qkv_epoch_expected) {
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        _spins++;
         __builtin_amdgcn_s_sleep(1);
       }
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -344,6 +350,7 @@ __device__ __noinline__ void
   // fired, and the megakernel deadlocked. Attention chunks are now served by
   // any of the workers_per_xcd (30) workers on this XCD.
   MPK_TW_SUB(30, xcd_rank);
+  MPK_WS_PHASE(30, qkv_epoch_expected, xcd_id);
   {
     if (xcd_rank < NUM_KV_CHUNKS) {
       int kv_chunk_idx = xcd_rank;
@@ -390,6 +397,7 @@ __device__ __noinline__ void
       // Phase 4: Chunk barrier — CROC last-chunk-worker runs merge
       // ══════════════════════════════════════════════════════════════════
       MPK_TW_SUB(40, kv_chunk_idx);
+      MPK_WS_PHASE(40, qkv_epoch_expected, xcd_id);
       // Flush this chunk's o_acc/lse_acc partials before arriving.
       //
       // The chunk kernel writes its partials with ordinary stores, which may
@@ -431,6 +439,7 @@ __device__ __noinline__ void
         // Phase 5: Merge (write-through fused) + signal
         // ══════════════════════════════════════════════════════════════════
         MPK_TW_SUB(50, s_chunk_prev);
+        MPK_WS_PHASE(50, qkv_epoch_expected, xcd_id);
         // WRITE_THROUGH=true: merge writes bf16 output directly via st_wt,
         // eliminating the separate __syncthreads + readback + flush pass.
         merge_splitkv_ck_fmha<__hip_bfloat16,
@@ -491,6 +500,7 @@ __device__ __noinline__ void
   // so DMA runs in the background during the spin-wait (~5-60us).
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(60, attn_release_expected);
+  MPK_WS_PHASE(60, qkv_epoch_expected, xcd_id);
   int oproj_topk_tiles_per_xcd =
       oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
 
@@ -572,8 +582,16 @@ __device__ __noinline__ void
   }
 #endif
 
-  while (ld_nt_s32(&attn_release[xcd_id * 16]) < attn_release_expected) {
-    __builtin_amdgcn_s_sleep(1);
+  MPK_WS_WAIT_BEGIN(60, attn_release_expected);
+  {
+    int _obs;
+    int _spins = 0;
+    while ((_obs = ld_nt_s32(&attn_release[xcd_id * 16])) <
+           attn_release_expected) {
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      _spins++;
+      __builtin_amdgcn_s_sleep(1);
+    }
   }
   asm volatile("buffer_inv" ::: "memory");
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -586,6 +604,7 @@ __device__ __noinline__ void
   // Phase 7: O-proj + RMSNorm + Router + TopK
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(70, oproj_topk_tiles_per_xcd);
+  MPK_WS_PHASE(70, qkv_epoch_expected, xcd_id);
   {
     if (xcd_rank < oproj_topk_tiles_per_xcd) {
       int oproj_tile_idx = xcd_id * oproj_topk_tiles_per_xcd + xcd_rank;
@@ -639,9 +658,15 @@ __device__ __noinline__ void
   // results are globally visible.
   // All threads poll independently — eliminates __syncthreads overhead.
   MPK_TW_SUB(75, routing_expected);
+  MPK_WS_PHASE(75, qkv_epoch_expected, xcd_id);
   {
     int *my_release = &routing_ready[(1 + xcd_id) * 16];
-    while (ld_nt_s32(my_release) < routing_expected) {
+    MPK_WS_WAIT_BEGIN(75, routing_expected);
+    int _obs;
+    int _spins = 0;
+    while ((_obs = ld_nt_s32(my_release)) < routing_expected) {
+      MPK_WS_WAIT_TICK(_obs, _spins);
+      _spins++;
       __builtin_amdgcn_s_sleep(1);
     }
   }
@@ -657,6 +682,7 @@ __device__ __noinline__ void
   for (int moe_t = xcd_rank; moe_t < moe_total_tiles_per_xcd;
        moe_t += workers_per_xcd) {
     MPK_TW_SUB(80, moe_t);
+    MPK_WS_PHASE(80, qkv_epoch_expected, xcd_id);
     gang_moe_fused_mxfp4_kernel_mi300<QKV_BATCH_SIZE,
                                       MOE_INTERMEDIATE_SIZE,
                                       MOE_HIDDEN_SIZE,
@@ -729,6 +755,7 @@ __device__ __noinline__ void
   }
 #endif
   MPK_TW_SUB(90, tile_idx);
+  MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);
 }
 
 } // namespace kernel
