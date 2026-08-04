@@ -347,20 +347,6 @@ def pack_mxfp4_workgroup(blocks: torch.Tensor, scales: torch.Tensor,
     return packed.contiguous()
 
 
-def pack_bf16_workgroup(weight_bf16: torch.Tensor,
-                        output_per_wg: int) -> torch.Tensor:
-    """Pack BF16 weight [out_dim, K] into workgroup layout [n_wgs, OPW*K*2] bytes.
-
-    Each workgroup: OPW rows x K bf16 values = OPW*K*2 bytes (no scales section).
-    """
-    out_dim, K = weight_bf16.shape
-    assert out_dim % output_per_wg == 0
-    n_wgs = out_dim // output_per_wg
-    # [n_wgs, OPW, K] bf16 -> view as uint8 [n_wgs, OPW*K*2]
-    return weight_bf16.reshape(n_wgs, output_per_wg, K).contiguous().view(
-        torch.uint8).reshape(n_wgs, -1)
-
-
 def dequant_mxfp4_to_bf16(blocks: torch.Tensor, scales: torch.Tensor,
                            target_out_dim: int = None,
                            target_reduction: int = None) -> torch.Tensor:
@@ -1537,19 +1523,12 @@ if __name__ == "__main__":
             qkv_out_size = w_qkv_shuffled.shape[0]  # fused_qkv_dim
             # Quantize/pack weights for workgroup layout
             qkv_output_per_wg = 64  # 10 tiles/XCD fits in 30 workers, kvupd fusion needs OPW==head_dim
-            use_bf16_native = os.environ.get("USE_FP16_ACT") == "1"
-            if use_bf16_native:
-                # BF16 native weights: store pre-dequanted BF16 in workgroup layout
-                w_qkv_packed = pack_bf16_workgroup(w_qkv_shuffled, output_per_wg=qkv_output_per_wg)
-                w_qkv_mxfp4 = _attach_input_keep(
-                    w_qkv_packed, f"layer_{i}_qkv_bf16")
-            else:
-                qkv_blocks, qkv_scales = quantize_bf16_to_mxfp4(w_qkv_shuffled)
-                w_qkv_packed = pack_mxfp4_workgroup(
-                    qkv_blocks, qkv_scales, output_per_wg=qkv_output_per_wg,
-                ).squeeze(0)  # [n_wgs, wg_bytes]
-                w_qkv_mxfp4 = _attach_input_keep(
-                    w_qkv_packed, f"layer_{i}_qkv_mxfp4")
+            qkv_blocks, qkv_scales = quantize_bf16_to_mxfp4(w_qkv_shuffled)
+            w_qkv_packed = pack_mxfp4_workgroup(
+                qkv_blocks, qkv_scales, output_per_wg=qkv_output_per_wg,
+            ).squeeze(0)  # [n_wgs, wg_bytes]
+            w_qkv_mxfp4 = _attach_input_keep(
+                w_qkv_packed, f"layer_{i}_qkv_mxfp4")
             # QKV bias: shuffle Q/K/V biases to match interleaved weight layout
             q_bias = layer.self_attn.q_proj.bias.data.to("cuda")
             k_bias = layer.self_attn.k_proj.bias.data.to("cuda")
@@ -1958,17 +1937,12 @@ if __name__ == "__main__":
             if is_rocm:
                 # Quantize/pack O-proj weight
                 o_output_per_wg = 16
-                if use_bf16_native:
-                    w_o_packed = pack_bf16_workgroup(w_o, output_per_wg=o_output_per_wg)
-                    w_o_mxfp4 = _attach_input_keep(
-                        w_o_packed, f"layer_{i}_o_proj_bf16")
-                else:
-                    o_blocks, o_scales = quantize_bf16_to_mxfp4(w_o)
-                    w_o_packed = pack_mxfp4_workgroup(
-                        o_blocks, o_scales, output_per_wg=o_output_per_wg,
-                    ).squeeze(0)  # [n_wgs, wg_bytes]
-                    w_o_mxfp4 = _attach_input_keep(
-                        w_o_packed, f"layer_{i}_o_proj_mxfp4")
+                o_blocks, o_scales = quantize_bf16_to_mxfp4(w_o)
+                w_o_packed = pack_mxfp4_workgroup(
+                    o_blocks, o_scales, output_per_wg=o_output_per_wg,
+                ).squeeze(0)  # [n_wgs, wg_bytes]
+                w_o_mxfp4 = _attach_input_keep(
+                    w_o_packed, f"layer_{i}_o_proj_mxfp4")
 
             # === MoE block weight prep (needed before fused path) ===
             post_norm_w_padded = pad_weight_1d(

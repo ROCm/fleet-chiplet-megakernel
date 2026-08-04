@@ -504,7 +504,6 @@ __device__ __noinline__ void
   int oproj_topk_tiles_per_xcd =
       oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
 
-#if !defined(USE_BF16_NATIVE_WEIGHTS) && !defined(USE_BF16_ACTIVATIONS)
   {
     constexpr int OPROJ_WG_DATA =
         OPROJ_OUTPUT_PER_WG * (OPROJ_REDUCTION_SIZE / 2);
@@ -518,13 +517,10 @@ __device__ __noinline__ void
     constexpr int OPROJ_SLPT = (OPROJ_N16_SCALE + 255) / 256;
     constexpr int OPROJ_SCALE_PAD = OPROJ_SLPT * 256 * 16;
 
-#ifdef USE_FP4_ACTIVATIONS
-    constexpr int OPROJ_FP_TOK = OPROJ_REDUCTION_SIZE / 2;
-    constexpr int OPROJ_FP_SCL = OPROJ_NUM_B32 * 4;
-#else
+    // Activations are FP8 E4M3: one byte per element, one E8M0 scale byte per
+    // 32-element block. See _gang_wave_parallel_fp8_quant.
     constexpr int OPROJ_FP_TOK = OPROJ_REDUCTION_SIZE;
     constexpr int OPROJ_FP_SCL = OPROJ_NUM_B32;
-#endif
     constexpr int OPROJ_LDS_W_OFF =
         ((OPROJ_FP_TOK + OPROJ_FP_SCL + 15) / 16) * 16;
 
@@ -580,7 +576,6 @@ __device__ __noinline__ void
       }
     }
   }
-#endif
 
   MPK_WS_WAIT_BEGIN(60, attn_release_expected);
   {

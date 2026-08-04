@@ -18,7 +18,7 @@ All commands below run from the repo root.
 
 ```bash
 rm -rf demo/gpt_oss/permanent_output_dir
-USE_FP8_ACT=1 HIP_VISIBLE_DEVICES=$GPU \
+HIP_VISIBLE_DEVICES=$GPU \
 python3 demo/gpt_oss/demo.py --use-mirage \
   --model-path "$MODEL_PATH" \
   --prompt "Tell me the history of america" \
@@ -39,7 +39,7 @@ The input prompt is set with `--prompt` (wrap it in double quotes):
 
 ```bash
 rm -rf demo/gpt_oss/permanent_output_dir
-USE_FP8_ACT=1 HIP_VISIBLE_DEVICES=$GPU \
+HIP_VISIBLE_DEVICES=$GPU \
 python3 demo/gpt_oss/demo.py --use-mirage \
   --model-path "$MODEL_PATH" \
   --prompt "Explain how transformers work in simple terms" \
@@ -52,13 +52,15 @@ Notes:
   change the token count and make `Decode avg` non-comparable.
 - `--max-seq-length` is the total sequence length (prompt + generated tokens). Keep
   it at `512` for benchmarking; shorter values give artificially low TPOT.
+- The GEMM arithmetic is not selectable: every MI300 kernel runs MXFP4 weights
+  against FP8 E4M3 activations (E8M0 per-128-element block scales) on
+  `v_mfma_scale_f32_16x16x128_f8f6f4`, accumulating in f32.
 
 ## Required environment
 
 | Variable | Value | Why |
 |----------|-------|-----|
 | `MIRAGE_HOME` | repo root | Mirage repo root. |
-| `USE_FP8_ACT` | `1` | FP8 activations (the benchmark config). |
 | `HIP_VISIBLE_DEVICES` | GPU id | Target GPU. |
 
 ## Key flags
