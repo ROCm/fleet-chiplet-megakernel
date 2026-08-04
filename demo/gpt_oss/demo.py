@@ -525,6 +525,11 @@ if __name__ == "__main__":
     if args.max_layers is not None:
         num_layers = min(num_layers, args.max_layers)
         print(f"Using {num_layers} layers (out of {config.num_hidden_layers})")
+        # Truncate the reference too. num_layers only bounds the MPK task
+        # graph; GptOssModel.forward iterates self.layers unconditionally, so
+        # without this the Torch path silently keeps running all 36 layers and
+        # any MPK-vs-Torch comparison under --max-layers is meaningless.
+        model.model.layers = model.model.layers[:num_layers]
     total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
 
     # ── Perplexity mode ───────────────────────────────────────────────────
@@ -2319,6 +2324,22 @@ if __name__ == "__main__":
             top1.extend(chunk_logits.argmax(dim=-1).tolist())
             lp = torch.log_softmax(chunk_logits, dim=-1)
             ent.extend((-(lp.exp() * lp).sum(dim=-1)).tolist())
+        # Raw logit rows for a direct MPK-vs-Torch comparison. Derived metrics
+        # (NLL, entropy) can only say the distributions differ; the raw vectors
+        # say *how* -- a scale error, an offset, or unstructured noise are three
+        # different bugs and they look identical after a softmax.
+        if os.environ.get("PPL_DUMP_LOGITS"):
+            rows = [int(x) for x in
+                    os.environ.get("PPL_DUMP_ROWS", "1,2,5,10,50,100").split(",")
+                    if int(x) < n_ppl - 1]
+            torch.save(
+                {"rows": rows,
+                 "logits": {r: model.lm_head(hidden[0, r, :]).float().cpu()
+                            for r in rows},
+                 "hidden": {r: hidden[0, r, :].float().cpu() for r in rows}},
+                os.environ["PPL_DUMP_LOGITS"])
+            print(f"[PPL] dumped rows {rows} to "
+                  f"{os.environ['PPL_DUMP_LOGITS']}")
         report_perplexity(
             "torch", nll_sum, n_ppl - 1, args, corpus_tokens=n_ppl,
             per_pos=per_pos, top1=top1, targets=targets.tolist(),
@@ -2596,6 +2617,20 @@ if __name__ == "__main__":
                       f"{bad_idx} index mismatches, {bad_val} value "
                       f"mismatches -> "
                       f"{'OK' if bad_idx == 0 and bad_val == 0 else 'MISMATCH'}")
+            if os.environ.get("PPL_DUMP_LOGITS"):
+                rows = [int(x) for x in
+                        os.environ.get("PPL_DUMP_ROWS",
+                                       "1,2,5,10,50,100").split(",")
+                        if int(x) < n_ppl - 1]
+                # Sink row r+1 holds the distribution over tokens[r+1], i.e.
+                # the same position the Torch dump indexes as row r.
+                torch.save(
+                    {"rows": rows,
+                     "logits": {r: ppl_logits_torch[r + 1, :real_vocab]
+                                .float().cpu() for r in rows}},
+                    os.environ["PPL_DUMP_LOGITS"])
+                print(f"[PPL] dumped rows {rows} to "
+                      f"{os.environ['PPL_DUMP_LOGITS']}")
             report_perplexity(
                 "mpk", nll_sum, n_ppl - 1, args, corpus_tokens=n_ppl,
                 per_pos=per_pos, top1=top1, targets=targets.tolist(),
