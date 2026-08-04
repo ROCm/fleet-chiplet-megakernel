@@ -19,7 +19,6 @@ set -uo pipefail   # NOT -e: a single length OOMing must not kill the sweep
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MIRAGE_HOME="${MIRAGE_HOME:-$ROOT}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
-export USE_FP8_ACT="${USE_FP8_ACT:-1}"
 export PPL_MODE=1
 MODEL_PATH="${MODEL_PATH:-${GPT_OSS_MODEL_PATH:-openai/gpt-oss-120b}}"
 LENS="${PPL_LENS:-512 1024 2048 4096 8192 16384 32768}"

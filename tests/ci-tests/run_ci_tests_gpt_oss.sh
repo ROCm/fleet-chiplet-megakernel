@@ -13,7 +13,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MIRAGE_HOME="${MIRAGE_HOME:-$ROOT}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
-export USE_FP8_ACT="${USE_FP8_ACT:-1}"
 MODEL_PATH="${MODEL_PATH:-${GPT_OSS_MODEL_PATH:-openai/gpt-oss-120b}}"
 PROMPT="${GPT_OSS_PROMPT:-Tell me the history of america}"
 MAX_SEQ_LEN="${GPT_OSS_MAX_SEQ_LEN:-512}"

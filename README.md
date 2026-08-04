@@ -24,7 +24,7 @@ export MODEL_PATH=/path/to/gpt-oss-120b   # local GPT-OSS 120B weights (or HF re
 export GPU=0                              # target GPU id
 
 rm -rf demo/gpt_oss/permanent_output_dir
-USE_FP8_ACT=1 HIP_VISIBLE_DEVICES=$GPU \
+HIP_VISIBLE_DEVICES=$GPU \
 python3 demo/gpt_oss/demo.py --use-mirage \
   --model-path "$MODEL_PATH" \
   --prompt "Tell me the history of america" \
