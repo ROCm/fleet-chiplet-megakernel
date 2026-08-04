@@ -34,6 +34,96 @@ PADDED_HIDDEN_SIZE = 2944
 PADDED_INTERMEDIATE_SIZE = 2944
 
 
+# WikiText-2 raw, test split. Blank lines and the "= Section =" headers are
+# dropped, the rest joined with "\n\n", then truncated to --ppl-max-tokens.
+# Recording the recipe here (rather than a token count alone) is what makes
+# numbers from different runs comparable.
+PPL_CORPUS_DESC = "wikitext-2-raw-v1/test, non-header non-blank lines, '\\n\\n'-joined"
+
+
+def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
+    """Return up to `max_tokens` token ids for the perplexity corpus.
+
+    `corpus` is either 'wikitext2' or a path to a UTF-8 text file. The file
+    fallback exists so the measurement runs on a machine with no network.
+    """
+    if corpus == "wikitext2":
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        lines = [
+            t.strip() for t in ds["text"]
+            if t.strip() and not t.strip().startswith("=")
+        ]
+        text = "\n\n".join(lines)
+    else:
+        with open(corpus, "r", encoding="utf-8") as f:
+            text = f.read()
+    ids = tokenizer(text, return_tensors=None, add_special_tokens=False)["input_ids"]
+    return ids[:max_tokens]
+
+
+def report_perplexity(mode: str, nll_sum: float, n_scored: int, args,
+                      corpus_tokens: int, per_pos=None, top1=None,
+                      targets=None, tokenizer=None, ent=None):
+    """Print (and optionally dump) a perplexity result.
+
+    per_pos/top1/targets are optional diagnostics: with PPL_DEBUG=1 they are
+    printed per position, which is how you tell a uniformly-degraded
+    distribution apart from a handful of catastrophic rows.
+    """
+    if per_pos is not None and os.environ.get("PPL_DEBUG", "0") == "1":
+        print(f"\n[PPL_DEBUG {mode}] per-position NLL "
+              f"(pos, target, nll, top1, top1==target)")
+        for i, nll in enumerate(per_pos):
+            t = int(targets[i]) if targets is not None else -1
+            p = int(top1[i]) if top1 is not None else -1
+            print(f"  pos={i + 1:4d} tgt={t:6d} nll={nll:8.4f} "
+                  f"top1={p:6d} {'HIT' if p == t else ''}")
+        if top1 is not None and targets is not None:
+            import numpy as _np
+            hits = sum(1 for i in range(len(per_pos))
+                       if int(top1[i]) == int(targets[i]))
+            print(f"  top-1 accuracy: {hits}/{len(per_pos)} "
+                  f"({100.0 * hits / len(per_pos):.1f}%)")
+    mean_nll = nll_sum / n_scored
+    ppl = math.exp(mean_nll)
+    print(f"\n{'=' * 60}")
+    print(f"PERPLEXITY ({mode})")
+    print(f"{'=' * 60}")
+    print(f"  corpus         : {args.ppl_corpus} ({PPL_CORPUS_DESC})")
+    print(f"  corpus tokens  : {corpus_tokens}")
+    print(f"  scored positions: {n_scored}")
+    print(f"  mean NLL       : {mean_nll:.6f}")
+    print(f"  perplexity     : {ppl:.4f}")
+    if ent:
+        print(f"  mean entropy   : {sum(ent) / len(ent):.4f} nats"
+              f"  (sharpness; a noisier GEMM raises this)")
+    if top1 is not None and targets is not None:
+        hits = sum(1 for i in range(len(top1))
+                   if int(top1[i]) == int(targets[i]))
+        print(f"  top-1 accuracy : {hits}/{len(top1)} "
+              f"({100.0 * hits / len(top1):.2f}%)")
+    print(f"{'=' * 60}")
+    if args.ppl_out:
+        os.makedirs(os.path.dirname(args.ppl_out) or ".", exist_ok=True)
+        with open(args.ppl_out, "w") as f:
+            json.dump({
+                "mode": mode,
+                "corpus": args.ppl_corpus,
+                "corpus_desc": PPL_CORPUS_DESC,
+                "corpus_tokens": corpus_tokens,
+                "scored_positions": n_scored,
+                "mean_nll": mean_nll,
+                "perplexity": ppl,
+                "per_position_nll": per_pos,
+                "top1": top1,
+                "targets": targets,
+                "entropy": ent,
+            }, f, indent=2)
+        print(f"Saved perplexity to {args.ppl_out}")
+    return ppl
+
+
 def grid_for_rmsnorm_linear_layer(size: int):
     if size % 64 == 0:
         return size // 64
@@ -360,6 +450,23 @@ if __name__ == "__main__":
                         help="Only use first N layers (for memory-constrained testing)")
     parser.add_argument("--verify", action="store_true",
                         help="Run both PyTorch and Mirage, compare intermediates")
+    parser.add_argument(
+        "--ppl-corpus", default="wikitext2",
+        help=("Corpus for PPL_MODE=1. Either 'wikitext2' (HuggingFace "
+              "wikitext/wikitext-2-raw-v1, test split) or a path to a UTF-8 "
+              "text file."),
+    )
+    parser.add_argument(
+        "--ppl-max-tokens", default=512, type=int,
+        help=("Number of corpus tokens to score in PPL_MODE. The logits sink "
+              "is [max_seq_length+1, padded_vocab] float32 (~400KB/position), "
+              "and the megakernel runs one iteration per token, so this is "
+              "both the memory and the runtime knob."),
+    )
+    parser.add_argument(
+        "--ppl-out", default=None,
+        help="Dump the PPL_MODE result to this JSON path.",
+    )
     args = parser.parse_args()
     if args.verify:
         args.use_mirage = True
@@ -419,24 +526,73 @@ if __name__ == "__main__":
         num_layers = min(num_layers, args.max_layers)
         print(f"Using {num_layers} layers (out of {config.num_hidden_layers})")
     total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
+
+    # ── Perplexity mode ───────────────────────────────────────────────────
+    # Score a fixed corpus instead of generating. The megakernel already does
+    # teacher forcing during prefill: prepare_next_batch only copies a sampled
+    # token into tokens[] once `step + 1 >= prompt_length`, so while we are
+    # still inside the prompt every position conditions on the *reference*
+    # prefix. Loading the corpus as one long prompt and running prefill-only
+    # is therefore exactly the teacher-forced pass perplexity needs -- no
+    # per-step host round trip and no change to the megakernel loop.
+    ppl_mode = os.environ.get("PPL_MODE", "0") == "1"
+    ppl_token_ids = None
+    if ppl_mode:
+        if args.use_mirage and args.max_num_batched_tokens != 1:
+            # The LM head task RMSNorms batch_count rows but feeds only row 0
+            # to the GEMM, so a multi-token iteration would emit one logit row
+            # for a batch of positions. Perplexity needs one row per position.
+            raise ValueError(
+                "PPL_MODE requires --max-num-batched-tokens 1; the LM head "
+                f"emits one logit row per iteration (got "
+                f"{args.max_num_batched_tokens})."
+            )
+        if args.use_mirage and os.environ.get("FUSE_TAIL", "0") == "1":
+            # The fused tail never dereferences its lm_logits output pointer,
+            # so it has no logits sink to attach.
+            raise ValueError("PPL_MODE is incompatible with FUSE_TAIL=1.")
+        ppl_token_ids = load_ppl_corpus(
+            tokenizer, args.ppl_corpus, args.ppl_max_tokens
+        )
+        n_ppl = len(ppl_token_ids)
+        if n_ppl < 2:
+            raise ValueError(
+                f"PPL corpus tokenized to {n_ppl} tokens; need at least 2 "
+                f"to score a single next-token prediction."
+            )
+        # One extra slot so the last scored position has somewhere to land and
+        # prepare_next_batch's `step + num_tokens + 1 >= max_seq_length` stop
+        # fires the moment prefill completes -- prefill-only, no decode.
+        args.max_seq_length = n_ppl + 1
+        print(f"[PPL] corpus={args.ppl_corpus} tokens={n_ppl} "
+              f"max_seq_length={args.max_seq_length}")
+
     tokens = torch.full((total_num_requests, args.max_seq_length), 0, dtype=torch.long, device="cuda")
 
-    # Tokenize prompt (apply chat template if available)
-    text = args.prompt
-    if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
-        messages = [{"role": "user", "content": text}]
-        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        model_inputs = tokenizer([formatted], return_tensors="pt", add_special_tokens=False).to("cuda")
-        print(f"Chat template applied: {len(model_inputs.input_ids[0])} tokens")
+    if ppl_mode:
+        ids = torch.tensor(ppl_token_ids, dtype=torch.long, device="cuda")
+        for r in range(total_num_requests):
+            tokens[r, :n_ppl] = ids
+        prompt_lengths = torch.full(
+            (total_num_requests,), n_ppl, dtype=torch.int, device="cuda"
+        )
     else:
-        model_inputs = tokenizer([text], return_tensors="pt").to("cuda")
-    for r in range(total_num_requests):
-        for i in range(model_inputs.input_ids.shape[-1]):
-            tokens[r, i] = model_inputs.input_ids[0, i]
-    prompt_lengths = torch.full(
-        (total_num_requests,), model_inputs.input_ids.shape[-1],
-        dtype=torch.int, device="cuda"
-    )
+        # Tokenize prompt (apply chat template if available)
+        text = args.prompt
+        if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+            messages = [{"role": "user", "content": text}]
+            formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            model_inputs = tokenizer([formatted], return_tensors="pt", add_special_tokens=False).to("cuda")
+            print(f"Chat template applied: {len(model_inputs.input_ids[0])} tokens")
+        else:
+            model_inputs = tokenizer([text], return_tensors="pt").to("cuda")
+        for r in range(total_num_requests):
+            for i in range(model_inputs.input_ids.shape[-1]):
+                tokens[r, i] = model_inputs.input_ids[0, i]
+        prompt_lengths = torch.full(
+            (total_num_requests,), model_inputs.input_ids.shape[-1],
+            dtype=torch.int, device="cuda"
+        )
 
     # Position embeddings
     positions = torch.arange(args.max_seq_length).unsqueeze(0).to("cuda")
@@ -1210,6 +1366,22 @@ if __name__ == "__main__":
         argmax_out = mpk.attach_input(torch_tensor=output_tokens, name="output_token")
         if fuse_tail:
             argmax_in = make_tensor("argmax_in", (bs, vocab_size))
+        # Perplexity sink: full logit row per scored position. Row r holds the
+        # distribution over tokens[r], written by the iteration that consumed
+        # tokens[r-1] (task_register passes runtime_config.step[0] + 1), so
+        # row 0 is never written and rows 1..n_ppl are. float32, not bf16 --
+        # bf16's ~0.4% relative precision is the same order as the GEMM error
+        # this buffer exists to measure.
+        ppl_logits = None
+        if ppl_mode:
+            ppl_bytes = args.max_seq_length * vocab_size * 4
+            print(f"[PPL] logits sink: [{args.max_seq_length}, {vocab_size}] "
+                  f"f32 = {ppl_bytes / 1e9:.2f} GB")
+            ppl_logits = make_tensor(
+                "ppl_logits", (args.max_seq_length, vocab_size),
+                torch_dtype=torch.float32,
+            )
+            ppl_logits_torch = _tensor_refs["ppl_logits"]
 
         # Split-K workspace for linear_with_residual on MI300
         # Must include done counter space: per XCD we need n_tiles_per_xcd ints
@@ -2053,6 +2225,7 @@ if __name__ == "__main__":
                 output_per_wg=lm_head_output_per_wg,
                 output_stride=vocab_size,
                 block_dim=(256, 1, 1),
+                ppl_logits=ppl_logits,
             )
             mpk.argmax_reduce_layer(
                 input=(argmax_part_value, argmax_part_index),
@@ -2084,8 +2257,55 @@ if __name__ == "__main__":
         tokens.size(1) - prompt_lengths[0].item()
     )
     output_len = max(0, min(output_len, tokens.size(1) - prompt_lengths[0].item()))
+    if ppl_mode:
+        # Prefill-only: every scored position must condition on the reference
+        # prefix, and a single generated token would start feeding the model
+        # its own output.
+        output_len = 0
 
-    if not args.use_mirage:
+    if ppl_mode and not args.use_mirage:
+        # Torch reference perplexity on the same slice. One causal forward
+        # over the whole sequence is teacher forcing by construction.
+        if os.environ.get("PPL_MXFP4_HEAD", "0") == "1":
+            # MPK quantizes the LM head to MXFP4; the Torch reference keeps it
+            # in bf16. That is a real accuracy difference between the two
+            # paths and it would otherwise be charged to the megakernel.
+            # Round-tripping the reference head through the same quantizer
+            # isolates kernel error from quantization error.
+            _b, _s = quantize_bf16_to_mxfp4(model.lm_head.weight.data)
+            model.lm_head.weight.data = dequant_mxfp4_to_bf16(_b, _s)[0].to(
+                model.lm_head.weight.dtype
+            )
+            print("[PPL] Torch LM head round-tripped through MXFP4")
+        ids = tokens[:1, :n_ppl]
+        cos_e = position_embeddings[0][:, :n_ppl]
+        sin_e = position_embeddings[1][:, :n_ppl]
+        hidden, _ = model.model(
+            input_ids=ids, position_embeddings=(cos_e, sin_e), step=step,
+        )
+        targets = tokens[0, 1:n_ppl]
+        # Chunk the LM head: [n, 201088] float32 logits at once is avoidable
+        # memory pressure and the sum is exact either way.
+        nll_sum = 0.0
+        per_pos, top1, ent = [], [], []
+        CH = 64
+        for lo in range(0, n_ppl - 1, CH):
+            hi = min(lo + CH, n_ppl - 1)
+            chunk_logits = model.lm_head(hidden[0, lo:hi, :]).float()
+            losses = torch.nn.functional.cross_entropy(
+                chunk_logits, targets[lo:hi], reduction="none"
+            )
+            nll_sum += losses.sum().item()
+            per_pos.extend(losses.tolist())
+            top1.extend(chunk_logits.argmax(dim=-1).tolist())
+            lp = torch.log_softmax(chunk_logits, dim=-1)
+            ent.extend((-(lp.exp() * lp).sum(dim=-1)).tolist())
+        report_perplexity(
+            "torch", nll_sum, n_ppl - 1, args, corpus_tokens=n_ppl,
+            per_pos=per_pos, top1=top1, targets=targets.tolist(),
+            tokenizer=tokenizer, ent=ent,
+        )
+    elif not args.use_mirage:
         prompt_len = prompt_lengths[0].item()
         decode_limit = prompt_len + output_len
         for cur_pos in range(prompt_len, decode_limit):
@@ -2231,6 +2451,124 @@ if __name__ == "__main__":
             _fwd_total_iters = int(_m_tot.group(1))
             _fwd_total_avg = float(_m_tot.group(2))
             _fwd_dropped = int(_m_tot.group(3))
+
+        if ppl_mode:
+            # ppl_logits[r] is the distribution over tokens[0, r], written by
+            # the iteration that consumed tokens[0, r-1]. Row 0 is never
+            # written, so scored positions are 1..n_ppl-1.
+            #
+            # Slice to config.vocab_size: the buffer is padded to 201216 and
+            # the pad columns were filled by rows of the zero-padded LM head
+            # weight. They are not real vocabulary and must not enter the
+            # softmax denominator.
+            real_vocab = config.vocab_size
+            targets = tokens[0, 1:n_ppl]
+            nll_sum = 0.0
+            per_pos, top1, ent = [], [], []
+            CH = 64
+            for lo in range(1, n_ppl, CH):
+                hi = min(lo + CH, n_ppl)
+                chunk = ppl_logits_torch[lo:hi, :real_vocab].float()
+                losses = torch.nn.functional.cross_entropy(
+                    chunk, targets[lo - 1:hi - 1], reduction="none"
+                )
+                nll_sum += losses.sum().item()
+                per_pos.extend(losses.tolist())
+                top1.extend(chunk.argmax(dim=-1).tolist())
+                # Distribution sharpness. Numeric noise in the GEMM flattens
+                # the softmax, which *lowers* NLL at positions the model gets
+                # wrong -- so entropy has to be reported alongside perplexity
+                # or a noisier kernel can look like a better one.
+                lp = torch.log_softmax(chunk, dim=-1)
+                ent.extend((-(lp.exp() * lp).sum(dim=-1)).tolist())
+            # A row the kernel never touched is all zeros -- uniform over the
+            # vocabulary, ln(201088) = 12.21 nats. Catching that here beats
+            # reporting a plausible-looking but meaningless number.
+            n_zero = int(
+                (ppl_logits_torch[1:n_ppl, :real_vocab].abs().sum(dim=1) == 0)
+                .sum().item()
+            )
+            if n_zero:
+                print(f"[PPL] WARNING: {n_zero}/{n_ppl - 1} scored rows are "
+                      f"all-zero -- the logits sink was not written for them.")
+            # Per-column coverage. An exactly-0.0 logit is possible but
+            # vanishingly unlikely in float32, so a nonzero count here means
+            # columns the kernel never wrote -- which reads as logit 0 and
+            # produces a ~17-nat NLL whenever the target lands on one.
+            zc = (ppl_logits_torch[1:n_ppl, :real_vocab] == 0.0)
+            print(f"[PPL] zero columns: total={int(zc.sum().item())} "
+                  f"per-row mean={zc.float().sum(dim=1).mean().item():.1f} "
+                  f"of {real_vocab}")
+            if zc.any():
+                r0 = int(zc.any(dim=1).nonzero()[0].item())
+                cols = zc[r0].nonzero().flatten()
+                print(f"[PPL]   first affected row {r0 + 1}: "
+                      f"{cols.numel()} zero cols, first 16 = "
+                      f"{cols[:16].tolist()}")
+            pad_max = (
+                ppl_logits_torch[1:n_ppl, real_vocab:].abs().max().item()
+                if vocab_size > real_vocab else 0.0
+            )
+            print(f"[PPL] pad-column max |logit| (excluded): {pad_max:.4f}")
+
+            # Self-consistency: the last prefill iteration consumed
+            # tokens[n_ppl-1], wrote sink row n_ppl, AND -- because
+            # step + 1 == prompt_length there -- had its argmax copied into
+            # tokens[0, n_ppl] by prepare_next_batch. If the sink is a
+            # faithful copy of the values the in-register argmax reduced,
+            # those two must name the same token. This checks the sink
+            # against the kernel's own reduction rather than against Torch,
+            # so it isolates "is the sink right" from "is MXFP4 accurate".
+            if n_ppl < args.max_seq_length:
+                sink_top = int(
+                    ppl_logits_torch[n_ppl, :real_vocab].argmax().item()
+                )
+                kernel_top = int(tokens[0, n_ppl].item())
+                ok = "OK" if sink_top == kernel_top else "MISMATCH"
+                print(f"[PPL] sink/argmax self-check: sink_argmax={sink_top} "
+                      f"kernel_token={kernel_top} -> {ok}")
+
+                # Stronger: the same last iteration also left 240 per-worker
+                # (max, abs_idx) pairs in argmax_part_*. Each worker owns a
+                # known set of 64-column tiles, so recomputing its max from
+                # the sink and comparing checks every column of the row, not
+                # just the single winner above.
+                pv = _tensor_refs["argmax_part_value"][0].float()
+                pi = _tensor_refs["argmax_part_index"][0]
+                wpx = mpk.num_workers // 8               # workers per XCD
+                nwg = (vocab_size // lm_head_output_per_wg) // 8
+                sink_row = ppl_logits_torch[n_ppl]
+                bad_idx = bad_val = 0
+                for p in range(8):
+                    pstart = p * nwg * lm_head_output_per_wg
+                    for r in range(wpx):
+                        cols = torch.cat([
+                            torch.arange(
+                                pstart + wg * lm_head_output_per_wg,
+                                pstart + (wg + 1) * lm_head_output_per_wg,
+                                device="cuda")
+                            for wg in range(r, nwg, wpx)
+                        ])
+                        vals = sink_row[cols]
+                        k = int(vals.argmax().item())
+                        w = p * wpx + r
+                        if int(cols[k].item()) != int(pi[w].item()):
+                            bad_idx += 1
+                        # argmax_part_value is bf16: 8 mantissa bits, so
+                        # compare at bf16 resolution, not exactly.
+                        elif abs(float(vals[k]) - float(pv[w])) > \
+                                0.02 * max(1.0, abs(float(pv[w]))):
+                            bad_val += 1
+                print(f"[PPL] sink/per-worker-argmax check over all "
+                      f"{mpk.num_workers} workers: "
+                      f"{bad_idx} index mismatches, {bad_val} value "
+                      f"mismatches -> "
+                      f"{'OK' if bad_idx == 0 and bad_val == 0 else 'MISMATCH'}")
+            report_perplexity(
+                "mpk", nll_sum, n_ppl - 1, args, corpus_tokens=n_ppl,
+                per_pos=per_pos, top1=top1, targets=targets.tolist(),
+                tokenizer=tokenizer, ent=ent,
+            )
 
         #print("tokens.shape = ", tokens.shape, flush=True)
         #print("All tokens:", tokens[0].tolist())

@@ -40,6 +40,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     void const *bias_ptr,
     void *argmax_val_ptr, // [num_workers] bf16: per-worker max value
     void *argmax_idx_ptr, // [num_workers] int64: per-worker absolute index
+    void *logits_out_ptr, // [max_seq_length, output_stride] f32, or nullptr.
+                          // Perplexity mode only: when non-null the full logit
+                          // row is also written to HBM at row `step`. Null on
+                          // the serving path, which keeps logits in registers
+                          // and pays no HBM traffic.
+    int step,             // row of logits_out_ptr to write (ignored if null)
     int num_active_tokens,
     int n_wgs_per_xcd,
     int workers_per_xcd,
@@ -285,6 +291,19 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           if (val > thread_max) {
             thread_max = val;
             thread_max_abs_idx = (long long)abs_idx;
+          }
+          // Perplexity mode: also spill the logit to HBM. abs_idx is the
+          // vocab column this lane owns, so the writes across all workers
+          // tile the row exactly once -- no atomics, no races.
+          //
+          // Stored as f32, not bf16: bf16 carries ~0.4% relative precision,
+          // which is the same order as the GEMM error this buffer exists to
+          // measure. Truncating here would fold a comparable one-sided error
+          // into the very quantity under test.
+          if (logits_out_ptr != nullptr) {
+            reinterpret_cast<float *>(
+                logits_out_ptr)[(long long)step * output_stride + abs_idx] =
+                val;
           }
         }
       }
