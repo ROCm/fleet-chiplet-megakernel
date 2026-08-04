@@ -173,13 +173,16 @@ __device__ __noinline__ void
   //   every XCD's Phase 2 barrier, so both happen after this worker arrives
   //   there, hence after these loads.
   //
-  // This is why Phase 2 must be joined by *all* workers_per_xcd and not just
-  // the QKV/attention workers. Narrowing it lets a worker that arrives
-  // nowhere before Phase 7b fall a full layer behind, read an already-bumped
-  // counter, and then wait for a bump this layer never produces -- while the
-  // layer that would produce it waits on that worker's MoE tiles. That is a
-  // real deadlock, and it was an intermittent one because it needs a
+  // This is why Phase 2 must be *arrived at* by all workers_per_xcd and not
+  // just the QKV/attention workers. Narrowing the arrival set lets a worker
+  // that arrives nowhere before Phase 7b fall a full layer behind, read an
+  // already-bumped counter, and then wait for a bump this layer never produces
+  // -- while the layer that would produce it waits on that worker's MoE tiles.
+  // That is a real deadlock, and it was an intermittent one because it needs a
   // full-layer skew to occur.
+  //
+  // Note this constrains the *arrival* set, not the *wait* set. Only workers
+  // that read QKV output need to block on the epoch; see Phase 2 below.
   int routing_expected = ld_nt_s32(routing_ready) + 1;
   int attn_release_expected = ld_nt_s32(&attn_release[xcd_id * 16]) + 1;
 
@@ -199,11 +202,12 @@ __device__ __noinline__ void
   // this load and this worker's arrival, and E+1 is always the epoch this
   // layer will reach.
   //
-  // Do not narrow the participant set: a worker that waits on the epoch but
+  // Do not narrow the *arrival* set: a worker that waits on the epoch but
   // never arrives has no such ordering, can read an already-bumped value, and
-  // will then wait for an epoch that this layer never reaches. Narrowing it
-  // also breaks the ordering the routing_ready/attn_release snapshots above
-  // depend on.
+  // will then wait for an epoch that this layer never reaches. Narrowing
+  // arrivals also breaks the ordering the routing_ready/attn_release snapshots
+  // above depend on. Narrowing which workers *block* on the epoch is safe and
+  // is done below -- arrival is what carries the ordering.
   int qkv_epoch_expected =
       __atomic_load_n(&qkv_epoch[xcd_id * 16], __ATOMIC_RELAXED) + 1;
 
@@ -282,13 +286,13 @@ __device__ __noinline__ void
   // Phase 2: QKV barrier — epoch-based
   //
   // Arrived at by every worker on this XCD: the QKV GEMM workers, the
-  // attention-chunk workers, and the MoE-only workers beyond both. Workers
-  // with no QKV tile arrive immediately and then wait here for the GEMM to
-  // land before reading K/V in Phase 3.
+  // attention-chunk workers, and the MoE-only workers beyond both. Only the
+  // attention-chunk workers (rank < NUM_KV_CHUNKS) then *block* here for the
+  // GEMM to land before reading K/V in Phase 3 -- the rest arrive and move on.
   //
   // This is the single point in the layer that every worker on the XCD passes
   // through, which is what makes it the layer's skew bound. Two things depend
-  // on that:
+  // on that, and both are satisfied by arrival alone:
   //
   //   1. Every waiter must also arrive, or its epoch snapshot is unordered
   //      against the bump and it can wait forever (see qkv_epoch_expected).
@@ -317,21 +321,42 @@ __device__ __noinline__ void
       }
     }
 
-    // All participants poll epoch (L2 coherent, per-XCD only)
-    MPK_WS_WAIT_BEGIN(20, qkv_epoch_expected);
-    if (tid == 0) {
-      int _obs;
-      int _spins = 0;
-      while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
-                                     __ATOMIC_RELAXED)) < qkv_epoch_expected) {
-        MPK_WS_WAIT_TICK(_obs, _spins);
-        _spins++;
-        __builtin_amdgcn_s_sleep(1);
+    // Only the workers that actually read this layer's QKV output poll the
+    // epoch. Everyone arrives (above); only ranks < NUM_KV_CHUNKS wait.
+    //
+    // Arrival is what carries the ordering, not the wait. Both properties in
+    // the header comment are preserved by arrival alone:
+    //
+    //   1. The bump is still gated on all workers_per_xcd arrivals, and every
+    //      poller still snapshots before it arrives, so no bump for this layer
+    //      can land between a poller's snapshot and its arrival.
+    //   2. A non-polling worker is still pinned to this layer: it cannot reach
+    //      Phase 6/7b until it has arrived here, and the epoch cannot bump
+    //      until it does. Its attn_release / routing_ready snapshots (taken at
+    //      the top, before this arrival) therefore still happen-before the
+    //      producers, which are all downstream of this barrier's release.
+    //
+    // What the wait costs: ranks >= NUM_KV_CHUNKS have no QKV tile and no
+    // attention chunk, so waiting here only delays their Phase 6 O-proj weight
+    // DMA -- which is issued before the attn_release poll precisely so it can
+    // overlap a spin-wait. Blocking them here serialized that DMA behind QKV.
+    if (xcd_rank < NUM_KV_CHUNKS) {
+      MPK_WS_WAIT_BEGIN(20, qkv_epoch_expected);
+      if (tid == 0) {
+        int _obs;
+        int _spins = 0;
+        while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
+                                       __ATOMIC_RELAXED)) <
+               qkv_epoch_expected) {
+          MPK_WS_WAIT_TICK(_obs, _spins);
+          _spins++;
+          __builtin_amdgcn_s_sleep(1);
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
       }
-      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+      __syncthreads();
+      asm volatile("buffer_inv" ::: "memory");
     }
-    __syncthreads();
-    asm volatile("buffer_inv" ::: "memory");
   }
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
@@ -636,12 +661,12 @@ __device__ __noinline__ void
           oproj_topk_tiles_per_xcd,
           oproj_tile_idx,
           routing_ready,
-#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
-          _ts_base
-#else
-          nullptr
-#endif
-      );
+          // ts_base: the O-proj/TopK kernel's optional per-sub-op timestamp
+          // sink. Nothing here reads those slots -- the [FUSED_PHASE] printf
+          // below derives every number from _fused_t0.._fused_t4, which are
+          // taken in this function. This used to name a _ts_base that was
+          // never declared, so MPK_DEVICE_TIMING=1 did not compile.
+          nullptr);
     }
   }
 
