@@ -2266,17 +2266,36 @@ if __name__ == "__main__":
     if ppl_mode and not args.use_mirage:
         # Torch reference perplexity on the same slice. One causal forward
         # over the whole sequence is teacher forcing by construction.
-        if os.environ.get("PPL_MXFP4_HEAD", "0") == "1":
-            # MPK quantizes the LM head to MXFP4; the Torch reference keeps it
-            # in bf16. That is a real accuracy difference between the two
-            # paths and it would otherwise be charged to the megakernel.
-            # Round-tripping the reference head through the same quantizer
-            # isolates kernel error from quantization error.
-            _b, _s = quantize_bf16_to_mxfp4(model.lm_head.weight.data)
-            model.lm_head.weight.data = dequant_mxfp4_to_bf16(_b, _s)[0].to(
-                model.lm_head.weight.dtype
+        def _mxfp4_roundtrip(w):
+            """Push a bf16 weight through the same quantizer MPK uses."""
+            b, s = quantize_bf16_to_mxfp4(w.data)
+            w.data = dequant_mxfp4_to_bf16(b, s)[0].to(w.dtype).reshape(
+                w.data.shape
             )
+
+        # MPK quantizes weights the checkpoint stores in bf16 -- the LM head,
+        # QKV and O-proj -- down to MXFP4, while this reference keeps them in
+        # bf16. (The MoE experts are natively MXFP4 in both paths, so they are
+        # not part of the difference.) Comparing the two as-is charges that
+        # quantization loss to the megakernel. Round-tripping the reference's
+        # weights through the same quantizer separates "the kernel computes
+        # something different" from "the kernel was handed coarser weights".
+        #
+        # PPL_MXFP4_HEAD=1  head only (the original, narrower control)
+        # PPL_MXFP4_MATCH=1 head + QKV + O-proj: the matched-precision run
+        _match = os.environ.get("PPL_MXFP4_MATCH", "0") == "1"
+        if _match or os.environ.get("PPL_MXFP4_HEAD", "0") == "1":
+            _mxfp4_roundtrip(model.lm_head.weight)
             print("[PPL] Torch LM head round-tripped through MXFP4")
+        if _match:
+            n_rt = 0
+            for _lyr in model.model.layers:
+                for _w in (_lyr.self_attn.q_proj, _lyr.self_attn.k_proj,
+                           _lyr.self_attn.v_proj, _lyr.self_attn.o_proj):
+                    _mxfp4_roundtrip(_w.weight)
+                    n_rt += 1
+            print(f"[PPL] Torch QKV/O-proj round-tripped through MXFP4 "
+                  f"({n_rt} weights)")
         ids = tokens[:1, :n_ppl]
         cos_e = position_embeddings[0][:, :n_ppl]
         sin_e = position_embeddings[1][:, :n_ppl]
