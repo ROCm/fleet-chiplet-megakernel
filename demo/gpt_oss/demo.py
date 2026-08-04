@@ -2484,10 +2484,31 @@ if __name__ == "__main__":
             # A row the kernel never touched is all zeros -- uniform over the
             # vocabulary, ln(201088) = 12.21 nats. Catching that here beats
             # reporting a plausible-looking but meaningless number.
-            n_zero = int(
-                (ppl_logits_torch[1:n_ppl, :real_vocab].abs().sum(dim=1) == 0)
-                .sum().item()
-            )
+            #
+            # Both of these run chunked. A whole-tensor `== 0.0` on the sink
+            # allocates an [n, vocab] bool and `.float()` an [n, vocab] f32 --
+            # at 32k that is 6 GB and 25 GB on top of the 25 GB sink, i.e. an
+            # OOM in the diagnostic rather than in the thing being measured.
+            n_zero = 0
+            zero_total = 0
+            first_zero_row = -1
+            first_zero_cols = None
+            pad_max = 0.0
+            for lo in range(1, n_ppl, CH):
+                hi = min(lo + CH, n_ppl)
+                blk = ppl_logits_torch[lo:hi, :real_vocab]
+                zc = (blk == 0.0)
+                per_row = zc.sum(dim=1)
+                zero_total += int(per_row.sum().item())
+                n_zero += int((per_row == real_vocab).sum().item())
+                if first_zero_row < 0 and bool((per_row > 0).any().item()):
+                    i0 = int((per_row > 0).nonzero()[0].item())
+                    first_zero_row = lo + i0
+                    first_zero_cols = zc[i0].nonzero().flatten()[:16].tolist()
+                if vocab_size > real_vocab:
+                    pad_max = max(pad_max, float(
+                        ppl_logits_torch[lo:hi, real_vocab:].abs().max().item()
+                    ))
             if n_zero:
                 print(f"[PPL] WARNING: {n_zero}/{n_ppl - 1} scored rows are "
                       f"all-zero -- the logits sink was not written for them.")
@@ -2495,20 +2516,12 @@ if __name__ == "__main__":
             # vanishingly unlikely in float32, so a nonzero count here means
             # columns the kernel never wrote -- which reads as logit 0 and
             # produces a ~17-nat NLL whenever the target lands on one.
-            zc = (ppl_logits_torch[1:n_ppl, :real_vocab] == 0.0)
-            print(f"[PPL] zero columns: total={int(zc.sum().item())} "
-                  f"per-row mean={zc.float().sum(dim=1).mean().item():.1f} "
+            print(f"[PPL] zero columns: total={zero_total} "
+                  f"per-row mean={zero_total / max(1, n_ppl - 1):.1f} "
                   f"of {real_vocab}")
-            if zc.any():
-                r0 = int(zc.any(dim=1).nonzero()[0].item())
-                cols = zc[r0].nonzero().flatten()
-                print(f"[PPL]   first affected row {r0 + 1}: "
-                      f"{cols.numel()} zero cols, first 16 = "
-                      f"{cols[:16].tolist()}")
-            pad_max = (
-                ppl_logits_torch[1:n_ppl, real_vocab:].abs().max().item()
-                if vocab_size > real_vocab else 0.0
-            )
+            if first_zero_row >= 0:
+                print(f"[PPL]   first affected row {first_zero_row}: "
+                      f"first 16 zero cols = {first_zero_cols}")
             print(f"[PPL] pad-column max |logit| (excluded): {pad_max:.4f}")
 
             # Self-consistency: the last prefill iteration consumed
