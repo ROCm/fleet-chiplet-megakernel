@@ -490,60 +490,93 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           unsigned ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
           asm volatile(
               // Zero accumulator
+              // ── Two disjoint operand banks ──
+              //   Bank 0: A v[22:25], A scale v7,  B v[8:15],  B scale v16
+              //   Bank 1: A v[26:29], A scale v18, B v[32:39], B scale v19
+              //   Address scratch v17, accumulator a[0:3].
+              //
+              // Prefetching into the registers the current MFMA reads is a WAR
+              // race: lgkmcnt tracks when LDS data lands in the VGPR, not when
+              // the MFMA finished sampling its operands, and a 16x16x128 MFMA
+              // streams them over the op rather than latching at issue. When LDS
+              // returns fast the write-back lands mid-MFMA and the op sees
+              // mixed-iteration operands (~17-22% of launches before banking).
+              // Ping-pong: while the MFMA consumes bank X, prefetch writes bank
+              // 1-X, so no register is ever both a live source and an in-flight
+              // LDS destination.
+              //
+              // Verified by tests/standalone/test_mfma_pipeline_hazards.hip.
               "v_accvgpr_write_b32 a0, 0\n"
               "v_accvgpr_write_b32 a1, 0\n"
               "v_accvgpr_write_b32 a2, 0\n"
               "v_accvgpr_write_b32 a3, 0\n"
 
-              // Pre-issue 5 reads for iteration 0
-              "ds_read_b128 v[22:25], %[wa]\n"           // weight A (16B FP4)
-              "ds_read_u8   v7, %[wsa]\n"                // weight A scale
-              "ds_read_b128 v[8:11], %[ta]\n"            // token B lo (16B FP8)
-              "ds_read_b128 v[12:15], %[ta] offset:64\n" // token B hi (16B FP8)
-              "ds_read_u8   v16, %[tsa]\n"               // token B scale
-              "s_mov_b32 s13, 0\n"                       // loop counter
+              // Pre-issue 5 reads for iteration 0 into bank 0
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, %[tsa]\n"
+              "s_mov_b32 s13, 0\n"
 
-              // ── Iterations 0..22: prefetch next, MFMA current ──
               "PIPELINED_W13_T0_%=:\n"
-              "s_waitcnt lgkmcnt(0)\n" // iter N reads complete
-
-              // Advance addresses for iter N+1
+              // ---- consume bank 0, prefetch into bank 1 ----
+              "s_waitcnt lgkmcnt(0)\n"
               "v_add_u32_e32 %[wa], 64, %[wa]\n"
               "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
               "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
               "s_add_i32 s13, s13, 1\n"
-
-              // Token B scale → v17 FIRST (oldest in queue, completes first)
               "v_add_u32_e32 v17, s13, %[tsa]\n"
-              "ds_read_u8   v17, v17\n" // [lgkmcnt +1] oldest
-              // Prefetch iter N+1 data into SAME regs (MFMA reads old values)
-              "ds_read_b128 v[22:25], %[wa]\n"           // [lgkmcnt +2]
-              "ds_read_u8   v7, %[wsa]\n"                // [lgkmcnt +3]
-              "ds_read_b128 v[8:11], %[ta]\n"            // [lgkmcnt +4]
-              "ds_read_b128 v[12:15], %[ta] offset:64\n" // [lgkmcnt +5]
-
-              // MFMA from iter N data (32 cycles, reads v[22:25] v[8:15] v7
-              // v16)
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
               "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+              "s_cbranch_scc0 W13_T0_TAIL_B1_%=\n"
 
-              // Copy next token scale during MFMA execution.
-              // lgkmcnt(4): wait for token scale (oldest, issued first), leave
-              // 4 data reads flying
-              "s_waitcnt lgkmcnt(4)\n"
-              "v_mov_b32_e32 v16, v17\n"
-
+              // ---- consume bank 1, prefetch into bank 0 ----
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "s_add_i32 s13, s13, 1\n"
+              "v_add_u32_e32 v17, s13, %[tsa]\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+              "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
               "s_cmpk_lt_i32 s13, %[iters_m1]\n"
               "s_cbranch_scc1 PIPELINED_W13_T0_%=\n"
 
-              // ── Final iteration: no more prefetch needed ──
+              // ── Final MFMA ──
+              // Both tails are emitted because exit parity decides which bank
+              // holds the final operands. Live MFMA_ITERS is 23 (odd), so the
+              // loop falls out of the bank 1 half with the last operands in
+              // BANK 0 -- this path. An even count exits via W13_T0_TAIL_B1
+              // with them in bank 1. One tail alone would silently use the
+              // wrong bank for one parity.
               "s_waitcnt lgkmcnt(0)\n"
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
               "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_branch W13_T0_ACC_%=\n"
 
-              // Read accumulator into output
-              "s_nop 7\n"
-              "s_nop 0\n"
+              "W13_T0_TAIL_B1_%=:\n"
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+              "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+
+              "W13_T0_ACC_%=:\n"
+              // 32 clocks: the scaled MFMA is a 32-cycle op on CDNA4. The old
+              // "s_nop 7; s_nop 0" was 9 clocks (correct only for a 4-pass
+              // MFMA) and returned a partially-retired accumulator every time.
+              "s_nop 15\n"
+              "s_nop 15\n"
               "v_accvgpr_read_b32 %[acc0], a0\n"
               "v_accvgpr_read_b32 %[acc1], a1\n"
               "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -569,10 +602,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "v15",
                 "v16",
                 "v17",
+                "v18",
+                "v19",
                 "v22",
                 "v23",
                 "v24",
                 "v25",
+                "v26",
+                "v27",
+                "v28",
+                "v29",
+                "v32",
+                "v33",
+                "v34",
+                "v35",
+                "v36",
+                "v37",
+                "v38",
+                "v39",
                 "a0",
                 "a1",
                 "a2",
@@ -793,39 +840,93 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             unsigned ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
 
             asm volatile(
+                // ── Two disjoint operand banks ──
+                //   Bank 0: A v[22:25], A scale v7,  B v[8:15],  B scale v16
+                //   Bank 1: A v[26:29], A scale v18, B v[32:39], B scale v19
+                //   Address scratch v17, accumulator a[0:3].
+                //
+                // Prefetching into the registers the current MFMA reads is a WAR
+                // race: lgkmcnt tracks when LDS data lands in the VGPR, not when
+                // the MFMA finished sampling its operands, and a 16x16x128 MFMA
+                // streams them over the op rather than latching at issue. When LDS
+                // returns fast the write-back lands mid-MFMA and the op sees
+                // mixed-iteration operands (~17-22% of launches before banking).
+                // Ping-pong: while the MFMA consumes bank X, prefetch writes bank
+                // 1-X, so no register is ever both a live source and an in-flight
+                // LDS destination.
+                //
+                // Verified by tests/standalone/test_mfma_pipeline_hazards.hip.
                 "v_accvgpr_write_b32 a0, 0\n"
                 "v_accvgpr_write_b32 a1, 0\n"
                 "v_accvgpr_write_b32 a2, 0\n"
                 "v_accvgpr_write_b32 a3, 0\n"
+
+                // Pre-issue 5 reads for iteration 0 into bank 0
                 "ds_read_b128 v[22:25], %[wa]\n"
                 "ds_read_u8   v7, %[wsa]\n"
                 "ds_read_b128 v[8:11], %[ta]\n"
                 "ds_read_b128 v[12:15], %[ta] offset:64\n"
                 "ds_read_u8   v16, %[tsa]\n"
                 "s_mov_b32 s13, 0\n"
+
                 "PIPELINED_W13_T1_%=:\n"
+                // ---- consume bank 0, prefetch into bank 1 ----
                 "s_waitcnt lgkmcnt(0)\n"
                 "v_add_u32_e32 %[wa], 64, %[wa]\n"
                 "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
                 "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
                 "s_add_i32 s13, s13, 1\n"
                 "v_add_u32_e32 v17, s13, %[tsa]\n"
-                "ds_read_u8   v17, v17\n"
+                "ds_read_u8   v19, v17\n"
+                "ds_read_b128 v[26:29], %[wa]\n"
+                "ds_read_u8   v18, %[wsa]\n"
+                "ds_read_b128 v[32:35], %[ta]\n"
+                "ds_read_b128 v[36:39], %[ta] offset:64\n"
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+                "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+                "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+                "s_cbranch_scc0 W13_T1_TAIL_B1_%=\n"
+
+                // ---- consume bank 1, prefetch into bank 0 ----
+                "s_waitcnt lgkmcnt(0)\n"
+                "v_add_u32_e32 %[wa], 64, %[wa]\n"
+                "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+                "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+                "s_add_i32 s13, s13, 1\n"
+                "v_add_u32_e32 v17, s13, %[tsa]\n"
+                "ds_read_u8   v16, v17\n"
                 "ds_read_b128 v[22:25], %[wa]\n"
                 "ds_read_u8   v7, %[wsa]\n"
                 "ds_read_b128 v[8:11], %[ta]\n"
                 "ds_read_b128 v[12:15], %[ta] offset:64\n"
-                "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
-                "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
-                "s_waitcnt lgkmcnt(4)\n"
-                "v_mov_b32_e32 v16, v17\n"
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+                "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
                 "s_cmpk_lt_i32 s13, %[iters_m1]\n"
                 "s_cbranch_scc1 PIPELINED_W13_T1_%=\n"
+
+                // ── Final MFMA ──
+                // Both tails are emitted because exit parity decides which bank
+                // holds the final operands. Live MFMA_ITERS is 23 (odd), so the
+                // loop falls out of the bank 1 half with the last operands in
+                // BANK 0 -- this path. An even count exits via W13_T1_TAIL_B1
+                // with them in bank 1. One tail alone would silently use the
+                // wrong bank for one parity.
                 "s_waitcnt lgkmcnt(0)\n"
                 "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
                 "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
-                "s_nop 7\n"
-                "s_nop 0\n"
+                "s_branch W13_T1_ACC_%=\n"
+
+                "W13_T1_TAIL_B1_%=:\n"
+                "s_waitcnt lgkmcnt(0)\n"
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+                "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+
+                "W13_T1_ACC_%=:\n"
+                // 32 clocks: the scaled MFMA is a 32-cycle op on CDNA4. The old
+                // "s_nop 7; s_nop 0" was 9 clocks (correct only for a 4-pass
+                // MFMA) and returned a partially-retired accumulator every time.
+                "s_nop 15\n"
+                "s_nop 15\n"
                 "v_accvgpr_read_b32 %[acc0], a0\n"
                 "v_accvgpr_read_b32 %[acc1], a1\n"
                 "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -851,10 +952,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   "v15",
                   "v16",
                   "v17",
+                  "v18",
+                  "v19",
                   "v22",
                   "v23",
                   "v24",
                   "v25",
+                  "v26",
+                  "v27",
+                  "v28",
+                  "v29",
+                  "v32",
+                  "v33",
+                  "v34",
+                  "v35",
+                  "v36",
+                  "v37",
+                  "v38",
+                  "v39",
                   "a0",
                   "a1",
                   "a2",
@@ -1511,59 +1626,93 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         unsigned w2_ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
         asm volatile(
             // Zero accumulator
+            // ── Two disjoint operand banks ──
+            //   Bank 0: A v[22:25], A scale v7,  B v[8:15],  B scale v16
+            //   Bank 1: A v[26:29], A scale v18, B v[32:39], B scale v19
+            //   Address scratch v17, accumulator a[0:3].
+            //
+            // Prefetching into the registers the current MFMA reads is a WAR
+            // race: lgkmcnt tracks when LDS data lands in the VGPR, not when
+            // the MFMA finished sampling its operands, and a 16x16x128 MFMA
+            // streams them over the op rather than latching at issue. When LDS
+            // returns fast the write-back lands mid-MFMA and the op sees
+            // mixed-iteration operands (~17-22% of launches before banking).
+            // Ping-pong: while the MFMA consumes bank X, prefetch writes bank
+            // 1-X, so no register is ever both a live source and an in-flight
+            // LDS destination.
+            //
+            // Verified by tests/standalone/test_mfma_pipeline_hazards.hip.
             "v_accvgpr_write_b32 a0, 0\n"
             "v_accvgpr_write_b32 a1, 0\n"
             "v_accvgpr_write_b32 a2, 0\n"
             "v_accvgpr_write_b32 a3, 0\n"
 
-            // Pre-issue 5 reads for iteration 0
-            "ds_read_b128 v[22:25], %[wa]\n"           // weight A (16B FP4)
-            "ds_read_u8   v7, %[wsa]\n"                // weight A scale
-            "ds_read_b128 v[8:11], %[ta]\n"            // token B lo (16B FP8)
-            "ds_read_b128 v[12:15], %[ta] offset:64\n" // token B hi (16B FP8)
-            "ds_read_u8   v16, %[tsa]\n"               // token B scale
-            "s_mov_b32 s13, 0\n"                       // loop counter
+            // Pre-issue 5 reads for iteration 0 into bank 0
+            "ds_read_b128 v[22:25], %[wa]\n"
+            "ds_read_u8   v7, %[wsa]\n"
+            "ds_read_b128 v[8:11], %[ta]\n"
+            "ds_read_b128 v[12:15], %[ta] offset:64\n"
+            "ds_read_u8   v16, %[tsa]\n"
+            "s_mov_b32 s13, 0\n"
 
-            // ── Iterations 0..W2_MFMA_ITERS-2: prefetch next, MFMA current ──
             "PIPELINED_W2_T0_%=:\n"
-            "s_waitcnt lgkmcnt(0)\n" // iter N reads complete
-
-            // Advance addresses for iter N+1
+            // ---- consume bank 0, prefetch into bank 1 ----
+            "s_waitcnt lgkmcnt(0)\n"
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
             "s_add_i32 s13, s13, 1\n"
-
-            // Token B scale → v17 FIRST (oldest in queue, completes first)
             "v_add_u32_e32 v17, s13, %[tsa]\n"
-            "ds_read_u8   v17, v17\n" // [lgkmcnt +1] oldest
-            // Prefetch iter N+1 data into SAME regs (MFMA reads old values)
-            "ds_read_b128 v[22:25], %[wa]\n"           // [lgkmcnt +2]
-            "ds_read_u8   v7, %[wsa]\n"                // [lgkmcnt +3]
-            "ds_read_b128 v[8:11], %[ta]\n"            // [lgkmcnt +4]
-            "ds_read_b128 v[12:15], %[ta] offset:64\n" // [lgkmcnt +5]
-
-            // MFMA from iter N data (32 cycles, reads v[22:25] v[8:15] v7 v16)
+            "ds_read_u8   v19, v17\n"
+            "ds_read_b128 v[26:29], %[wa]\n"
+            "ds_read_u8   v18, %[wsa]\n"
+            "ds_read_b128 v[32:35], %[ta]\n"
+            "ds_read_b128 v[36:39], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+            "s_cbranch_scc0 W2_T0_TAIL_B1_%=\n"
 
-            // Copy next token scale during MFMA execution.
-            // lgkmcnt(4): wait for token scale (oldest, issued first), leave 4
-            // data reads flying
-            "s_waitcnt lgkmcnt(4)\n"
-            "v_mov_b32_e32 v16, v17\n"
-
+            // ---- consume bank 1, prefetch into bank 0 ----
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+            "ds_read_u8   v16, v17\n"
+            "ds_read_b128 v[22:25], %[wa]\n"
+            "ds_read_u8   v7, %[wsa]\n"
+            "ds_read_b128 v[8:11], %[ta]\n"
+            "ds_read_b128 v[12:15], %[ta] offset:64\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+            "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc1 PIPELINED_W2_T0_%=\n"
 
-            // ── Final iteration: no more prefetch needed ──
+            // ── Final MFMA ──
+            // Both tails are emitted because exit parity decides which bank
+            // holds the final operands. Live MFMA_ITERS is 23 (odd), so the
+            // loop falls out of the bank 1 half with the last operands in
+            // BANK 0 -- this path. An even count exits via W2_T0_TAIL_B1
+            // with them in bank 1. One tail alone would silently use the
+            // wrong bank for one parity.
             "s_waitcnt lgkmcnt(0)\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_branch W2_T0_ACC_%=\n"
 
-            // Read accumulator into output
-            "s_nop 7\n"
-            "s_nop 0\n"
+            "W2_T0_TAIL_B1_%=:\n"
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+            "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+
+            "W2_T0_ACC_%=:\n"
+            // 32 clocks: the scaled MFMA is a 32-cycle op on CDNA4. The old
+            // "s_nop 7; s_nop 0" was 9 clocks (correct only for a 4-pass
+            // MFMA) and returned a partially-retired accumulator every time.
+            "s_nop 15\n"
+            "s_nop 15\n"
             "v_accvgpr_read_b32 %[acc0], a0\n"
             "v_accvgpr_read_b32 %[acc1], a1\n"
             "v_accvgpr_read_b32 %[acc2], a2\n"
@@ -1589,10 +1738,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "v15",
               "v16",
               "v17",
+              "v18",
+              "v19",
               "v22",
               "v23",
               "v24",
               "v25",
+              "v26",
+              "v27",
+              "v28",
+              "v29",
+              "v32",
+              "v33",
+              "v34",
+              "v35",
+              "v36",
+              "v37",
+              "v38",
+              "v39",
               "a0",
               "a1",
               "a2",

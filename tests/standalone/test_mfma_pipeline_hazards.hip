@@ -19,18 +19,30 @@
  * Hazard 2 (AccVGPR read before retirement)
  *   "s_nop 7; s_nop 0" is a 9-clock gap. The FP4xFP8 scaled MFMA is a
  *   32-cycle op on CDNA4, so v_accvgpr_read_b32 samples the accumulator
- *   mid-retirement. Deterministic: fails every launch. The signature is a
- *   stale a0 with a1..a3 already correct.
+ *   mid-retirement. Deterministic: fails every launch. The accumulator
+ *   retires progressively, so the signature depends on the gap: at 9 clocks
+ *   a0..a2 are stale with a3 correct, at 10 clocks only a0 is stale.
+ *
+ *   Measured threshold on gfx950 is exactly 11 clocks -- 10 fails 300/300,
+ *   11 passes 300/300. Note that LLVM's hazard recognizer emits precisely
+ *   "s_nop 7; s_nop 2" (11 clocks) for intrinsic-based MFMAs elsewhere in
+ *   this codebase, which corroborates the number. Inline asm bypasses that
+ *   recognizer entirely -- that is why the hand-written tail sat 2 clocks
+ *   short. We still pad to 32 rather than 11: the threshold is not
+ *   architecturally documented, and the tail runs once per GEMM.
  *
  * The fix for hazard 1 is two disjoint operand banks (ping-pong), so no
  * register is ever both a live MFMA source and an in-flight LDS destination.
  * The fix for hazard 2 is "s_nop 15" x2 == 32 clocks.
  *
- * NOTE ON LOOP PARITY: with an EVEN iteration count the ping-pong loop exits
- * on a bank-1 iteration, so the trailing MFMA must read BANK 0. A single-tail
- * port gets this backwards and silently reintroduces the bug. Both exit paths
- * are spelled out below. MFMA_ITERS here is 22 to match production
- * (W13_MFMA_ITERS = W2_MFMA_ITERS = QKV = 2880/128 = 22).
+ * NOTE ON LOOP PARITY: the ping-pong loop's exit parity decides which bank
+ * holds the final operands. An ODD iteration count falls out of the bank-1
+ * half (final operands in bank 0); an EVEN count exits via the bank-0 half
+ * (final operands in bank 1). A single-tail port gets one of the two cases
+ * backwards and silently reintroduces the bug, so BOTH exit paths are spelled
+ * out below. Production runs 23 iterations (REDUCTION_SIZE 2944 /
+ * K_PER_MFMA 128) for QKV, W13 and W2 alike. Rebuild with -DMFMA_ITERS=22 to
+ * exercise the even case.
  *
  * Build: ./build.sh   (or see the hipcc line in that script)
  * Run:   ./test_mfma_pipeline_hazards [launches]
@@ -47,7 +59,11 @@
 #include <cstdlib>
 #include <vector>
 
-#define MFMA_ITERS 22
+#ifndef MFMA_ITERS
+// Production runs 23 (REDUCTION_SIZE 2944 / K_PER_MFMA 128). Both parities
+// are exercised -- see the ITERS note in the header comment.
+#define MFMA_ITERS 23
+#endif
 
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \
