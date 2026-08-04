@@ -2505,6 +2505,7 @@ class PersistentKernel:
         output_per_wg: int,
         output_stride: int,
         block_dim: tuple = (256, 1, 1),
+        ppl_logits: DTensor = None,
     ):
         """Fused RMSNorm + MXFP4 Gang Linear + Bias + Argmax (norm-once).
 
@@ -2515,6 +2516,11 @@ class PersistentKernel:
         total_tiles_per_xcd = workers_per_xcd (each worker enters once).
         Output: one (bf16 max, int64 abs_idx) per worker.
         Follow with argmax_reduce_layer(CHUNK_SIZE=0) for final token.
+
+        ppl_logits: optional [max_seq_length, output_stride] float32 sink.
+        When supplied the kernel ALSO writes the full logit row for the
+        position being scored, which perplexity needs and argmax discards.
+        Costs a 393KB HBM write per step, so leave it None for serving.
         """
         assert norm_input.num_dims == 2
         assert mxfp4_weight.num_dims == 2
@@ -2533,11 +2539,20 @@ class PersistentKernel:
         tb_graph.new_input(bias, (1, -1, -1), 1, True)
         tb_graph.new_input(argmax_part_value, (1, -1, -1), -1, True)
         tb_graph.new_input(argmax_part_index, (1, -1, -1), -1, True)
-        self.kn_graph.customized(
-            [norm_input, norm_weight, norm_output, mxfp4_weight, bias,
-             argmax_part_value, argmax_part_index],
-            tb_graph,
-        )
+        tensors = [norm_input, norm_weight, norm_output, mxfp4_weight, bias,
+                   argmax_part_value, argmax_part_index]
+        if ppl_logits is not None:
+            # input_map (-1,-1,-1), NOT (1,-1,-1) like the argmax partials.
+            # A non-negative map partitions that dim across grid_dim.x, and the
+            # runtime pre-shifts each block's base pointer by
+            # bid.x * vocab/8. The kernel indexes logits by the *absolute*
+            # vocab column (the same abs_idx it uses for argmax), so a
+            # pre-shifted base would double-count the partition offset --
+            # blocks 0..3 would write every other 25152-column stripe and
+            # blocks 4..7 would run off the end of the row into the next one.
+            tb_graph.new_input(ppl_logits, (-1, -1, -1), -1, True)
+            tensors.append(ppl_logits)
+        self.kn_graph.customized(tensors, tb_graph)
         self.kn_graph.register_task(
             tb_graph, "gang_rmsnorm_linear_mxfp4_bias_argmax_mi300",
             [output_stride, output_per_wg, n_wgs_per_xcd,

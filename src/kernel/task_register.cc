@@ -1187,6 +1187,9 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp4_bias_mi300_task(
 // total_tiles_per_xcd = workers_per_xcd (each worker enters once, loops
 // internally). Inputs: [norm_input, norm_weight, norm_output, mxfp4_weight,
 // bias] Outputs: [argmax_part_value (bf16), argmax_part_index (int64)]
+//   plus an OPTIONAL third output [ppl_logits (f32)] used only by perplexity
+//   mode. When absent the kernel gets a nullptr and skips the HBM logits
+//   write entirely, so the serving path is byte-for-byte the previous code.
 int TaskRegister::register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 5);
@@ -1199,9 +1202,10 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
   int num_inputs = 5;
-  int num_outputs = 2;
-
-  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  // 2 outputs normally, 3 when a perplexity logits sink is attached.
+  int num_outputs = (int)bgraph.operators.size() - num_inputs;
+  assert(num_outputs == 2 || num_outputs == 3);
+  bool emit_logits = (num_outputs == 3);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
     if (input_ops.size() < (size_t)num_inputs) {
@@ -1228,6 +1232,14 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
   code.e("    task_desc->input_ptrs[4],");  // bias
   code.e("    task_desc->output_ptrs[0],"); // argmax_part_value (bf16)
   code.e("    task_desc->output_ptrs[1],"); // argmax_part_index (int64)
+  if (emit_logits) {
+    code.e("    task_desc->output_ptrs[2],"); // ppl_logits (f32)
+  } else {
+    code.e("    nullptr,"); // no logits sink
+  }
+  // Row to write in the logits buffer: the position being scored. step[0] is
+  // the last consumed position, so the token produced here lands at step+1.
+  code.e("    runtime_config.step[0] + 1,");
   code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
   code.e("    $,", n_wgs_per_xcd);
   code.e("    $,", workers_per_xcd);

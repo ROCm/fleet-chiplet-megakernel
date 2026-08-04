@@ -654,8 +654,16 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         task_register
             ->register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
                 customized->bgraph, params);
-    task_config[op] = std::make_tuple(
-        5, 2, TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300, variant_id);
+    // 2 outputs normally (argmax value/index); 3 when a perplexity logits
+    // sink is attached as a trailing output. Derive rather than hardcode so
+    // both shapes reach runtime.cc with a consistent input/output split.
+    int argmax_num_outputs = (int)customized->bgraph.operators.size() - 5;
+    assert(argmax_num_outputs == 2 || argmax_num_outputs == 3);
+    task_config[op] =
+        std::make_tuple(5,
+                        argmax_num_outputs,
+                        TASK_GANG_RMSNORM_LINEAR_MXFP4_BIAS_ARGMAX_MI300,
+                        variant_id);
     gang_task_tiles_per_xcd[op] = params[3]; // total_tiles_per_xcd
   } else if (name == "gang_mulsumradd_rmsnorm_linear_mxfp4_bias_mi300") {
     assert(params.size() == 7 &&
