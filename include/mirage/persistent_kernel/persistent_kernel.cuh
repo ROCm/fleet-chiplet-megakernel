@@ -3086,33 +3086,6 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    (double)g_fwdpass_time_ns[i] / 1000000.0,
                    g_fwdpass_tokens[i]);
           }
-          // Latency-vs-sequence-position curve.
-          //
-          // This is the number that actually answers "does per-token latency
-          // stay flat as the sequence grows". The run average cannot: it
-          // blends a cheap 2 ms iteration at position 0 with an expensive one
-          // at position 32k and reports something in between, which hides
-          // exactly the scaling behaviour being measured. Deciles over the
-          // decimated ring now span the whole run.
-          if (g_fwdpass_count > 10) {
-            printf("[FWD_PASS_CURVE] latency by sequence position (decile):\n");
-            for (int d = 0; d < 10; d++) {
-              int lo = 1 + (int)((long long)(g_fwdpass_count - 1) * d / 10);
-              int hi = 1 + (int)((long long)(g_fwdpass_count - 1) * (d + 1) / 10);
-              unsigned long long sum = 0;
-              int n = 0;
-              for (int i = lo; i < hi && i < FWDPASS_LOG_MAX; i++) {
-                sum += g_fwdpass_time_ns[i];
-                n++;
-              }
-              if (n > 0) {
-                printf("[FWD_PASS_CURVE]   pos~%6d  avg_ms=%.3f  (n=%d)\n",
-                       lo * g_fwdpass_stride,
-                       (double)sum / (double)n / 1000000.0,
-                       n);
-              }
-            }
-          }
           // Untruncated summary. dropped>0 means the per-iter lines above are
           // only the first FWDPASS_LOG_MAX iterations and must not be averaged
           // as if they were the whole run -- use total_ms/iters instead.
@@ -4026,13 +3999,18 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
             }
           }
         }
-        printf("[MPK] ML table validation: %d null inputs, %d null outputs "
-               "(%d/%d null in undeclared slots, expected)\n",
-               null_in,
-               null_out,
-               unused_in,
-               unused_out);
-        fflush(stdout);
+        // Only report when something is actually wrong. A healthy graph has
+        // null_in == null_out == 0, and printing that on every run trains the
+        // reader to skip the line that matters.
+        if (null_in || null_out) {
+          printf("[MPK] ML table validation: %d null inputs, %d null outputs "
+                 "(%d/%d null in undeclared slots, expected)\n",
+                 null_in,
+                 null_out,
+                 unused_in,
+                 unused_out);
+          fflush(stdout);
+        }
       }
 
       // === Compact task graph: remove layers 1..35 tasks and inter-layer
@@ -4419,10 +4397,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                      0,
                      NUM_XCDS_PC * sizeof(int));
 
-    printf("[MPK] XCD templates uploaded: %d entries x %d max_tpw\n",
-           total_template_entries,
-           max_tpw);
-    fflush(stdout);
 
     // Use device memory for iter_ready and terminate (GPU-only polling)
     {
