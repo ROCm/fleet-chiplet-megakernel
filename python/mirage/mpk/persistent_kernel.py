@@ -382,6 +382,14 @@ def get_compile_command(
             # the nil-address memory fault. Off by default: the per-layer
             # writes cost a little and only matter while chasing that bug.
             flags = flags + ["-DMPK_NIL_TRIPWIRE"]
+        if int(os.environ.get("MPK_WORKER_STATE", "0")) == 1:
+            # Per-phase worker-state breadcrumbs: which phase/barrier each
+            # worker is in, dumped on a hang. This is how the fused-layer
+            # deadlocks were attributed, so keep it reachable -- but off by
+            # default. The stores go to pinned *host* memory over PCIe from
+            # ~30 sites in the two hottest task headers, several inside spin
+            # loops; measured 2.386 -> 2.321 ms/iter when compiled out.
+            flags = flags + ["-DMPK_WORKER_STATE"]
         if int(os.environ.get("TRACE_MOE", "0")) == 1:
             flags = flags + ["-DMPK_TRACE_MOE_DISPATCH"]
         if int(os.environ.get("EMBED_DEBUG", "0")) == 1:
