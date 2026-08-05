@@ -1144,14 +1144,18 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
   }
   __syncthreads();
 #endif
+#ifdef MPK_WORKER_STATE
   // Same publication for the worker-state phase breadcrumb (see MPK_WS_PHASE).
   // Indexed by blockIdx.x, matching the 4-int-per-worker dump layout.
+  // Gated like the tripwire above: with MPK_WORKER_STATE off nothing reads
+  // g_ws_dev, so this store and its __syncthreads are pure overhead.
   if (threadIdx.x == 0) {
     g_ws_dev = config.precomp_dbg_worker_state;
     // Stride to the barrier-watch half of the buffer (see MPK_WS_WAIT_BEGIN).
     g_ws_nworkers = config.num_workers;
   }
   __syncthreads();
+#endif
   worker_queues[0] = config.worker_queues[worker_id];
   worker_queue_ids[0] = worker_id;
   int num_worker_queues = 1;
