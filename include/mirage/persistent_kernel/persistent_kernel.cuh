@@ -263,7 +263,8 @@ __device__ __forceinline__ void mpk_ws_wave_sync(int wave, int tid) {
 __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
   if (tid == 0 && g_ws_dev != nullptr) {
     int *b = g_ws_dev + g_ws_nworkers * 4 + blockIdx.x * 4;
-    __atomic_store_n(&b[3], -(code * 100000 + (aux % 100000)), __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &b[3], -(code * 100000 + (aux % 100000)), __ATOMIC_RELAXED);
   }
 }
 // Compile-time gate for the inline worker-state dump sites below. The runtime
@@ -309,7 +310,7 @@ __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
 // HIP/ROCm compatibility macros and type aliases
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
 #include <hip/hip_runtime.h>
-                                         // CUDA runtime API -> HIP equivalents
+// CUDA runtime API -> HIP equivalents
 #define cudaMalloc hipMalloc
 #define cudaFree hipFree
 #define cudaStreamSynchronize hipStreamSynchronize
@@ -325,9 +326,9 @@ __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
   hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaEventDisableTiming hipEventDisableTiming
-                                         // HIP's hipFuncSetAttribute requires
-                                         // const void*; wrap to cast function
-                                         // pointers
+// HIP's hipFuncSetAttribute requires
+// const void*; wrap to cast function
+// pointers
 #define cudaFuncSetAttribute(func, attr, value)                                \
   hipFuncSetAttribute(reinterpret_cast<const void *>(func), attr, value)
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
@@ -2173,8 +2174,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // which layer they were actually stuck in -- the counter could
               // not distinguish a worker on layer 0 from one on layer 35.
               // Encoding the layer makes the dump localize the stall.
-              if (threadIdx.x == 0 &&
-                  MPK_WS_ON(config)) {
+              if (threadIdx.x == 0 && MPK_WS_ON(config)) {
                 int *ws = config.precomp_dbg_worker_state + worker_id * 4;
                 __atomic_store_n(&ws[3], 40000 + ml, __ATOMIC_RELAXED);
               }
@@ -2348,8 +2348,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int tile_idx = n_tile_start + t;
 #ifdef MPK_PRECOMPUTED_DISPATCH
             // Phase 12 = about to execute gang tile
-            if (threadIdx.x == 0 &&
-                MPK_WS_ON(config)) {
+            if (threadIdx.x == 0 && MPK_WS_ON(config)) {
               int *ws = config.precomp_dbg_worker_state + worker_id * 4;
               __atomic_store_n(&ws[3], 1200 + tile_idx, __ATOMIC_RELAXED);
             }
@@ -3629,12 +3628,13 @@ static void tripwire_dump(int sig) {
     }
     printed++;
   }
-  fprintf(stderr,
-          "(%d workers left breadcrumbs; layer span %llu..%llu; %d null ptrs)\n",
-          printed,
-          printed ? min_layer : 0,
-          max_layer,
-          nulls);
+  fprintf(
+      stderr,
+      "(%d workers left breadcrumbs; layer span %llu..%llu; %d null ptrs)\n",
+      printed,
+      printed ? min_layer : 0,
+      max_layer,
+      nulls);
   fprintf(stderr, "===== END TRIPWIRE =====\n");
   fflush(stderr);
   // Restore default disposition and re-raise so the exit status is unchanged.
@@ -3649,7 +3649,7 @@ static void tripwire_dump(int sig) {
 // process dies without our handler ever running (observed). A file on disk
 // survives regardless of who wins the signal-handler race, and the fault
 // aborts within ~1s of launch, so a short interval catches it.
-static volatile bool g_tw_snap_stop = false;
+static bool volatile g_tw_snap_stop = false;
 static std::thread g_tw_snap_thread;
 
 static void tripwire_snapshot_loop() {
@@ -3964,9 +3964,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       {
         int null_in = 0, null_out = 0, unused_in = 0, unused_out = 0;
         for (int L = 0; L < ml_layers; L++) {
-          bool is_lmhead =
-              all_tasks[fused_layer_positions[L]].task_type ==
-              TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
+          bool is_lmhead = all_tasks[fused_layer_positions[L]].task_type ==
+                           TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300;
           int used_in = is_lmhead ? 28 : 24;
           int used_out = is_lmhead ? 13 : 11;
           for (int xcd = 0; xcd < NUM_XCDS_ML; xcd++) {
@@ -3978,7 +3977,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                   continue;
                 }
                 if (null_in < 8) {
-                  printf("[MPK] ML_NULL_IN layer=%d xcd=%d idx=%d\n", L, xcd, i);
+                  printf(
+                      "[MPK] ML_NULL_IN layer=%d xcd=%d idx=%d\n", L, xcd, i);
                 }
                 null_in++;
               }
@@ -4396,7 +4396,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     (void)cudaMemset(global_runtime_config.precomp_xcd_rank_counter,
                      0,
                      NUM_XCDS_PC * sizeof(int));
-
 
     // Use device memory for iter_ready and terminate (GPU-only polling)
     {
@@ -4948,8 +4947,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         unsigned long long ir = dbg_a_ir.load(std::memory_order_relaxed);
         int term = dbg_a_term.load(std::memory_order_relaxed);
         unsigned long long td = dbg_a_td.load(std::memory_order_relaxed);
-        unsigned long long polls =
-            dbg_a_polls.load(std::memory_order_relaxed);
+        unsigned long long polls = dbg_a_polls.load(std::memory_order_relaxed);
         // dev_polls is normally 0 for the whole run -- a healthy 32k run shows
         // 0 at every tick. hipMemcpyAsync does not complete while the
         // persistent kernel occupies the GPU, even on a private stream, so
@@ -4960,14 +4958,15 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         // dump below: it lives in pinned host memory and advances even while
         // HIP is blocked. Frozen `done` across ticks = actually stuck.
         if (dbg_i % 30 == 0 || term) {
-          fprintf(stderr,
-                  "[HOST_DBG] t=%ds iter_ready=%llu terminate=%d "
-                  "tasks_done=%llu dev_polls=%llu (0 is normal; watch `done`)\n",
-                  dbg_i + 1,
-                  ir,
-                  term,
-                  td,
-                  polls);
+          fprintf(
+              stderr,
+              "[HOST_DBG] t=%ds iter_ready=%llu terminate=%d "
+              "tasks_done=%llu dev_polls=%llu (0 is normal; watch `done`)\n",
+              dbg_i + 1,
+              ir,
+              term,
+              td,
+              polls);
         }
         // Dump per-worker state + summary
         if (g_dbg_h_worker_state && dbg_i >= 2) {
@@ -5039,15 +5038,33 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int fl = (phase - 50000000) % 1000;
                 char const *pn = "?";
                 switch (fp) {
-                  case 20: pn = "P2-qkv-epoch"; break;
-                  case 30: pn = "P3-attn-chunk"; break;
-                  case 40: pn = "P4-chunk-barrier"; break;
-                  case 50: pn = "P5-merge"; break;
-                  case 60: pn = "P6-attn-xcd-barrier"; break;
-                  case 70: pn = "P7-oproj"; break;
-                  case 75: pn = "P7b-routing-poll"; break;
-                  case 80: pn = "P8-moe"; break;
-                  case 90: pn = "P9-layer-done"; break;
+                  case 20:
+                    pn = "P2-qkv-epoch";
+                    break;
+                  case 30:
+                    pn = "P3-attn-chunk";
+                    break;
+                  case 40:
+                    pn = "P4-chunk-barrier";
+                    break;
+                  case 50:
+                    pn = "P5-merge";
+                    break;
+                  case 60:
+                    pn = "P6-attn-xcd-barrier";
+                    break;
+                  case 70:
+                    pn = "P7-oproj";
+                    break;
+                  case 75:
+                    pn = "P7b-routing-poll";
+                    break;
+                  case 80:
+                    pn = "P8-moe";
+                    break;
+                  case 90:
+                    pn = "P9-layer-done";
+                    break;
                 }
                 fprintf(stderr,
                         "  w%d: pos=%d dep=%d done=%d xcd=%d epoch=%d %s\n",
@@ -5166,9 +5183,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             // Only a worker whose phase says it is still executing can be
             // holding anything, so gate every watch read on that.
             for (int w = 0; w < g_dbg_num_workers; w++) {
-              int wphase =
-                  __atomic_load_n(&g_dbg_h_worker_state[w * 4 + 3],
-                                  __ATOMIC_RELAXED);
+              int wphase = __atomic_load_n(&g_dbg_h_worker_state[w * 4 + 3],
+                                           __ATOMIC_RELAXED);
               bool in_task = (wphase >= 0);
               int *b = g_dbg_h_worker_state + g_dbg_num_workers * 4 + w * 4;
               int bid = __atomic_load_n(&b[0], __ATOMIC_RELAXED);
@@ -5189,15 +5205,33 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   fp = ((wphase - 50000000) / 1000) % 100;
                   fl = (wphase - 50000000) % 1000;
                   switch (fp) {
-                    case 20: pn = "P2-qkv-epoch"; break;
-                    case 30: pn = "P3-attn-chunk"; break;
-                    case 40: pn = "P4-chunk-barrier"; break;
-                    case 50: pn = "P5-merge"; break;
-                    case 60: pn = "P6-attn-xcd-barrier"; break;
-                    case 70: pn = "P7-oproj"; break;
-                    case 75: pn = "P7b-routing-poll"; break;
-                    case 80: pn = "P8-moe"; break;
-                    case 90: pn = "P9-layer-done"; break;
+                    case 20:
+                      pn = "P2-qkv-epoch";
+                      break;
+                    case 30:
+                      pn = "P3-attn-chunk";
+                      break;
+                    case 40:
+                      pn = "P4-chunk-barrier";
+                      break;
+                    case 50:
+                      pn = "P5-merge";
+                      break;
+                    case 60:
+                      pn = "P6-attn-xcd-barrier";
+                      break;
+                    case 70:
+                      pn = "P7-oproj";
+                      break;
+                    case 75:
+                      pn = "P7b-routing-poll";
+                      break;
+                    case 80:
+                      pn = "P8-moe";
+                      break;
+                    case 90:
+                      pn = "P9-layer-done";
+                      break;
                   }
                 }
                 int *a = g_dbg_h_worker_state + g_dbg_num_workers * 8 + w * 4;
@@ -5208,7 +5242,15 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 fprintf(stderr,
                         "    >>> w%d IN TASK: phase=%d (%s xcd=%d epoch=%d) "
                         "watch[bid=%d obs=%d exp=%d spins=%d]\n",
-                        w, wphase, pn, fx, fl, bid, obs, exp_, spins);
+                        w,
+                        wphase,
+                        pn,
+                        fx,
+                        fl,
+                        bid,
+                        obs,
+                        exp_,
+                        spins);
                 // Per-wave exit mask for the MoE W13->W2 poll. That poll is
                 // thread-divergent by construction (each thread tests the
                 // release flag on its own, no __syncthreads), so waves of one
@@ -5262,7 +5304,9 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   fprintf(stderr,
                           "        MoE arrivals=%d (arrivals%%46=%d) "
                           "expert_id=%d\n",
-                          a0, a0 % 46, a1);
+                          a0,
+                          a0 % 46,
+                          a1);
                 }
                 if (false) {
                   // a0 = raw arrival counter. If a0 is an exact multiple of
@@ -5276,7 +5320,12 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                   fprintf(stderr,
                           "        MoE aux: arrivals=%d (arrivals%%46=%d) "
                           "expert_id=%d slots_ok=%d/8 spread=%d min=%d %s\n",
-                          a0, a0 % 46, a1, n_ok, spread, a3,
+                          a0,
+                          a0 % 46,
+                          a1,
+                          n_ok,
+                          spread,
+                          a3,
                           spread != 0
                               ? "<== SLOTS DISAGREE: release fan-out lost"
                               : (a0 % 46 == 0
@@ -5294,19 +5343,45 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                 int maux = (-spins) % 100000;
                 char const *mn = "?";
                 switch (mcode) {
-                  case 8000: mn = "MoE tile loop"; break;
-                  case 8100: mn = "MoE exit: past tile range"; break;
-                  case 8101: mn = "MoE exit: W13 padding tile"; break;
-                  case 8102: mn = "MoE exit: token out of batch"; break;
-                  case 8103: mn = "MoE exit: token not routed"; break;
-                  case 8200: mn = "MoE W13 compute"; break;
-                  case 8201: mn = "MoE W13 done, at barrier"; break;
-                  case 8300: mn = "MoE W2 entry"; break;
-                  case 8302: mn = "MoE W2: cleared W13->W2 barrier"; break;
-                  case 8303: mn = "MoE W2: FP8 quant"; break;
-                  case 8304: mn = "MoE W2: drain HBM loads"; break;
-                  case 8305: mn = "MoE W2: MFMA loop"; break;
-                  case 8306: mn = "MoE W2: epilogue"; break;
+                  case 8000:
+                    mn = "MoE tile loop";
+                    break;
+                  case 8100:
+                    mn = "MoE exit: past tile range";
+                    break;
+                  case 8101:
+                    mn = "MoE exit: W13 padding tile";
+                    break;
+                  case 8102:
+                    mn = "MoE exit: token out of batch";
+                    break;
+                  case 8103:
+                    mn = "MoE exit: token not routed";
+                    break;
+                  case 8200:
+                    mn = "MoE W13 compute";
+                    break;
+                  case 8201:
+                    mn = "MoE W13 done, at barrier";
+                    break;
+                  case 8300:
+                    mn = "MoE W2 entry";
+                    break;
+                  case 8302:
+                    mn = "MoE W2: cleared W13->W2 barrier";
+                    break;
+                  case 8303:
+                    mn = "MoE W2: FP8 quant";
+                    break;
+                  case 8304:
+                    mn = "MoE W2: drain HBM loads";
+                    break;
+                  case 8305:
+                    mn = "MoE W2: MFMA loop";
+                    break;
+                  case 8306:
+                    mn = "MoE W2: epilogue";
+                    break;
                 }
                 fprintf(stderr,
                         "    w%d NOT POLLING: mark %d (%s) tile=%d"
@@ -5338,8 +5413,9 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
               }
             }
             if (!bw.empty()) {
-              fprintf(stderr, "  *** BARRIER WATCH (workers still spinning) "
-                              "***\n");
+              fprintf(stderr,
+                      "  *** BARRIER WATCH (workers still spinning) "
+                      "***\n");
               for (auto const &kv : bw) {
                 char const *bn = "?";
                 int bid = kv.first;
@@ -5374,72 +5450,96 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
             }
           }
           if (verbose) {
-          if (!fl_phase_hist.empty()) {
-            fprintf(stderr, "  fused-layer phases (all %d workers):",
-                    g_dbg_num_workers);
-            for (auto const &kv : fl_phase_hist) {
-              char const *pn = "?";
-              switch (kv.first) {
-                case 20: pn = "P2-qkv-epoch"; break;
-                case 30: pn = "P3-attn-chunk"; break;
-                case 40: pn = "P4-chunk-barrier"; break;
-                case 50: pn = "P5-merge"; break;
-                case 60: pn = "P6-attn-xcd-barrier"; break;
-                case 70: pn = "P7-oproj"; break;
-                case 75: pn = "P7b-routing-poll"; break;
-                case 80: pn = "P8-moe"; break;
-                case 90: pn = "P9-layer-done"; break;
+            if (!fl_phase_hist.empty()) {
+              fprintf(stderr,
+                      "  fused-layer phases (all %d workers):",
+                      g_dbg_num_workers);
+              for (auto const &kv : fl_phase_hist) {
+                char const *pn = "?";
+                switch (kv.first) {
+                  case 20:
+                    pn = "P2-qkv-epoch";
+                    break;
+                  case 30:
+                    pn = "P3-attn-chunk";
+                    break;
+                  case 40:
+                    pn = "P4-chunk-barrier";
+                    break;
+                  case 50:
+                    pn = "P5-merge";
+                    break;
+                  case 60:
+                    pn = "P6-attn-xcd-barrier";
+                    break;
+                  case 70:
+                    pn = "P7-oproj";
+                    break;
+                  case 75:
+                    pn = "P7b-routing-poll";
+                    break;
+                  case 80:
+                    pn = "P8-moe";
+                    break;
+                  case 90:
+                    pn = "P9-layer-done";
+                    break;
+                }
+                fprintf(stderr, " %s=%d", pn, kv.second);
               }
-              fprintf(stderr, " %s=%d", pn, kv.second);
-            }
-            fprintf(stderr, "  epoch=[%d..%d]%s\n", fl_layer_min,
-                    fl_layer_max,
-                    fl_layer_min != fl_layer_max
-                        ? "  *** EPOCH SKEW: workers on different layers ***"
-                        : "");
-            // Per-XCD breakdown. Each XCD runs 30 workers, so a phase that
-            // shows fewer than 30 on some XCD is missing arrivals there --
-            // that XCD is the one holding a per-XCD barrier.
-            for (auto const &kv : fl_phase_hist) {
-              fprintf(stderr, "    phase %d per-xcd:", kv.first);
-              for (int x = 0; x < 8; x++) {
-                auto it = fl_px_hist.find(kv.first * 10 + x);
-                fprintf(stderr, " x%d=%d", x,
-                        it == fl_px_hist.end() ? 0 : it->second);
-              }
-              fprintf(stderr, "\n");
-            }
-          }
-          fprintf(stderr,
-                  "  phases: spinning=%d dep_done=%d signaling=%d sig_done=%d "
-                  "gang_tile=%d gang_entry=%d",
-                  phase_hist[0],
-                  phase_hist[1],
-                  phase_hist[2],
-                  phase_hist[3],
-                  phase_gang_stuck,
-                  phase_gang_entry);
-          fprintf(stderr,
-                  "\n  moe: w13=%d w13sig=%d w2entry=%d w2poll=%d w2done=%d "
-                  "w2quant=%d w2lds=%d w2mfma=%d w2epi=%d",
-                  moe_sub[0],
-                  moe_sub[1],
-                  moe_sub[2],
-                  moe_sub[3],
-                  moe_sub[4],
-                  moe_sub[5],
-                  moe_sub[6],
-                  moe_sub[7],
-                  moe_epilogue);
-          if (phase_hist[0] > 0) {
-            fprintf(stderr, " | stuck_deps:");
-            for (int d = 0; d < 256; d++) {
-              if (dep_hist[d] > 0) {
-                fprintf(stderr, " ev%d=%d", d, dep_hist[d]);
+              fprintf(stderr,
+                      "  epoch=[%d..%d]%s\n",
+                      fl_layer_min,
+                      fl_layer_max,
+                      fl_layer_min != fl_layer_max
+                          ? "  *** EPOCH SKEW: workers on different layers ***"
+                          : "");
+              // Per-XCD breakdown. Each XCD runs 30 workers, so a phase that
+              // shows fewer than 30 on some XCD is missing arrivals there --
+              // that XCD is the one holding a per-XCD barrier.
+              for (auto const &kv : fl_phase_hist) {
+                fprintf(stderr, "    phase %d per-xcd:", kv.first);
+                for (int x = 0; x < 8; x++) {
+                  auto it = fl_px_hist.find(kv.first * 10 + x);
+                  fprintf(stderr,
+                          " x%d=%d",
+                          x,
+                          it == fl_px_hist.end() ? 0 : it->second);
+                }
+                fprintf(stderr, "\n");
               }
             }
-          }
-          fprintf(stderr, "\n");
+            fprintf(
+                stderr,
+                "  phases: spinning=%d dep_done=%d signaling=%d sig_done=%d "
+                "gang_tile=%d gang_entry=%d",
+                phase_hist[0],
+                phase_hist[1],
+                phase_hist[2],
+                phase_hist[3],
+                phase_gang_stuck,
+                phase_gang_entry);
+            fprintf(stderr,
+                    "\n  moe: w13=%d w13sig=%d w2entry=%d w2poll=%d w2done=%d "
+                    "w2quant=%d w2lds=%d w2mfma=%d w2epi=%d",
+                    moe_sub[0],
+                    moe_sub[1],
+                    moe_sub[2],
+                    moe_sub[3],
+                    moe_sub[4],
+                    moe_sub[5],
+                    moe_sub[6],
+                    moe_sub[7],
+                    moe_epilogue);
+            if (phase_hist[0] > 0) {
+              fprintf(stderr, " | stuck_deps:");
+              for (int d = 0; d < 256; d++) {
+                if (dep_hist[d] > 0) {
+                  fprintf(stderr, " ev%d=%d", d, dep_hist[d]);
+                }
+              }
+            }
+            fprintf(stderr, "\n");
           } // verbose
         }
         // Dump event counters to diagnose which events haven't fired

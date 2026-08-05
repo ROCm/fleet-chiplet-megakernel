@@ -317,8 +317,8 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
     // is an uninitialized register. Clamping the partner index to the last
     // valid sub-block makes the reduction read only lanes that ran.
     int base_lane = lane_id & ~3;
-    int const sb_first = sb - sub_idx;         // first sb of this super-block
-    int const sb_last = NSUBBLOCKS - 1;        // last sb that actually runs
+    int const sb_first = sb - sub_idx;  // first sb of this super-block
+    int const sb_last = NSUBBLOCKS - 1; // last sb that actually runs
     int const n_valid = min(4, sb_last - sb_first + 1);
     float a0 = __shfl(amax, base_lane);
     float a1 = __shfl(amax, base_lane + min(1, n_valid - 1));

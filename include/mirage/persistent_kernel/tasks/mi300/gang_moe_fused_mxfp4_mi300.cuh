@@ -83,9 +83,9 @@ namespace kernel {
 // counter, so 9 lines used out of 10 reserved per expert.
 //   [xcd * MOE_BAR_LINE]         per-XCD release flag  (st_wt, HBM)
 //   [MOE_BAR_COUNTER_SLOT * ..]  global arrival count  (atomic, L2)
-constexpr int MOE_BAR_LINE = 16;         // int32 per cache line
-constexpr int MOE_BAR_COUNTER_SLOT = 8;  // line index of the arrival counter
-constexpr int MOE_BAR_SLOTS = 10;        // lines reserved per expert
+constexpr int MOE_BAR_LINE = 16;        // int32 per cache line
+constexpr int MOE_BAR_COUNTER_SLOT = 8; // line index of the arrival counter
+constexpr int MOE_BAR_SLOTS = 10;       // lines reserved per expert
 constexpr int MOE_BAR_STRIDE = MOE_BAR_SLOTS * MOE_BAR_LINE; // ints per expert
 
 template <int BATCH_SIZE,
@@ -218,13 +218,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Marker 1001: tile decoded, expert_id read. If num_activated_experts or
   // expert_id is out of range here, every pointer built below is wild --
   // this is the marker that separates "bad routing input" from "bad compute".
-  MOE_DBG_ENTRY(1001,
-                ((unsigned long long)(unsigned short)global_tile) |
-                    (((unsigned long long)(unsigned char)expert_idx) << 16) |
-                    (((unsigned long long)(unsigned char)
-                          num_activated_experts)
-                     << 32) |
-                    (((unsigned long long)(is_w2 ? 1 : 0)) << 40));
+  MOE_DBG_ENTRY(
+      1001,
+      ((unsigned long long)(unsigned short)global_tile) |
+          (((unsigned long long)(unsigned char)expert_idx) << 16) |
+          (((unsigned long long)(unsigned char)num_activated_experts) << 32) |
+          (((unsigned long long)(is_w2 ? 1 : 0)) << 40));
   int expert_id = d_mask[expert_idx];
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
@@ -498,8 +497,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               // Prefetching into the registers the current MFMA reads is a WAR
               // race: lgkmcnt tracks when LDS data lands in the VGPR, not when
               // the MFMA finished sampling its operands, and a 16x16x128 MFMA
-              // streams them over the op rather than latching at issue. When LDS
-              // returns fast the write-back lands mid-MFMA and the op sees
+              // streams them over the op rather than latching at issue. When
+              // LDS returns fast the write-back lands mid-MFMA and the op sees
               // mixed-iteration operands (~17-22% of launches before banking).
               // Ping-pong: while the MFMA consumes bank X, prefetch writes bank
               // 1-X, so no register is ever both a live source and an in-flight
@@ -845,15 +844,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 //   Bank 1: A v[26:29], A scale v18, B v[32:39], B scale v19
                 //   Address scratch v17, accumulator a[0:3].
                 //
-                // Prefetching into the registers the current MFMA reads is a WAR
-                // race: lgkmcnt tracks when LDS data lands in the VGPR, not when
-                // the MFMA finished sampling its operands, and a 16x16x128 MFMA
-                // streams them over the op rather than latching at issue. When LDS
-                // returns fast the write-back lands mid-MFMA and the op sees
-                // mixed-iteration operands (~17-22% of launches before banking).
-                // Ping-pong: while the MFMA consumes bank X, prefetch writes bank
-                // 1-X, so no register is ever both a live source and an in-flight
-                // LDS destination.
+                // Prefetching into the registers the current MFMA reads is a
+                // WAR race: lgkmcnt tracks when LDS data lands in the VGPR, not
+                // when the MFMA finished sampling its operands, and a 16x16x128
+                // MFMA streams them over the op rather than latching at issue.
+                // When LDS returns fast the write-back lands mid-MFMA and the
+                // op sees mixed-iteration operands (~17-22% of launches before
+                // banking). Ping-pong: while the MFMA consumes bank X, prefetch
+                // writes bank 1-X, so no register is ever both a live source
+                // and an in-flight LDS destination.
                 //
                 // Verified by tests/standalone/test_mfma_pipeline_hazards.hip.
                 "v_accvgpr_write_b32 a0, 0\n"
@@ -924,7 +923,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "W13_T1_ACC_%=:\n"
                 // 32 clocks: the scaled MFMA is a 32-cycle op on CDNA4. The old
                 // "s_nop 7; s_nop 0" was 9 clocks (correct only for a 4-pass
-                // MFMA) and returned a partially-retired accumulator every time.
+                // MFMA) and returned a partially-retired accumulator every
+                // time.
                 "s_nop 15\n"
                 "s_nop 15\n"
                 "v_accvgpr_read_b32 %[acc0], a0\n"

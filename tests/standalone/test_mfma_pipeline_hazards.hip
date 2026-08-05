@@ -52,11 +52,11 @@
  *               schedule production code should match.
  */
 
-#include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <hip/hip_runtime.h>
 #include <vector>
 
 #ifndef MFMA_ITERS
@@ -69,7 +69,10 @@
   do {                                                                         \
     hipError_t err = call;                                                     \
     if (err != hipSuccess) {                                                   \
-      std::fprintf(stderr, "HIP error at %s:%d: %s\n", __FILE__, __LINE__,     \
+      std::fprintf(stderr,                                                     \
+                   "HIP error at %s:%d: %s\n",                                 \
+                   __FILE__,                                                   \
+                   __LINE__,                                                   \
                    hipGetErrorString(err));                                    \
       std::exit(2);                                                            \
     }                                                                          \
@@ -116,17 +119,20 @@
 // Both operand banks are clobbered in every variant so the register
 // allocator cannot reuse them and perturb the schedule under test.
 #define HAZ_CLOBBER                                                            \
-  "memory", "s13", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",        \
-      "v15", "v16", "v17", "v18", "v19", "v22", "v23", "v24", "v25", "v26",    \
-      "v27", "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38",    \
-      "v39", "a0", "a1", "a2", "a3"
+  "memory", "s13", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", \
+      "v16", "v17", "v18", "v19", "v22", "v23", "v24", "v25", "v26", "v27",    \
+      "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39",    \
+      "a0", "a1", "a2", "a3"
 
 // ---------------------------------------------------------------------------
 // BROKEN: the historical production schedule. Both hazards present.
 // Kept so the test proves it is actually detecting something.
 // ---------------------------------------------------------------------------
-__global__ void mfma_broken(float *out, uint8_t const *Ad, uint8_t const *As,
-                            uint8_t const *Bd, uint8_t const *Bs) {
+__global__ void mfma_broken(float *out,
+                            uint8_t const *Ad,
+                            uint8_t const *As,
+                            uint8_t const *Bd,
+                            uint8_t const *Bs) {
   HAZ_PROLOGUE
   asm volatile(
       "v_accvgpr_write_b32 a0, 0\nv_accvgpr_write_b32 a1, 0\n"
@@ -153,8 +159,7 @@ __global__ void mfma_broken(float *out, uint8_t const *Ad, uint8_t const *As,
       "s_nop 7\ns_nop 0\n"
       "v_accvgpr_read_b32 %[a0], a0\nv_accvgpr_read_b32 %[a1], a1\n"
       "v_accvgpr_read_b32 %[a2], a2\nv_accvgpr_read_b32 %[a3], a3\n"
-      : HAZ_OUTS
-      : HAZ_INS
+      : HAZ_OUTS:HAZ_INS
       : HAZ_CLOBBER);
   HAZ_EPILOGUE
 }
@@ -163,8 +168,11 @@ __global__ void mfma_broken(float *out, uint8_t const *Ad, uint8_t const *As,
 // FIXED: two disjoint operand banks + a 32-clock retirement gap.
 // This is the schedule production code should match.
 // ---------------------------------------------------------------------------
-__global__ void mfma_fixed(float *out, uint8_t const *Ad, uint8_t const *As,
-                           uint8_t const *Bd, uint8_t const *Bs) {
+__global__ void mfma_fixed(float *out,
+                           uint8_t const *Ad,
+                           uint8_t const *As,
+                           uint8_t const *Bd,
+                           uint8_t const *Bs) {
   HAZ_PROLOGUE
   asm volatile(
       "v_accvgpr_write_b32 a0, 0\nv_accvgpr_write_b32 a1, 0\n"
@@ -209,8 +217,7 @@ __global__ void mfma_fixed(float *out, uint8_t const *Ad, uint8_t const *As,
       "s_nop 15\ns_nop 15\n"
       "v_accvgpr_read_b32 %[a0], a0\nv_accvgpr_read_b32 %[a1], a1\n"
       "v_accvgpr_read_b32 %[a2], a2\nv_accvgpr_read_b32 %[a3], a3\n"
-      : HAZ_OUTS
-      : HAZ_INS
+      : HAZ_OUTS:HAZ_INS
       : HAZ_CLOBBER);
   HAZ_EPILOGUE
 }
@@ -220,8 +227,11 @@ __global__ void mfma_fixed(float *out, uint8_t const *Ad, uint8_t const *As,
 // Every operand is fully resident before the MFMA issues, and the MFMA is
 // fully retired before anything touches its registers or accumulator.
 // ---------------------------------------------------------------------------
-__global__ void mfma_reference(float *out, uint8_t const *Ad, uint8_t const *As,
-                               uint8_t const *Bd, uint8_t const *Bs) {
+__global__ void mfma_reference(float *out,
+                               uint8_t const *Ad,
+                               uint8_t const *As,
+                               uint8_t const *Bd,
+                               uint8_t const *Bs) {
   HAZ_PROLOGUE
   asm volatile(
       "v_accvgpr_write_b32 a0, 0\nv_accvgpr_write_b32 a1, 0\n"
@@ -247,8 +257,11 @@ __global__ void mfma_reference(float *out, uint8_t const *Ad, uint8_t const *As,
   HAZ_EPILOGUE
 }
 
-typedef void (*hazard_kernel_t)(float *, uint8_t const *, uint8_t const *,
-                                uint8_t const *, uint8_t const *);
+typedef void (*hazard_kernel_t)(float *,
+                                uint8_t const *,
+                                uint8_t const *,
+                                uint8_t const *,
+                                uint8_t const *);
 
 int main(int argc, char **argv) {
   int const launches = (argc > 1) ? std::atoi(argv[1]) : 300;
@@ -295,17 +308,17 @@ int main(int argc, char **argv) {
   HIP_CHECK(hipMemcpy(dB, hB.data(), szB, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(dBs, hBs.data(), szBs, hipMemcpyHostToDevice));
 
-  size_t const smem =
-      64 * MFMA_ITERS + 64 + 128 * MFMA_ITERS + 64 + 256;
+  size_t const smem = 64 * MFMA_ITERS + 64 + 128 * MFMA_ITERS + 64 + 256;
 
   std::vector<float> host((size_t)grid * 1024);
   auto launch = [&](hazard_kernel_t k, int blocks) {
     HIP_CHECK(hipMemset(dOut, 0, (size_t)blocks * 1024 * sizeof(float)));
-    hipLaunchKernelGGL(k, dim3(blocks), dim3(256), smem, 0, dOut, dA, dAs, dB,
-                       dBs);
+    hipLaunchKernelGGL(
+        k, dim3(blocks), dim3(256), smem, 0, dOut, dA, dAs, dB, dBs);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
-    HIP_CHECK(hipMemcpy(host.data(), dOut,
+    HIP_CHECK(hipMemcpy(host.data(),
+                        dOut,
                         (size_t)blocks * 1024 * sizeof(float),
                         hipMemcpyDeviceToHost));
   };
@@ -321,8 +334,8 @@ int main(int argc, char **argv) {
   }
 
   std::printf("gfx950 scaled-MFMA pipeline hazard regression\n");
-  std::printf("  iterations %d, grid %d, launches %d\n", MFMA_ITERS, grid,
-              launches);
+  std::printf(
+      "  iterations %d, grid %d, launches %d\n", MFMA_ITERS, grid, launches);
   std::printf("  reference lane0 accumulator: %.4f\n\n", truth[0]);
 
   struct Variant {
@@ -349,9 +362,9 @@ int main(int argc, char **argv) {
           if (got != truth[i]) {
             bad = true;
             if (std::fabs(truth[i]) > 1e-6) {
-              worst_rel = std::max(
-                  worst_rel,
-                  std::fabs((double)got - truth[i]) / std::fabs(truth[i]));
+              worst_rel = std::max(worst_rel,
+                                   std::fabs((double)got - truth[i]) /
+                                       std::fabs(truth[i]));
             }
           }
         }
@@ -360,8 +373,8 @@ int main(int argc, char **argv) {
         }
       }
     }
-    std::printf("  %-28s %7ld/%ld blocks differ", v.name, wrong_blocks,
-                total_blocks);
+    std::printf(
+        "  %-28s %7ld/%ld blocks differ", v.name, wrong_blocks, total_blocks);
     if (wrong_blocks) {
       std::printf("  (worst rel err %.2f%%)", 100.0 * worst_rel);
     }
@@ -374,11 +387,12 @@ int main(int argc, char **argv) {
     // a toolchain or scheduler change may be hiding the hazard rather than
     // fixing it. Report loudly instead of passing quietly.
     if (!v.must_match && wrong_blocks == 0) {
-      std::printf("  WARNING: the known-broken schedule now matches the "
-                  "reference.\n"
-                  "           This test can no longer prove it detects the "
-                  "hazard.\n"
-                  "           Inspect the emitted ISA before trusting a pass.\n");
+      std::printf(
+          "  WARNING: the known-broken schedule now matches the "
+          "reference.\n"
+          "           This test can no longer prove it detects the "
+          "hazard.\n"
+          "           Inspect the emitted ISA before trusting a pass.\n");
     }
   }
 
