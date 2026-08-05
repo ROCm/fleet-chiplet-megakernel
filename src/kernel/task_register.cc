@@ -2103,7 +2103,12 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   code.e("    $,", oproj_tiles_per_xcd);
   code.e("    $,", moe_total_tiles_per_xcd);
   code.e("    $,", workers_per_xcd);
-  code.e("    tile_idx);");
+  code.e("    tile_idx,");
+  // Deterministic layer counter, published by the ml loop into the free int32
+  // of the n_tile union member. The task derives its barrier release values
+  // from this instead of snapshotting a shared counter -- see the
+  // layer_counter comment in gang_full_layer_fused_mi300.cuh.
+  code.e("    (int)task_desc->task_metadata._linear_reserved);");
   return register_task_variant(TASK_GANG_FULL_LAYER_FUSED_MI300,
                                code.to_string());
 }
@@ -2223,7 +2228,9 @@ int TaskRegister::register_gang_full_layer_with_lmhead_fused_mi300_task(
   code.e("    $,", lm_n_wgs_per_xcd);
   code.e("    $,", lm_output_stride);
   code.e("    $,", lm_actual_hidden_dim);
-  code.e("    tile_idx);");
+  code.e("    tile_idx,");
+  // See the matching comment in the non-LM-head variant above.
+  code.e("    (int)task_desc->task_metadata._linear_reserved);");
   return register_task_variant(TASK_GANG_FULL_LAYER_WITH_LMHEAD_FUSED_MI300,
                                code.to_string());
 }

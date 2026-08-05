@@ -95,7 +95,8 @@ __device__ __noinline__ void
                                                    int lm_n_wgs_per_xcd,
                                                    int lm_output_stride,
                                                    int lm_actual_hidden_dim,
-                                                   int tile_idx) {
+                                                   int tile_idx,
+                                                   int task_layer_idx) {
   return; // TEMPORARILY skip entire fused task to measure fixed overhead
   // ══════════════════════════════════════════════════════════════════
   // Phases 1-8: run type 216 (QKV, Attn, O-proj, TopK, MoE)
@@ -144,7 +145,8 @@ __device__ __noinline__ void
       oproj_tiles_per_xcd,
       moe_total_tiles_per_xcd,
       workers_per_xcd,
-      tile_idx);
+      tile_idx,
+      task_layer_idx);
 
   // input_ptrs layout (28 inputs):
   //  [0..23] same as type 216
