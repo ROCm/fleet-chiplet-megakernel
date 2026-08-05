@@ -2107,6 +2107,34 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
 #endif
 
+              // Publish the deterministic layer counter for this layer.
+              //
+              // The fused-layer task derives its three barrier release values
+              // from this instead of snapshotting "current counter + 1". The
+              // snapshot was only valid if the reader was ordered before this
+              // layer's producer, which nothing guaranteed -- that is the race
+              // f1fa720 worked around by making *every* worker arrive at the
+              // Phase 2 barrier, at a cost of ~0.27ms/iter.
+              //
+              // pc_iter is the decode iteration (1-based) and ml the layer, so
+              // this counts exactly what the per-XCD epoch counts: one bump per
+              // layer, never reset, monotonic across the whole run. Every
+              // worker computes the same value with no read of a shared
+              // counter, so there is nothing left to race.
+              //
+              // _linear_reserved is the free int32 of the n_tile union member
+              // this task already uses (n_tile_start / n_tile_count are the two
+              // uint16s below it); it is declared in runtime_header.h and read
+              // nowhere else in the tree.
+              //
+              // task_desc is a reused shared-memory slot, so this store must be
+              // visible to the whole block before any worker enters the task.
+              if (threadIdx.x == 0) {
+                task_desc->task_metadata._linear_reserved =
+                    (int32_t)((pc_iter - 1) * config.ml_num_layers + ml);
+              }
+              __syncthreads();
+
               // Execute this layer
               int my_tiles = 0;
               // Publish the layer index into the worker-state phase slot.
