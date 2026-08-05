@@ -415,9 +415,27 @@ __device__ __noinline__ void
       // ntiles=32 so 14 of 30 chunks exit early via the empty-chunk path and
       // never race, while at 32k ntiles=2048 gives every one of the 30 chunks
       // real work to write, so the window is open on all of them every layer.
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      //
+      // Scope: this barrier is per-XCD (chunk_barrier[xcd_id * 16]), so the
+      // chunk workers and the merging worker are always on the same XCD and
+      // share one 32MB L2. Making the partials visible therefore only requires
+      // getting them *into* L2 -- not flushing L2 to HBM.
+      //
+      // db48239 used threadfence_gpu() here, which is agent scope and lowers to
+      // `buffer_wbl2 sc1; s_waitcnt vmcnt(0)` (verified in gfx950 ISA). The
+      // buffer_wbl2 is an L2->HBM writeback of the whole cache, paid by every
+      // chunk worker on every layer, and it buys nothing a same-XCD consumer
+      // can observe: see the intra-XCD section of mpk_atoms.cuh, "all CUs
+      // within an XCD share the same 32MB L2 ... No buffer_wbl2 required".
+      // Dropping it is worth ~0.16 ms/iter at seq 512.
+      //
+      // What remains is the part that is actually load-bearing: s_waitcnt
+      // vmcnt(0) retires all 256 threads' outstanding stores so they have
+      // reached L2 before tid 0's release atomic. Workgroup-scope fences emit
+      // no instruction at all on gfx950, so they cannot substitute -- the
+      // consumer is a different block.
       __syncthreads();
-      threadfence_gpu();
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __shared__ int s_chunk_prev;
       if (tid == 0) {
         s_chunk_prev = atom_add_release_gpu_s32(&chunk_barrier[xcd_id * 16], 1);
@@ -426,10 +444,20 @@ __device__ __noinline__ void
 
       if ((s_chunk_prev % NUM_KV_CHUNKS) == NUM_KV_CHUNKS - 1) {
         // Last chunk worker: run merge (no reset needed — modular check)
+        //
         // Acquire the partials the other chunks released above. buffer_inv
-        // drops stale vL1 lines so the merge reads what they actually wrote
-        // rather than this CU's cached copy from a previous layer.
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        // drops this CU's stale vL1 lines so the merge reads what they
+        // actually wrote rather than a cached copy from a previous layer --
+        // vL1 is per-CU, so this is required even though the producers share
+        // our L2.
+        //
+        // Plain `buffer_inv` (no sc1) invalidates vL1 only. The acquire fence
+        // that used to precede it was agent scope, which emits `buffer_inv
+        // sc1` and additionally invalidates L2 -- discarding lines this XCD's
+        // own chunk workers had just written, and forcing them to be re-read
+        // from HBM. The producers are all on this XCD (the barrier is
+        // per-XCD), so their stores are already in our L2 and invalidating it
+        // is both unnecessary and actively harmful.
         asm volatile("buffer_inv" ::: "memory");
 
         // ══════════════════════════════════════════════════════════════════
