@@ -203,9 +203,9 @@ __device__ __noinline__ void
   // so the participant set is free to be the set that actually needs the
   // barrier. This is the pre-f1fa720 participant set, now safe to use because
   // nothing reads a shared counter -- it measured neutral, not faster.
-  int const qkv_epoch_participants =
-      total_qkv_tiles_per_xcd > NUM_KV_CHUNKS ? total_qkv_tiles_per_xcd
-                                              : NUM_KV_CHUNKS;
+  int const qkv_epoch_participants = total_qkv_tiles_per_xcd > NUM_KV_CHUNKS
+                                         ? total_qkv_tiles_per_xcd
+                                         : NUM_KV_CHUNKS;
 
   // Publish the layer counter the MoE W13->W2 barrier keys off.
   //

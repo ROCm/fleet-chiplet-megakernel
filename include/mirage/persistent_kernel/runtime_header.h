@@ -306,8 +306,8 @@ static_assert(
 struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
-        trigger_event(t.trigger_event), dependent_event(t.dependent_event),
-        input_ptrs{}, output_ptrs{},
+        trigger_event(t.trigger_event),
+        dependent_event(t.dependent_event), input_ptrs{}, output_ptrs{},
 #ifdef MPK_ENABLE_TMA
         input_tma_desc_ptrs{}, output_tma_desc_ptrs{},
 #endif
