@@ -128,8 +128,12 @@ __device__ __forceinline__ void
                      __ATOMIC_RELAXED);
   }
 }
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_PHASE(phase, layer, xcd)                                        \
   mpk_ws_phase((phase), (layer), (xcd), tid)
+#else
+#define MPK_WS_PHASE(phase, layer, xcd) ((void)0)
+#endif
 
 // Barrier watch: what a spinning worker is actually waiting *for*.
 //
@@ -262,8 +266,23 @@ __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
     __atomic_store_n(&b[3], -(code * 100000 + (aux % 100000)), __ATOMIC_RELAXED);
   }
 }
-#define MPK_WS_MARK(code, aux) mpk_ws_mark((code), (aux), tid)
+// Compile-time gate for the inline worker-state dump sites below. The runtime
+// null check alone still costs a global load and a branch at ~30 sites, several
+// of them in the per-layer dispatch loop; measured 2.386 -> 2.321 ms/iter when
+// compiled out. Define MPK_WORKER_STATE to get the dump back.
+#ifdef MPK_WORKER_STATE
+#define MPK_WS_ON(cfg) ((cfg).precomp_dbg_worker_state != nullptr)
+#else
+#define MPK_WS_ON(cfg) (false)
+#endif
 
+#ifdef MPK_WORKER_STATE
+#define MPK_WS_MARK(code, aux) mpk_ws_mark((code), (aux), tid)
+#else
+#define MPK_WS_MARK(code, aux) ((void)0)
+#endif
+
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAIT_BEGIN(barrier_id, expected)                                \
   mpk_ws_wait_begin((barrier_id), (expected), tid)
 #define MPK_WS_WAIT_TICK(observed, spins)                                      \
@@ -272,6 +291,10 @@ __device__ __forceinline__ void mpk_ws_mark(int code, int aux, int tid) {
       mpk_ws_wait_tick((observed), (spins), tid);                              \
     }                                                                          \
   } while (0)
+#else
+#define MPK_WS_WAIT_BEGIN(barrier_id, expected) ((void)0)
+#define MPK_WS_WAIT_TICK(observed, spins) ((void)0)
+#endif
 
 #if defined(MIRAGE_GRACE_HOPPER)
 #include "tasks/hopper/task_header.cuh"
@@ -1503,7 +1526,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     if (threadIdx.x == 0) {
 #ifdef MPK_PRECOMPUTED_DISPATCH
       // Debug: write current task position (state[0]) before dep check
-      if (config.precomp_dbg_worker_state != nullptr) {
+      if (MPK_WS_ON(config)) {
         int *ws = config.precomp_dbg_worker_state + worker_id * 4;
         __atomic_store_n(&ws[0],
                          (int)get_task_position_index(task_ids[queue_pos]),
@@ -1521,7 +1544,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         EventCounter actual_counts = 0;
 #ifdef MPK_PRECOMPUTED_DISPATCH
         // Debug: write dep_event index (state[1])
-        if (config.precomp_dbg_worker_state != nullptr) {
+        if (MPK_WS_ON(config)) {
           int *ws = config.precomp_dbg_worker_state + worker_id * 4;
           __atomic_store_n(&ws[1], (int)event_index, __ATOMIC_RELAXED);
         }
@@ -1555,7 +1578,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_PRECOMPUTED_DISPATCH
             // Mark as spinning: ws[3] = -(needed - actual) to distinguish from
             // "not spinning"
-            if (config.precomp_dbg_worker_state != nullptr) {
+            if (MPK_WS_ON(config)) {
               int *ws = config.precomp_dbg_worker_state + worker_id * 4;
               __atomic_store_n(&ws[3],
                                -((int)(needed_counts - actual_counts)),
@@ -1587,7 +1610,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       }
 #ifdef MPK_PRECOMPUTED_DISPATCH
       // Phase 10 = dep check done, about to execute task
-      if (config.precomp_dbg_worker_state != nullptr) {
+      if (MPK_WS_ON(config)) {
         int *ws = config.precomp_dbg_worker_state + worker_id * 4;
         __atomic_store_n(&ws[3], 10, __ATOMIC_RELAXED);
       }
@@ -2019,7 +2042,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       __syncthreads();
 #ifdef MPK_PRECOMPUTED_DISPATCH
       // Phase 11 = past gang __syncthreads, entering tile loop
-      if (threadIdx.x == 0 && config.precomp_dbg_worker_state != nullptr) {
+      if (threadIdx.x == 0 && MPK_WS_ON(config)) {
         int *ws = config.precomp_dbg_worker_state + worker_id * 4;
         __atomic_store_n(&ws[3], 11, __ATOMIC_RELAXED);
       }
@@ -2147,7 +2170,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // not distinguish a worker on layer 0 from one on layer 35.
               // Encoding the layer makes the dump localize the stall.
               if (threadIdx.x == 0 &&
-                  config.precomp_dbg_worker_state != nullptr) {
+                  MPK_WS_ON(config)) {
                 int *ws = config.precomp_dbg_worker_state + worker_id * 4;
                 __atomic_store_n(&ws[3], 40000 + ml, __ATOMIC_RELAXED);
               }
@@ -2322,7 +2345,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_PRECOMPUTED_DISPATCH
             // Phase 12 = about to execute gang tile
             if (threadIdx.x == 0 &&
-                config.precomp_dbg_worker_state != nullptr) {
+                MPK_WS_ON(config)) {
               int *ws = config.precomp_dbg_worker_state + worker_id * 4;
               __atomic_store_n(&ws[3], 1200 + tile_idx, __ATOMIC_RELAXED);
             }
@@ -2332,7 +2355,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           }
 #ifdef MPK_PRECOMPUTED_DISPATCH
           // Phase 13 = tile loop done
-          if (threadIdx.x == 0 && config.precomp_dbg_worker_state != nullptr) {
+          if (threadIdx.x == 0 && MPK_WS_ON(config)) {
             int *ws = config.precomp_dbg_worker_state + worker_id * 4;
             __atomic_store_n(&ws[3], 13, __ATOMIC_RELAXED);
           }
@@ -2399,7 +2422,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     }
 #ifdef MPK_PRECOMPUTED_DISPATCH
     // Phase 15 = task execution done, about to syncthreads
-    if (threadIdx.x == 0 && config.precomp_dbg_worker_state != nullptr) {
+    if (threadIdx.x == 0 && MPK_WS_ON(config)) {
       int *ws = config.precomp_dbg_worker_state + worker_id * 4;
       __atomic_store_n(&ws[3], 15, __ATOMIC_RELAXED);
     }
@@ -2601,7 +2624,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_PRECOMPUTED_DISPATCH
       // Debug: increment per-worker tasks_done (state[2])
       // Phase 20 = about to signal event
-      if (config.precomp_dbg_worker_state != nullptr) {
+      if (MPK_WS_ON(config)) {
         int *ws = config.precomp_dbg_worker_state + worker_id * 4;
         __atomic_store_n(&ws[2],
                          __atomic_load_n(&ws[2], __ATOMIC_RELAXED) + 1,
@@ -2832,7 +2855,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
 #ifdef MPK_PRECOMPUTED_DISPATCH
     // Phase 30 = event signaling complete, looping back
-    if (threadIdx.x == 0 && config.precomp_dbg_worker_state != nullptr) {
+    if (threadIdx.x == 0 && MPK_WS_ON(config)) {
       int *ws = config.precomp_dbg_worker_state + worker_id * 4;
       __atomic_store_n(&ws[3], 30, __ATOMIC_RELAXED);
     }
