@@ -73,3 +73,21 @@ ncu_tmp
 #nsys
 *.nsys-rep
 *.sqlite
+
+# demo / CI run artifacts
+outputs/
+
+# standalone kernel test binaries (tests/standalone/build.sh)
+tests/standalone/test_mfma_simple
+tests/standalone/test_mfma_pipeline_hazards
+
+# hipcc -save-temps intermediates
+*-hip-amdgcn-amd-amdhsa-*.bc
+*-hip-amdgcn-amd-amdhsa-*.hipi
+*-hip-amdgcn-amd-amdhsa-*.s
+*-hip-amdgcn-amd-amdhsa-*.out
+*-hip-amdgcn-amd-amdhsa-*.out.resolution.txt
+*-host-x86_64-unknown-linux-gnu.bc
+*-host-x86_64-unknown-linux-gnu.hipi
+*-host-x86_64-unknown-linux-gnu.s
+*-hip-amdgcn-amd-amdhsa.hipfb
