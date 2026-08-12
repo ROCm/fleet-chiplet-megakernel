@@ -158,6 +158,33 @@ __device__ __forceinline__ void st_wt_zero128(void *addr) {
 #endif
 }
 
+// Write-through 128-bit store (4x float), sc0 sc1.
+// Same instruction as st_wt_zero128 but with a caller-supplied value. Needed
+// wherever one XCD produces f32 data that another XCD consumes: a plain store
+// stops in the producing XCD's L2, which is NOT coherent across XCDs (see
+// threadfence_gpu below), so the consumer reads whatever its own L2 holds.
+// `addr` must be 16-byte aligned.
+__device__ __forceinline__ void st_wt_f32x4(void *addr, float4 val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
+  v4u32 v;
+  __builtin_memcpy(&v, &val, 16);
+  asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
+               :
+               : "v"(addr), "v"(v)
+               : "memory");
+#else
+  // float4 has no volatile assignment operator; go component-wise.
+  float const *src = reinterpret_cast<float const *>(&val);
+  volatile float *dst = reinterpret_cast<volatile float *>(addr);
+  dst[0] = src[0];
+  dst[1] = src[1];
+  dst[2] = src[2];
+  dst[3] = src[3];
+#endif
+}
+
 // Write-through 32-bit store (1x float or 2x bf16)
 __device__ __forceinline__ void st_wt_u32(void *addr, unsigned int val) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \

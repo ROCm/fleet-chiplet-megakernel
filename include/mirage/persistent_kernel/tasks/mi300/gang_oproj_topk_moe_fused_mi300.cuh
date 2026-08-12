@@ -93,7 +93,7 @@ __device__ __attribute__((always_inline)) void
   // tile_idx = xcd_id * workers_per_xcd + rank
   int xcd_rank = tile_idx % workers_per_xcd;
 
-  // CROC hierarchical release pattern for routing synchronization.
+  // Hierarchical release pattern for routing synchronization.
   // routing_ready[0] = epoch counter (incremented by TopK worker).
   // routing_ready[(1+xcd_id)*16] = per-XCD release flag (written by TopK via
   // st_wt). Each MoE worker polls only its XCD-local release flag — no
@@ -171,7 +171,13 @@ __device__ __attribute__((always_inline)) void
         total_topk_tiles,
         oproj_topk_tiles_per_xcd,
         oproj_tile_idx,
-        routing_ready);
+        routing_ready,
+        // layer_epoch = 0: keep the callee's snapshot form. `expected` above is
+        // itself a snapshot (ld_nt of routing_ready + 1) taken before Phase 1,
+        // so feeding it in would propagate the same race rather than remove it.
+        // This task type is not the one the fused full-layer path uses; giving
+        // it a real layer counter is a separate change with its own soak.
+        /*layer_epoch=*/0);
   }
 
 #ifdef MPK_FUSED_PHASE_TIMING
@@ -181,7 +187,7 @@ __device__ __attribute__((always_inline)) void
 #endif
 
   // ── Wait for TopK to finish ──
-  // CROC hierarchical release: each worker polls its XCD-local release flag.
+  // Hierarchical release: each worker polls its XCD-local release flag.
   // TopK worker wrote per-XCD flags via st_wt after threadfence_gpu,
   // so polling is XCD-local (hot in L2, no cross-XCD contention).
   if (tid == 0) {

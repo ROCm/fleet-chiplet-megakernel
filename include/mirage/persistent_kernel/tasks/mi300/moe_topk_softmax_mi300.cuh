@@ -22,6 +22,8 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
+#include "mpk_atoms.cuh" // st_wt_u16, st_wt_u32
+
 namespace kernel {
 
 static constexpr int MI300_WARP_SIZE = 64; // AMD wavefront size
@@ -47,8 +49,16 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     void *__restrict__ input_ptr,  // [num_rows, NUM_EXPERTS]
     void *__restrict__ output_ptr, // [num_rows, k] (float weights)
     int const num_rows,
+    // Allocated row stride of routing_indices, which is BATCH_SIZE -- not
+    // num_rows. The two differ whenever fewer tokens are active than the batch
+    // was sized for (the fused router passes num_active_tokens as num_rows).
+    // The MoE tile decode indexes this buffer as `d_routing + expert*BATCH_SIZE`
+    // and reads lanes [0, BATCH_SIZE), so writing or clearing at a narrower
+    // stride puts every expert's row at the wrong offset and leaves the tail
+    // holding a previous layer's routing values.
+    int const routing_row_stride,
     int const k,
-    void *__restrict__ routing_indices_ptr,   // [NUM_EXPERTS, num_rows] int32
+    void *__restrict__ routing_indices_ptr,   // [NUM_EXPERTS, stride] int32
     void *__restrict__ active_expert_ids_ptr, // [NUM_EXPERTS + 1] int32
     int const start_expert,
     int const end_expert,
@@ -58,16 +68,37 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
   int *active_expert_ids = static_cast<int *>(active_expert_ids_ptr);
 
+  // Union of experts activated by *any* row, marked during TopK and compacted
+  // at the bottom. One byte per local expert; the write is idempotent (every
+  // writer stores 1), so no atomics are needed.
+  __shared__ unsigned char s_hit[NUM_EXPERTS];
+
   // Initialize routing indices to 0.
-  // active_expert_ids initialization is NOT needed: we write directly to
-  // active_expert_ids[0..k-1] during TopK and set the count after.
+  // active_expert_ids initialization is NOT needed: the compaction pass at the
+  // bottom writes [0..count-1] densely and then the count at [NUM_EXPERTS], and
+  // no consumer reads past the count.
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
        expert += blockDim.x) {
     if (routing_indices != nullptr) {
-      for (int row = 0; row < num_rows; ++row) {
-        routing_indices[expert * num_rows + row] = 0;
+      // Clear the whole allocated row, not just the active prefix: the MoE
+      // decode ballots over all BATCH_SIZE lanes, so a stale nonzero in
+      // [num_rows, stride) would compact a token that does not exist into an
+      // MFMA column.
+      //
+      // Write-through for the same reason as the logits reset below: the
+      // winners are published with `st_wt_u32` straight to HBM, so a plain
+      // store leaves a dirty zero line in this XCD's L2 whose writeback can
+      // land after a later layer has written the same address. Here the
+      // consequence is worse than a perturbed weight -- a dropped routing
+      // index silently removes a token from an expert's MFMA column set.
+      for (int row = 0; row < routing_row_stride; ++row) {
+        st_wt_u32((void *)&routing_indices[expert * routing_row_stride + row],
+                  0u);
       }
     }
+  }
+  for (int e = threadIdx.x; e < NUM_EXPERTS; e += blockDim.x) {
+    s_hit[e] = 0;
   }
   __syncthreads();
 
@@ -110,13 +141,42 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       }
     }
 
-    // Reset input buffer to 0 (for split-k gate linear compatibility)
+    // Reset input buffer to 0 (for split-k gate linear compatibility).
+    //
+    // WRITE-THROUGH, to match the producer. The 128 router workers publish
+    // each logit with `st_wt_u16` (sc0 sc1), which bypasses L2 and lands in
+    // HBM, and they sit on all 8 XCDs while this reader is on one. A plain
+    // store here leaves a *dirty* copy of the line in this XCD's L2. That line
+    // is not merely stale-on-read -- the acquire in topk_noinline drops it
+    // before the next read -- it is a pending writeback of zeros. Whenever it
+    // is evicted after the next layer's router has already written that
+    // address in HBM, the eviction overwrites a live logit with 0.
+    //
+    // A zeroed logit does not crash and does not change the ranking: 0 is far
+    // below the winners, so TopK returns the same experts in the same order
+    // and `routing_indices` / `active_expert_ids` come out bit-identical. But
+    // the softmax denominator is a sum over *all* NUM_EXPERTS logits, so the
+    // renormalized weights all shift in the low bits.
+    //
+    // Do NOT read the paragraph above as an explanation of any observed
+    // moe_topk_weight nondeterminism. It was, and it was the wrong suspect: the
+    // real cause of run-to-run moe_topk_weight divergence at batch_size >= 8
+    // was a dim-0 `input_map` on the output tensor, which made the host offset
+    // the base pointer by whole rows. See the NOTE at the `topk_weight`
+    // new_input() sites in persistent_kernel.py. The write-through reset here
+    // is still correct and still required for the L2 reason given above; it
+    // just shifts low bits, not whole rows. Define MPK_NO_LOGIT_RESET to keep
+    // the logits readable when dumping tensors for a golden reference.
+#ifndef MPK_NO_LOGIT_RESET
     for (int ldg = 0; ldg < LDG_PER_THREAD; ++ldg) {
       int src_offset = ldg * THREADS_PER_ROW * ELTS_PER_LDG;
       for (int e = 0; e < ELTS_PER_LDG; ++e) {
-        thread_read_ptr[src_offset + e] = static_cast<T>(0);
+        T zero = static_cast<T>(0);
+        st_wt_u16(&thread_read_ptr[src_offset + e],
+                  *reinterpret_cast<unsigned short *>(&zero));
       }
     }
+#endif
 
     // Max reduction within subgroup
     float thread_max = row_chunk[0];
@@ -227,12 +287,16 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 
         if (node_uses && routing_indices != nullptr) {
           int const local_expert = expert - start_expert;
-          st_wt_u32(
-              (void *)&routing_indices[local_expert * num_rows + thread_row],
-              (unsigned)(k_idx + 1));
-          if (active_expert_ids != nullptr) {
-            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
-          }
+          st_wt_u32((void *)&routing_indices[local_expert * routing_row_stride +
+                                             thread_row],
+                    (unsigned)(k_idx + 1));
+          // Mark, do not write: at num_rows > 1 several rows reach this line
+          // with different `expert` for the same k_idx, so indexing the output
+          // by k_idx made rows overwrite each other. Marking a per-expert byte
+          // is idempotent and deduplicates for free -- which the MoE tile
+          // decode requires, since it maps tile -> active_expert_ids[i] and
+          // would otherwise run the same expert twice and drop another.
+          s_hit[local_expert] = 1;
         }
       }
 
@@ -263,10 +327,48 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   }
   __syncthreads();
 
-  // Set active expert count (thread 0 only, single wavefront handles all rows
-  // for batch=1)
-  if (active_expert_ids != nullptr && threadIdx.x == 0) {
-    st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS], (unsigned)k);
+  // ── Compact the hit set into a dense, ascending, deduplicated list ──
+  // Wavefront 0 alone, so the running `count` needs no atomics: it is a plain
+  // register carried across the chunk loop, uniform across the wave because
+  // every lane derives it from the same ballot masks.
+  //
+  // At num_rows == 1 this reproduces the old behaviour up to ordering: exactly
+  // k distinct experts win, so count == k, and the ids come out sorted instead
+  // of in topk order. No consumer depends on that order -- they either scan
+  // [0, count) or index by tile.
+  if (active_expert_ids != nullptr && threadIdx.x < MI300_WARP_SIZE) {
+    int const lane = threadIdx.x;
+    unsigned long long const lane_mask = (1ULL << lane) - 1ULL;
+    int count = 0;
+    for (int base = 0; base < NUM_EXPERTS; base += MI300_WARP_SIZE) {
+      int const e = base + lane;
+      bool const hit = (e < NUM_EXPERTS) && (s_hit[e] != 0);
+      unsigned long long const ballot = __ballot(hit);
+      if (hit) {
+        int const pos = count + __popcll(ballot & lane_mask);
+        st_wt_u32((void *)&active_expert_ids[pos], (unsigned)(start_expert + e));
+      }
+      count += __popcll(ballot);
+    }
+    // Sentinel-fill the unused slots. The MoE tile decode must decide "is this
+    // tile padding?" from a value that is *per-slot*, never from the count:
+    // the count is one word shared by all 36 layers, so two workers that read
+    // it at different moments can disagree about how many slots are live, and
+    // then disagree about which tiles are W13. That disagreement is a deadlock,
+    // not drift -- the skipped tiles never reach the per-expert arrival, the
+    // `% W13_TILES` release never fires, and the W2 workers spin forever.
+    //
+    // A slot read is not immune to the same cross-layer skew, but it degrades
+    // the way the mask already did before packing: a worker gets some layer's
+    // expert id and produces slightly wrong numbers. Every worker that looks at
+    // slot s reads the same address, so they cannot disagree about whether s is
+    // padding while agreeing on everything else.
+    for (int e = count + lane; e < NUM_EXPERTS; e += MI300_WARP_SIZE) {
+      st_wt_u32((void *)&active_expert_ids[e], (unsigned)-1);
+    }
+    if (lane == 0) {
+      st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS], (unsigned)count);
+    }
   }
 }
 

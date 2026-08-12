@@ -2246,6 +2246,40 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           } else {
             // ===== Original fast-loop: per-layer dispatch =====
             while (true) {
+              // Publish the layer counter here too.
+              //
+              // The multi-layer branch above stores this once per `ml`, and the
+              // fused-layer task derives all four of its barrier release values
+              // from it (qkv_epoch, attn_release, routing_ready, and the MoE
+              // W13->W2 layer_epoch). This branch never did -- so on any run
+              // where multi-layer batching is off (it needs >1 fused layer;
+              // `--max-layers 1` disables it, and the host prints "Multi-layer
+              // table: disabled"), the field kept the ~0ull that
+              // FullTaskDesc's constructor writes into raw_payload.
+              //
+              // That made task_layer_idx == -1, so every expected value was
+              // layer_counter + 1 == 0, and *every* barrier in the fused layer
+              // became a no-op: the counters are host allocations that start at
+              // 0, so `while (observed < 0)` never spins even once. Verified
+              // directly -- an instrumented Phase 6 poll reported
+              // ALREADY-PAST on 101440 of 101440 entries, none waiting.
+              //
+              // With the cross-XCD attention barrier disabled, O-proj reads
+              // attn_out while the merges are still running. The damage is
+              // silent and lands on the requests whose merges finish last and
+              // the workers that reach Phase 6 first (xcd_rank >=
+              // total_qkv_tiles_per_xcd) -- the row>=2 x wg>=10 block seen in
+              // attn_proj_out, and the reason a delay anywhere in Phase 6 made
+              // it disappear while no cache fence on either side helped.
+              //
+              // Same expression as the ml branch: monotonic, never reset, one
+              // bump per layer. There is exactly one fused layer per iteration
+              // on this path, so the layer term is 0.
+              if (threadIdx.x == 0) {
+                task_desc->task_metadata._linear_reserved =
+                    (int32_t)(pc_iter - 1);
+              }
+              __syncthreads();
               int n_tile_start = (int)task_desc->task_metadata.n_tile_start;
               int n_tile_count = (int)task_desc->task_metadata.n_tile_count;
               int my_tiles = 0;

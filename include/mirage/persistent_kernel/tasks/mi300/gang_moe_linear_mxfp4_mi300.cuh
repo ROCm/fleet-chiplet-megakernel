@@ -241,6 +241,169 @@ __device__ __forceinline__ void
   __syncthreads();
 }
 
+// ── Multi-row FP8 quant: stages up to 16 token rows for N-axis MFMA packing ──
+//
+// The MFMA is mfma_scale_f32_16x16x128_f8f6f4: M=16 weight rows, N=16 token
+// columns, K=128. Lane l supplies A[m = l&15][k-blk = l>>4] and
+// B[n = l&15][k-blk = l>>4], and receives D[m = (l>>4)*4 + i][n = l&15]. The
+// single-token path broadcasts one token into all 16 N columns and reads back
+// only n == 0, throwing away 15/16 of every MFMA. Staging token `col` at LDS
+// row `col` lets up to 16 batch rows cost exactly what 1 row used to: same
+// MFMA count, same weight traffic.
+//
+// Calling the single-row helper once per row would leave 164 of 256 threads
+// idle on every call (REDUCTION_SIZE/32 = 92 sub-blocks) and cost one
+// __syncthreads per row. Flattening (row, sub_block) into one strided loop
+// keeps all 256 threads busy and needs a single barrier at the end.
+//
+// The __shfl amax combine requires the 4 sub-blocks of a 128-element super
+// block to land in 4 consecutive lanes. Flattening preserves that: NSUB % 4
+// == 0 keeps a super-block from straddling a row boundary, and idx = tid +
+// n*256 preserves idx % 4 == tid % 4.
+//
+// `row_off(r)` returns the element offset of row r within src_bf16. It is a
+// callable, not a table, so the contiguous callers (QKV / O-proj / LM head)
+// can compute it in registers while MoE reads a gathered LDS table. Rows
+// >= n_rows clamp so their loads stay in bounds; their N columns are masked
+// off at the epilogue.
+template <int REDUCTION_SIZE, int ROWS, int TOK_ROW_STRIDE, int SC_STRIDE,
+          bool NT_LOAD, typename RowOff>
+__device__ __forceinline__ void _gang_multirow_fp8_quant_impl(
+    unsigned short const *__restrict__ src_bf16,
+    RowOff row_off,
+    int n_rows,
+    uint8_t *__restrict__ s_tok_fp8,
+    uint8_t *__restrict__ s_tok_scales) {
+
+  constexpr int SUB_BLOCK = 32;
+  constexpr int NSUB = REDUCTION_SIZE / SUB_BLOCK;
+  constexpr int TOTAL = ROWS * NSUB;
+  static_assert(NSUB % 4 == 0,
+                "128-element super-blocks must not straddle a token row");
+  static_assert(TOK_ROW_STRIDE % 16 == 0,
+                "keeps the i32x4 B-operand loads 16B-aligned");
+
+  int const tid = threadIdx.x;
+  int const lane_id = tid & 63;
+
+  for (int idx = tid; idx < TOTAL; idx += 256) {
+    int const r = ROWS == 1 ? 0 : idx / NSUB;
+    int const sb = idx - r * NSUB;
+    int const base = sb * SUB_BLOCK;
+    int const super_blk = sb >> 2;
+    int const sub_idx = sb & 3;
+
+    unsigned short const *row = src_bf16 + row_off(r < n_rows ? r : 0) + base;
+
+    float vals[SUB_BLOCK];
+    float amax = 0.0f;
+    if constexpr (NT_LOAD) {
+      // Non-temporal loads for cross-XCD reads (W2): the source was just
+      // written by another XCD and will not be reused, so bypass L2.
+#pragma unroll
+      for (int j = 0; j < SUB_BLOCK; j += 8) {
+        i32x4_t v4 = __builtin_nontemporal_load((i32x4_t const *)(row + j));
+        unsigned short const *vs = (unsigned short const *)&v4;
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+          vals[j + q] = _gang_bf16_to_float(vs[q]);
+          amax = fmaxf(amax, fabsf(vals[j + q]));
+        }
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < SUB_BLOCK; j++) {
+        vals[j] = _gang_bf16_to_float(row[j]);
+        amax = fmaxf(amax, fabsf(vals[j]));
+      }
+    }
+
+    int base_lane = lane_id & ~3;
+    float a0 = __shfl(amax, base_lane);
+    float a1 = __shfl(amax, base_lane + 1);
+    float a2 = __shfl(amax, base_lane + 2);
+    float a3 = __shfl(amax, base_lane + 3);
+    float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
+
+    uint8_t se = _gang_compute_e8m0_fp8(block_amax);
+    float scale_f;
+    if (se == 0) {
+      scale_f = 1.0f;
+    } else {
+      union {
+        float f;
+        uint32_t u;
+      } sv;
+      sv.u = (uint32_t)se << 23;
+      scale_f = sv.f;
+    }
+
+    uint8_t *dst = s_tok_fp8 + (ROWS == 1 ? 0 : r * TOK_ROW_STRIDE) + base;
+#pragma unroll
+    for (int j = 0; j < SUB_BLOCK; j += 4) {
+      fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j], vals[j + 1], scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j + 2], vals[j + 3], scale_f, true);
+      *(int *)(dst + j) = *(int const *)&pk;
+    }
+
+    if (sub_idx == 0) {
+      s_tok_scales[(ROWS == 1 ? 0 : r * SC_STRIDE) + super_blk] = se;
+    }
+  }
+  __syncthreads();
+}
+
+// Gather form: `row_elem_off` is an LDS table of ROWS element offsets. This is
+// what lets MoE quantize only the tokens routed to one expert, and lets W2
+// address tok*(NUM_TOPK*INTERMEDIATE) + slot*INTERMEDIATE. The caller must
+// have published the table (its own __syncthreads) before calling.
+template <int REDUCTION_SIZE, int ROWS, int TOK_ROW_STRIDE, int SC_STRIDE,
+          bool NT_LOAD = false>
+__device__ __forceinline__ void _gang_multirow_fp8_quant_gather(
+    unsigned short const *__restrict__ src_bf16,
+    int const *__restrict__ row_elem_off,
+    int n_rows,
+    uint8_t *__restrict__ s_tok_fp8,
+    uint8_t *__restrict__ s_tok_scales) {
+  _gang_multirow_fp8_quant_impl<REDUCTION_SIZE, ROWS, TOK_ROW_STRIDE, SC_STRIDE,
+                                NT_LOAD>(
+      src_bf16, [&](int r) { return row_elem_off[r]; }, n_rows, s_tok_fp8,
+      s_tok_scales);
+}
+
+// Contiguous form: rows [row_base, row_base + ROWS) of a plain
+// [MAX_ROW, src_row_stride] bf16 matrix. Used by QKV / O-proj / LM head, which
+// read straight from a norm buffer and need no gather. The offset is a
+// register computation, so unlike the gather form this costs no LDS and no
+// extra barrier -- at ROWS == 1 it reduces to the same address the old
+// single-row quantizer formed.
+template <int REDUCTION_SIZE, int ROWS, int MAX_ROW, int TOK_ROW_STRIDE,
+          int SC_STRIDE, bool NT_LOAD = false>
+__device__ __forceinline__ void _gang_multirow_fp8_quant(
+    unsigned short const *__restrict__ src_bf16,
+    int src_row_stride,
+    int row_base,
+    int n_rows,
+    uint8_t *__restrict__ s_tok_fp8,
+    uint8_t *__restrict__ s_tok_scales) {
+  // Clamp: BATCH_SIZE need not be a multiple of 16, so the last column block
+  // can address rows past the end of the source. Those N columns are masked
+  // off by tok_active at the epilogue; here the read only has to stay in
+  // bounds.
+  _gang_multirow_fp8_quant_impl<REDUCTION_SIZE, ROWS, TOK_ROW_STRIDE, SC_STRIDE,
+                                NT_LOAD>(
+      src_bf16,
+      [&](int r) {
+        int src_row = row_base + r;
+        src_row = src_row < MAX_ROW ? src_row : MAX_ROW - 1;
+        return src_row * src_row_stride;
+      },
+      n_rows, s_tok_fp8, s_tok_scales);
+}
+
 // NT-load variant of per-thread FP8 quantization for W2 cross-XCD reads.
 // Same sub-block structure as non-NT variant but uses dwordx4 NT loads.
 template <int REDUCTION_SIZE>

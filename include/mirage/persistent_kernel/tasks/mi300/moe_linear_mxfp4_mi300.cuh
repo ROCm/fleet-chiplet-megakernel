@@ -15,7 +15,6 @@
 
 // MoE linear kernel for MI300/MI350 with native MXFP4 weights.
 // Uses scalar GEMV with LUT-based FP4 dequantization and wave reduction.
-// Based on croc's mxfp4_dequant_gemv_kernel approach.
 //
 // Weight format: MXFP4 (FP4 E2M1 + E8M0 block scales, 32 elements per block)
 //   Per workgroup: [data: OPW * K/2 bytes][scales: OPW * K/32 bytes]

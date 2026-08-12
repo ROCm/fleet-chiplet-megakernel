@@ -414,6 +414,14 @@ if __name__ == "__main__":
                         help="Use AITER fused MoE (CK-tile MXFP4 path)")
     parser.add_argument("--max-num-batched-tokens", default=1, type=int)
     parser.add_argument("--max-num-batched-requests", default=1, type=int)
+    parser.add_argument(
+        "--num-requests", default=None, type=int,
+        help=("Total requests to run. Defaults to --max-num-batched-requests. "
+              "Set it higher to exercise request rotation: requests retire as "
+              "they finish, their pages return to the free list, and queued "
+              "requests are admitted into the freed slots by "
+              "prepare_next_batch."),
+    )
     parser.add_argument("--page-size", default=4096, type=int)
     parser.add_argument("--max-num-pages", default=16, type=int)
     parser.add_argument("--output-dir", help="Output files directory")
@@ -424,6 +432,13 @@ if __name__ == "__main__":
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
+    parser.add_argument(
+        "--prompts", nargs="+", default=None,
+        help=("Distinct prompts, one per request (cycled if fewer than "
+              "--num-requests). Overrides --prompt. This is the multi-request "
+              "correctness gate: with identical prompts a request reading the "
+              "wrong KV cache produces the right answer anyway."),
+    )
     parser.add_argument(
         "--save-tokens", nargs="?", const="auto", default=None,
         help=("Dump generated token_ids to JSON for the correctness test. If the "
@@ -454,6 +469,39 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+
+    # ── Batch-shape liveness constraints ──────────────────────────────────
+    # These are hang-avoidance, not style. Violating any of them produces a
+    # stalled megakernel (all 240 workers spinning on a barrier that can never
+    # be satisfied), which looks identical to a hardware hang.
+    if args.use_mirage:
+        assert 1 <= args.max_num_batched_tokens <= 16, (
+            f"--max-num-batched-tokens must be in 1..16 (tokens ride the N "
+            f"axis of the 16x16x128 MFMA); got {args.max_num_batched_tokens}")
+        assert 1 <= args.max_num_batched_requests <= 8, (
+            f"--max-num-batched-requests must be in 1..8; got "
+            f"{args.max_num_batched_requests}. Above 8 the per-request chunk "
+            f"budget (30 workers/XCD // B) drops below 3 and the split-KV "
+            f"attention decomposition stops paying for itself.")
+        assert args.max_num_batched_tokens >= args.max_num_batched_requests, (
+            f"--max-num-batched-tokens ({args.max_num_batched_tokens}) must be "
+            f">= --max-num-batched-requests ({args.max_num_batched_requests}). "
+            f"prepare_next_batch gives each request min(1, budget-left) tokens, "
+            f"so trailing requests would get 0 tokens forever, never advance "
+            f"their step, and never retire.")
+        _pages_per_req = (args.max_seq_length + args.page_size - 1) // args.page_size
+        _pages_needed = args.max_num_batched_requests * _pages_per_req
+        assert args.max_num_pages >= _pages_needed, (
+            f"--max-num-pages={args.max_num_pages} is too small: "
+            f"{args.max_num_batched_requests} requests x {_pages_per_req} pages "
+            f"of {args.page_size} tokens needs {_pages_needed}. The page free "
+            f"list would run dry mid-run.")
+        if args.num_requests is None:
+            args.num_requests = args.max_num_batched_requests
+        assert args.num_requests >= args.max_num_batched_requests, (
+            f"--num-requests ({args.num_requests}) must be >= "
+            f"--max-num-batched-requests ({args.max_num_batched_requests})")
+
     if args.verify:
         args.use_mirage = True
     if args.use_aiter:
@@ -516,7 +564,10 @@ if __name__ == "__main__":
         # without this the Torch path silently keeps running all 36 layers and
         # any MPK-vs-Torch comparison under --max-layers is meaningless.
         model.model.layers = model.model.layers[:num_layers]
-    total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
+    # total_num_requests may exceed max_num_batched_requests: the extra ones
+    # queue behind the batch slots and are admitted by prepare_next_batch as
+    # earlier requests retire.
+    total_num_requests = 1 if not args.use_mirage else args.num_requests
 
     # ── Perplexity mode ───────────────────────────────────────────────────
     # Score a fixed corpus instead of generating. The megakernel already does
@@ -529,15 +580,25 @@ if __name__ == "__main__":
     ppl_mode = os.environ.get("PPL_MODE", "0") == "1"
     ppl_token_ids = None
     if ppl_mode:
-        if args.use_mirage and args.max_num_batched_tokens != 1:
-            # The LM head task RMSNorms batch_count rows but feeds only row 0
-            # to the GEMM, so a multi-token iteration would emit one logit row
-            # for a batch of positions. Perplexity needs one row per position.
+        # The bs==1 restriction that used to live here is gone: the LM head
+        # RMSNormed batch_count rows but fed only row 0 to the GEMM, so a
+        # multi-token iteration emitted one logit row for a whole batch of
+        # positions. It now packs tokens onto the MFMA's N axis (token `col`
+        # occupies column `col`) and writes one row per position with
+        # argmax_row_stride, which is exactly what perplexity needs.
+        #
+        # Multiple *requests* are still excluded, and unlike the token case
+        # this one cannot be lifted from the host. task_register.cc emits the
+        # logits sink row as `runtime_config.step[0] + 1` -- request 0's step,
+        # for every request. At B>1 all requests would write the same row.
+        # Since every request is loaded with the same corpus, the result would
+        # look entirely plausible while actually being a race.
+        if args.use_mirage and args.max_num_batched_requests > 1:
             raise ValueError(
-                "PPL_MODE requires --max-num-batched-tokens 1; the LM head "
-                f"emits one logit row per iteration (got "
-                f"{args.max_num_batched_tokens})."
-            )
+                f"PPL_MODE requires --max-num-batched-requests 1 (got "
+                f"{args.max_num_batched_requests}); the logits sink row is "
+                f"derived from request 0's step, so all requests would race "
+                f"on the same row.")
         if args.use_mirage and os.environ.get("FUSE_TAIL", "0") == "1":
             # The fused tail never dereferences its lm_logits output pointer,
             # so it has no logits sink to attach.
@@ -568,22 +629,65 @@ if __name__ == "__main__":
             (total_num_requests,), n_ppl, dtype=torch.int, device="cuda"
         )
     else:
-        # Tokenize prompt (apply chat template if available)
-        text = args.prompt
-        if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
-            messages = [{"role": "user", "content": text}]
-            formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            model_inputs = tokenizer([formatted], return_tensors="pt", add_special_tokens=False).to("cuda")
-            print(f"Chat template applied: {len(model_inputs.input_ids[0])} tokens")
+        def _tokenize_prompt(text):
+            """Tokenize one prompt, applying the chat template if there is one."""
+            if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+                messages = [{"role": "user", "content": text}]
+                formatted = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+                enc = tokenizer([formatted], return_tensors="pt",
+                                add_special_tokens=False).to("cuda")
+            else:
+                enc = tokenizer([text], return_tensors="pt").to("cuda")
+            return enc.input_ids[0]
+
+        # One prompt per request. Distinct prompts are what make a
+        # cross-request KV leak observable -- with identical prompts every
+        # request produces the same tokens whether or not attention read the
+        # right cache.
+        _prompt_texts = args.prompts if args.prompts else [args.prompt]
+        _req_ids = [_tokenize_prompt(_prompt_texts[r % len(_prompt_texts)])
+                    for r in range(total_num_requests)]
+        _lens = [int(t.numel()) for t in _req_ids]
+        if max(_lens) > args.max_seq_length:
+            raise ValueError(
+                f"prompt of {max(_lens)} tokens exceeds "
+                f"--max-seq-length {args.max_seq_length}")
+        for r, ids_r in enumerate(_req_ids):
+            tokens[r, :ids_r.numel()] = ids_r
+        prompt_lengths = torch.tensor(_lens, dtype=torch.int, device="cuda")
+        if len(_prompt_texts) > 1 or total_num_requests > 1:
+            print(f"Prompt lengths per request: {_lens}")
         else:
-            model_inputs = tokenizer([text], return_tensors="pt").to("cuda")
-        for r in range(total_num_requests):
-            for i in range(model_inputs.input_ids.shape[-1]):
-                tokens[r, i] = model_inputs.input_ids[0, i]
-        prompt_lengths = torch.full(
-            (total_num_requests,), model_inputs.input_ids.shape[-1],
-            dtype=torch.int, device="cuda"
-        )
+            print(f"Chat template applied: {_lens[0]} tokens")
+
+        # --max-new-tokens on the MPK path.
+        #
+        # MPK has no runtime decode-step bound. prepare_next_batch stops on
+        # `step + num_tokens + 1 >= config.max_seq_length`
+        # (persistent_kernel.cuh:728) and on nothing else -- the only other
+        # exit, profiling_num_iters, comes from the compile-time
+        # -DMPK_PROFILING_NUM_ITERS and has no runtime setter. So the flag was
+        # silently ignored here while the Torch branch honoured it through
+        # `decode_limit`, and step counts had to be controlled by hand via
+        # --max-seq-length. Translate it into the bound MPK actually reads.
+        #
+        # Longest prompt, not request 0's: max_seq_length is a single global
+        # bound shared by every request, so sizing it off a shorter prompt
+        # would truncate the longer ones mid-generation.
+        if args.use_mirage and args.max_new_tokens is not None:
+            _needed = max(_lens) + args.max_new_tokens
+            if _needed < args.max_seq_length:
+                args.max_seq_length = _needed
+                tokens = tokens[:, :_needed].contiguous()
+                print(f"[CFG] --max-new-tokens {args.max_new_tokens} -> "
+                      f"max_seq_length={_needed} "
+                      f"(prompt {max(_lens)} + {args.max_new_tokens})")
+            else:
+                print(f"[CFG] --max-new-tokens {args.max_new_tokens} needs "
+                      f"max_seq_length {_needed}, but --max-seq-length is "
+                      f"{args.max_seq_length}; generation stops at "
+                      f"{args.max_seq_length - max(_lens)} new tokens.")
 
     # Position embeddings
     positions = torch.arange(args.max_seq_length).unsqueeze(0).to("cuda")
@@ -1142,29 +1246,50 @@ if __name__ == "__main__":
         # decode kernel already stamps LSE=-inf for chunks that get no KV tiles,
         # so over-provisioning chunks at short seqlen is safe (just wasteful).
         #
-        # KV_TILE=64 in paged_attention_decode_minimal_hd64_mi300.cuh; aim for
-        # >=2 tiles per chunk so a chunk is worth its merge overhead.
+        # KV_TILE=16 in paged_attention_decode_minimal_hd64_mi300.cuh; the /64
+        # below is a coarse "is this sequence long enough to be worth splitting"
+        # heuristic, not a tile count.
+        #
+        # With B > 1 requests in flight the 30 workers/XCD are shared between
+        # requests and chunks: xcd_rank decomposes as
+        # (request, chunk) = (xcd_rank / NUM_KV_CHUNKS, xcd_rank % NUM_KV_CHUNKS),
+        # so the chunk budget per request is 30 // B. This is the same
+        # occupancy-driven split-K decision vLLM makes (partition only when the
+        # machine is not already full), just expressed as a compile-time shape.
         _nw, _ = mi.get_configurations_from_gpu(rank)
-        MAX_KV_CHUNKS = _nw // 8  # workers per XCD (240/8 = 30 on MI350)
+        _workers_per_xcd = _nw // 8  # 240/8 = 30 on MI350
+        MAX_KV_CHUNKS = _workers_per_xcd // args.max_num_batched_requests
+        assert MAX_KV_CHUNKS >= 1, (
+            f"max_num_batched_requests={args.max_num_batched_requests} exceeds "
+            f"the {_workers_per_xcd} workers per XCD; no chunk budget left."
+        )
         _env_chunks = os.environ.get("CK_FMHA_NUM_KV_CHUNKS")
         if _env_chunks is not None:
             ck_fmha_num_kv_chunks = int(_env_chunks)
         else:
             _kv_tiles = max(1, (args.max_seq_length + 63) // 64)
-            ck_fmha_num_kv_chunks = max(8, min(MAX_KV_CHUNKS, _kv_tiles // 2))
+            # Floor of 8 chunks: below that the merge overhead is cheaper than
+            # the serialization, so short sequences still want the split. The
+            # floor is then clamped to the per-request budget rather than
+            # dropped -- clamping keeps B<=3 (budget >= 10) bit-identical to
+            # the single-request path, and only B>=4 gives up chunk depth.
+            _want = max(8, min(MAX_KV_CHUNKS, _kv_tiles // 2))
+            ck_fmha_num_kv_chunks = max(1, min(MAX_KV_CHUNKS, _want))
         assert ck_fmha_num_kv_chunks >= 1
         use_split_attn_chunks = (ck_fmha_num_kv_chunks > 1)
         fuse_full_layer = os.environ.get("FUSE_FULL_LAYER", "1") == "1"
         if fuse_full_layer and ck_fmha_num_kv_chunks > MAX_KV_CHUNKS:
             raise ValueError(
-                f"CK_FMHA_NUM_KV_CHUNKS={ck_fmha_num_kv_chunks} exceeds the "
-                f"{MAX_KV_CHUNKS} workers per XCD available to claim chunks in "
-                f"the fused full-layer gang task; the split-KV merge would "
-                f"never fire and the kernel would hang."
+                f"CK_FMHA_NUM_KV_CHUNKS={ck_fmha_num_kv_chunks} x "
+                f"max_num_batched_requests={args.max_num_batched_requests} "
+                f"exceeds the {_workers_per_xcd} workers per XCD available to "
+                f"claim (request, chunk) pairs in the fused full-layer gang "
+                f"task; the split-KV merge would never fire and the kernel "
+                f"would hang."
             )
         print(f"[CFG] max_seq_length={args.max_seq_length} "
               f"ck_fmha_num_kv_chunks={ck_fmha_num_kv_chunks} "
-              f"(max {MAX_KV_CHUNKS})")
+              f"(max {MAX_KV_CHUNKS}, B={args.max_num_batched_requests})")
         fuse_tail = os.environ.get("FUSE_TAIL", "0") == "1"
 
         if args.profiling:
@@ -1262,6 +1387,9 @@ if __name__ == "__main__":
             bs, lse_dim1, dtype=torch.float32, device="cuda")
         ck_fmha_lse_acc = mpk.attach_input(
             torch_tensor=ck_fmha_lse_acc_tensor, name="ck_fmha_lse_acc")
+        if args.verify:
+            verify_tensors["ck_fmha_lse_acc"] = ck_fmha_lse_acc_tensor
+            verify_tensors["ck_fmha_q_workspace"] = ck_fmha_q_ws_tensor
 
         attn_out = make_tensor("attn_out", (bs, num_local_q_heads * head_dim))
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
@@ -1272,6 +1400,8 @@ if __name__ == "__main__":
                 bs, o_acc_dim1, dtype=torch.float32, device="cuda")
             ck_fmha_o_acc = mpk.attach_input(
                 torch_tensor=ck_fmha_o_acc_tensor, name="ck_fmha_o_acc")
+            if args.verify:
+                verify_tensors["ck_fmha_o_acc"] = ck_fmha_o_acc_tensor
         else:
             ck_fmha_o_acc = None
         attn_proj_out = make_tensor("attn_proj_out", (bs, PADDED_HIDDEN_SIZE))
@@ -1311,13 +1441,25 @@ if __name__ == "__main__":
         if fuse_oproj_moe:
             fuse_oproj_topk = True  # fused O-proj+MoE implies fused O-proj+TopK
         if fuse_oproj_topk:
-            # 704 int32: full-layer fusion counter buffer layout:
+            # full-layer fusion counter buffer layout:
             #   0..18*16-1:  type 215 counters
             #   19*16 (304): attn_global_counter (cross-XCD sync)
             #   20*16 (320): qkv_epoch[0..7] per-XCD epoch flags
-            #   28*16 (448): chunk_barrier[0..7] per-XCD chunk arrival
             #   36*16 (576): attn_xcd_release[0..7] per-XCD release flags
-            counter_size = 896 if fuse_tail else 832
+            #   44*16 (704): fused-tail counters (moe/resadd/lmhead/argmax),
+            #                4 slots ending at 48*16
+            #   48*16 (768): chunk_barrier[xcd][req], 8*B slots of 16 ints
+            #                -> 128*B ints
+            # The chunk barrier lives *above* the tail counters (rather than at
+            # its historical 28*16) precisely because it is the only region
+            # that grows with B; keeping it last means every other slot address
+            # is unchanged at any batch width.
+            # + 272 ints on top for the layer-boundary global barrier: 8
+            # per-XCD arrival lines, one global arrival line, and 8 per-XCD
+            # release lines, 16 ints each. It sits immediately above the chunk
+            # barrier -- see FULL_LAYER_LAYER_BARRIER_SLOT in
+            # gang_full_layer_fused_mi300.cuh.
+            counter_size = 768 + 128 * args.max_num_batched_requests + 272
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -1346,8 +1488,13 @@ if __name__ == "__main__":
         swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
         # W2 output: [bs, top_k, padded_hidden]
         mlp_out = make_tensor("mlp_out", (bs, num_experts_per_tok, PADDED_HIDDEN_SIZE))
-        # F32 workspace for W2 atomicAdd: replaces MulSumAdd standalone task
-        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # F32 workspace for W2 output: one private slab per (token, topk slot),
+        # laid out [bs, top_k, padded_hidden] but kept 2-D so the existing
+        # num_dims == 2 asserts hold. The slot axis is what makes the reduction
+        # deterministic -- W2 stores (no atomicAdd) and the consumer sums the
+        # slots of its own row in fixed order. See moe_ws_layout.cuh, whose
+        # MOE_WS_SLOTS must equal num_experts_per_tok.
+        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
         mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
@@ -1546,6 +1693,12 @@ if __name__ == "__main__":
             w_k_norm = None
             k_cache = _attach_input_keep(model.model.kv_cache[0][i], f"layer_{i}_k_cache")
             v_cache = _attach_input_keep(model.model.kv_cache[1][i], f"layer_{i}_v_cache")
+            if args.verify and (i < 2 or os.environ.get("MPK_KV_ALL")):
+                # Layers 0-1 only: the KV cache is the one attention input
+                # written by a different task than the one that reads it, so a
+                # stale or racy read shows up here first.
+                verify_tensors[f"L{i}_k_cache"] = model.model.kv_cache[0][i]
+                verify_tensors[f"L{i}_v_cache"] = model.model.kv_cache[1][i]
 
             # Per-head attention sinks (GPT-OSS specific)
             w_sinks = _attach_input_keep(
@@ -2414,6 +2567,16 @@ if __name__ == "__main__":
         _saved_stdout_fd = os.dup(1)
         os.dup2(_fwd_pass_log.fileno(), 1)
 
+        # MPK_WARMUP_LAUNCHES: launch the megakernel N extra times before the
+        # timed run. This is the regression test for cross-launch barrier
+        # state: the counter buffers are host-allocated once and never reset,
+        # while every __shared__ per-launch counter restarts at 0. Any barrier
+        # target derived from a per-launch value (rather than snapshotted from
+        # the persistent counter) hangs on the second launch.
+        for _w in range(int(os.environ.get("MPK_WARMUP_LAUNCHES", "0"))):
+            mpk()
+            torch.cuda.synchronize()
+
         starter.record()
         mpk()
         ender.record()
@@ -2556,29 +2719,47 @@ if __name__ == "__main__":
                       f"kernel_token={kernel_top} -> {ok}")
 
                 # Stronger: the same last iteration also left 240 per-worker
-                # (max, abs_idx) pairs in argmax_part_*. Each worker owns a
-                # known set of 64-column tiles, so recomputing its max from
-                # the sink and comparing checks every column of the row, not
-                # just the single winner above.
-                pv = _tensor_refs["argmax_part_value"][0].float()
-                pi = _tensor_refs["argmax_part_index"][0]
+                # (max, abs_idx) pairs in argmax_part_* for EACH of its token
+                # rows. Each worker owns a known set of 64-column tiles, so
+                # recomputing its max from the sink and comparing checks every
+                # column of the row, not just the single winner above.
+                #
+                # argmax_part_* is [batch, num_workers] and row `t` holds the
+                # partials for the token the last iteration placed at sink row
+                # `last_base + t`. Indexing it at [0] and comparing against
+                # sink row n_ppl is only correct at bs==1, where the last
+                # iteration carried a single token and those two coincide; at
+                # bs>1 row 0 belongs to the *first* token of the final chunk
+                # and mismatches every column. Derive the base instead and
+                # check all the rows the last iteration actually wrote.
+                bt = args.max_num_batched_tokens
+                # Scored sink rows are 1..n_ppl. Prefill consumes `bt` tokens
+                # per iteration, so the final chunk covers the last
+                # `n_last = ((n_ppl - 1) % bt) + 1` of them.
+                n_last = ((n_ppl - 1) % bt) + 1
+                last_base = n_ppl - n_last + 1
                 wpx = mpk.num_workers // 8               # workers per XCD
                 nwg = (vocab_size // lm_head_output_per_wg) // 8
-                sink_row = ppl_logits_torch[n_ppl]
-                bad_idx = bad_val = 0
+                # Column sets are token-independent -- build them once.
+                col_sets = []
                 for p in range(8):
                     pstart = p * nwg * lm_head_output_per_wg
                     for r in range(wpx):
-                        cols = torch.cat([
+                        col_sets.append(torch.cat([
                             torch.arange(
                                 pstart + wg * lm_head_output_per_wg,
                                 pstart + (wg + 1) * lm_head_output_per_wg,
                                 device="cuda")
                             for wg in range(r, nwg, wpx)
-                        ])
+                        ]))
+                bad_idx = bad_val = 0
+                for t in range(n_last):
+                    pv = _tensor_refs["argmax_part_value"][t].float()
+                    pi = _tensor_refs["argmax_part_index"][t]
+                    sink_row = ppl_logits_torch[last_base + t]
+                    for w, cols in enumerate(col_sets):
                         vals = sink_row[cols]
                         k = int(vals.argmax().item())
-                        w = p * wpx + r
                         if int(cols[k].item()) != int(pi[w].item()):
                             bad_idx += 1
                         # argmax_part_value is bf16: 8 mantissa bits, so
@@ -2587,7 +2768,8 @@ if __name__ == "__main__":
                                 0.02 * max(1.0, abs(float(pv[w]))):
                             bad_val += 1
                 print(f"[PPL] sink/per-worker-argmax check over all "
-                      f"{mpk.num_workers} workers: "
+                      f"{mpk.num_workers} workers x {n_last} token rows "
+                      f"(sink rows {last_base}..{last_base + n_last - 1}): "
                       f"{bad_idx} index mismatches, {bad_val} value "
                       f"mismatches -> "
                       f"{'OK' if bad_idx == 0 and bad_val == 0 else 'MISMATCH'}")
@@ -2624,7 +2806,18 @@ if __name__ == "__main__":
             #for tid in gen_ids.tolist():
             #    print(f"  {tid} -> '{tokenizer.decode([tid])}'")
             response = tokenizer.decode(valid_ids, skip_special_tokens=True)
-            print(response)
+            if total_num_requests > 1:
+                # Print the continuation separately from the prompt: with
+                # distinct prompts per request this is what shows that each
+                # request attended to its own KV cache rather than request 0's.
+                cont = tokenizer.decode(valid_ids[prompt_len_r:],
+                                        skip_special_tokens=True)
+                print(f"----- request {r} (step={step[r].item()}, "
+                      f"prompt_len={prompt_len_r}) -----")
+                print(f"[prompt] {tokenizer.decode(valid_ids[:prompt_len_r], skip_special_tokens=True)!r}")
+                print(f"[cont  ] {cont!r}")
+            else:
+                print(response)
 
         if save_path and rank == 0:
             gen0 = tokens[0, : step[0].item() + 1]
@@ -2722,12 +2915,92 @@ if __name__ == "__main__":
                   f"over {_fwd_total_iters} iters")
         print("=" * 80)
 
+        # Run-to-run bitwise fingerprint. MPK is nondeterministic even at B=1,
+        # and the divergence accumulates over ~20 tokens, so generated text is
+        # a terrible oracle: it says "differs" long after the first bad bit.
+        # Dump a hash of every captured intermediate plus the token ids, run
+        # twice, and diff -- the FIRST differing tensor localizes the defect.
+        # Pair with --max-seq-length == prompt_len+1 for a prefill-only run,
+        # which has no autoregressive feedback at all.
+        if os.environ.get("MPK_FINGERPRINT") and verify_tensors:
+            torch.cuda.synchronize()
+            import hashlib as _hl
+            _fp = {}
+            for _nm in sorted(verify_tensors):
+                _t = verify_tensors[_nm].detach().cpu()
+                # view as uint8 -- bf16 has no numpy dtype, and we want the
+                # raw bits anyway, not a value-preserving cast.
+                _b = _t.contiguous().view(torch.uint8).numpy().tobytes()
+                _fp[_nm] = _hl.sha1(_b).hexdigest()[:16]
+            _fp["__tokens__"] = _hl.sha1(
+                tokens.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+            _fp["__step__"] = str(step.tolist())
+            with open(os.environ["MPK_FINGERPRINT"], "w") as _f:
+                for _k in sorted(_fp):
+                    _f.write(f"{_k} {_fp[_k]}\n")
+            print(f"[FP] wrote {os.environ['MPK_FINGERPRINT']}")
+            if os.environ.get("MPK_DUMP_TENSORS"):
+                # MPK_KV_ONLY_DUMP: keep only the KV caches. With MPK_KV_ALL
+                # the full dump is ~4.8GB per run at 36 layers, and comparing
+                # two runs means holding both. The KV caches are the only
+                # per-step history in the dump -- every other tensor is
+                # last-iteration scratch -- so for a multi-step divergence
+                # hunt they are the entire signal.
+                _kv_only = os.environ.get("MPK_KV_ONLY_DUMP")
+                _dump = {_k: verify_tensors[_k].detach().cpu()
+                         for _k in verify_tensors
+                         if not _kv_only or "_cache" in _k}
+                # The token ids and per-request step are what make a dump
+                # interpretable: without them a row-to-row difference in
+                # embed_out cannot be told apart from "these rows embedded
+                # different tokens", which is expected once any request has
+                # generated even one token of its own.
+                _dump["__step_t__"] = step.detach().cpu().clone()
+                # The tokens actually consumed by the *last* forward pass.
+                # embed_out rows can only be compared against each other once
+                # these are known equal; at the end of a run that generated a
+                # token they are not, and every downstream row difference is
+                # then legitimate rather than a defect.
+                _dump["__input_tokens_t__"] = input_tokens.detach().cpu().clone()
+                _dump["__tokens_t__"] = tokens.detach().cpu().clone()
+                _dump["__plen_t__"] = prompt_lengths.detach().cpu().clone()
+                torch.save(_dump, os.environ["MPK_DUMP_TENSORS"])
+                print(f"[FP] dumped tensors to {os.environ['MPK_DUMP_TENSORS']}")
+
         # === Verification: compare Mirage intermediates with PyTorch reference ===
-        if args.verify and verify_tensors:
+        # MPK_FP_ONLY skips the Torch reference pass below. That pass builds a
+        # second full copy of the model's activations and OOMs at larger
+        # --max-layers, which kills the process *before* the fingerprint above
+        # is written. When all you want is the run-to-run bitwise fingerprint,
+        # the reference is dead weight.
+        if args.verify and verify_tensors and not os.environ.get("MPK_FP_ONLY"):
             print("\n" + "=" * 80)
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)
             torch.cuda.synchronize()
+
+            # Row-symmetry sweep. Every captured tensor is [rows, ...] with one
+            # row per batch slot. Run with identical prompts in every slot: any
+            # tensor whose rows differ names a reduction whose result depends on
+            # arrival order or on batch composition. The FIRST such tensor in
+            # dataflow order is the defect; everything after it is downstream.
+            if bs > 1:
+                print("\n--- Row symmetry (identical prompts => rows must match) ---")
+                for _nm in sorted(verify_tensors):
+                    _t = verify_tensors[_nm]
+                    if _t.dim() < 1 or _t.shape[0] < 2:
+                        continue
+                    _r0 = _t[0].float()
+                    _worst, _worst_r = 0.0, -1
+                    for _r in range(1, _t.shape[0]):
+                        _d = (_t[_r].float() - _r0).abs().max().item()
+                        if _d > _worst:
+                            _worst, _worst_r = _d, _r
+                    _flag = "  <-- DIFFERS" if _worst > 0 else ""
+                    _norms = [f"{_t[_i].float().norm().item():.4g}"
+                              for _i in range(min(_t.shape[0], 4))]
+                    print(f"  {_nm:28s} rows={_t.shape[0]} max|row_i-row_0|="
+                          f"{_worst:.6g} (row {_worst_r}) norms={_norms}{_flag}")
 
             # Debug: check q_workspace and k_cache values
             q_ws_nz = (ck_fmha_q_ws_tensor.abs() > 1e-6).sum().item()
@@ -3136,16 +3409,20 @@ if __name__ == "__main__":
                     nonzero_k = (mg_mlp_out[0, k].abs() > 1e-6).sum().item()
                     print(f"  Slot {k}[:8]: {vals}  (nonzero: {nonzero_k}/{mg_mlp_out.shape[-1]})")
 
-            # 9d. MoE workspace_f32 (atomicAdd accumulator used in fused path)
+            # 9d. MoE workspace_f32 (per-(token, topk slot) W2 output, fused path)
             mg_ws_f32 = verify_tensors.get("moe_workspace_f32")
             if mg_ws_f32 is not None:
-                print(f"\n--- MoE workspace_f32 (atomicAdd output) ---")
-                ws_vals = mg_ws_f32[0, :8].float().tolist()
-                ws_nonzero = (mg_ws_f32[0].abs() > 1e-6).sum().item()
-                ws_norm = mg_ws_f32[0, :hidden_size].float().norm().item()
+                # Stored flat as [bs, top_k * PADDED_HIDDEN_SIZE]; the consumer
+                # sums the slot axis, so do the same here before comparing.
+                ws_slots = mg_ws_f32[0].view(num_experts_per_tok, -1).float()
+                ws_sum = ws_slots.sum(dim=0)
+                print(f"\n--- MoE workspace_f32 (slot-summed W2 output) ---")
+                ws_vals = ws_sum[:8].tolist()
+                ws_nonzero = (ws_sum.abs() > 1e-6).sum().item()
+                ws_norm = ws_sum[:hidden_size].norm().item()
                 print(f"  ws_f32[:8]: {ws_vals}")
-                print(f"  nonzero: {ws_nonzero}/{mg_ws_f32.shape[-1]}, norm: {ws_norm:.4f}")
-                print(f"  pad region [{hidden_size}:] max: {mg_ws_f32[0, hidden_size:].abs().max().item():.6f}")
+                print(f"  nonzero: {ws_nonzero}/{ws_sum.shape[-1]}, norm: {ws_norm:.4f}")
+                print(f"  pad region [{hidden_size}:] max: {ws_sum[hidden_size:].abs().max().item():.6f}")
 
                 # Note: mlp_mid (W13 output) is also available for debugging if needed
 

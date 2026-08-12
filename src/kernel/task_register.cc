@@ -1239,6 +1239,9 @@ int TaskRegister::register_gang_rmsnorm_linear_mxfp4_bias_argmax_mi300_task(
   }
   // Row to write in the logits buffer: the position being scored. step[0] is
   // the last consumed position, so the token produced here lands at step+1.
+  // NOTE: single-request only. With MPK_MAX_NUM_BATCHED_REQUESTS > 1 every
+  // request would write this same row and race. The host gates PPL_MODE on
+  // max_num_batched_requests == 1 (demo/gpt_oss/demo.py).
   code.e("    runtime_config.step[0] + 1,");
   code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
   code.e("    $,", n_wgs_per_xcd);
@@ -2048,14 +2051,27 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
   int moe_hidden_size = moe_intermediate_size;
 
   float scale_s = 1.0f / sqrtf((float)head_dim) * 1.44269504088896340736f;
-  int oproj_n_wgs_per_xcd = oproj_tiles_per_xcd / batch_size;
+  // oproj_tiles_per_xcd is now n_bblk * n_wgs_per_xcd (persistent_kernel.py):
+  // tokens ride the MFMA N axis, so the host emits one tile block per 16
+  // tokens, not one per token. Dividing by batch_size here would recover a
+  // fractional -- and at bs>16 simply wrong -- weight-group count.
+  int n_bblk = (batch_size + 15) / 16;
+  int oproj_n_wgs_per_xcd = oproj_tiles_per_xcd / n_bblk;
+
+  // DECODE_ONLY compiles out paged_attention_ck_fmha_prefill, which is only
+  // reachable when a request contributes seqlen_q > 1 in one iteration. That
+  // cannot happen while batch_size == 1, and hardcoding `true` there saved
+  // real LDS/VGPR. At batch_size > 1 a single request supplies multiple query
+  // rows per iteration, so seqlen_q > 1 and the branch IS taken -- baking in
+  // `true` would silently produce no attention output for that request.
+  bool decode_only = (batch_size == 1);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  // 22 template parameters + DECODE_ONLY=true (compile out prefill attention
-  // path)
+  // 22 template parameters + DECODE_ONLY + NUM_REQS
   code.e("kernel::gang_full_layer_fused_kernel_mi300<$, $, $, $, $, $, $, $, "
-         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, true>(",
+         "$, $, $, $, $, $, $, $, $, $, $, $, $, $, $, "
+         "MPK_MAX_NUM_BATCHED_REQUESTS>(",
          batch_size,
          qkv_output_per_wg,
          qkv_reduction_size,
@@ -2077,7 +2093,8 @@ int TaskRegister::register_gang_full_layer_fused_mi300_task(
          moe_intermediate_size,
          moe_hidden_size,
          w13_output_per_wg,
-         w2_output_per_wg);
+         w2_output_per_wg,
+         decode_only);
   // Pass input/output pointer arrays directly (2 params instead of 34)
   code.e("    task_desc->input_ptrs,");
   code.e("    task_desc->output_ptrs,");
@@ -2173,7 +2190,12 @@ int TaskRegister::register_gang_full_layer_with_lmhead_fused_mi300_task(
   int lm_reduction_size = input_ops[24]->dtensor.dim[0];
 
   float scale_s = 1.0f / sqrtf((float)head_dim) * 1.44269504088896340736f;
-  int oproj_n_wgs_per_xcd = oproj_tiles_per_xcd / batch_size;
+  // oproj_tiles_per_xcd is now n_bblk * n_wgs_per_xcd (persistent_kernel.py):
+  // tokens ride the MFMA N axis, so the host emits one tile block per 16
+  // tokens, not one per token. Dividing by batch_size here would recover a
+  // fractional -- and at bs>16 simply wrong -- weight-group count.
+  int n_bblk = (batch_size + 15) / 16;
+  int oproj_n_wgs_per_xcd = oproj_tiles_per_xcd / n_bblk;
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
@@ -5297,6 +5319,10 @@ int TaskRegister::register_moe_topk_softmax_mi300_task(
          /*BYTES_PER_LDG=*/16);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->output_ptrs[0],");
+  code.e("    $,", batch_size);
+  // routing_row_stride: routing_indices is [num_experts, batch_size], and
+  // this standalone variant runs all batch_size rows, so the number of rows
+  // and the allocated stride coincide.
   code.e("    $,", batch_size);
   code.e("    $,", num_experts_per_tok);
   code.e("    task_desc->output_ptrs[1],");

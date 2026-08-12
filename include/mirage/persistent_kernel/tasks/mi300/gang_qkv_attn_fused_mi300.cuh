@@ -19,7 +19,7 @@
 // the paged attention task (141) into a single gang task, eliminating
 // the scheduler transition between them (~12µs × 36 layers = 432µs).
 //
-// CROC-style last-worker-does-attention pattern:
+// Last-worker-does-attention pattern:
 //   Every worker executes its QKV tile, then atomicAdd to per-XCD counter.
 //   The LAST worker to arrive (atomicAdd returns prev == total-1) runs
 //   attention inline — zero polling overhead, no separate attention tile.

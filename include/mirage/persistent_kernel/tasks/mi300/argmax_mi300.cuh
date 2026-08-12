@@ -53,6 +53,23 @@ __device__ __forceinline__ void block_reduce_max_idx(T &val, long long &idx) {
   int my_lane_id = lane_id();
   int my_warp_id = warp_id();
 
+  // Barrier BEFORE the write, not just after it.
+  //
+  // Both callers invoke this once per row of the batch, reusing these same
+  // smem slots every iteration, and the only barrier used to be the one below.
+  // That orders the write against warp 0's read within a single call, but
+  // nothing stops warps 1..N from racing ahead into row b+1 and overwriting
+  // smem_vals[warp] while warp 0 is still reducing row b. Warp 0 then mixes
+  // one row's partial max with another's.
+  //
+  // Unreachable at num_active_tokens == 1: the loop body runs once, so there
+  // is no next iteration to race with. That is exactly why B=1 is stable over
+  // ~25 runs while B=8 is not, and why the symptom is a single near-tie
+  // argmax position flipping for a subset of rows rather than garbage -- the
+  // stolen value is a real logit max from a neighbouring row, so it only
+  // changes the outcome when two candidates are close.
+  __syncthreads();
+
   if (my_lane_id == 0) {
     smem_vals[my_warp_id] = val;
     smem_idxs[my_warp_id] = idx;

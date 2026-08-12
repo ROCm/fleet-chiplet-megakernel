@@ -45,6 +45,7 @@
 
 #pragma once
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // reuse type defs + helpers
+#include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
 #include "tasks/mi300/swigluoai_mi300.cuh"             // fast_swigluoai()
 
 #if defined(MPK_NIL_TRIPWIRE) && defined(MPK_TW_SUB)
@@ -111,6 +112,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     void *barrier_ptr,       // [2*NUM_EXPERTS] int32
     int tile_idx) {
 
+  // ── N-axis packing geometry ───────────────────────────────────────────────
+  // Token `c` lives at LDS row `c` and feeds N column `c` of the 16x16x128
+  // MFMA, so an expert's whole routed token set costs one tile sweep instead
+  // of one per token.
+  //
+  // Batches wider than one MFMA N-tile keep the old token-per-tile decode. A
+  // NUM_BBLK-blocked compaction would leave some (expert, block) tiles with no
+  // live token, and an empty tile still has to arrive at the W13->W2 barrier
+  // or the `% W13_TILES` modulus below stops being exact -- which is the bs>1
+  // hang this packing exists to fix.
+  constexpr int MFMA_N = 16;
+  constexpr bool PACK_N = BATCH_SIZE <= MFMA_N;
+  constexpr int TOK_ROWS = PACK_N ? BATCH_SIZE : 1;
+  // Distinguishes "one staged row because the batch is one" (fold token index
+  // to a literal 0) from "one staged row because we fell back to the legacy
+  // per-token decode" (token index comes from the tile).
+  constexpr bool SINGLE_TOK = PACK_N && BATCH_SIZE == 1;
+
   // ── W13 constants (gate+up interleaved, MFMA reduction over hidden_size) ──
   constexpr int W13_OUTPUT_SIZE = 2 * INTERMEDIATE_SIZE; // 6144
   constexpr int W13_K = HIDDEN_SIZE;                     // 3072
@@ -122,7 +141,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   constexpr int64_t W13_EXPERT_BYTES =
       static_cast<int64_t>(W13_WGS) * W13_WG_BYTES;
   constexpr int W13_MFMA_ITERS = W13_K / 128;
-  constexpr int W13_TILES = BATCH_SIZE * W13_WGS;
+  // Tile space is weight groups only under packing: the token axis moved into
+  // the MFMA's N dimension. This is also what makes the barrier modulus at the
+  // bottom of Phase 0 exact again -- see the note there.
+  constexpr int W13_TILES = PACK_N ? W13_WGS : BATCH_SIZE * W13_WGS;
 
   // ── W2 constants (down projection, MFMA reduction over intermediate_size) ─
   constexpr int W2_OUTPUT_SIZE = HIDDEN_SIZE; // 3072
@@ -135,7 +157,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   constexpr int64_t W2_EXPERT_BYTES =
       static_cast<int64_t>(W2_WGS) * W2_WG_BYTES;
   constexpr int W2_MFMA_ITERS = W2_K / 128;
-  constexpr int W2_TILES = BATCH_SIZE * W2_WGS;
+  constexpr int W2_TILES = PACK_N ? W2_WGS : BATCH_SIZE * W2_WGS;
 
   // Common constants
   constexpr int K_PER_MFMA = 128; // FP4/FP8 MFMA: 16x16x128
@@ -179,41 +201,114 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // Marker 1000: about to read the routing mask. Everything downstream --
   // expert_id, the weight base pointers, the barrier slot -- derives from it.
   MOE_DBG_ENTRY(1000, (unsigned long long)tile_idx);
+  // Read for diagnostics only. Nothing that decides tile partitioning or
+  // padding may derive from this word -- see the padding note below.
   int num_activated_experts = d_mask[NUM_EXPERTS];
 #ifdef MPK_MOE_SINGLE_EXPERT
+  constexpr bool MPK_MOE_SINGLE_EXPERT_ACTIVE = true;
   num_activated_experts = min(num_activated_experts, 1);
+#else
+  constexpr bool MPK_MOE_SINGLE_EXPERT_ACTIVE = false;
 #endif
 
+  // ── Tile space is compile-time, not routing-dependent ─────────────────────
+  // MAX_ACTIVATED must equal the host's `max_activated` in
+  // persistent_kernel.py, which is what sizes moe_total_tiles_per_xcd.
+  //
+  // The partitioning below (total_w13, the is_w2 split, expert_idx) MUST NOT
+  // depend on num_activated_experts. There is one moe_mask buffer shared by
+  // all 36 layers and no barrier at the layer boundary, so workers straddle
+  // layers -- a worker still finishing layer L can read layer L+1's mask.
+  // While the count was the compile-time constant k on every layer that was
+  // harmless: a stale read gave the same partitioning and only shifted which
+  // expert ids were used. Once the count became a true per-layer union over
+  // routed tokens (needed for bs>1 dedup) it varies, two workers computing
+  // this arithmetic from different counts disagree about which tiles are W13,
+  // and the `% W13_TILES` release below never fires -- the W2 workers then
+  // spin forever. Deriving it from a constant makes every worker agree by
+  // construction, whichever layer's mask it happened to read.
+  //
+  // The runtime count is still used, but only to skip padding tiles, where
+  // reading a stale value costs at worst a wasted or skipped expert-slot on
+  // one layer -- never a partitioning disagreement.
+  constexpr int MAX_ACTIVATED =
+      (NUM_TOPK * BATCH_SIZE < NUM_EXPERTS) ? NUM_TOPK * BATCH_SIZE
+                                            : NUM_EXPERTS;
+
+  // The output workspace is indexed by topk slot, so its slot count must be
+  // this model's experts-per-token. If they disagree, slot writes alias across
+  // tokens (too few) or the consumer sums uninitialized slabs (too many) --
+  // both silent. Consumers derive the same stride from MOE_WS_SLOTS.
+  static_assert(NUM_TOPK == MOE_WS_SLOTS,
+                "MOE_WS_SLOTS in moe_ws_layout.cuh must equal NUM_TOPK");
+
   int global_tile = tile_idx * 8 + xcd_id;
-  int total_w13_real = num_activated_experts * W13_TILES;
-  int total_w13 =
-      ((total_w13_real + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
-  int total_w2 = num_activated_experts * W2_TILES;
-  int total_tiles = total_w13 + total_w2;
-  if (global_tile >= total_tiles) {
+  constexpr int TOTAL_W13_REAL = MAX_ACTIVATED * W13_TILES;
+  constexpr int TOTAL_W13 =
+      ((TOTAL_W13_REAL + PAD_MULTIPLE - 1) / PAD_MULTIPLE) * PAD_MULTIPLE;
+  constexpr int TOTAL_W2 = MAX_ACTIVATED * W2_TILES;
+  constexpr int TOTAL_TILES = TOTAL_W13 + TOTAL_W2;
+  if (global_tile >= TOTAL_TILES) {
     MPK_WS_MARK(8100, global_tile); // exit: past end of tile range
     return;
   }
 
-  bool is_w2 = (global_tile >= total_w13);
+  bool is_w2 = (global_tile >= TOTAL_W13);
   int expert_idx, phase_tile;
   if (!is_w2) {
     expert_idx = global_tile / W13_TILES;
     phase_tile = global_tile % W13_TILES;
-    // Padding tile: expert_idx beyond activated range → skip
-    if (expert_idx >= num_activated_experts) {
-      MPK_WS_MARK(8101, global_tile); // exit: W13 padding tile
-      return;
-    }
   } else {
-    int w2_tile = global_tile - total_w13;
+    int w2_tile = global_tile - TOTAL_W13;
     expert_idx = w2_tile / W2_TILES;
     phase_tile = w2_tile % W2_TILES;
   }
 
+  // ── Nothing read from the mask may steer control flow ─────────────────────
+  // There is one moe_mask buffer for all 36 layers and no layer-boundary
+  // barrier, so workers straddle layers and two of them can read *different
+  // layers' masks* for the same slot. That rules out deciding anything
+  // structural from the mask -- not the tile partitioning, not whether a slot
+  // is padding, and not the barrier address:
+  //
+  //   * count-derived padding (`expert_idx >= num_activated_experts`): the two
+  //     sides disagree about which tiles are W13, one returns without arriving,
+  //     the counter stops short, the `% W13_TILES` release never fires.
+  //     Observed as bid=805 with arrivals%46=41 -- exactly the 5 tiles skipped.
+  //   * slot-derived padding (a -1 sentinel at [count, NUM_EXPERTS)): better,
+  //     but slot s still reads live in a layer with a larger count and padding
+  //     in one with a smaller count, so the same disagreement returns.
+  //   * `base = expert_id * MOE_BAR_STRIDE`: the address itself came from mask
+  //     *contents*, so slot s resolving to expert 110 for one worker and
+  //     another id for its partner split the arrivals across two counters.
+  //     Observed as obs=0 with arrivals=43 -- 3 tiles landed elsewhere.
+  //
+  // So: the tile space is compile-time (above), the barrier is indexed by
+  // *slot* (below), and padding tiles do not return -- they fall through with
+  // no active token, run their MFMA over the clamped row, store nothing, and
+  // arrive like every other tile. Every slot in [0, MAX_ACTIVATED) therefore
+  // arrives exactly W13_TILES times every layer no matter what the mask says,
+  // which is what makes the release unconditional.
+  //
+  // The mask is still read, for expert_id -- but only to pick weights. A stale
+  // read there is the benign numeric drift the mask always had (a token gets a
+  // neighbouring layer's expert), not a deadlock.
+  int expert_id_raw = d_mask[expert_idx];
+  bool const is_padding_slot =
+      (expert_id_raw < 0) || (expert_id_raw >= NUM_EXPERTS) ||
+      (MPK_MOE_SINGLE_EXPERT_ACTIVE && expert_idx >= 1);
+  // Clamp before it reaches any pointer arithmetic: the sentinel is -1, and the
+  // weight/routing base pointers are built unconditionally below.
+  int expert_id = is_padding_slot ? 0 : expert_id_raw;
+  if (is_padding_slot) {
+    MPK_WS_MARK(is_w2 ? 8105 : 8101, global_tile); // padding tile (runs empty)
+  }
+
   int n_wgs = is_w2 ? W2_WGS : W13_WGS;
-  int tok_idx = phase_tile / n_wgs;
-  int wg_idx = phase_tile % n_wgs;
+  // Under packing the tile space *is* the weight-group space, so the divide
+  // folds away and every tile covers all of the expert's routed tokens.
+  int tok_idx = PACK_N ? 0 : phase_tile / n_wgs;
+  int wg_idx = PACK_N ? phase_tile : phase_tile % n_wgs;
 
   // Marker 1001: tile decoded, expert_id read. If num_activated_experts or
   // expert_id is out of range here, every pointer built below is wild --
@@ -224,20 +319,116 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           (((unsigned long long)(unsigned char)expert_idx) << 16) |
           (((unsigned long long)(unsigned char)num_activated_experts) << 32) |
           (((unsigned long long)(is_w2 ? 1 : 0)) << 40));
-  int expert_id = d_mask[expert_idx];
   int const *expert_routing = d_routing + expert_id * BATCH_SIZE;
 
-  if (tok_idx >= BATCH_SIZE) {
+  if (!PACK_N && tok_idx >= BATCH_SIZE) {
     MPK_WS_MARK(8102, global_tile); // exit: token out of batch
     return;
   }
 
-  int route_val = expert_routing[tok_idx];
-  if (route_val == 0) {
-    MPK_WS_MARK(8103, global_tile); // exit: token not routed here
-    return;
+  // ── Per-expert token compaction ───────────────────────────────────────────
+  // Which of the batch's tokens routed to this expert, packed into MFMA N
+  // columns 0..n_tok-1. This is what replaces the 16 separate tile launches
+  // (one per token, 15 of which used to early-return) with 16 scalar loads.
+  //
+  // The early return those launches took is exactly the bs>1 hang: a tile that
+  // returns above never reaches the atom_add_release_gpu_s32 at the end of
+  // Phase 0, so `prev_global % W13_TILES == W13_TILES - 1` never fires and the
+  // W2 workers spin forever. Nothing below this point may return early.
+  __shared__ int s_tok_of_col[PACK_N ? MFMA_N : 1];
+  __shared__ int s_slot_of_col[PACK_N ? MFMA_N : 1];
+  __shared__ int s_row_off[PACK_N ? MFMA_N : 1];
+  __shared__ int s_n_tok;
+
+  int my_tok, topk_slot, n_tok;
+  bool tok_active;
+
+  if constexpr (SINGLE_TOK) {
+    // BATCH_SIZE == 1: there is one token, it is token 0, and an expert only
+    // appears in the activated list because that token routed to it. Keep the
+    // original scalar path -- no table, no extra barrier, and the token index
+    // stays a compile-time literal so every address derived from it is
+    // uniform. (Packing a one-row batch would cost a __syncthreads for
+    // nothing; that class of drift is what the ISA gate exists to catch.)
+    int route_val = expert_routing[0];
+    if (route_val == 0) {
+      MPK_WS_MARK(8103, global_tile); // exit: token not routed here
+      return;
+    }
+    my_tok = 0;
+    topk_slot = route_val - 1;
+    n_tok = 1;
+    tok_active = (col == 0);
+  } else if constexpr (PACK_N) {
+    if (warp_id == 0) {
+      // Clear then compact, both from wave 0: LDS ops from one wave retire in
+      // program order, so the pad entries are overwritten by the compaction
+      // and never read stale. (They are also never read -- inactive lanes and
+      // the quantizer's row clamp both land on slot 0 -- but leaving the table
+      // undefined would make that an invariant nobody states.)
+      bool const in_range = lane_id < MFMA_N;
+      if (in_range) {
+        s_tok_of_col[lane_id] = 0;
+        s_slot_of_col[lane_id] = 0;
+        s_row_off[lane_id] = 0;
+      }
+
+      // The ballot runs on the whole wave, not inside the lane_id < 16 branch:
+      // it reports only currently-active lanes, so issuing it under divergence
+      // would make the prefix count depend on which lanes happen to be on.
+      // A padding slot contributes no tokens. Forced to 0 rather than skipped:
+      // expert_id was clamped to 0 for padding, so expert_routing points at a
+      // real expert's row and would otherwise compact that expert's tokens into
+      // a tile that must produce nothing. The ballot below still runs on the
+      // whole wave, so n_tok comes out 0 and every lane is inactive -- the tile
+      // does its MFMA over the clamped row, stores nothing, and arrives.
+      int rv = (in_range && lane_id < BATCH_SIZE && !is_padding_slot)
+                   ? expert_routing[lane_id]
+                   : 0;
+      unsigned long long hit = __ballot(rv != 0);
+      int dst = __popcll(hit & ((1ull << lane_id) - 1));
+      if (rv != 0) {
+        s_tok_of_col[dst] = lane_id;
+        s_slot_of_col[dst] = rv - 1;
+        // W13 reads the token straight out of the norm buffer; W2 reads the
+        // SwiGLU output, which is indexed by (token, topk slot). `is_w2` is
+        // uniform across the block, so one table serves whichever phase this
+        // tile is in.
+        s_row_off[dst] =
+            is_w2 ? lane_id * (NUM_TOPK * INTERMEDIATE_SIZE) +
+                        (rv - 1) * INTERMEDIATE_SIZE
+                  : lane_id * W13_K;
+      }
+      if (lane_id == 0) {
+        s_n_tok = (int)__popcll(hit);
+      }
+    }
+    __syncthreads();
+    n_tok = s_n_tok;
+    if (n_tok == 0) {
+      // Should be unreachable: an expert is in active_expert_ids only because
+      // some token routed to it. Mark rather than return -- returning is what
+      // breaks the barrier modulus. Every lane is inactive, so the tile runs
+      // its MFMA over token 0's clamped row and writes nothing.
+      MPK_WS_MARK(8104, global_tile);
+    }
+    tok_active = col < n_tok;
+    int const src_col = tok_active ? col : 0;
+    my_tok = s_tok_of_col[src_col];
+    topk_slot = s_slot_of_col[src_col];
+  } else {
+    // Legacy per-token tile decode for batches wider than one MFMA N-tile.
+    int route_val = expert_routing[tok_idx];
+    if (route_val == 0) {
+      MPK_WS_MARK(8103, global_tile); // exit: token not routed here
+      return;
+    }
+    my_tok = tok_idx;
+    topk_slot = route_val - 1;
+    n_tok = 1;
+    tok_active = (col == 0);
   }
-  int topk_slot = route_val - 1;
+  (void)n_tok;
 
 #ifdef MPK_ENABLE_MOE_SUBPHASE
   g_subphase_scratch[0] = __builtin_amdgcn_s_memrealtime();
@@ -249,9 +440,45 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   if (!is_w2) {
     MOE_DBG_SUBPHASE(2000);
     MPK_WS_MARK(8200, global_tile); // W13 compute
-    // Shared memory layout: FP8 quantized tokens + scales
+
+    // A tile with no routed token has nothing to compute, but it still has to
+    // arrive -- the release fires on `% W13_TILES`, which counts every tile in
+    // the compile-time space whether or not the mask happened to fill its slot.
+    // Skipping only the compute is what keeps the barrier exact *and* the cost
+    // proportional to the tokens actually routed: the GEMM below streams the
+    // full expert weight tile from HBM, so running it for an empty slot would
+    // make latency scale with MAX_ACTIVATED (4/8/16/32/64 at bs=1/2/4/8/16)
+    // rather than with the handful of experts a batch really touches.
+    //
+    // Jumping rather than nesting the whole phase in an `if`: the arrival block
+    // is ~1000 lines below, and every path between here and there must reach it.
+    if (n_tok == 0) {
+      goto w13_arrive;
+    }
+    // Braced so the `goto w13_arrive` above does not jump across these
+    // initializations -- the label must sit outside their scope.
+    {
+    // Shared memory layout: FP8 quantized tokens + scales, TOK_ROWS rows.
+    // The +16 pad per row is load-bearing: at ds_read_b128 granularity lane
+    // `col` lands in bank group (col * (stride/16)) % 8, and 2960/16 == 185 is
+    // odd, so the 16 lanes spread over all 8 groups instead of piling into one.
+    constexpr int W13_TOK_ROW_STRIDE = W13_K + 16;
+    constexpr int W13_SC_STRIDE = ((W13_MFMA_ITERS + 3) / 4) * 4;
+    constexpr int W13_TOK_REGION = TOK_ROWS * W13_TOK_ROW_STRIDE;
+    constexpr int W13_SC_REGION = TOK_ROWS * W13_SC_STRIDE;
     uint8_t *s_tok_fp8 = (uint8_t *)_fused_smem;
-    uint8_t *s_tok_scales = s_tok_fp8 + W13_K;
+    uint8_t *s_tok_scales = s_tok_fp8 + W13_TOK_REGION;
+
+    // B operand base for this lane: token row `col`. Inactive lanes clamp to
+    // row 0 rather than skipping -- they still owe their ds_reads and their
+    // share of the MFMA, which is a wave-level op reading B from all 64 lanes.
+    // Folded to a literal at TOK_ROWS == 1 so the address stays uniform.
+    uint8_t *b_tok =
+        s_tok_fp8 +
+        (TOK_ROWS == 1 ? 0 : (tok_active ? col : 0) * W13_TOK_ROW_STRIDE);
+    uint8_t *b_scl =
+        s_tok_scales +
+        (TOK_ROWS == 1 ? 0 : (tok_active ? col : 0) * W13_SC_STRIDE);
 
     // Weight pointers
     uint8_t const *expert_weight =
@@ -260,6 +487,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         expert_weight + static_cast<int64_t>(wg_idx) * W13_WG_BYTES;
     uint8_t const *wg_scales = wg_data + W13_WG_DATA;
 
+    // Single-row paths quantize one contiguous row at `tok_idx`; the packed
+    // multi-row path gathers via s_row_off and `tok_idx` is a literal 0 there,
+    // so this base is right for both. `my_tok` is per-lane under packing and
+    // must not be used to form a block-wide base.
     unsigned short const *input_base = A + tok_idx * W13_K;
 
 #ifdef MPK_W13_LDS_PREFETCH
@@ -274,8 +505,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     constexpr int W13_TILE_BYTES = W13_TILE_DATA_PADDED + W13_TILE_SCALE;
 
     // Compute LDS base offset (hoisted before loads for direct HBM→LDS path)
-    constexpr int LDS_W13_OFF = ((W13_K + W13_MFMA_ITERS + 15) / 16) * 16;
-    static_assert(LDS_W13_OFF + W13_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+    constexpr int LDS_W13_OFF =
+        ((W13_TOK_REGION + W13_SC_REGION + 15) / 16) * 16;
+    // AMD reserves 3 KB of the 155 KB (runtime_header.h), and the layer index
+    // sits in the last 4 bytes. The old bound was 155*1024, wrong by 3 KB in
+    // the permissive direction.
+    static_assert(LDS_W13_OFF + W13_TILE_BYTES * NUM_WAVES <=
+                      mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                          mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                   "W13 LDS weight tiles exceed MI350X LDS budget");
     uint8_t *lds_w13_base = (uint8_t *)_fused_smem + LDS_W13_OFF;
     i32x4_t w13_rsrc = make_w_buffer_rsrc(
@@ -407,7 +644,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     }
 #endif // MPK_W13_LDS_PREFETCH — 24 dwordx4 loads in flight
 
-    _gang_wave_parallel_fp8_quant<W13_K>(input_base, s_tok_fp8, s_tok_scales);
+    if constexpr (PACK_N && !SINGLE_TOK) {
+      // Gather: only the tokens routed to this expert, in N-column order.
+      // s_row_off was published by the compaction's __syncthreads above.
+      _gang_multirow_fp8_quant_gather<W13_K, TOK_ROWS, W13_TOK_ROW_STRIDE,
+                                      W13_SC_STRIDE>(
+          A, s_row_off, n_tok, s_tok_fp8, s_tok_scales);
+    } else {
+      _gang_wave_parallel_fp8_quant<W13_K>(input_base, s_tok_fp8, s_tok_scales);
+    }
 
 #ifdef MPK_ENABLE_MOE_SUBPHASE
     g_subphase_scratch[1] = __builtin_amdgcn_s_memrealtime();
@@ -485,8 +730,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               (unsigned)(uintptr_t)(lds_w13_data + row_data_base + g * 16);
           unsigned ws_addr =
               (unsigned)(uintptr_t)(lds_w13_sc + row_scale_base + g);
-          unsigned t_addr = (unsigned)(uintptr_t)(s_tok_fp8 + g * 16);
-          unsigned ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
+          unsigned t_addr = (unsigned)(uintptr_t)(b_tok + g * 16);
+          unsigned ts_addr = (unsigned)(uintptr_t)(b_scl);
           asm volatile(
               // Zero accumulator
               // ── Two disjoint operand banks ──
@@ -754,7 +999,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
 
         // tile_iter=0 SwiGLU epilogue (tile_iter=1 HBM loads fly in background)
-        if (col == 0) {
+        //
+        // Lane (g, col) holds D[m = wave_tile*16 + g*4 + i][n = col]: four
+        // output columns of token `col`. The guard is on the token, not on
+        // col == 0 -- every lane now has live results. The gate/up pairing
+        // survives untouched: acc[i] and acc[i+1] are adjacent along m, both
+        // in this lane.
+        if (tok_active) {
           constexpr int ACT_STRIDE = W13_OUTPUT_SIZE / 2;
           for (int i = 0; i < 4; i += 2) {
             int out_n =
@@ -773,7 +1024,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               float activated =
                   fast_swigluoai(acc[i] + bias_g, acc[i + 1] + bias_u);
               int act_n = out_n / 2;
-              int out_idx = tok_idx * (NUM_TOPK * ACT_STRIDE) +
+              int out_idx = my_tok * (NUM_TOPK * ACT_STRIDE) +
                             topk_slot * ACT_STRIDE + act_n;
               st_wt_u16(&d_swiglu_out[out_idx], _gang_float_to_bf16(activated));
             }
@@ -835,8 +1086,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 (unsigned)(uintptr_t)(lds_w13_data + row_data_base + g * 16);
             unsigned ws_addr =
                 (unsigned)(uintptr_t)(lds_w13_sc + row_scale_base + g);
-            unsigned t_addr = (unsigned)(uintptr_t)(s_tok_fp8 + g * 16);
-            unsigned ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
+            unsigned t_addr = (unsigned)(uintptr_t)(b_tok + g * 16);
+            unsigned ts_addr = (unsigned)(uintptr_t)(b_scl);
 
             asm volatile(
                 // ── Two disjoint operand banks ──
@@ -976,7 +1227,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   "a3");
           }
           // tile_iter=1 SwiGLU epilogue
-          if (col == 0) {
+          if (tok_active) {
             constexpr int ACT_STRIDE = W13_OUTPUT_SIZE / 2;
             for (int i = 0; i < 4; i += 2) {
               int out_n =
@@ -996,7 +1247,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 float activated =
                     fast_swigluoai(acc[i] + bias_g, acc[i + 1] + bias_u);
                 int act_n = out_n / 2;
-                int out_idx = tok_idx * (NUM_TOPK * ACT_STRIDE) +
+                int out_idx = my_tok * (NUM_TOPK * ACT_STRIDE) +
                               topk_slot * ACT_STRIDE + act_n;
                 st_wt_u16(&d_swiglu_out[out_idx],
                           _gang_float_to_bf16(activated));
@@ -1066,8 +1317,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #pragma unroll 1
       for (int ki = 0; ki < W13_MFMA_ITERS; ki += 8) {
         {
-          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki];
+          i32x8_t b = _gang_load_fp8_mfma_b(b_tok, ki * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki];
           acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
         }
         if (ki + 8 < W13_MFMA_ITERS) {
@@ -1082,8 +1333,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 1];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 1) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 1];
           acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
         }
         if (ki + 9 < W13_MFMA_ITERS) {
@@ -1098,8 +1349,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 2];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 2) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 2];
           acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
         }
         if (ki + 10 < W13_MFMA_ITERS) {
@@ -1114,8 +1365,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 3];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 3) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 3];
           acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
         }
         if (ki + 11 < W13_MFMA_ITERS) {
@@ -1130,8 +1381,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 4) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 4];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 4) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 4];
           acc = _gang_mfma_f4xf8(a4, b, acc, sa4, sb);
         }
         if (ki + 12 < W13_MFMA_ITERS) {
@@ -1146,8 +1397,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 5) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 5];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 5) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 5];
           acc = _gang_mfma_f4xf8(a5, b, acc, sa5, sb);
         }
         if (ki + 13 < W13_MFMA_ITERS) {
@@ -1162,8 +1413,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 6) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 6];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 6) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 6];
           acc = _gang_mfma_f4xf8(a6, b, acc, sa6, sb);
         }
         if (ki + 14 < W13_MFMA_ITERS) {
@@ -1178,8 +1429,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
         if (ki + 7 < W13_MFMA_ITERS) {
           i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 7) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 7];
+              _gang_load_fp8_mfma_b(b_tok, (ki + 7) * K_PER_MFMA, g);
+          int sb = (int)b_scl[ki + 7];
           acc = _gang_mfma_f4xf8(a7, b, acc, sa7, sb);
         }
         if (ki + 15 < W13_MFMA_ITERS) {
@@ -1196,7 +1447,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
       // Fused SwiGLU epilogue (identical to gang_moe_linear_mxfp4 FUSE_SWIGLU
       // path)
-      if (col == 0) {
+      if (tok_active) {
         constexpr int ACT_STRIDE = W13_OUTPUT_SIZE / 2; // = INTERMEDIATE_SIZE
         for (int i = 0; i < 4; i += 2) {
           int out_n = wg_idx * W13_OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
@@ -1215,7 +1466,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 fast_swigluoai(acc[i] + bias_g, acc[i + 1] + bias_u);
 
             int act_n = out_n / 2;
-            int out_idx = tok_idx * (NUM_TOPK * ACT_STRIDE) +
+            int out_idx = my_tok * (NUM_TOPK * ACT_STRIDE) +
                           topk_slot * ACT_STRIDE + act_n;
             st_wt_u16(&d_swiglu_out[out_idx], _gang_float_to_bf16(activated));
           }
@@ -1231,13 +1482,19 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     __asm__ __volatile__("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 
+    } // end W13 compute region
+  w13_arrive:
     // ── Mechanism C W13 signal (producer side)
     // ──────────────────────────────── Uses layer index from shared memory for
     // monotonically increasing release
     MOE_DBG_SUBPHASE(2001);
     MPK_WS_MARK(8201, global_tile); // W13 done, arriving at barrier
     if (tid == 0) {
-      int base = expert_id * MOE_BAR_STRIDE;
+      // Indexed by *slot*, not expert_id: the id comes from the shared mask and
+      // can differ between two workers straddling a layer boundary, which would
+      // split one slot's arrivals across two counters. The slot is derived from
+      // the compile-time tile space, so every worker agrees on it.
+      int base = expert_idx * MOE_BAR_STRIDE;
       // Single global arrival (all W13 tiles increment one counter).
       //
       // The counter must NOT share a cache line with the release slots below.
@@ -1253,6 +1510,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // COUNTER_OFF puts the counter on the next line.
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
+      // Exact only if every tile counted by W13_TILES arrives here. Under
+      // packing W13_TILES == W13_WGS and no tile returns between the decode
+      // and this line, so it is. The pre-packing decode had a token axis and
+      // a `route_val == 0` early return, which at bs>1 made the count fall
+      // short by the number of unrouted (expert, token) pairs -- and the W2
+      // workers below spun forever waiting for a release that never fired.
       if ((prev_global % W13_TILES) == W13_TILES - 1) {
         // Last W13 arrival: write per-XCD release = layer_idx + 1
         constexpr int LAYER_IDX_SMEM_OFF =
@@ -1281,10 +1544,35 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   // PHASE 1: W2 (down projection) → write BF16 to mlp_out
   // ══════════════════════════════════════════════════════════════════════════
 
-  // Shared memory layout: FP8 tokens + per-MFMA-tile scales
-  uint8_t *s_tok_fp8 = (uint8_t *)_fused_smem;
+  // No routed token: nothing to reduce, and unlike W13 there is no arrival to
+  // preserve (the W2 epilogue is an atomicAdd into the workspace, not a
+  // barrier), so this can return outright instead of jumping past the compute.
+  // It must return *before* the W13->W2 poll below: an empty slot's W13 tiles
+  // reach the arrival but write no output, so waiting on that release would be
+  // waiting to read nothing.
+  if (n_tok == 0) {
+    MPK_WS_MARK(8106, global_tile); // exit: W2 tile with no routed token
+    return;
+  }
+
+  // Shared memory layout: FP8 tokens + per-MFMA-tile scales, TOK_ROWS rows.
+  // Same +16 row pad as W13 -- see the note there for why it is load-bearing.
   constexpr int W2_TOTAL_MFMA = W2_K / K_PER_MFMA;
-  uint8_t *s_tok_scales = s_tok_fp8 + W2_K;
+  constexpr int W2_TOK_ROW_STRIDE = W2_K + 16;
+  constexpr int W2_SC_STRIDE = ((W2_MFMA_ITERS + 3) / 4) * 4;
+  constexpr int W2_TOK_REGION = TOK_ROWS * W2_TOK_ROW_STRIDE;
+  constexpr int W2_SC_REGION = TOK_ROWS * W2_SC_STRIDE;
+  uint8_t *s_tok_fp8 = (uint8_t *)_fused_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + W2_TOK_REGION;
+
+  // Per-lane B operand base; inactive lanes clamp to row 0 rather than
+  // skipping. See the W13 note.
+  uint8_t *b_tok =
+      s_tok_fp8 +
+      (TOK_ROWS == 1 ? 0 : (tok_active ? col : 0) * W2_TOK_ROW_STRIDE);
+  uint8_t *b_scl =
+      s_tok_scales +
+      (TOK_ROWS == 1 ? 0 : (tok_active ? col : 0) * W2_SC_STRIDE);
 
   MOE_DBG_SUBPHASE(3000);
   MPK_WS_MARK(8300, global_tile); // W2 entry
@@ -1315,15 +1603,23 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       make_w_buffer_rsrc(expert_weight, static_cast<uint32_t>(W2_EXPERT_BYTES));
   uint32_t w2_wg_voff_base = static_cast<uint32_t>(wg_idx) * W2_WG_BYTES;
 
-  constexpr int LDS_W2_OFF = ((W2_K + W2_MFMA_ITERS + 15) / 16) * 16;
-  static_assert(LDS_W2_OFF + W2_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+  constexpr int LDS_W2_OFF = ((W2_TOK_REGION + W2_SC_REGION + 15) / 16) * 16;
+  // 155 KB minus AMD's 3 KB reservation minus the layer-index word. The old
+  // bound was 155*1024, wrong by 3 KB in the permissive direction.
+  static_assert(LDS_W2_OFF + W2_TILE_BYTES * NUM_WAVES <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                 "W2 LDS weight tiles exceed MI350X LDS budget");
   uint8_t *lds_w2_base = (uint8_t *)_fused_smem + LDS_W2_OFF;
 
   MOE_DBG_SUBPHASE(3001);
   // All threads independently read layer_idx from LDS (uniform value).
   // Eliminates shared variable and __syncthreads broadcast.
-  int base = expert_id * MOE_BAR_STRIDE;
+  // Indexed by *slot*, not expert_id: the id comes from the shared mask and
+  // can differ between two workers straddling a layer boundary, which would
+  // split one slot's arrivals across two counters. The slot is derived from
+  // the compile-time tile space, so every worker agrees on it.
+  int base = expert_idx * MOE_BAR_STRIDE;
   int w2_expected;
   {
     constexpr int LAYER_IDX_SMEM_OFF =
@@ -1530,11 +1826,21 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   MOE_DBG_SUBPHASE(3003);
   MPK_WS_MARK(8303, global_tile); // W2: FP8 quant of SwiGLU output
   {
-    unsigned short const *w2_input_base =
-        d_swiglu_out + tok_idx * (NUM_TOPK * INTERMEDIATE_SIZE) +
-        topk_slot * INTERMEDIATE_SIZE;
-    _gang_wave_parallel_fp8_quant_nt<W2_K>(
-        w2_input_base, s_tok_fp8, s_tok_scales);
+    if constexpr (PACK_N && !SINGLE_TOK) {
+      // s_row_off already holds tok*(NUM_TOPK*INTERMEDIATE) +
+      // slot*INTERMEDIATE for this phase (`is_w2` picked the formula at
+      // compaction time). NT loads: the SwiGLU output was just written by
+      // another XCD and will not be reused.
+      _gang_multirow_fp8_quant_gather<W2_K, TOK_ROWS, W2_TOK_ROW_STRIDE,
+                                      W2_SC_STRIDE, /*NT_LOAD=*/true>(
+          d_swiglu_out, s_row_off, n_tok, s_tok_fp8, s_tok_scales);
+    } else {
+      unsigned short const *w2_input_base =
+          d_swiglu_out + my_tok * (NUM_TOPK * INTERMEDIATE_SIZE) +
+          topk_slot * INTERMEDIATE_SIZE;
+      _gang_wave_parallel_fp8_quant_nt<W2_K>(
+          w2_input_base, s_tok_fp8, s_tok_scales);
+    }
   }
 
   // Drain ALL pending HBM loads: buffer_load_lds (weight) + scale loads
@@ -1580,7 +1886,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     constexpr int W2_LPT_L = (w2_n16_L + 255) / 256;
     constexpr int W2_TILE_DATA_PADDED_L = W2_LPT_L * 256 * 16;
     constexpr int W2_TILE_BYTES_L = W2_TILE_DATA_PADDED_L + W2_TILE_SCALE_L;
-    constexpr int LDS_W2_OFF_L = ((W2_K + W2_MFMA_ITERS + 15) / 16) * 16;
+    // Must match LDS_W2_OFF above -- the DMA writes where that says and the
+    // MFMA reads where this says.
+    constexpr int LDS_W2_OFF_L = LDS_W2_OFF;
     uint8_t *lds_w2_base_l = (uint8_t *)_fused_smem + LDS_W2_OFF_L;
 
     // ── tile_iter=0: weights already in LDS from pre-load ──────────────
@@ -1598,8 +1906,12 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       int out_n_base = wg_idx * W2_OUTPUT_PER_WG + wave_tile_0 * 16 + g * 4;
       float pf_rw = 0.0f;
       uint2 pf_bias = {0, 0};
-      if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
-        float const *rw_ptr = &d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
+      // Guard on the token, not col == 0: every lane holds live results now.
+      // The routing weight becomes a 16-lane gather (exactly the loads the 16
+      // separate per-token tiles used to issue); the bias depends only on the
+      // output column, so the 16 lanes load the same bytes and coalesce.
+      if (tok_active && out_n_base < W2_OUTPUT_SIZE) {
+        float const *rw_ptr = &d_routing_weight[my_tok * NUM_TOPK + topk_slot];
         unsigned short const *bias_ptr =
             &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
         asm volatile("global_load_dword %0, %2, off\n"
@@ -1622,8 +1934,8 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             (unsigned)(uintptr_t)(lds_w2_data + row_data_base + g * 16);
         unsigned w2_ws_addr =
             (unsigned)(uintptr_t)(lds_w2_scales + row_scale_base + g);
-        unsigned w2_t_addr = (unsigned)(uintptr_t)(s_tok_fp8 + g * 16);
-        unsigned w2_ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
+        unsigned w2_t_addr = (unsigned)(uintptr_t)(b_tok + g * 16);
+        unsigned w2_ts_addr = (unsigned)(uintptr_t)(b_scl);
         asm volatile(
             // Zero accumulator
             // ── Two disjoint operand banks ──
@@ -1765,7 +2077,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       MOE_DBG_SUBPHASE(3006);
       MPK_WS_MARK(8306, global_tile); // W2: epilogue
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-      if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
+      if (tok_active && out_n_base < W2_OUTPUT_SIZE) {
         unsigned bt0 = (pf_bias.x & 0xFFFFu) << 16;
         unsigned bt1 = pf_bias.x & 0xFFFF0000u;
         unsigned bt2 = (pf_bias.y & 0xFFFFu) << 16;
@@ -1775,13 +2087,26 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         __builtin_memcpy(&bv1, &bt1, 4);
         __builtin_memcpy(&bv2, &bt2, 4);
         __builtin_memcpy(&bv3, &bt3, 4);
-        int ws_base = tok_idx * HIDDEN_SIZE + out_n_base;
-        atomicAdd(&d_workspace_f32[ws_base + 0], (acc[0] + bv0) * pf_rw);
-        atomicAdd(&d_workspace_f32[ws_base + 1], (acc[1] + bv1) * pf_rw);
-        atomicAdd(&d_workspace_f32[ws_base + 2], (acc[2] + bv2) * pf_rw);
-        if (out_n_base + 3 < W2_OUTPUT_SIZE) {
-          atomicAdd(&d_workspace_f32[ws_base + 3], (acc[3] + bv3) * pf_rw);
-        }
+        // Stores, not atomicAdd: this tile is the ONLY writer of
+        // (my_tok, topk_slot, out_n_base..+3). A token routes to a given
+        // expert at most once, so topk_slot is unique per (token, expert), and
+        // wg_idx partitions the hidden axis across tiles. See moe_ws_layout.cuh
+        // for why the shared per-token accumulator broke row symmetry at B>1.
+        //
+        // Write-through (sc0 sc1) is mandatory, not an optimization: the
+        // consumer runs on a different XCD and MI300/MI350 L2 is not coherent
+        // across XCDs, so a plain store would be invisible to it. The atomicAdd
+        // this replaced went to the coherent point implicitly. `ws_base` is
+        // 16B-aligned -- out_n_base steps by 4 floats and both HIDDEN_SIZE and
+        // W2_OUTPUT_SIZE are multiples of 4 -- so all four lanes always store
+        // and one dwordx4 covers them.
+        int ws_base =
+            moe_ws_offset(my_tok, topk_slot, HIDDEN_SIZE) + out_n_base;
+        float4 wv = {(acc[0] + bv0) * pf_rw,
+                     (acc[1] + bv1) * pf_rw,
+                     (acc[2] + bv2) * pf_rw,
+                     (acc[3] + bv3) * pf_rw};
+        st_wt_f32x4(&d_workspace_f32[ws_base], wv);
       }
     }
 
@@ -1968,9 +2293,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         int out_n_base = wg_idx * W2_OUTPUT_PER_WG + wave_tile_1 * 16 + g * 4;
         float pf_rw = 0.0f;
         uint2 pf_bias = {0, 0};
-        if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
+        if (tok_active && out_n_base < W2_OUTPUT_SIZE) {
           float const *rw_ptr =
-              &d_routing_weight[tok_idx * NUM_TOPK + topk_slot];
+              &d_routing_weight[my_tok * NUM_TOPK + topk_slot];
           unsigned short const *bias_ptr =
               &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
           asm volatile("global_load_dword %0, %2, off\n"
@@ -1994,13 +2319,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           a[2] = a_lo[2];
           a[3] = a_lo[3];
           int sa = (int)lds_w2_scales[row_scale_base + kt / 32 + g];
-          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, kt, g);
-          int sb = (int)s_tok_scales[ki];
+          i32x8_t b = _gang_load_fp8_mfma_b(b_tok, kt, g);
+          int sb = (int)b_scl[ki];
           acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);
         }
 
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        if (col == 0 && out_n_base < W2_OUTPUT_SIZE) {
+        if (tok_active && out_n_base < W2_OUTPUT_SIZE) {
           unsigned bt0 = (pf_bias.x & 0xFFFFu) << 16;
           unsigned bt1 = pf_bias.x & 0xFFFF0000u;
           unsigned bt2 = (pf_bias.y & 0xFFFFu) << 16;
@@ -2010,13 +2335,16 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           __builtin_memcpy(&bv1, &bt1, 4);
           __builtin_memcpy(&bv2, &bt2, 4);
           __builtin_memcpy(&bv3, &bt3, 4);
-          int ws_base = tok_idx * HIDDEN_SIZE + out_n_base;
-          atomicAdd(&d_workspace_f32[ws_base + 0], (acc[0] + bv0) * pf_rw);
-          atomicAdd(&d_workspace_f32[ws_base + 1], (acc[1] + bv1) * pf_rw);
-          atomicAdd(&d_workspace_f32[ws_base + 2], (acc[2] + bv2) * pf_rw);
-          if (out_n_base + 3 < W2_OUTPUT_SIZE) {
-            atomicAdd(&d_workspace_f32[ws_base + 3], (acc[3] + bv3) * pf_rw);
-          }
+          // Write-through store -- sole writer of this (token, slot, hidden)
+          // range, and the consumer is on another XCD. See the tile_iter=0
+          // epilogue above and moe_ws_layout.cuh.
+          int ws_base =
+              moe_ws_offset(my_tok, topk_slot, HIDDEN_SIZE) + out_n_base;
+          float4 wv = {(acc[0] + bv0) * pf_rw,
+                       (acc[1] + bv1) * pf_rw,
+                       (acc[2] + bv2) * pf_rw,
+                       (acc[3] + bv3) * pf_rw};
+          st_wt_f32x4(&d_workspace_f32[ws_base], wv);
         }
       }
     }

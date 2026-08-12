@@ -300,6 +300,20 @@ __device__ __noinline__ void
       va[3] = v_ptr[3 * HEAD_DIM];
     }
 
+    // Every warp has now copied tile t out of LDS into registers (kr, va).
+    // Later in this same iteration each thread overwrites lds_k/lds_v with
+    // tile t+1 from the prefetch registers. The __syncthreads() at the top of
+    // the loop only orders those writes against the *next* iteration's reads;
+    // nothing ordered them against *this* iteration's reads, so a warp that
+    // ran ahead to the write could clobber a tile a slower warp had not
+    // finished reading. That is a genuine cross-warp write-after-read race on
+    // LDS, and it silently corrupts K/V for the lagging warp.
+    //
+    // This barrier closes the read half of the double-buffer-free pipeline.
+    // It only fires when the prefetch is live (ntiles > 1); with one tile per
+    // chunk the writes are dead and this costs a single s_barrier.
+    __syncthreads();
+
     // 2x QK MFMA
     __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
 #pragma unroll

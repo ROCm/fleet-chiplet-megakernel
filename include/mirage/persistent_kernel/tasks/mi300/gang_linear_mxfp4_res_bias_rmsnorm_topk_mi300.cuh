@@ -51,6 +51,40 @@
 
 namespace kernel {
 
+// ── O-proj LDS layout, shared with the Phase-6 weight DMA ─────────────────
+// gang_full_layer_fused_mi300.cuh issues the buffer_load_lds that fills the
+// weight region, and it derives the base independently -- different file,
+// different template parameters. If the two formulas drift, the DMA writes
+// where one says and the MFMA reads where the other says: wrong numerics, no
+// crash, nothing out of bounds. So both sites call these instead.
+constexpr int oproj_lds_tok_rows(int batch_size) {
+  return batch_size < 16 ? batch_size : 16;
+}
+
+// End of the token staging region (FP8 activations + E8M0 block scales), which
+// is also the base of the K-parallel cross-wave reduction buffer. That buffer
+// used to alias the staging region at offset 0, writing into it before the
+// __syncthreads while other waves could still be reading their B operands. At
+// one token row that survived only because wave 2's write window just missed
+// wave 3's read window; with 16 rows staged it is a clean overlap, so it gets
+// its own space.
+constexpr int oproj_lds_red_off(int batch_size, int reduction_size) {
+  int const rows = oproj_lds_tok_rows(batch_size);
+  // +16 pad per row: at ds_read_b128 granularity lane `col` lands in bank
+  // group (col * (stride/16)) % 8, and 2960/16 == 185 is odd, so the 16 lanes
+  // spread over all 8 groups instead of piling into one.
+  int const tok_region = rows * (reduction_size + 16);
+  int const sc_region = rows * (((reduction_size / 128 + 3) / 4) * 4);
+  return ((tok_region + sc_region + 15) / 16) * 16;
+}
+
+// Base of the MXFP4 weight region: past the reduction buffer, which is
+// NUM_WAVES(4) * 64 lanes * 4 floats = 4096 B.
+constexpr int oproj_lds_w_off(int batch_size, int reduction_size) {
+  return ((oproj_lds_red_off(batch_size, reduction_size) + 4096 + 15) / 16) *
+         16;
+}
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -88,6 +122,13 @@ __device__ __attribute__((noinline)) void
         // Optional: when non-null, the TopK-completing worker writes 1 here
         // via st_wt_u32 so the fused wrapper can poll before MoE.
         int *routing_ready_ptr = nullptr,
+        // Per-layer epoch for the Phase 2 barrier release target. Must be a
+        // value that is monotonic across the whole run, bumps exactly once per
+        // invocation of this barrier, and is computable by every worker without
+        // reading shared state -- the fused callers pass layer_counter + 1.
+        // 0 means "no layer loop", which selects the snapshot form; see the
+        // comment at oproj_release_expected for why that is only safe there.
+        int layer_epoch = 0,
         // Optional: per-worker timestamp ring buffer pointer (g_fused_ts).
         // When non-null, writes slots 9 (oproj_done), 10 (barrier_done),
         // 11 (rmsnorm_router_done) for sub-phase breakdown.
@@ -120,7 +161,15 @@ __device__ __attribute__((noinline)) void
 
   constexpr int NUM_WAVES = 4;
 
-  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+  // ── Token staging layout (N-axis MFMA packing) ──────────────────────────
+  // Token `col` lives at LDS row `col` and feeds N column `col` of the
+  // 16x16x128 MFMA, so up to 16 batch rows cost what 1 row used to.
+  constexpr int MFMA_N = 16;
+  constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
 
   unsigned short const *A = (unsigned short const *)input_ptr;
   uint8_t const *W = (uint8_t const *)weight_ptr;
@@ -137,7 +186,7 @@ __device__ __attribute__((noinline)) void
 
   extern __shared__ char _lm_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_lm_smem;
-  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -162,10 +211,32 @@ __device__ __attribute__((noinline)) void
   // PHASE 1: O-PROJ (MXFP4 linear + bias + residual)
   // ════════════════════════════════════════════════════════════════════════
 
-  int tok_idx = local_tile / n_wgs_per_xcd;
+  // Tile space is (column block, weight group), not (token, weight group):
+  // the token axis moved into the MFMA's N dimension, so the host emits
+  // n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
+  int bblk = local_tile / n_wgs_per_xcd;
   int wg_idx = local_tile % n_wgs_per_xcd;
+  // At TOK_ROWS == 1 there is exactly one column block, so every tile that
+  // survives the guard below has bblk == 0 and the base is a literal zero.
+  // The compiler cannot derive that from `batch_count - bblk*16 > 0`, and
+  // leaving it as a runtime value makes every downstream address non-uniform
+  // -- worth 32 bytes of scratch in the epilogue.
+  int tok_row_base = TOK_ROWS == 1 ? 0 : bblk * MFMA_N;
+  // Whole-block early-out only. An individual inactive lane inside a live
+  // block must NOT leave -- it still owes its ds_reads and its share of the
+  // MFMA, which is a wave-level op reading B from all 64 lanes.
+  int n_valid_tok = batch_count - tok_row_base;
+  // The token this lane owns. At TOK_ROWS == 1 only col 0 is live, so adding
+  // col is a no-op -- but writing it costs the uniform token index its
+  // scalar-ness, and every address derived from it becomes per-lane. Fold.
+  int my_tok = TOK_ROWS == 1 ? 0 : tok_row_base + col;
+  // At TOK_ROWS == 1 the surviving block has n_valid_tok == 1, so the general
+  // form is exactly `col == 0` -- but only the constant form is compile-time
+  // known, and handing the allocator a runtime predicate here costs 16 bytes
+  // of scratch in the epilogue. Spell out the fold.
+  bool tok_active = TOK_ROWS == 1 ? (col == 0) : (col < n_valid_tok);
 
-  if (tok_idx >= batch_count) {
+  if (n_valid_tok <= 0) {
     goto oproj_barrier;
   }
 
@@ -173,87 +244,19 @@ __device__ __attribute__((noinline)) void
     uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
     uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
-    unsigned short const *input_row = A + tok_idx * REDUCTION_SIZE;
+    // Stage up to 16 token rows. The bespoke inline quantizer that used to
+    // live here was a second copy of the E8M0 logic that only ever handled
+    // row 0; the shared helper covers both OUTPUT_PER_WG shapes.
+    _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE,
+                             TOK_ROW_STRIDE, SC_STRIDE>(
+        A, REDUCTION_SIZE, tok_row_base, n_valid_tok, s_tok_fp8, s_tok_scales);
 
-    // FP8 quant only — weights already in LDS via Phase 6 buffer_load_lds
-    if constexpr (OUTPUT_PER_WG < 64) {
-      constexpr int SUB_BLOCK = 32;
-      constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
-      int const lane_id_q = tid & 63;
-
-      if (tid < NSUBBLOCKS) {
-        int const sb = tid;
-        int const base = sb * SUB_BLOCK;
-        int const super_blk = sb / 4;
-        int const sub_idx = sb & 3;
-        uint32_t const *base_ptr = (uint32_t const *)(input_row + base);
-
-        uint32_t dw[16];
-        asm volatile("global_load_dwordx4 %0, %4, off\n"
-                     "global_load_dwordx4 %1, %5, off\n"
-                     "global_load_dwordx4 %2, %6, off\n"
-                     "global_load_dwordx4 %3, %7, off"
-                     : "=&v"(*(i32x4_t *)&dw[0]),
-                       "=&v"(*(i32x4_t *)&dw[4]),
-                       "=&v"(*(i32x4_t *)&dw[8]),
-                       "=&v"(*(i32x4_t *)&dw[12])
-                     : "v"(base_ptr),
-                       "v"(base_ptr + 4),
-                       "v"(base_ptr + 8),
-                       "v"(base_ptr + 12)
-                     : "memory");
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-
-        float vals[32];
-        float amax = 0.0f;
-#pragma unroll
-        for (int j = 0; j < 16; j++) {
-          float lo = _gang_bf16_to_float((unsigned short)(dw[j] & 0xFFFF));
-          float hi = _gang_bf16_to_float((unsigned short)(dw[j] >> 16));
-          vals[j * 2] = lo;
-          vals[j * 2 + 1] = hi;
-          amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
-        }
-
-        int base_lane = lane_id_q & ~3;
-        float a0 = __shfl(amax, base_lane);
-        float a1 = __shfl(amax, base_lane + 1);
-        float a2 = __shfl(amax, base_lane + 2);
-        float a3 = __shfl(amax, base_lane + 3);
-        float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
-
-        uint8_t se = _gang_compute_e8m0_fp8(block_amax);
-        float scale_f;
-        if (se == 0) {
-          scale_f = 1.0f;
-        } else {
-          union {
-            float f;
-            uint32_t u;
-          } sv;
-          sv.u = (uint32_t)se << 23;
-          scale_f = sv.f;
-        }
-
-#pragma unroll
-        for (int j = 0; j < 32; j += 4) {
-          fp8x4_t pk = {};
-          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
-              pk, vals[j], vals[j + 1], scale_f, false);
-          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
-              pk, vals[j + 2], vals[j + 3], scale_f, true);
-          *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
-        }
-
-        if (sub_idx == 0) {
-          s_tok_scales[super_blk] = se;
-        }
-      }
-      __syncthreads();
-    } else {
-      _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-          input_row, s_tok_fp8, s_tok_scales);
-    }
+    // B operand base for this lane: token row `col`. Inactive lanes clamp to
+    // row 0 rather than skipping, so the exec mask cannot sink above the
+    // ds_read_b128 (see the CRITICAL note at the K-parallel reduce).
+    uint8_t const *b_tok = s_tok_fp8 + (tok_active ? col : 0) * TOK_ROW_STRIDE;
+    uint8_t const *b_scl =
+        s_tok_scales + (tok_active ? col : 0) * SC_STRIDE;
 
     if constexpr (OUTPUT_PER_WG >= 64) {
       // N-parallel: 4 waves handle different output rows
@@ -342,8 +345,8 @@ __device__ __attribute__((noinline)) void
 #pragma unroll 1
         for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
           {
-            i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki];
+            i32x8_t b = _gang_load_fp8_mfma_b(b_tok, ki * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki];
             acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
           }
           if (ki + 4 < MFMA_ITERS) {
@@ -369,8 +372,8 @@ __device__ __attribute__((noinline)) void
           }
           {
             i32x8_t b =
-                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki + 1];
+                _gang_load_fp8_mfma_b(b_tok, (ki + 1) * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki + 1];
             acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
           }
           if (ki + 5 < MFMA_ITERS) {
@@ -396,8 +399,8 @@ __device__ __attribute__((noinline)) void
           }
           {
             i32x8_t b =
-                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki + 2];
+                _gang_load_fp8_mfma_b(b_tok, (ki + 2) * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki + 2];
             acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
           }
           if (ki + 6 < MFMA_ITERS) {
@@ -423,8 +426,8 @@ __device__ __attribute__((noinline)) void
           }
           if (ki + 3 < MFMA_ITERS) {
             i32x8_t b =
-                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki + 3];
+                _gang_load_fp8_mfma_b(b_tok, (ki + 3) * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki + 3];
             acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
           }
           if (ki + 7 < MFMA_ITERS) {
@@ -453,11 +456,18 @@ __device__ __attribute__((noinline)) void
         // Epilogue: acc + bias + residual -> bf16, write-through store
         // bias/residual are XCD-partitioned -> use local out_n_base
         // output is replicated -> add xcd_output_col_offset for writes
-        if (col == 0) {
+        //
+        // Lane (g, col) holds D[m = wave_tile*16 + g*4 + i][n = col], i.e. four
+        // output columns of token `col`. The guard is on the token, not on
+        // col == 0: every lane now has live results. Bias depends only on the
+        // output column, so the 16 lanes load the same 8 bytes and coalesce;
+        // residual becomes a 16-row gather -- exactly the loads the 16
+        // separate per-token tiles used to issue.
+        if (tok_active) {
           int out_n_local = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
           int out_n_global = xcd_output_col_offset + out_n_local;
-          int res_idx_base = tok_idx * output_stride + out_n_local;
-          int out_idx_base = tok_idx * output_stride + out_n_global;
+          int res_idx_base = my_tok * output_stride + out_n_local;
+          int out_idx_base = my_tok * output_stride + out_n_global;
 
           uint2 bias_packed;
           __builtin_memcpy(&bias_packed, &d_bias[out_n_local], 8);
@@ -517,9 +527,9 @@ __device__ __attribute__((noinline)) void
       // the MFMA loop + K-parallel reduction (~800 ns away).  Addresses
       // depend only on tile indices, not on MFMA results.
       uint2 pf_bias = {0, 0}, pf_res = {0, 0};
-      if (warp_id == 0 && col == 0) {
+      if (warp_id == 0 && tok_active) {
         int out_n_local_pf = wg_idx * OUTPUT_PER_WG + g * 4;
-        int res_idx_pf = tok_idx * output_stride + out_n_local_pf;
+        int res_idx_pf = my_tok * output_stride + out_n_local_pf;
         unsigned short const *bias_addr = &d_bias[out_n_local_pf];
         unsigned short const *res_addr = &d_residual[res_idx_pf];
         asm volatile("global_load_dwordx2 %0, %2, off\n"
@@ -532,9 +542,16 @@ __device__ __attribute__((noinline)) void
       // Read weights from LDS (populated by Phase 6 buffer_load_lds DMA).
       // LDS layout mirrors HBM tile layout: data at [0..WG_DATA_BYTES),
       // scales at [OPROJ_LDS_DATA_PAD..OPROJ_LDS_DATA_PAD + WG_SCALE_BYTES).
-      // Must match Phase 6 OPROJ_LDS_W_OFF (uses NUM_BLOCKS_32, not MFMA_ITERS)
-      constexpr int OPROJ_LDS_OFF =
-          ((FP8_TOK_DATA + NUM_BLOCKS_32 + 15) / 16) * 16;
+      // Must match the Phase 6 DMA base byte-for-byte -- both call
+      // oproj_lds_w_off() so there is only one formula to keep right.
+      constexpr int OPROJ_LDS_OFF = oproj_lds_w_off(BATCH_SIZE, REDUCTION_SIZE);
+      static_assert(OPROJ_LDS_OFF >= TOK_REGION + SC_REGION + 4096,
+                    "weight region must clear the token staging + reduce "
+                    "buffers");
+      static_assert(OPROJ_LDS_OFF + OPROJ_LDS_DATA_PAD + OPROJ_LDS_SCALE_PAD <=
+                        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                            mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                    "O-proj LDS exceeds the MI350X budget");
       uint8_t const *lds_w_data = (uint8_t const *)_lm_smem + OPROJ_LDS_OFF;
       uint8_t const *lds_w_scales = lds_w_data + OPROJ_LDS_DATA_PAD;
 
@@ -559,8 +576,8 @@ __device__ __attribute__((noinline)) void
     a[5] = 0;                                                                  \
     a[6] = 0;                                                                  \
     a[7] = 0;                                                                  \
-    i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (KI)*K_PER_MFMA, g);          \
-    int sb = (int)s_tok_scales[KI];                                            \
+    i32x8_t b = _gang_load_fp8_mfma_b(b_tok, (KI)*K_PER_MFMA, g);          \
+    int sb = (int)b_scl[KI];                                            \
     acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
   } while (0)
 #define DO_MFMA_LDS_FP4(KI)                                                    \
@@ -613,18 +630,32 @@ __device__ __attribute__((noinline)) void
       // Fix: every lane writes to a unique LDS slot.
       // Layout: [warp_id][lane_id][4_accum_values]
       // Total: NUM_WAVES * 64 * 4 = 1024 floats = 4096 bytes
-      // The reduction reads only col==0 lanes' data (lane_id = g*16+0).
-      float *lds_reduce = (float *)_lm_smem;
+      //
+      // Since lane_id == g*16 + col, that layout already *is*
+      // [warp][g][col][4] == [warp][n-column][token][4]. Packing the token
+      // axis therefore costs zero extra LDS: every lane simply keeps its own
+      // slot instead of only the col==0 lanes' being read back.
+      //
+      // The buffer sits past the token staging region rather than aliasing it
+      // at offset 0. Aliasing was safe at one token row only by accident of
+      // timing; with 16 rows staged, these writes land on B operands other
+      // waves are still reading.
+      float *lds_reduce =
+          (float *)((uint8_t *)_lm_smem +
+                    oproj_lds_red_off(BATCH_SIZE, REDUCTION_SIZE));
       for (int i = 0; i < 4; i++) {
         lds_reduce[(warp_id * 64 + lane_id) * 4 + i] = acc[i];
       }
       __syncthreads();
 
-      if (warp_id == 0 && col == 0) {
+      if (warp_id == 0 && tok_active) {
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        // Each lane reduces its own (g, col) slot: output columns g*4..g*4+3
+        // of token col. At TOK_ROWS == 1 that slot is always g*16, and saying
+        // so keeps the address scalar in g -- reading lane_id here instead
+        // costs scratch even though the two are equal under tok_active.
+        int const src_lane = TOK_ROWS == 1 ? g * 16 : lane_id;
         for (int w = 0; w < NUM_WAVES; w++) {
-          // Read from col==0 lanes: lane_id = g*16 + 0 = g*16
-          int src_lane = g * 16; // col==0 lane for this g
           v0 += lds_reduce[(w * 64 + src_lane) * 4 + 0];
           v1 += lds_reduce[(w * 64 + src_lane) * 4 + 1];
           v2 += lds_reduce[(w * 64 + src_lane) * 4 + 2];
@@ -635,7 +666,7 @@ __device__ __attribute__((noinline)) void
         // output is replicated -> add xcd_output_col_offset
         int out_n_local = wg_idx * OUTPUT_PER_WG + g * 4;
         int out_n_global = xcd_output_col_offset + out_n_local;
-        int out_idx_base = tok_idx * output_stride + out_n_global;
+        int out_idx_base = my_tok * output_stride + out_n_global;
 
         // Wait for bias+residual prefetched before MFMA loop.
         // Early-clobber outputs prevent the compiler from aliasing
@@ -707,8 +738,13 @@ oproj_barrier :
     ts_base[9] = __builtin_amdgcn_s_memrealtime(); // slot 9: oproj_mfma_done
   }
 #endif
-  __syncthreads();
+  // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
+  // guarantee: run after __syncthreads it only retires wave 0's stores, and
+  // tid 0 then publishes an arrival advertising output that waves 1..3 may
+  // still have in flight. Draining first makes every wave's stores retire,
+  // and the barrier then makes that true block-wide.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
 
   // ── Prefetch gamma + router weights during barrier wait ──────────
   // These are data-independent of O-proj output.
@@ -722,14 +758,69 @@ oproj_barrier :
   i32x2_pf_t w_pf_buf[MAX_ITERS_PF];
 
   {
-    // Mechanism C: single global arrive + per-XCD release flags
-    // Uses monotonically increasing expected values (no reset needed)
-    // All threads read release_expected independently (ld_nt is uniform),
-    // eliminating shared variables and both __syncthreads.
-    int oproj_release_expected =
-        ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+    // Mechanism C: single global arrive + per-XCD release flags.
+    //
+    // The release target is derived from the layer counter, not snapshotted.
+    // It used to be `ld_nt_s32(&hier_barrier[xcd_id*16]) + 1` -- "whatever is
+    // there now, plus one" -- which is only correct if every one of the 184
+    // workers performs that read before *any* XCD's releaser overwrites the
+    // slot. Nothing orders those two events: the read sits after this block's
+    // own __syncthreads, but the releaser is a different workgroup on a
+    // different XCD, and it can fan out the eight release flags while a worker
+    // here has not yet taken its snapshot.
+    //
+    // A worker that reads *after* the update computes a target one lower than
+    // the value already published, so its poll is satisfied on entry: it falls
+    // straight through and reads attn_proj_out while the other XCDs' O-proj
+    // stores are still in flight. O-proj writes column-partitioned and the
+    // RMSNorm below reads the full row, so seven eighths of what it consumes
+    // may not be written yet. The observable signature is exact -- rmsnorm_out
+    // differing run to run while attn_proj_out, the settled HBM content, is
+    // bit-identical.
+    //
+    // This is the same defect the fused kernel already fixed for the other
+    // three counters (see the layer_counter block in
+    // gang_full_layer_fused_mi300.cuh: "These used to be snapshots of current
+    // value + 1"). This barrier was the one holdout.
+    //
+    // `layer_epoch` is that counter, passed in by the caller rather than read
+    // from a shared location: (iterations * num_layers + layer) + 1, monotonic,
+    // never reset, and identical for every worker with nothing to order. The
+    // two fused callers both have it in hand. The standalone task type
+    // (register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task) has no
+    // layer loop -- it is one task per dispatch -- so it passes 0 and keeps the
+    // snapshot, which is safe there precisely because there is no second layer
+    // to race with.
+    int const oproj_release_expected =
+        layer_epoch > 0 ? layer_epoch
+                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
 
     if (tid == 0) {
+      // GPU-scope release fence before the arrival.
+      //
+      // atom_add_release_gpu_s32 is not a release on AMD -- its own definition
+      // (mpk_atoms.cuh) emits only `flat_atomic_add ... sc0 sc1; s_waitcnt`,
+      // with the comment "Ordering provided by explicit threadfence_gpu()
+      // before this call." That call was never made here.
+      //
+      // The drain above (`s_waitcnt vmcnt(0)` + __syncthreads) retires this
+      // block's O-proj stores, which is what a *same-XCD* consumer needs. But
+      // this barrier is global: the workers released by it read
+      // attn_proj_out columns produced on all eight XCDs, and MI300/MI350 L2
+      // is not coherent across XCDs. Retiring a store means it reached this
+      // XCD's L2, not that a remote XCD can see it.
+      //
+      // threadfence_gpu lowers to `buffer_wbl2 sc1; s_waitcnt vmcnt(0)` on
+      // gfx950 -- the L2->HBM writeback that actually makes those columns
+      // visible to the other seven XCDs. Without it the release flag (st_wt,
+      // straight to HBM) can overtake the data it advertises.
+      //
+      // Contrast Phase 4's chunk barrier in gang_full_layer_fused_mi300.cuh,
+      // which deliberately does *not* do this: that barrier is per-XCD, so
+      // its producers and consumer share one L2 and the writeback would be
+      // pure cost. Here the consumer is remote and the writeback is the whole
+      // point. Only the arriving thread of each block pays it.
+      threadfence_gpu();
       // Single global arrival (all workers increment one counter)
       int prev_global =
           atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
@@ -768,7 +859,6 @@ oproj_barrier :
     }
 
     // All threads poll per-XCD release flag independently.
-    // Eliminates __syncthreads — each thread confirms the barrier itself.
     // ld_nt coalesces across waves, so no extra HBM traffic.
     while (ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) <
            oproj_release_expected) {
@@ -776,8 +866,51 @@ oproj_barrier :
     }
   }
 
-  // Invalidate L2 so we read fresh O-PROJ output from HBM
-  asm volatile("buffer_inv" ::: "memory");
+  // Rendezvous before the acquire. The per-thread poll above establishes, for
+  // each wave independently, that the barrier has been released -- and that
+  // used to be the whole argument for dropping this __syncthreads ("each
+  // thread confirms the barrier itself"). It is not sufficient, because the
+  // acquire that follows is `buffer_inv`, which is a *per-wave* instruction
+  // acting on caches the whole CU shares.
+  //
+  // Without the rendezvous: wave 0 clears its poll, invalidates, and begins
+  // reading attn_proj_out through vL1/L2 -- repopulating those lines. Wave 3
+  // has not cleared its poll yet, so some of the lines wave 0 just pulled in
+  // are pre-barrier values from XCDs that had not finished storing. Wave 3
+  // then runs its own buffer_inv, but that invalidate happens *before* it
+  // reads, and the stale lines were already re-cached by wave 0 after it. The
+  // sc1 invalidate cannot undo a fill that a sibling wave performs behind it.
+  //
+  // Draining, rendezvousing, then invalidating makes the invalidate the first
+  // memory event any wave performs after the barrier is known released
+  // block-wide, which is what the acquire has to mean. This is the read side of
+  // the same drain-then-rendezvous discipline the release sides in this file
+  // already follow.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
+
+  // Cross-XCD ACQUIRE for the O-proj output. Must be `sc1` (vL1 + L2).
+  //
+  // The barrier above is global, not per-XCD: every O-proj worker on all eight
+  // XCDs increments hier_barrier[8*16], and the last arrival releases all of
+  // them. It has to be, because O-proj *writes* column-partitioned -- worker
+  // (xcd, wg) owns columns xcd*368 + wg*16 .. +16 -- while the RMSNorm below
+  // reads all ACTUAL_HIDDEN_DIM columns of its token row. Seven eighths of
+  // what each worker reads here was produced on a different XCD, and
+  // MI300/MI350 L2 is not coherent across XCDs.
+  //
+  // The producer is `st_wt_u64` (sc0 sc1), so the data bypasses L2 and lands
+  // in HBM. Plain `buffer_inv` drops vL1 only. This same worker read these
+  // same addresses one layer ago, so its L2 still holds those lines and the
+  // load is served from L2 -- returning the *previous* layer's O-proj output.
+  // Which lines survive depends on L2 eviction timing, hence run to run
+  // variation. The observable signature is exact: rows of `rmsnorm_out`
+  // differing between two runs whose `attn_proj_out` (the settled HBM content)
+  // is bit-identical -- the norm read something that is not what is in memory.
+  //
+  // The comment this replaces already said "Invalidate L2"; the instruction
+  // simply never encoded it.
+  asm volatile("buffer_inv sc1" ::: "memory");
   // Drain prefetched gamma + router weight loads (issued before barrier).
   // NT loads bypass L2, unaffected by buffer_inv.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -836,14 +969,10 @@ oproj_barrier :
     // Max iterations per thread: ceil(H4 / 256)
     constexpr int MAX_ITERS = (H4 + 255) / 256;
 
-    float ssq = 0.0f;
-    float dp = 0.0f;
     bf16 const *my_gate = d_gate_w + local_tile * output_stride;
 
-    char const *h_base = (char const *)d_hidden;
     char const *g_base = (char const *)d_gamma;
     char const *w_base = (char const *)my_gate;
-    char *n_base = (char *)d_normed;
 
     // Register cache for hidden, gamma, and gate_weight raw bf16 values.
     // 3 arrays × MAX_ITERS entries × 2 VGPRs = 18 VGPRs (MAX_ITERS=3).
@@ -852,164 +981,226 @@ oproj_barrier :
     i32x2_t w_cache[MAX_ITERS];
     int n_cached = 0;
 
-    // ── Pass 1: Pipelined hidden load + ssq accumulation ────────────
-    // Gamma and router weights already prefetched before O-proj barrier
-    // (g_pf_buf / w_pf_buf). Only hidden state needs fresh loads here.
+    // Two independent cross-wave reductions run in this phase, and they must
+    // not share storage. `red` carries the ssq reduction and then, at red[0],
+    // the *broadcast* of irms, which every one of the 256 threads reads. The
+    // dp reduction that follows used to write red[wave] -- so wave 0's
+    // `red[0] = dp` lands on the very slot waves 1..3 are still reading irms
+    // from.
+    //
+    // Nothing separates the two: the `__syncthreads()` after the irms store is
+    // the *last* barrier before pass 2, and pass 2 both reads irms and writes
+    // dp. Worse, irms is consumed inside pass 2's unrolled loop (n = h*irms*g),
+    // so the compiler is free to keep re-reading the LDS slot rather than
+    // hoisting it into a VGPR -- which widens the window from a few
+    // instructions to the whole loop.
+    //
+    // A wave that reads a clobbered irms computes a wrong norm for its quarter
+    // of the row. That value is *stored* to norm_output (the MoE's input) and
+    // folded into the router dot product, so the damage lands in
+    // rmsnorm_out_moe and in the routing decision at once -- and it is timing
+    // dependent, hence different every run. Which quarter of the row is hit
+    // depends on which wave loses the race, so the corruption is spread evenly
+    // across the row rather than confined to one workgroup's columns.
+    //
+    // Giving dp its own slots removes the aliasing outright; 64 bytes of LDS
+    // is cheaper than a third barrier on the critical path.
+    __shared__ float red[16];
+    __shared__ float red_dp[16];
 
-    // Prefetch first hidden iteration
-    i32x2_t h_pf;
-    if (tid < H4) {
-      int byte_off = tid * 8;
-      asm volatile("global_load_dwordx2 %0, %1, off"
-                   : "=v"(h_pf)
-                   : "v"(h_base + byte_off)
-                   : "memory");
-    }
+    // This worker owns router expert `local_tile` for *every* token. The
+    // pipeline below used to run once with no token offset anywhere, so at
+    // batch > 1 all rows were routed by token 0's logits and the normed
+    // buffer the MoE reads held token 0 in every row. It is a GEMV, not a
+    // GEMM: ~184 extra FMA per thread per token, so a plain loop is the right
+    // shape -- restructuring it into MFMA would cost more than it saves.
+    //
+    // At BATCH_SIZE == 1 the bound is a compile-time 1 and the loop vanishes.
+    int const n_tok_router = BATCH_SIZE == 1 ? 1 : batch_count;
 
-#pragma unroll
-    for (int iter = 0; iter < MAX_ITERS; iter++) {
-      int i_cur = tid + iter * 256;
-      if (i_cur >= H4) {
-        break;
-      }
+    for (int b = 0; b < n_tok_router; b++) {
+      char const *h_base =
+          (char const *)(d_hidden + (int64_t)b * output_stride);
+      char *n_base = (char *)(d_normed + (int64_t)b * output_stride);
 
-      // Wait for hidden load (gamma+router already in VGPRs from pre-barrier)
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-      i32x2_t h_v = h_pf;
+      float ssq = 0.0f;
+      float dp = 0.0f;
 
-      // Prefetch next hidden iteration
-      int i_next = i_cur + 256;
-      if (i_next < H4) {
-        int byte_off_next = i_next * 8;
+      // ── Pass 1: Pipelined hidden load + ssq accumulation ────────────
+      // Gamma and router weights already prefetched before O-proj barrier
+      // (g_pf_buf / w_pf_buf). Only hidden state needs fresh loads here.
+
+      // Prefetch first hidden iteration
+      i32x2_t h_pf;
+      if (tid < H4) {
+        int byte_off = tid * 8;
         asm volatile("global_load_dwordx2 %0, %1, off"
                      : "=v"(h_pf)
-                     : "v"(h_base + byte_off_next)
+                     : "v"(h_base + byte_off)
                      : "memory");
       }
 
-      // Cache: hidden from fresh load, gamma+router from pre-barrier prefetch
-      h_cache[iter] = h_v;
-      __builtin_memcpy(&g_cache[iter], &g_pf_buf[iter], 8);
-      __builtin_memcpy(&w_cache[iter], &w_pf_buf[iter], 8);
-      n_cached = iter + 1;
+#pragma unroll
+      for (int iter = 0; iter < MAX_ITERS; iter++) {
+        int i_cur = tid + iter * 256;
+        if (i_cur >= H4) {
+          break;
+        }
 
-      // Compute ssq from hidden values
-      float v0, v1, v2, v3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(v0), "=&v"(v1), "=&v"(v2), "=&v"(v3)
-                   : "v"(h_v[0]), "v"(h_v[1]));
-      ssq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
-    }
+        // Wait for hidden load (gamma+router already in VGPRs from pre-barrier)
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        i32x2_t h_v = h_pf;
+
+        // Prefetch next hidden iteration
+        int i_next = i_cur + 256;
+        if (i_next < H4) {
+          int byte_off_next = i_next * 8;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(h_pf)
+                       : "v"(h_base + byte_off_next)
+                       : "memory");
+        }
+
+        // Cache: hidden from the fresh load, gamma+router from the
+        // pre-barrier prefetch. Both of the latter are token-invariant, but
+        // the copy stays inside the loop rather than being hoisted: hoisting
+        // extends g_pf_buf/w_pf_buf's live range across the whole token
+        // sweep and the allocator answers with 16 more bytes of scratch even
+        // at BATCH_SIZE == 1. Re-copying the same VGPRs is free.
+        h_cache[iter] = h_v;
+        __builtin_memcpy(&g_cache[iter], &g_pf_buf[iter], 8);
+        __builtin_memcpy(&w_cache[iter], &w_pf_buf[iter], 8);
+        n_cached = iter + 1;
+
+        // Compute ssq from hidden values
+        float v0, v1, v2, v3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(v0), "=&v"(v1), "=&v"(v2), "=&v"(v3)
+                     : "v"(h_v[0]), "v"(h_v[1]));
+        ssq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+      }
 
 // Wave-level reduction for ssq
 #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      ssq += __shfl_xor(ssq, off);
-    }
-
-    // Cross-wave reduction via LDS
-    __shared__ float red[16];
-    if (lane == 0) {
-      red[wave] = ssq;
-    }
-    __syncthreads();
-
-    float irms;
-    if (tid == 0) {
-      float tot = 0.0f;
-      for (int w = 0; w < NUM_WAVES; w++) {
-        tot += red[w];
+      for (int off = 32; off > 0; off >>= 1) {
+        ssq += __shfl_xor(ssq, off);
       }
-      red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
-    }
-    __syncthreads();
-    irms = red[0];
+
+      // Cross-wave reduction via LDS
+      if (lane == 0) {
+        red[wave] = ssq;
+      }
+      __syncthreads();
+
+      float irms;
+      if (tid == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          tot += red[w];
+        }
+        red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+      }
+      __syncthreads();
+      irms = red[0];
 
 // ── Pass 2: Register-only norm + GEMV (no HBM re-reads) ─────────
 #pragma unroll
-    for (int iter = 0; iter < MAX_ITERS; iter++) {
-      if (iter >= n_cached) {
-        break;
+      for (int iter = 0; iter < MAX_ITERS; iter++) {
+        if (iter >= n_cached) {
+          break;
+        }
+        int byte_off = (tid + iter * 256) * 8;
+
+        // Unpack cached hidden
+        float h0, h1, h2, h3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(h0), "=&v"(h1), "=&v"(h2), "=&v"(h3)
+                     : "v"(h_cache[iter][0]), "v"(h_cache[iter][1]));
+
+        // Unpack cached gamma
+        float g0, g1, g2, g3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(g0), "=&v"(g1), "=&v"(g2), "=&v"(g3)
+                     : "v"(g_cache[iter][0]), "v"(g_cache[iter][1]));
+
+        // Compute norm = hidden * irms * gamma
+        float n0 = h0 * irms * g0;
+        float n1 = h1 * irms * g1;
+        float n2 = h2 * irms * g2;
+        float n3 = h3 * irms * g3;
+
+        // Pack and store normed output
+        uint32_t pk_lo, pk_hi;
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
+                     : "=v"(pk_lo)
+                     : "v"(n0), "v"(n1));
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
+                     : "=v"(pk_hi)
+                     : "v"(n2), "v"(n3));
+        i32x2_t n_packed;
+        n_packed[0] = (int)pk_lo;
+        n_packed[1] = (int)pk_hi;
+        asm volatile("global_store_dwordx2 %0, %1, off" ::"v"(n_base +
+                                                              byte_off),
+                     "v"(n_packed)
+                     : "memory");
+
+        // Unpack cached gate_weight and accumulate dot product
+        float w0, w1, w2, w3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(w0), "=&v"(w1), "=&v"(w2), "=&v"(w3)
+                     : "v"(w_cache[iter][0]), "v"(w_cache[iter][1]));
+        dp += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
       }
-      int byte_off = (tid + iter * 256) * 8;
-
-      // Unpack cached hidden
-      float h0, h1, h2, h3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(h0), "=&v"(h1), "=&v"(h2), "=&v"(h3)
-                   : "v"(h_cache[iter][0]), "v"(h_cache[iter][1]));
-
-      // Unpack cached gamma
-      float g0, g1, g2, g3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(g0), "=&v"(g1), "=&v"(g2), "=&v"(g3)
-                   : "v"(g_cache[iter][0]), "v"(g_cache[iter][1]));
-
-      // Compute norm = hidden * irms * gamma
-      float n0 = h0 * irms * g0;
-      float n1 = h1 * irms * g1;
-      float n2 = h2 * irms * g2;
-      float n3 = h3 * irms * g3;
-
-      // Pack and store normed output
-      uint32_t pk_lo, pk_hi;
-      asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                   : "=v"(pk_lo)
-                   : "v"(n0), "v"(n1));
-      asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                   : "=v"(pk_hi)
-                   : "v"(n2), "v"(n3));
-      i32x2_t n_packed;
-      n_packed[0] = (int)pk_lo;
-      n_packed[1] = (int)pk_hi;
-      asm volatile("global_store_dwordx2 %0, %1, off" ::"v"(n_base + byte_off),
-                   "v"(n_packed)
-                   : "memory");
-
-      // Unpack cached gate_weight and accumulate dot product
-      float w0, w1, w2, w3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(w0), "=&v"(w1), "=&v"(w2), "=&v"(w3)
-                   : "v"(w_cache[iter][0]), "v"(w_cache[iter][1]));
-      dp += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
-    }
 
 // Wave-level reduction for dp
 #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      dp += __shfl_xor(dp, off);
-    }
-
-    // Cross-wave LDS reduce
-    if (lane == 0) {
-      red[wave] = dp;
-    }
-    __syncthreads();
-
-    // tid==0 writes logit + bias via write-through store
-    if (tid == 0) {
-      float s = 0.0f;
-      for (int w = 0; w < NUM_WAVES; w++) {
-        s += red[w];
+      for (int off = 32; off > 0; off >>= 1) {
+        dp += __shfl_xor(dp, off);
       }
-      if (d_rbias) {
-        s += __bfloat162float(d_rbias[local_tile]);
+
+      // Cross-wave LDS reduce. Into red_dp, not red: red[0] is still serving
+      // as the irms broadcast that pass 2 above reads.
+      if (lane == 0) {
+        red_dp[wave] = dp;
       }
-      bf16 bval = __float2bfloat16(s);
-      st_wt_u16(&d_logits[local_tile],
-                *reinterpret_cast<unsigned short *>(&bval));
+      __syncthreads();
+
+      // tid==0 writes logit + bias via write-through store.
+      // logits_scratch is [batch, NUM_EXPERTS], XCD-partitioned along the
+      // expert axis: the pointer is pre-offset by xcd_id*CHUNK_N (which
+      // topk_noinline undoes) while the row stride stays NUM_EXPERTS.
+      if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          s += red_dp[w];
+        }
+        if (d_rbias) {
+          s += __bfloat162float(d_rbias[local_tile]);
+        }
+        bf16 bval = __float2bfloat16(s);
+        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
+                  *reinterpret_cast<unsigned short *>(&bval));
+      }
+
+      // Keep the next token's `red[wave] = ssq` from racing tid 0's read of
+      // this token's dp slots. Compiled out at BATCH_SIZE == 1, where the
+      // loop body runs once.
+      if constexpr (BATCH_SIZE > 1) {
+        __syncthreads();
+      }
     }
   }
 
@@ -1032,8 +1223,13 @@ topk_barrier :
         __builtin_amdgcn_s_memrealtime(); // slot 11: rmsnorm_router_done
   }
 #endif
-  __syncthreads();
+  // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
+  // guarantee: run after __syncthreads it only retires wave 0's stores, and
+  // tid 0 then publishes an arrival advertising output that waves 1..3 may
+  // still have in flight. Draining first makes every wave's stores retire,
+  // and the barrier then makes that true block-wide.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
 
   __shared__ int s_topk_done;
   if (tid == 0) {
@@ -1048,17 +1244,22 @@ topk_barrier :
           __builtin_amdgcn_s_memrealtime(); // slot 14: topk_compute_start
     }
 #endif
-    gang_rmsnorm_topk_detail::topk_noinline<__hip_bfloat16, NUM_EXPERTS, K>(
+    gang_rmsnorm_topk_detail::topk_noinline<__hip_bfloat16, NUM_EXPERTS, K, BATCH_SIZE>(
         logits_scratch_ptr,
         topk_weight_ptr,
         routing_indices_ptr,
         active_expert_ids_ptr,
         topk_counter,
         num_active_tokens);
-    // topk_noinline resets topk_counter internally
-    // topk_noinline's return has per-thread s_waitcnt, but thread 0 could reach
-    // threadfence_gpu before other threads finish their stores. syncthreads
-    // ensures all threads complete TopK stores before thread 0 flushes L2→HBM.
+    // topk_noinline resets topk_counter internally.
+    //
+    // Drain then rendezvous. __syncthreads alone is NOT enough here: it makes
+    // every wave *reach* this point, but `s_waitcnt` is per-wave, so a wave
+    // can arrive at the barrier with its routing_indices / active_expert_ids
+    // stores still in flight. tid 0 then fences and publishes the release,
+    // advertising data that has not landed. Each wave must retire its own
+    // stores first; the barrier then makes that true block-wide.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     if (tid == 0 && ts_base) {

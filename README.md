@@ -32,8 +32,60 @@ python3 demo/gpt_oss/demo.py --use-mirage \
 ```
 
 Read the **`Decode avg`** line for per-token decode latency (~2.0 ms/tok). Drop
-`--use-mirage` to run the PyTorch reference instead. Only **batch size 1** is
-supported for GPT-OSS 120B.
+`--use-mirage` to run the PyTorch reference instead.
+
+### Batching
+
+GPT-OSS 120B supports **up to 16 tokens per iteration** (`--max-num-batched-tokens
+1..16`) across **up to 8 concurrent requests** (`--max-num-batched-requests 1..8`).
+
+Tokens ride the N axis of the `16x16x128` scaled-MFMA instruction, which was
+already computing 16 columns for one token, so the dense GEMMs cost the same for
+16 tokens as for 1 and only the MoE grows — with the number of *distinct* experts
+the batch activates, not with the token count. Measured prefill: 2.09 / 4.06 /
+5.11 / 6.55 / 8.51 ms at 1 / 2 / 4 / 8 / 16 tokens, i.e. 16 tokens for 4.1x the
+cost of one.
+
+Concurrent requests reuse that same flat token axis — there is no batch
+dimension anywhere, exactly as in vLLM — so the only per-request structure is in
+attention. The 30 workers on each XCD are split as
+`(request, chunk) = (xcd_rank / chunks, xcd_rank % chunks)` with
+`chunks = 30 / B`, trading split-KV depth for batch width the same way vLLM
+picks partitioned vs non-partitioned attention on occupancy rather than on
+sequence length. Measured decode:
+
+| B | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| ms/iter | 2.13 | 2.50 | 5.36 | 8.19 |
+| tokens/s | 470 | 800 | 747 | 977 |
+
+Per-layer attribution (`MPK_DEVICE_TIMING=1`, µs, B=1 → B=8) shows where the
+growth actually goes:
+
+| | qkv gemm | attn | merge | oproj+topk | moe |
+|---|---|---|---|---|---|
+| B=1 | 9.0 | 4.8 | — | 14.8 | 22.0 |
+| B=8 | 10.7 | 11.2 | 2.6 | 16.3 | 34.0 |
+
+The MoE is the largest term (`min(topk*B, 128)` distinct experts, so expert
+weight traffic roughly 4 → 32 experts), and the dense GEMMs barely move — that
+is the batching win, already paid for by the N-axis token packing. Attention
+grows too, mostly because the per-request chunk budget falls from 8 to 3: less
+split-KV parallelism per request, not more work.
+
+```bash
+python3 demo/gpt_oss/demo.py --use-mirage --model-path "$MODEL_PATH" \
+  --max-num-batched-requests 4 --max-num-batched-tokens 4 \
+  --prompts "What is the capital of Japan?" "Who wrote Romeo and Juliet?" \
+            "Name three prime numbers." "What is 12 times 12?"
+```
+
+`--num-requests N` runs more requests than there are batch slots: requests
+retire as they finish, their KV pages return to the free list, and queued
+requests are admitted into the freed slots without leaving the megakernel.
+
+`PPL_MODE=1` requires `--max-num-batched-requests 1` — the logits sink row is
+derived from request 0's step, so all requests would write the same row.
 
 ### Correctness test (Torch vs Mirage)
 

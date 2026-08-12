@@ -206,10 +206,10 @@ __device__ __forceinline__ void gang_rmsnorm_linear_bias_kernel(
                                                     bias_ptr);
 }
 
-// Croc-style fused gate + TopK: 128 workers (one per expert).
+// Fused gate + TopK: 128 workers (one per expert).
 //
 // Replaces the 8-worker small_router_linear approach with 128-way parallel
-// dot products, matching croc's mega_phase4_gate pattern:
+// dot products:
 //   - Each worker computes 1 expert's gate logit (not 16 serially)
 //   - RMSNorm is fused into the GEMV (no intermediate BF16 round-trip)
 //   - 128 workers = 16/XCD, vs old 1/XCD = 8x more parallelism
@@ -237,7 +237,10 @@ __device__ __forceinline__ int get_xcd_id() {
 // Without this, inlining TopK into the persistent_kernel function causes the
 // compiler's instruction scheduler to pessimize the CK GEMM pipeline, making
 // ALL task types ~5-12% slower.
-template <typename T, int NUM_EXPERTS, int K>
+// ROUTING_ROW_STRIDE is the *allocated* row stride of routing_indices
+// (BATCH_SIZE), which is not num_active_tokens -- see the note on
+// topk_softmax_mi300_task_impl's routing_row_stride parameter.
+template <typename T, int NUM_EXPERTS, int K, int ROUTING_ROW_STRIDE>
 __device__ __attribute__((noinline)) void
     topk_noinline(void *logits_scratch_ptr,
                   void *topk_weight_ptr,
@@ -250,11 +253,25 @@ __device__ __attribute__((noinline)) void
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
                       static_cast<int64_t>(xcd_id) * CHUNK_N;
 
-  // Invalidate L2 cache before reading logits. Write-through stores from
-  // all 128 workers bypassed L2 → HBM. buffer_inv ensures the reader's L2
-  // fetches fresh data from HBM (zeroing stores from previous iteration may
-  // have populated L2 with stale zeros).
-  asm volatile("buffer_inv" ::: "memory");
+  // Invalidate before reading logits. The 128 producing workers wrote their
+  // logit with st_wt_u16 (sc0 sc1), which bypasses L2 and lands in HBM, and
+  // they sit on all 8 XCDs while this reader is on one -- MI300/MI350 L2 is
+  // not coherent across XCDs.
+  //
+  // This must therefore be `sc1` (vL1 + L2). Plain `buffer_inv` drops vL1
+  // only, so if this XCD's L2 still holds the logits line from the *previous*
+  // layer -- and it does, this same tile read the same address one layer ago
+  // -- the load is served from L2 and returns the previous layer's logits.
+  // The comment here already described exactly this hazard ("fetches fresh
+  // data from HBM"); the instruction just did not implement it.
+  //
+  // A stale logit does not crash and does not look like garbage: it is a
+  // real logit, so TopK returns real experts and routing stays in range. The
+  // token is simply routed through the wrong experts, and which lines survive
+  // depends on inter-XCD L2 eviction timing, so it varies run to run. That is
+  // the observed signature -- moe_routing_indices / moe_mask differ between
+  // runs while attention is bit-identical.
+  asm volatile("buffer_inv sc1" ::: "memory");
 
   topk_softmax_mi300_task_impl<T,
                                /*VPT=*/8,
@@ -263,6 +280,7 @@ __device__ __attribute__((noinline)) void
                                /*BYTES_PER_LDG=*/16>(logits_base,
                                                      topk_weight_ptr,
                                                      num_active_tokens,
+                                                     ROUTING_ROW_STRIDE,
                                                      K,
                                                      routing_indices_ptr,
                                                      active_expert_ids_ptr,
@@ -277,7 +295,7 @@ __device__ __attribute__((noinline)) void
 }
 } // namespace gang_rmsnorm_topk_detail
 
-// Croc-style fused RMSNorm + Gate GEMV + TopK.
+// Fused RMSNorm + Gate GEMV + TopK.
 //
 // 128 workers (16/XCD), one expert per worker. Each worker:
 //   1. Computes RMSNorm (irms) from hidden state — redundant, same result
@@ -352,8 +370,18 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     ssq += __shfl_xor(ssq, off);
   }
 
-  // Cross-wave reduction via LDS
+  // Cross-wave reduction via LDS.
+  //
+  // `red` carries ssq and then, at red[0], the irms *broadcast* that all 256
+  // threads read in step 2. The dp reduction at the end of step 2 therefore
+  // gets its own slots: writing red[wave] there would put wave 0's dp on top
+  // of the irms every other wave is still reading, and irms is consumed inside
+  // step 2's loop so the read is not necessarily hoisted. See the same fix and
+  // the full failure analysis in
+  // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh, which is where this
+  // pipeline was copied from.
   __shared__ float red[16];
+  __shared__ float red_dp[16];
   if (lane == 0) {
     red[wave] = ssq;
   }
@@ -429,9 +457,10 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
     dp += __shfl_xor(dp, off);
   }
 
-  // Cross-wave LDS reduce
+  // Cross-wave LDS reduce. Into red_dp, not red: red[0] is still the irms
+  // broadcast that step 2 above reads.
   if (lane == 0) {
-    red[wave] = dp;
+    red_dp[wave] = dp;
   }
   __syncthreads();
 
@@ -439,7 +468,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   if (tid == 0) {
     float s = 0.0f;
     for (int w = 0; w < NUM_WAVES; w++) {
-      s += red[w];
+      s += red_dp[w];
     }
     if (d_bias) {
       s += __bfloat162float(d_bias[tile_idx]);
@@ -463,7 +492,7 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
 
   // ═══ Step 4: Last worker runs TopK softmax ═══
   if (completed == total_gang_tiles) {
-    gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K>(
+    gang_rmsnorm_topk_detail::topk_noinline<T, NUM_EXPERTS, K, BATCH_SIZE>(
         logits_scratch_ptr,
         topk_weight_ptr,
         routing_indices_ptr,
