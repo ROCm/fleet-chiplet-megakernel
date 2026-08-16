@@ -1,5 +1,6 @@
 import torch
 import os
+import os as _os_pad
 import tempfile
 import subprocess
 import shutil
@@ -349,6 +350,313 @@ def get_compile_command(
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
         if int(os.environ.get("MPK_NO_LAYER_BARRIER", "0")) == 1:
             flags = flags + ["-DMPK_NO_LAYER_BARRIER"]
+        if int(os.environ.get("MPK_W2_CONSUMER_GATE", "0")) == 1:
+            flags = flags + ["-DMPK_W2_CONSUMER_GATE"]
+        if int(os.environ.get("MPK_WIDE_FP8_QUANT", "0")) == 1:
+            flags = flags + ["-DMPK_WIDE_FP8_QUANT"]
+        if int(os.environ.get("MPK_ABLATE_W13_QUANT", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_W13_QUANT"]
+        if int(os.environ.get("MPK_OPROJ_NO_WB", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_NO_WB"]
+        if int(os.environ.get("MPK_MFMA_PINGPONG_SCHED", "0")) == 1:
+            flags = flags + ["-DMPK_MFMA_PINGPONG_SCHED"]
+        if int(os.environ.get("MPK_XCD_LOCAL_BARRIER", "0")) == 1:
+            flags = flags + ["-DMPK_XCD_LOCAL_BARRIER"]
+        if int(os.environ.get("MPK_OPROJ_TREE_BARRIER", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_TREE_BARRIER"]
+        if int(os.environ.get("MPK_W13_LINEAR_LOAD", "0")) == 1:
+            # One W13 tile per wave, walked linearly in 23 1-KiB chunks,
+            # instead of four waves striping every tile in 6 4-KiB steps.
+            # Same LDS contents; 92 KiB fetched per workgroup instead of 96,
+            # and 2 address registers instead of 48.
+            flags = flags + ["-DMPK_W13_LINEAR_LOAD"]
+        if int(os.environ.get("MPK_INTERLAYER_FENCE", "0")) == 1:
+            # Restore the per-layer threadfence_gpu that is now off by default.
+            # It flushed L2 at the layer boundary, but the layer's output is
+            # written through (st_wt_f32x4, sc0 sc1) and Phase 9 drains before
+            # releasing, so there was nothing dirty in L2 to write back.
+            flags = flags + ["-DMPK_INTERLAYER_FENCE"]
+        if int(os.environ.get("MPK_ONE_NORM_WRITER", "0")) == 1:
+            # One router worker per XCD stores the normed row instead of all
+            # `router_tile_n` of them. Per-XCD, not device-wide: the store is a
+            # plain global_store into a non-coherent L2, so each XCD needs its
+            # own writer. Correctness-relevant -- check the generated text.
+            flags = flags + ["-DMPK_ONE_NORM_WRITER"]
+        if int(os.environ.get("MPK_NDEBUG", "0")) == 1:
+            # The ROCm branch never sets -DNDEBUG (only the sm_90 branch does),
+            # so every assert in the persistent kernel keeps its OCKL hostcall
+            # packet-ring code, and hipcc inlines those sites into the worker's
+            # main loop. Cold code, but it costs I-cache lines and register
+            # pressure at 1 wave/SIMD. Does not touch the [FWD_PASS] printf the
+            # harness measures with.
+            flags = flags + ["-DNDEBUG"]
+        if int(os.environ.get("MPK_MOE_INNER_WIDE", "0")) == 1:
+            # Widen MPK_MOE_INNER_TIMING's sample from tile 0 to every 37th
+            # tile. Tile 0 is the earliest-arriving worker on each arm, so its
+            # barrier wait bounds the skew instead of describing the population.
+            flags = flags + ["-DMPK_MOE_INNER_WIDE"]
+        if int(os.environ.get("MPK_W13_T1_LINEAR_LOAD", "0")) == 1:
+            # The same transform at the W13 tile_iter=1 site. Separate knob so
+            # T0 and T1 stay independently measurable: T1's loads are issued to
+            # overlap the SwiGLU epilogue, so the striped form's extra traffic
+            # may already be hidden there the way it is on the W2 arm.
+            flags = flags + ["-DMPK_W13_T1_LINEAR_LOAD"]
+        if int(os.environ.get("MPK_W13_T1_EARLY_SCALE_LOAD", "0")) == 1:
+            # Hoist the W13 tile-1 block-scale global reads up beside the
+            # tile-1 data loads, holding them in VGPRs across the tile-0 SwiGLU
+            # epilogue, so the tile-1 drain covers data and scales together and
+            # only an LDS scatter is left afterwards. The default path issues
+            # the scale reads after the data drain, serializing two HBM round
+            # trips. Worth roughly 0.06 ms/token, the second-largest of the
+            # six scheduling flags in this group.
+            flags = flags + ["-DMPK_W13_T1_EARLY_SCALE_LOAD"]
+        if int(os.environ.get("MPK_QKV_PREFETCH_SCALES", "0")) == 1:
+            # DMA the QKV block scales straight to LDS in the prefetch helper
+            # instead of reading them into VGPRs after the data drain and
+            # scattering. Removes a serialized second HBM round trip from
+            # Phase B; costs 608 bytes of LDS per tile (2432 total) because
+            # buffer_load_lds advances in 1 KiB chunks so the scale region has
+            # to be padded to 2 KiB. W_END goes 106,992 -> 109,424 of 158,720.
+            # This is the scale half of the QKV prefetch; the DMA hoist
+            # itself is already done in the fused layer's Phase 9. It is the
+            # costliest of the six, worth roughly 0.07 ms/token.
+            flags = flags + ["-DMPK_QKV_PREFETCH_SCALES"]
+        if int(os.environ.get("MPK_W13_T1_SPLIT_LDS_STAGE", "0")) == 1:
+            # Split the W13 tile-1 HBM->LDS transfer in two. 11 of its 23 KiB
+            # chunks go out *before* the tile-0 MFMA, into an LDS stage buffer
+            # disjoint from tile 0 so there is no WAR hazard on the tile the
+            # MFMA is still reading; the other 13 are issued from inside the
+            # final MFMA's result window, where the default schedule has only
+            # `s_nop` hazard padding. The prefix boundary is a whole row
+            # (7 rows = 10,080 B -> 11 KiB), so the tile-1 MFMA picks its
+            # buffer once from `col` instead of switching per iteration.
+            # Costs 44 KiB of LDS (11 KiB x 4 waves): 152,048 of 155,644 used.
+            # Worth roughly 0.036 ms/token.
+            flags = flags + ["-DMPK_W13_T1_SPLIT_LDS_STAGE"]
+        _sp = int(os.environ.get("MPK_SYS_POLL_LOAD", "0"))
+        if _sp >= 1:
+            # Poll the inter-XCD release flags with `global_load_dword sc0 sc1`
+            # instead of `nt`. `nt` is only an eviction hint -- it does not
+            # force a vL1 miss -- so a spin on it can keep re-reading a stale
+            # line until that line ages out, which shows up as a long tail on
+            # exactly the gate sites ATT flags as hottest. Every gate should
+            # poll with sc0 sc1.
+            flags = flags + [f"-DMPK_SYS_POLL_LOAD={_sp}"]
+        if int(os.environ.get("MPK_QKV_GATE_NO_AGENT_FENCE", "0")) == 1:
+            # Drop the agent-scope acquire fence at the qkv_epoch barrier. It
+            # lowers to `buffer_inv sc1` -- a whole-L2 invalidate -- to acquire
+            # an XCD-private counter written with sc0, and the vL1 `buffer_inv`
+            # that follows it is the acquire that barrier actually needs.
+            flags = flags + ["-DMPK_QKV_GATE_NO_AGENT_FENCE"]
+        if int(os.environ.get("MPK_W13_PREQUANT", "0")) == 1:
+            # Move the W13 activation quant out of the 184 MoE workgroups that
+            # each redo it and into the one router workgroup per XCD that
+            # already has the normed row in registers. The handoff buffer
+            # (norm_output) carries FP8 E4M3 + one E8M0 byte per 128 elements
+            # instead of BF16, so it is also half the bytes to read back.
+            #
+            # Bit-identical by construction: the quant input is the BF16 the
+            # old path round-tripped through, the scale domain is the same 128
+            # elements, the exponent rule is the consumer's own
+            # _gang_compute_e8m0_fp8, and the packed dword lands at the same
+            # LDS offset. MPK_ABLATE_W13_QUANT prices the ceiling at 0.047 ms.
+            #
+            # Requires MPK_ROUTER_FUSED_DP (it publishes from that flag's
+            # elected writer) and BATCH_SIZE == 1 (the publication is one row,
+            # not a per-token gather). Both are enforced in the kernel.
+            flags = flags + ["-DMPK_W13_PREQUANT"]
+        if int(os.environ.get("MPK_NARROW_GATE_POLL", "0")) == 1:
+            # One thread per block polls the Phase 6 / Phase 7b release lines
+            # instead of all 256, with a __syncthreads to carry the other
+            # waves. At sc0 sc1 every poll is a real trip to the coherency
+            # point, so 240 pollers per XCD contend the very line that is
+            # about to be written.
+            flags = flags + ["-DMPK_NARROW_GATE_POLL"]
+        if int(os.environ.get("MPK_W13_BIAS_PREFETCH", "0")) == 1:
+            # Hoist the W13 tile-0 SwiGLU bias to one global_load_dwordx2
+            # issued above the MFMA block, and pack the epilogue's two bf16
+            # results into a single dword store. Default codegen puts two
+            # scalar flat_load_dwords inside the epilogue instead; ATT charges
+            # 3.7% of all cycles to waiting on them.
+            flags = flags + ["-DMPK_W13_BIAS_PREFETCH"]
+        if int(os.environ.get("MPK_W2_ONLY_ARRIVE", "0")) == 1:
+            # Narrow the Phase 9 arrival to the workers that actually ran a W2
+            # tile. The barrier orders this layer's W2 stores against the next
+            # layer's workspace read, so a worker with no W2 tile is reporting
+            # the retirement of nothing while still gating the release. At the
+            # shipped geometry that is 8 of 31 workers per XCD.
+            flags = flags + ["-DMPK_W2_ONLY_ARRIVE"]
+        if int(os.environ.get("MPK_LEAN_ARRIVE", "0")) == 1:
+            # Remove the two dependent loads that sit in front of the Phase 9
+            # arrival atomic: the relaxed read of the local counter (to build
+            # `local_expected`) and the nt read of the release line (the
+            # `s_layer_rel_prev` snapshot). Both counters are monotonic and
+            # bounded by the barrier itself, so one division of the value the
+            # atomic already returns yields both.
+            flags = flags + ["-DMPK_LEAN_ARRIVE"]
+        if int(os.environ.get("MPK_W13_BIAS_PF_T0_ONLY", "0")) == 1:
+            # Restrict the above to tile 0. Tile 1's MFMA block is register
+            # -tighter than tile 0's, so hoisting a second live pair across it
+            # can cost more in occupancy than the flat_load wait it removes;
+            # this is the control that isolates the two halves.
+            flags = flags + ["-DMPK_W13_BIAS_PF_T0_ONLY"]
+        if int(os.environ.get("MPK_ROUTER_FUSED_DP", "0")) == 1:
+            # Fold the router dot product into the RMSNorm's ssq pass. irms is
+            # a scalar uniform over the row, so it can be applied once to the
+            # reduced dot product instead of once per element -- which removes
+            # dp's dependence on the ssq reduction, hence on pass 2. All that
+            # is left in pass 2 is the normed-row store, which one workgroup
+            # per XCD already owns, so the other 15 skip the pass, its two
+            # unpacks, its shuffle reduction and one __syncthreads.
+            # Reassociates the logit's rounding, so
+            # verify by hashing the generated text, not by timing.
+            flags = flags + ["-DMPK_ROUTER_FUSED_DP"]
+        if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
+            # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
+            # re-issue its quarter of the tile after the gate. tid 0 is the only
+            # thread that polls layer_release, and the poll is a vector load
+            # that otherwise queues behind its own wave's outstanding
+            # buffer_load_lds -- so the poller sees the release late by its own
+            # prefetch's latency. Waves 1-3 are idle during the spin and keep
+            # their share.
+            flags = flags + ["-DMPK_QKV_PF_WAVE_SPLIT"]
+        # The MoE W13 tile-space padding must be a whole scheduling round, i.e.
+        # 8 * workers_per_xcd, and the host computes it from the same variable.
+        # Passed as a define rather than left as a literal so the two sides
+        # cannot disagree -- see the note at PAD_MULTIPLE in
+        # gang_moe_fused_mxfp4_mi300.cuh for what a disagreement does.
+        flags = flags + [
+            "-DMPK_MOE_PAD_MULTIPLE="
+            + str(
+                8 * int(os.environ.get("MPK_WORKERS_PER_XCD", "30"))
+                if int(os.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1
+                else 240
+            )
+        ]
+        if int(os.environ.get("MPK_MERGE_TWO_PASS", "0")) == 1:
+            # Requires MPK_MERGE_KV_OUTER (it replaces that arm's kv loop).
+            # Breaks the merge's serial rescale chain: the running-max form
+            # makes chunk k's accumulate depend on chunk k-1's max, so the 31
+            # o loads cannot overlap. Two-pass reduces the lse values first,
+            # then every weight is known and all 31 o loads issue independently.
+            flags = flags + ["-DMPK_MERGE_TWO_PASS"]
+        if int(os.environ.get("MPK_MERGE_KV_OUTER", "0")) == 1:
+            # Interchange the split-KV merge's loop nest to KV-outer/dim-inner.
+            # The running softmax state (m, d, and both rescale weights) is a
+            # function of kv alone, but the dim-outer form recomputes it -- and
+            # reloads the same lse element -- once per dim. Bit-identical: each
+            # accumulator sees the same op sequence in the same order, so there
+            # is no reassociation. Also makes each lane's `o` loads adjacent
+            # within a kv step, replacing 4 B accesses at an 8 B stride with one
+            # wide load. The merge is serial on the last chunk worker and the
+            # per-XCD barrier waits on it.
+            flags = flags + ["-DMPK_MERGE_KV_OUTER"]
+        if int(os.environ.get("MPK_ROUTING_DERIVED_EPOCH", "0")) == 1:
+            # Derive the Phase 7b release epoch from layer_epoch instead of
+            # reading the flag back from HBM. The read-back is a dependent,
+            # cache-bypassing load in front of the nine stores that release all
+            # 240 workgroups, on the one thread whose latency nothing hides;
+            # the consumers already compute the same value locally
+            # (`layer_counter + 1`). Same fix the O-proj hierarchical barrier
+            # took for its own release target.
+            flags = flags + ["-DMPK_ROUTING_DERIVED_EPOCH"]
+        if int(os.environ.get("MPK_ROUTING_LANE_RELEASE", "0")) == 1:
+            # TESTED AND NOT ADOPTED (correct, but neutral: 2.022 vs 2.025
+            # interleaved). Publishes the eight per-XCD routing_ready flags
+            # from lanes 0..7 of one wave instead of eight back-to-back stores
+            # from tid 0 -- the same transform that pays at the O-proj and
+            # Phase 9 releases. It does not pay here because Phase 7b's wait is
+            # TopK compute, not release latency. See the flag site for the
+            # LDS-carried variant, which is measurably worse.
+            flags = flags + ["-DMPK_ROUTING_LANE_RELEASE"]
+        # MPK_OPROJ_ARRIVE_ONLY is deliberately NOT registered here. It is
+        # TESTED AND MEASURED INCORRECT: it lets the O-proj workers with no
+        # router tile skip the Phase 7 release poll, and since those workers
+        # (xcd_rank >= 16) are exactly the ones MPK_W2_CONSUMER_GATE excludes
+        # from the Phase 9 layer gate (xcd_rank < 10), that poll is their only
+        # gate -- without it they store next layer's attn_proj_out over a row a
+        # straggling XCD is still reading. Measured 2.015 vs 2.019 (no win) and
+        # one run in six generated different text. The #ifdef and its full
+        # analysis are retained at the flag site in
+        # gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh, but leaving it
+        # unregistered means an env var cannot turn a known race back on.
+        if int(os.environ.get("MPK_OPROJ_LEAN_ACQUIRE", "0")) == 1:
+            # Drop the __syncthreads + buffer_inv that follow the O-proj
+            # barrier's poll. The pair is self-supporting
+            # -- the rendezvous exists only to order the invalidate against
+            # sibling waves -- so both go or neither does. Safe because the
+            # producer is write-through sc0 sc1 (no stale line survives the
+            # store) and the only prior reader of this buffer is separated by
+            # Phase 9's layer gate, which already invalidates.
+            # Correctness-relevant: verify over many reps of generated text.
+            flags = flags + ["-DMPK_OPROJ_LEAN_ACQUIRE"]
+        _sc = os.environ.get("MPK_W13_T1_STAGE_CHUNKS_OVERRIDE", "")
+        if _sc != "":
+            # Debug: size of the staged prefix in 1 KiB chunks. Shrinking it
+            # moves the stage's top address down, which is how the LDS
+            # capacity question gets answered independently of the split.
+            flags = flags + [f"-DMPK_W13_T1_STAGE_CHUNKS_OVERRIDE={int(_sc)}"]
+        _sr = os.environ.get("MPK_W13_T1_STAGED_ROWS_OVERRIDE", "")
+        if _sr != "":
+            # Debug: how many of the 7 staged rows the tile-1 MFMA actually
+            # reads from the stage buffer. The prefix always writes all 7, so
+            # every value in [0, 7] must give identical numerics.
+            flags = flags + [f"-DMPK_W13_T1_STAGED_ROWS_OVERRIDE={int(_sr)}"]
+        if int(os.environ.get("MPK_W13_T1_SPLIT_CMP", "0")) == 1:
+            # Debug printf comparing the staged prefix against the same bytes
+            # in the tile slot. Only meaningful together with
+            # MPK_W13_T1_SPLIT_STAGE_PROBE, which fills both. Not a
+            # performance flag -- the printf serializes the wave.
+            flags = flags + ["-DMPK_W13_T1_SPLIT_CMP"]
+        if int(os.environ.get("MPK_W13_T1_SPLIT_READ_PROBE", "0")) == 1:
+            # Third bisection aid, used with MPK_W13_T1_SPLIT_STAGE_PROBE: the
+            # ordinary 23-chunk tile-1 load still fills the tile slot, so the
+            # stage buffer and the tile slot hold the *same* bytes for rows
+            # 0..6, but the tile-1 MFMA reads those rows from the stage. Any
+            # mismatch isolates the fault to the staged prefix or its reader,
+            # as opposed to the 13-chunk suffix write. Not a performance flag.
+            flags = flags + ["-DMPK_W13_T1_SPLIT_READ_PROBE"]
+        if int(os.environ.get("MPK_W13_T1_SPLIT_PROBE_DRAIN", "0")) == 1:
+            # Diagnostic companion to the two flags below: drain the early
+            # prefix right after issuing it. Removes the split's benefit, so
+            # it only answers "is this a vmcnt-accounting fault or an LDS
+            # overlap". Not a performance flag.
+            flags = flags + ["-DMPK_W13_T1_SPLIT_PROBE_DRAIN"]
+        if int(os.environ.get("MPK_W13_T1_SPLIT_STAGE_PROBE", "0")) == 1:
+            # Second bisection aid: issue the early 11-chunk prefix into the
+            # stage buffer but read nothing from it and keep the ordinary
+            # 23-chunk tile-1 load. A dead write, so numerics must match the
+            # baseline exactly; if they do not, the stage region overlaps LDS
+            # that is still live. Not a performance flag.
+            flags = flags + ["-DMPK_W13_T1_SPLIT_STAGE_PROBE"]
+        if int(os.environ.get("MPK_W13_T1_SPLIT_NOSUFFIX", "0")) == 1:
+            # Bisection aid for the flag above: keeps the split LDS layout and
+            # the early 11-chunk prefix, but issues the 13-chunk suffix from
+            # the ordinary tile-1 site instead of from inside the final tile-0
+            # MFMA. Separates a layout/addressing bug from an in-MFMA
+            # placement bug. Not a performance flag.
+            flags = flags + ["-DMPK_W13_T1_SPLIT_NOSUFFIX"]
+        if int(os.environ.get("MPK_W2_LINEAR_LOAD", "0")) == 1:
+            # Same transform at the W2 T0 site. Measured a regression there
+            # (2.199 -> 2.211) because W2's load is issued before the
+            # per-expert barrier poll, so its latency is already hidden and
+            # the striped form spreads the issue across all four waves.
+            # Kept as a separate knob rather than folded into
+            # MPK_W13_LINEAR_LOAD, which is a win on its own.
+            flags = flags + ["-DMPK_W2_LINEAR_LOAD"]
+        if int(os.environ.get("MPK_DRAIN_OVERLAP", "0")) == 1:
+            # Measurement arm, NOT a shipping mode. Moves Phase 9's
+            # `s_waitcnt vmcnt(0)` from before the arrival to after it, so the
+            # W2 write-through stores retire during the barrier spin. This is
+            # deliberately weaker than the default -- the arrival *is* the
+            # claim "my stores are visible" -- so it prices the drain rather
+            # than fixing it. See the correctness note at the post-arrival
+            # site in gang_full_layer_fused_mi300.cuh.
+            flags = flags + ["-DMPK_DRAIN_OVERLAP"]
+        if int(os.environ.get("MPK_OPROJ_INNER_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
+        if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_INNER_TIMING"]
         if int(os.environ.get("MPK_SUBPHASE_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_SUBPHASE_TIMING"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:
@@ -365,6 +673,13 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_LDS_WEIGHTS"]
         if int(os.environ.get("W13_LDS_PREFETCH", "1")) == 1:
             flags = flags + ["-DMPK_W13_LDS_PREFETCH"]
+        if int(os.environ.get("MPK_PREFETCH_NEXT_QKV", "1")) == 1:
+            # Issue the next layer's QKV weight HBM->LDS DMA during the Phase 9
+            # layer-barrier spin, where the memory system is otherwise idle for
+            # ~7.7 us per worker per layer. 2.482 -> 2.456 ms/iter at B=1
+            # seq 512. Only applies to the fused-layer path; the LM-head
+            # variant is excluded because it uses input slots 24..27 itself.
+            flags = flags + ["-DMPK_PREFETCH_NEXT_QKV"]
         if int(os.environ.get("MPK_GAP_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_GAP_TIMING"]
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_ACCUM"]
@@ -1954,7 +2269,23 @@ class PersistentKernel:
         # Pad W13 tile space to next multiple of 240 (30 workers/XCD × 8 XCDs)
         # so every worker's first tile is W13, eliminating compute imbalance.
         # Must match PAD_MULTIPLE in gang_moe_fused_mxfp4_mi300.cuh.
-        PAD_MULTIPLE = 240
+        # W13's tile space is padded to a whole scheduling round so that every
+        # worker's first tile is W13. A round is `workers_per_xcd * 8`, so at
+        # the non-default MPK_WORKERS_PER_XCD=31 the correct multiple is 248,
+        # not 240, and 240 deals 8 W2 tiles into W13's first round.
+        #
+        # TESTED AND REJECTED, for now: MPK_MOE_PAD_ROUND=1 makes this follow
+        # the worker count. It measures ~0.01 ms better and then produces a
+        # *different generated text on roughly one run in four*, against 31
+        # consecutive identical runs at 240. The padding itself cannot change
+        # numerics -- padding tiles early-return -- so what it changes is
+        # scheduling, and the flake is a pre-existing ordering bug in the
+        # W13->W2 barrier that 240's straggler pattern was hiding. Worth
+        # chasing on its own; not worth shipping for 0.01 ms.
+        if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
+            PAD_MULTIPLE = 8 * int(_os_pad.environ.get("MPK_WORKERS_PER_XCD", "30"))
+        else:
+            PAD_MULTIPLE = 240
         total_w13_real = max_activated * w13_tiles
         total_w13_padded = ((total_w13_real + PAD_MULTIPLE - 1) // PAD_MULTIPLE) * PAD_MULTIPLE
         total_w2 = max_activated * w2_tiles
@@ -3256,7 +3587,23 @@ class PersistentKernel:
         w2_wgs = down_weight.dim(1)
         num_topk = swiglu_out.dim(1)
         max_activated = min(num_topk * batch_size, moe_num_experts)
-        PAD_MULTIPLE = 240
+        # W13's tile space is padded to a whole scheduling round so that every
+        # worker's first tile is W13. A round is `workers_per_xcd * 8`, so at
+        # the non-default MPK_WORKERS_PER_XCD=31 the correct multiple is 248,
+        # not 240, and 240 deals 8 W2 tiles into W13's first round.
+        #
+        # TESTED AND REJECTED, for now: MPK_MOE_PAD_ROUND=1 makes this follow
+        # the worker count. It measures ~0.01 ms better and then produces a
+        # *different generated text on roughly one run in four*, against 31
+        # consecutive identical runs at 240. The padding itself cannot change
+        # numerics -- padding tiles early-return -- so what it changes is
+        # scheduling, and the flake is a pre-existing ordering bug in the
+        # W13->W2 barrier that 240's straggler pattern was hiding. Worth
+        # chasing on its own; not worth shipping for 0.01 ms.
+        if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
+            PAD_MULTIPLE = 8 * int(_os_pad.environ.get("MPK_WORKERS_PER_XCD", "30"))
+        else:
+            PAD_MULTIPLE = 240
 
         # Must match gang_moe_fused_mxfp4_mi300.cuh's W13_TILES/W2_TILES. The
         # kernel drops the token axis from the tile space so that every tile it
@@ -3270,6 +3617,12 @@ class PersistentKernel:
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        import os as _os
+        if _os.environ.get("MPK_MOE_TILE_DEBUG"):
+            print(f"[MOETILE] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_wgs={w13_wgs} w2_wgs={w2_wgs} w13_real={total_w13_real} "
+                  f"w13_pad={total_w13_padded} w2={total_w2} all={total_tiles_all} "
+                  f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         # Match standalone MoE worker count (30 = 240 workers / 8 XCDs)
         workers_per_xcd = self.num_workers // 8  # 30
@@ -3432,7 +3785,23 @@ class PersistentKernel:
         w2_wgs = down_weight.dim(1)
         num_topk = swiglu_out.dim(1)
         max_activated = min(num_topk * batch_size, moe_num_experts)
-        PAD_MULTIPLE = 240
+        # W13's tile space is padded to a whole scheduling round so that every
+        # worker's first tile is W13. A round is `workers_per_xcd * 8`, so at
+        # the non-default MPK_WORKERS_PER_XCD=31 the correct multiple is 248,
+        # not 240, and 240 deals 8 W2 tiles into W13's first round.
+        #
+        # TESTED AND REJECTED, for now: MPK_MOE_PAD_ROUND=1 makes this follow
+        # the worker count. It measures ~0.01 ms better and then produces a
+        # *different generated text on roughly one run in four*, against 31
+        # consecutive identical runs at 240. The padding itself cannot change
+        # numerics -- padding tiles early-return -- so what it changes is
+        # scheduling, and the flake is a pre-existing ordering bug in the
+        # W13->W2 barrier that 240's straggler pattern was hiding. Worth
+        # chasing on its own; not worth shipping for 0.01 ms.
+        if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
+            PAD_MULTIPLE = 8 * int(_os_pad.environ.get("MPK_WORKERS_PER_XCD", "30"))
+        else:
+            PAD_MULTIPLE = 240
 
         intermediate_size = swiglu_out.dim(2)
 
@@ -3448,6 +3817,12 @@ class PersistentKernel:
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        import os as _os
+        if _os.environ.get("MPK_MOE_TILE_DEBUG"):
+            print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_real={total_w13_real} w13_pad={total_w13_padded} "
+                  f"w2={total_w2} all={total_tiles_all} "
+                  f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         workers_per_xcd = self.num_workers // 8  # 30
 
@@ -3632,7 +4007,23 @@ class PersistentKernel:
         w2_wgs = down_weight.dim(1)
         num_topk = swiglu_out.dim(1)
         max_activated = min(num_topk * batch_size, moe_num_experts)
-        PAD_MULTIPLE = 240
+        # W13's tile space is padded to a whole scheduling round so that every
+        # worker's first tile is W13. A round is `workers_per_xcd * 8`, so at
+        # the non-default MPK_WORKERS_PER_XCD=31 the correct multiple is 248,
+        # not 240, and 240 deals 8 W2 tiles into W13's first round.
+        #
+        # TESTED AND REJECTED, for now: MPK_MOE_PAD_ROUND=1 makes this follow
+        # the worker count. It measures ~0.01 ms better and then produces a
+        # *different generated text on roughly one run in four*, against 31
+        # consecutive identical runs at 240. The padding itself cannot change
+        # numerics -- padding tiles early-return -- so what it changes is
+        # scheduling, and the flake is a pre-existing ordering bug in the
+        # W13->W2 barrier that 240's straggler pattern was hiding. Worth
+        # chasing on its own; not worth shipping for 0.01 ms.
+        if int(_os_pad.environ.get("MPK_MOE_PAD_ROUND", "0")) == 1:
+            PAD_MULTIPLE = 8 * int(_os_pad.environ.get("MPK_WORKERS_PER_XCD", "30"))
+        else:
+            PAD_MULTIPLE = 240
 
         intermediate_size = swiglu_out.dim(2)
 
@@ -3648,6 +4039,12 @@ class PersistentKernel:
         total_w2 = max_activated * w2_tiles
         total_tiles_all = total_w13_padded + total_w2
         moe_total_tiles_per_xcd = (total_tiles_all + 7) // 8
+        import os as _os
+        if _os.environ.get("MPK_MOE_TILE_DEBUG"):
+            print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_real={total_w13_real} w13_pad={total_w13_padded} "
+                  f"w2={total_w2} all={total_tiles_all} "
+                  f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
 
         workers_per_xcd = self.num_workers // 8  # 30
 

@@ -527,6 +527,177 @@ __device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt(
   __syncthreads();
 }
 
+// ── Wide FP8 quant: one lane per 16 values instead of one per 32 ─────────────
+//
+// The two functions above give each active thread a 32-value serial chain and
+// derive the 128-value E8M0 domain from four consecutive lanes via __shfl. For
+// K = 2880/3072 that activates only K/32 = 90..96 of the 256 threads: the other
+// ~160 sit out the whole quant, and the ones that do work run 32 bf16->f32
+// converts, 32 fabs/fmax, and 16 cvt_scalef32 back to back.
+//
+// The wide mapping halves the per-lane chain (16 values) and doubles the active
+// lanes (K/16 = 180..192), so the same K is quantized in half the serial steps.
+// The scale domain is unchanged at 128 values -- it is now spread over eight
+// lanes instead of four, so the reduction needs one more step. Three DPP row
+// ops do it without LDS and without __shfl's lane-index arithmetic:
+// quad_perm[1,0,3,2] and quad_perm[2,3,0,1] reduce within each group of four,
+// then row_half_mirror exchanges the two already-broadcast halves. Every lane
+// in the group of eight ends up holding the full amax, so no broadcast pass is
+// needed afterwards.
+//
+// Unlike the __shfl variants there is no tail-clamping logic here: the
+// static_assert below requires K to be a whole number of 128-value domains, so
+// no group of eight ever straddles the end of the row and every lane a DPP op
+// reads is a lane that ran.
+//
+// Numerically identical to the narrow variants: same E8M0 exponent rule over
+// the same 128 values, same cvt instruction, same packing order.
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ void
+    _gang_wave_parallel_fp8_quant_wide(unsigned short const *__restrict__ src_bf16,
+                                       uint8_t *__restrict__ s_tok_fp8,
+                                       uint8_t *__restrict__ s_tok_scales) {
+  constexpr int VALUES_PER_LANE = 16;
+  constexpr int LANES_PER_SCALE = 8;
+  constexpr int VALUES_PER_SCALE = VALUES_PER_LANE * LANES_PER_SCALE; // 128
+  static_assert(REDUCTION_SIZE % VALUES_PER_SCALE == 0,
+                "wide FP8 quant needs K to be a multiple of 128");
+
+  int const tid = threadIdx.x;
+  constexpr int ACTIVE_LANES = REDUCTION_SIZE / VALUES_PER_LANE;
+  if (tid < ACTIVE_LANES) {
+    int const base = tid * VALUES_PER_LANE;
+    float vals[VALUES_PER_LANE];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; i++) {
+      vals[i] = _gang_bf16_to_float(src_bf16[base + i]);
+      amax = fmaxf(amax, fabsf(vals[i]));
+    }
+
+    // `peer` must be early-clobber: it is written before the last read of
+    // `amax` in each pair, so sharing a register with the input corrupts it.
+    float peer;
+    asm volatile("s_nop 1\n"
+                 "v_mov_b32_dpp %1, %0 quad_perm:[1,0,3,2] row_mask:0xf "
+                 "bank_mask:0xf\n"
+                 "v_max_f32 %0, %0, %1\n"
+                 "s_nop 1\n"
+                 "v_mov_b32_dpp %1, %0 quad_perm:[2,3,0,1] row_mask:0xf "
+                 "bank_mask:0xf\n"
+                 "v_max_f32 %0, %0, %1\n"
+                 "s_nop 1\n"
+                 "v_mov_b32_dpp %1, %0 row_half_mirror row_mask:0xf "
+                 "bank_mask:0xf\n"
+                 "v_max_f32 %0, %0, %1"
+                 : "+v"(amax), "=&v"(peer));
+
+    uint8_t const se = _gang_compute_e8m0_fp8(amax);
+    float scale_f = 1.0f;
+    if (se != 0) {
+      uint32_t const bits = (uint32_t)se << 23;
+      __builtin_memcpy(&scale_f, &bits, sizeof(scale_f));
+    }
+
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; i += 4) {
+      fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[i], vals[i + 1], scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[i + 2], vals[i + 3], scale_f, true);
+      __builtin_memcpy(s_tok_fp8 + base + i, &pk, sizeof(pk));
+    }
+
+    if ((tid & (LANES_PER_SCALE - 1)) == 0) {
+      s_tok_scales[tid / LANES_PER_SCALE] = se;
+    }
+  }
+  __syncthreads();
+}
+
+// NT-load counterpart of the wide mapping, for the W2 input. The SwiGLU output
+// was written by another XCD and is never reused, so the loads keep sc0/sc1/nt
+// exactly as the narrow NT variant does. Two dwordx4 cover a lane's 16 bf16.
+//
+// The "=&v" early-clobber is load-bearing for the same reason spelled out at
+// length in _gang_wave_parallel_fp8_quant_nt above: without it the allocator
+// puts the first load's destination on top of the second's address operand.
+template <int REDUCTION_SIZE>
+__device__ __forceinline__ void _gang_wave_parallel_fp8_quant_nt_wide(
+    unsigned short const *__restrict__ src_bf16,
+    uint8_t *__restrict__ s_tok_fp8,
+    uint8_t *__restrict__ s_tok_scales) {
+  constexpr int VALUES_PER_LANE = 16;
+  constexpr int LANES_PER_SCALE = 8;
+  constexpr int VALUES_PER_SCALE = VALUES_PER_LANE * LANES_PER_SCALE; // 128
+  static_assert(REDUCTION_SIZE % VALUES_PER_SCALE == 0,
+                "wide FP8 quant needs K to be a multiple of 128");
+
+  int const tid = threadIdx.x;
+  constexpr int ACTIVE_LANES = REDUCTION_SIZE / VALUES_PER_LANE;
+  if (tid < ACTIVE_LANES) {
+    int const base = tid * VALUES_PER_LANE;
+    uint32_t const *base_ptr = (uint32_t const *)(src_bf16 + base);
+    uint32_t words[8];
+    asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1 nt\n"
+                 "global_load_dwordx4 %1, %3, off sc0 sc1 nt"
+                 : "=&v"(*(i32x4_t *)&words[0]), "=&v"(*(i32x4_t *)&words[4])
+                 : "v"(base_ptr), "v"(base_ptr + 4)
+                 : "memory");
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+
+    float vals[VALUES_PER_LANE];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE / 2; i++) {
+      float const lo = _gang_bf16_to_float((unsigned short)(words[i] & 0xFFFF));
+      float const hi = _gang_bf16_to_float((unsigned short)(words[i] >> 16));
+      vals[i * 2] = lo;
+      vals[i * 2 + 1] = hi;
+      amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
+    }
+
+    float peer;
+    asm volatile("s_nop 1\n"
+                 "v_mov_b32_dpp %1, %0 quad_perm:[1,0,3,2] row_mask:0xf "
+                 "bank_mask:0xf\n"
+                 "v_max_f32 %0, %0, %1\n"
+                 "s_nop 1\n"
+                 "v_mov_b32_dpp %1, %0 quad_perm:[2,3,0,1] row_mask:0xf "
+                 "bank_mask:0xf\n"
+                 "v_max_f32 %0, %0, %1\n"
+                 "s_nop 1\n"
+                 "v_mov_b32_dpp %1, %0 row_half_mirror row_mask:0xf "
+                 "bank_mask:0xf\n"
+                 "v_max_f32 %0, %0, %1"
+                 : "+v"(amax), "=&v"(peer));
+
+    uint8_t const se = _gang_compute_e8m0_fp8(amax);
+    float scale_f = 1.0f;
+    if (se != 0) {
+      uint32_t const bits = (uint32_t)se << 23;
+      __builtin_memcpy(&scale_f, &bits, sizeof(scale_f));
+    }
+
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; i += 4) {
+      fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[i], vals[i + 1], scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[i + 2], vals[i + 3], scale_f, true);
+      __builtin_memcpy(s_tok_fp8 + base + i, &pk, sizeof(pk));
+    }
+
+    if ((tid & (LANES_PER_SCALE - 1)) == 0) {
+      s_tok_scales[tid / LANES_PER_SCALE] = se;
+    }
+  }
+  MPK_WS_WAVE_SYNC(tid >> 6);
+  __syncthreads();
+}
+
 // FP4×FP8 scaled MFMA: 16x16x128, hardware dequant + multiply
 // A = weights (FP4 E2M1), 16 bytes/lane in lower 128 bits of i32x8
 // B = tokens  (FP8 E4M3), 32 bytes/lane split across i32x8

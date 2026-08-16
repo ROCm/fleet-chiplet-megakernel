@@ -258,20 +258,17 @@ __device__ __attribute__((noinline)) void
   // they sit on all 8 XCDs while this reader is on one -- MI300/MI350 L2 is
   // not coherent across XCDs.
   //
-  // This must therefore be `sc1` (vL1 + L2). Plain `buffer_inv` drops vL1
-  // only, so if this XCD's L2 still holds the logits line from the *previous*
-  // layer -- and it does, this same tile read the same address one layer ago
-  // -- the load is served from L2 and returns the previous layer's logits.
-  // The comment here already described exactly this hazard ("fetches fresh
-  // data from HBM"); the instruction just did not implement it.
+  // This was `buffer_inv sc1` (vL1 + L2) on that reasoning; it is now plain
+  // `buffer_inv` (vL1 only). See the layer-boundary acquire at the top of
+  // gang_full_layer_fused_mi300.cuh for why vL1-only is sufficient under the
+  // Phase 9 layer barrier, and for the ablation that established it.
   //
   // A stale logit does not crash and does not look like garbage: it is a
   // real logit, so TopK returns real experts and routing stays in range. The
-  // token is simply routed through the wrong experts, and which lines survive
-  // depends on inter-XCD L2 eviction timing, so it varies run to run. That is
-  // the observed signature -- moe_routing_indices / moe_mask differ between
-  // runs while attention is bit-identical.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  // token is simply routed through the wrong experts. The signature to watch
+  // for is moe_routing_indices / moe_mask differing between runs while
+  // attention is bit-identical.
+  asm volatile("buffer_inv" ::: "memory");
 
   topk_softmax_mi300_task_impl<T,
                                /*VPT=*/8,

@@ -101,6 +101,48 @@ __device__ __forceinline__ int ld_nt_s32(int *addr) {
 #endif
 }
 
+// System-scope 32-bit load for release polls.
+//
+// `nt` is only an eviction-policy hint: it does not force the load to miss
+// vL1, so a spin built on ld_nt_s32 keeps re-reading whatever line it already
+// has until that line happens to be evicted. `sc0 sc1` is the real
+// device-coherency read, which is what a release flag written by another XCD
+// needs. Every release gate in this kernel polls this way.
+__device__ __forceinline__ int ld_sys_s32(int *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int val;
+  asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<int volatile *>(addr);
+#endif
+}
+
+// The poll idiom the release gates use. MPK_SYS_POLL_LOAD swaps every gate
+// from the `nt` hint to a true system-scope read in one place, so the two can
+// be compared without touching each site.
+// It is a level, not a boolean: 1 converts the three fused-layer gates
+// (qkv_epoch / attn_release / routing_ready / layer_release), 2 additionally
+// converts the two per-XCD barriers inside MoE and O-proj. The second set
+// polls a line its own XCD produced, so it is a weaker case for sc1 and worth
+// measuring apart from the first.
+#if defined(MPK_SYS_POLL_LOAD) && MPK_SYS_POLL_LOAD >= 1
+#define MPK_LD_GATE(p) ld_sys_s32(p)
+#else
+#define MPK_LD_GATE(p) ld_nt_s32(p)
+#endif
+
+#if defined(MPK_SYS_POLL_LOAD) && MPK_SYS_POLL_LOAD >= 2
+#define MPK_LD_GATE2(p) ld_sys_s32(p)
+#else
+#define MPK_LD_GATE2(p) ld_nt_s32(p)
+#endif
+
 // Non-temporal store (bypasses cache, writes to memory)
 __device__ __forceinline__ void st_nt_u64(unsigned long long int *addr,
                                           unsigned long long int val) {
@@ -240,6 +282,40 @@ __device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
 #else
   int old_val;
   asm volatile("atom.add.release.gpu.s32 %0,[%1],%2;"
+               : "=r"(old_val)
+               : "l"(addr), "r"(val)
+               : "memory");
+  return old_val;
+#endif
+}
+
+// XCD-local counterpart of atom_add_release_gpu_s32: `sc0` without `sc1`.
+//
+// `sc1` is what carries an atomic through the device-wide coherency point. On
+// MI350 the eight XCDs have separate, non-coherent L2s, so an `sc0 sc1` atomic
+// must leave the XCD and serialise at that point; an `sc0`-only atomic is
+// resolved in the XCD's own L2 and never crosses the die boundary. `sc0` still
+// returns the pre-op value and is still atomic against every CU on this XCD,
+// which is the whole participant set of an XCD-private barrier.
+//
+// Only correct for a counter whose writers AND readers are all on one XCD --
+// i.e. every access is indexed by that worker's own `xcd_id`. Using it on a
+// counter any other XCD touches drops the update into a private L2 where the
+// remote reader cannot see it, and the barrier hangs. `MPK_XCD_LOCAL_BARRIER`
+// gates each conversion so the pairing can be re-checked per site.
+__device__ __forceinline__ int atom_add_xcd_local_s32(int *addr, int val) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int old_val;
+  asm volatile("flat_atomic_add %0, %1, %2 sc0\n"
+               "s_waitcnt vmcnt(0) lgkmcnt(0)"
+               : "=v"(old_val)
+               : "v"(addr), "v"(val)
+               : "memory");
+  return old_val;
+#else
+  int old_val;
+  asm volatile("atom.add.release.cta.s32 %0,[%1],%2;"
                : "=r"(old_val)
                : "l"(addr), "r"(val)
                : "memory");

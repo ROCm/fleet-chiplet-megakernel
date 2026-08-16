@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 # This function returns the shared memory limit (in bytes)
@@ -61,7 +63,13 @@ def get_configurations_from_gpu(rank):
         elif sm_cnt >= 200:
             # MI350: 256 CUs, 8 XCDs (32 CUs/XCD)
             num_xcds = 8
-            worker = 240  # Same as MI300X for compatibility
+            # 240 (30/XCD) is the MI300X-compatible default. It leaves the
+            # machine short: 240 workers + 8 scheduler blocks = 248 of the 256
+            # CUs, so 8 CUs sit empty for the whole run. MPK_WORKERS_PER_XCD
+            # raises it -- 31 fills the idle CU, 32 would need the schedulers
+            # to share a CU with a worker.
+            workers_per_xcd = int(os.environ.get("MPK_WORKERS_PER_XCD", "30"))
+            worker = num_xcds * workers_per_xcd
             scheduler = num_xcds
             worker = min(worker, MAX_NUM_WORKERS)
             print(f"AMD MI350 config: workers={worker}, schedulers={scheduler}, "

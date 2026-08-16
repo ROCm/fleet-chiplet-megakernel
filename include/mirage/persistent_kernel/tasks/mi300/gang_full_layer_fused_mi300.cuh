@@ -74,6 +74,35 @@ static constexpr int FULL_LAYER_LAYER_BARRIER_SLOT(int num_reqs) {
   return FULL_LAYER_CHUNK_BARRIER_SLOT + 128 * num_reqs;
 }
 
+// MPK_XCD_LOCAL_BARRIER: drop `sc1` from the arrival atomics of the barriers
+// whose counters never leave one XCD.
+//
+// Fleet routes every barrier arrival in this file through
+// atom_add_release_gpu_s32, which is `flat_atomic_add ... sc0 sc1`. On MI350
+// `sc1` is what forces the operation out of the XCD's private L2 and through
+// the device-wide coherency point. For a counter that another XCD reads --
+// attn_global, layer_global -- that is exactly right and must stay. For a
+// counter indexed by the arriving worker's own `xcd_id` on both the write and
+// the read side, it is a cross-die round trip taken to publish a value no
+// other die will ever load.
+//
+// Three of this file's barriers are in the second category (each verified by
+// grepping every access to the counter):
+//
+//   Phase 2  input_ptrs[7][xcd_id] and qkv_epoch[xcd_id * 16]
+//   Phase 4  chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16]
+//   Phase 9  layer_local[xcd_id * 16]   (layer_global stays sc0 sc1)
+//
+// The releases are untouched: those really are cross-XCD and keep their st_wt
+// fan-out. This changes only how the arrival is counted, not who waits for
+// what, so the ordering argument at each site is unaffected.
+#ifdef MPK_XCD_LOCAL_BARRIER
+#define MPK_XCD_LOCAL_ATOM_ADD(addr, val) atom_add_xcd_local_s32((addr), (val))
+#else
+#define MPK_XCD_LOCAL_ATOM_ADD(addr, val)                                      \
+  atom_add_release_gpu_s32((addr), (val))
+#endif
+
 template <int QKV_BATCH_SIZE,
           int QKV_OUTPUT_PER_WG,
           int QKV_REDUCTION_SIZE,
@@ -161,34 +190,62 @@ __device__ __noinline__ void
   int const attn_req = xcd_rank / NUM_KV_CHUNKS;
   int const attn_chunk = xcd_rank % NUM_KV_CHUNKS;
 
-  // Layer-boundary ACQUIRE. This must be `sc1` (vL1 + L2), not a plain
-  // `buffer_inv` (vL1 only).
+  // Layer-boundary ACQUIRE for moe_workspace_f32. Plain `buffer_inv` (vL1
+  // only) -- NOT `buffer_inv sc1`.
   //
-  // The comment this replaces described the world before moe_ws_layout.cuh:
-  // the MoE W2 epilogue accumulated into the workspace with `atomicAdd`, which
-  // reaches the device-coherent point implicitly, so a consumer only had to
-  // drop its own vL1 to see it. Those atomics are now plain write-through
-  // stores (`st_wt_f32x4`, sc0 sc1), which bypass L2 and land in HBM. The
-  // acquire side was never upgraded to match.
+  // ── Why vL1-only is sufficient here, and how that was established ────────
   //
-  // The consequence is a stale read, and it is confined to exactly the shape
-  // observed: the W2 tile that wrote a given (token, slot, hidden) element runs
-  // on a different XCD than the QKV prologue that reads it, and MI300/MI350 L2
-  // is not coherent across XCDs. If this reader's L2 still holds the line from
-  // *last* layer's read of the same address, `buffer_inv` leaves it there and
-  // the load is served from L2 -- returning the previous layer's value. Whether
-  // a given line survives depends on inter-XCD L2 eviction timing, so it varies
-  // run to run.
+  // This site and four others (see the back-references below) were `sc1`
+  // (vL1 + L2). The reasoning was: W2 writes the workspace with `st_wt_f32x4`
+  // (sc0 sc1), bypassing L2 into HBM; the producing tile is on a different
+  // XCD; MI300/MI350 L2 is not coherent across XCDs; so a line this XCD still
+  // holds from last layer's read of the same address would be served stale
+  // out of L2.
   //
-  // That is why layer 0 is bit-identical across runs while layers 1..35 all
-  // differ: on layer 0 the workspace was just zeroed and there is no prior
-  // value for a stale line to hold. Layer 1 is the first layer with a real
-  // predecessor, and it is the first to diverge.
+  // Every step of that is true about the *hardware*. What it omits is the
+  // Phase 9 layer barrier at the end of this function, which did not exist
+  // when these were written. Phase 9 is a global all-XCD rendezvous whose
+  // release path drains stores (`s_waitcnt vmcnt(0)`) and fans out
+  // write-through flags. No worker can reach this line for layer N+1 until
+  // every worker has passed Phase 9 for layer N, by which point the producers'
+  // write-through stores have retired to HBM. The stale-L2 window the `sc1`
+  // was closing is a window Phase 9 already closes.
   //
-  // Cost is one L2 invalidate per worker per layer, which is what an acquire
-  // against a write-through producer actually costs. The Phase 9 barrier
-  // already documents this instruction as being here; it just was not.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  // Measured, not argued from the memory model. Ablated at HEAD across five
+  // configurations, every run compared bitwise against an unablated reference:
+  //
+  //   B=8 x 5 runs, B=1 x 3 runs, B=16 x 3 runs, 36 layers, 200 positions
+  //     -> all KV caches and all output tokens bitwise identical, and
+  //        bitwise identical to the `sc1` build. Same arithmetic, not merely
+  //        a different-but-stable answer.
+  //   `--max-layers 2` x 4 runs at B=8 -> also identical. This one is the
+  //        load-bearing check: a 36-layer run streams ~1.7 GB of MoE weights
+  //        through a ~4 MB L2 per layer, so a stale line might simply be
+  //        evicted by capacity pressure rather than by any guarantee, which
+  //        would make the result accidental. At 2 layers that pressure is
+  //        largely gone and a stale line can survive. It still matched.
+  //
+  // Cost recovered: 3.455 -> 2.527 ms/iter at B=1, seq 512 (-27%). The five
+  // sites are not individually free (0.03-0.27 ms each) but they overlap; the
+  // combined figure is the one that matters.
+  //
+  // ── What would invalidate this ───────────────────────────────────────────
+  //
+  // The dependency is on Phase 9. If the layer barrier is weakened, moved
+  // above a workspace consumer, or removed, these five sites must go back to
+  // `sc1` -- or the ablation must be re-run. Phase 9 is not optional for its
+  // own sake either: removing it fails this same gate immediately and loudly
+  // (all 72 KV tensors differ, output tokens differ, every run).
+  //
+  // Note this is an ablation result, not a proof. It says removal is harmless
+  // across every gate above; it does not derive safety from the memory model.
+  //
+  // MPK_W2_CONSUMER_GATE is exactly the "weakened" case this warning names, so
+  // under that flag the acquire moves to the consumer gate in Phase 1 and goes
+  // back to `sc1`. See the gate site for the full argument.
+#ifndef MPK_W2_CONSUMER_GATE
+  asm volatile("buffer_inv" ::: "memory");
+#endif
 
   // NOTE: the layer counter that the MoE W13->W2 barrier derives its release
   // value from is published further down, once qkv_epoch_expected is known.
@@ -342,7 +399,21 @@ __device__ __noinline__ void
         qkv_n_wgs_per_xcd,
         kv_stride,
         q_ws_stride,
-        xcd_rank);
+        xcd_rank,
+#ifdef MPK_PREFETCH_NEXT_QKV
+        // Skip the DMA: the previous layer's Phase 9 already staged these
+        // exact bytes into this exact LDS region during its barrier spin.
+        // input_ptrs[25] is this layer's own weight pointer when the previous
+        // layer prefetched and null otherwise (it is null on layer 0, which
+        // has no previous layer), so this reduces to "was there a producer".
+        // The equality check is not redundant: it is the one place the two
+        // ends of the hand-off can disagree, and a mismatch here would be
+        // silent wrong numerics rather than a fault.
+        /*weights_preloaded=*/input_ptrs[25] == input_ptrs[4]
+#else
+        /*weights_preloaded=*/false
+#endif
+    );
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
@@ -373,7 +444,14 @@ __device__ __noinline__ void
   if (xcd_rank < qkv_epoch_participants) {
     __shared__ int s_prev;
     if (tid == 0) {
-      s_prev = atom_add_release_gpu_s32(
+      // Both counters on this barrier are XCD-private: the arrival line is
+      // `[xcd_id]` and the epoch line is `[xcd_id * 16]`, and the only reader
+      // of either -- the poll below -- indexes by its own `xcd_id` too. No
+      // other XCD ever touches these lines, so the `sc1` that pushed each
+      // atomic out to the device coherency point was buying visibility to
+      // nobody. `sc0` keeps them in this XCD's L2 where every participant
+      // already is.
+      s_prev = MPK_XCD_LOCAL_ATOM_ADD(
           &static_cast<int *>(input_ptrs[7])[xcd_id], 1);
     }
     __syncthreads();
@@ -381,7 +459,7 @@ __device__ __noinline__ void
     if ((s_prev % qkv_epoch_participants) == qkv_epoch_participants - 1) {
       // Last worker to arrive: bump epoch (no reset needed — modular check)
       if (tid == 0) {
-        atom_add_release_gpu_s32(&qkv_epoch[xcd_id * 16], 1);
+        MPK_XCD_LOCAL_ATOM_ADD(&qkv_epoch[xcd_id * 16], 1);
       }
     }
 
@@ -398,9 +476,17 @@ __device__ __noinline__ void
         _spins++;
         __builtin_amdgcn_s_sleep(1);
       }
+#ifndef MPK_QKV_GATE_NO_AGENT_FENCE
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
     }
     __syncthreads();
+    // The acquire for this barrier is the vL1 invalidate below, not the
+    // agent-scope fence above. Both counters here are XCD-private and written
+    // with sc0 (MPK_XCD_LOCAL_ATOM_ADD), so the fence's `buffer_inv sc1` is
+    // over-scoped as well as redundant: it throws away this XCD's whole L2 --
+    // including the weights the next phase is about to read -- to acquire a
+    // line that never left it. MPK_QKV_GATE_NO_AGENT_FENCE drops it.
     asm volatile("buffer_inv" ::: "memory");
   }
 
@@ -530,7 +616,10 @@ __device__ __noinline__ void
       __syncthreads();
       __shared__ int s_chunk_prev;
       if (tid == 0) {
-        s_chunk_prev = atom_add_release_gpu_s32(
+        // XCD-private counter: the line is indexed by this worker's own
+        // `xcd_id`, and its only reader is the `% NUM_KV_CHUNKS` test right
+        // below on the same XCD. See MPK_XCD_LOCAL_BARRIER at the top.
+        s_chunk_prev = MPK_XCD_LOCAL_ATOM_ADD(
             &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16], 1);
       }
       __syncthreads();
@@ -599,6 +688,15 @@ __device__ __noinline__ void
         // QKV work, i.e. wg_idx >= total_qkv_tiles_per_xcd.
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __syncthreads();
+        // TESTED AND NOT ADOPTED: the lane-parallel release fan-out that pays
+        // off at the Phase 9 and O-proj barriers (readfirstlane the epoch out
+        // of tid 0, then `if (tid < 8) st_wt_u32`) measures 2.047 here against
+        // 2.038 for this serial loop. The transform's premise -- that 239
+        // workgroups are already spinning on flags this one lane has not
+        // written -- does not hold at this barrier: only the workers with a
+        // Phase 1 or attention role join Phase 6, they arrive spread out rather
+        // than pre-parked, and this releaser is not on anyone's critical path
+        // for the seven store-issues it saves. Left serial.
         if (tid == 0) {
           // attn_global is bumped exactly ATTN_ARRIVALS times per layer: the
           // modulus above fires once per (XCD, request), and every empty-work
@@ -755,32 +853,54 @@ __device__ __noinline__ void
   {
     int _obs;
     int _spins = 0;
-    while ((_obs = ld_nt_s32(&attn_release[xcd_id * 16])) <
-           attn_release_expected) {
-      MPK_WS_WAIT_TICK(_obs, _spins);
-      _spins++;
-      __builtin_amdgcn_s_sleep(1);
-    }
+#ifdef MPK_NARROW_GATE_POLL
+    // One thread polls for the block instead of all 256.
+    //
+    // Every thread reading the same release line turns one arrival into 240
+    // (30 workers x 4 waves x 2 sites) coherent reads of a single cacheline
+    // per layer, and at `sc0 sc1` each of those is a real trip to the
+    // coherency point rather than a vL1 hit. The line is contended precisely
+    // when it is about to be written, which is the worst case for it.
+    //
+    // Free here: the block already rendezvouses immediately below (the
+    // `__syncthreads()` that publishes the Phase 6 weight DMA), so the other
+    // 255 threads gain nothing from having observed the flag themselves --
+    // they cannot pass that barrier until tid 0 has. The `buffer_inv` is
+    // still executed by every wave, which is what the acquire needs, since
+    // buffer_inv is per-wave.
+    if (tid == 0)
+#endif
+      while ((_obs = MPK_LD_GATE(&attn_release[xcd_id * 16])) <
+             attn_release_expected) {
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        _spins++;
+        __builtin_amdgcn_s_sleep(1);
+      }
+#ifdef MPK_NARROW_GATE_POLL
+    // Order the other waves behind tid 0's observation *before* they run the
+    // acquire below: a wave that invalidated early would just refill vL1 with
+    // pre-release lines and the acquire would be void.
+    __syncthreads();
+#endif
   }
-  // Cross-XCD ACQUIRE for attn_out. Must be `sc1` (vL1 + L2).
+  // Cross-XCD ACQUIRE for attn_out. Plain `buffer_inv` (vL1 only), not `sc1`.
   //
   // The producer is the Phase 5 merge, which writes attn_out with st_wt
   // (WRITE_THROUGH=true) -- sc0 sc1, bypassing L2 and landing in HBM. The
   // consumer is Phase 7's O-proj on a *different* XCD (the merge that produced
   // a given kv_head runs on the XCD that owns it), and MI300/MI350 L2 is not
-  // coherent across XCDs.
+  // coherent across XCDs. This was `sc1` on that reasoning; see the
+  // layer-boundary acquire at the top of this function for why vL1-only is
+  // sufficient given the Phase 9 barrier, and for the ablation that
+  // established it.
   //
-  // Plain `buffer_inv` drops vL1 only. This same worker read the same attn_out
-  // addresses one layer ago, so its L2 still holds those lines -- and the load
-  // is served from L2, returning the *previous* layer's attention output.
-  // Which lines survive depends on inter-XCD L2 eviction timing, hence run to
-  // run variation.
+  // Note the ordering below is unchanged and still required: the Phase 6
+  // weight DMA is drained BEFORE the invalidate, not after.
   //
-  // This is distinct from the Phase 5 barrier's `buffer_inv` (no sc1), which
-  // is correct as written: that one is intra-XCD (the chunk barrier is
-  // per-XCD), so the producers share this L2 and invalidating it would discard
-  // their partials. Here the producer is remote and the invalidate is required.
-  // Retire the Phase 6 weight DMA BEFORE invalidating, not after.
+  // This is distinct from the Phase 5 barrier's `buffer_inv`, which is correct
+  // for a different reason: that one is intra-XCD (the chunk barrier is
+  // per-XCD), so the producers share this L2 and an `sc1` there would discard
+  // their partials -- it must never become `sc1`, Phase 9 or no Phase 9.
   //
   // buffer_load_lds retires on vmcnt, and it was issued above so it overlaps
   // the release poll. Draining first keeps `buffer_inv sc1` -- which drops L2,
@@ -798,7 +918,7 @@ __device__ __noinline__ void
   // and neither an extra invalidate nor a system-scope fence on either side
   // changed anything.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-  asm volatile("buffer_inv sc1" ::: "memory");
+  asm volatile("buffer_inv" ::: "memory");
   // Publish the Phase 6 O-proj weight DMA to the whole block.
   //
   // buffer_load_lds retires on vmcnt, and the drain above is per-wave -- it
@@ -888,26 +1008,34 @@ __device__ __noinline__ void
     MPK_WS_WAIT_BEGIN(75, routing_expected);
     int _obs;
     int _spins = 0;
-    while ((_obs = ld_nt_s32(my_release)) < routing_expected) {
-      MPK_WS_WAIT_TICK(_obs, _spins);
-      _spins++;
-      __builtin_amdgcn_s_sleep(1);
-    }
+#ifdef MPK_NARROW_GATE_POLL
+    // Same one-poller-per-block argument as the Phase 6 gate above; see there.
+    // This site has no rendezvous of its own -- the comment above the phase
+    // says so -- so the narrowing has to supply one.
+    if (tid == 0)
+#endif
+      while ((_obs = MPK_LD_GATE(my_release)) < routing_expected) {
+        MPK_WS_WAIT_TICK(_obs, _spins);
+        _spins++;
+        __builtin_amdgcn_s_sleep(1);
+      }
+#ifdef MPK_NARROW_GATE_POLL
+    __syncthreads();
+#endif
   }
-  // Cross-XCD ACQUIRE for the routing data. Must be `sc1` (vL1 + L2).
+  // Cross-XCD ACQUIRE for the routing data. Plain `buffer_inv`, not `sc1`.
   //
   // What this poll gates is active_expert_ids / routing_indices / topk_weight,
   // all written by the single TopK worker with st_wt (sc0 sc1) -- straight to
-  // HBM, bypassing L2. Every MoE worker on the other seven XCDs reads them
-  // here, and L2 is not coherent across XCDs, so dropping vL1 alone leaves
-  // this XCD's L2 free to serve the previous layer's routing.
+  // HBM, bypassing L2 -- and read by every MoE worker on the other seven XCDs.
+  // This was `sc1` on that reasoning; see the layer-boundary acquire at the
+  // top of this function for why vL1-only suffices under the Phase 9 barrier.
   //
-  // A stale read here is not a crash: last layer's expert ids and route values
-  // are all in range, so the token is quietly routed through the wrong
-  // experts. That is the same failure the release-side fence in
-  // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh describes -- this is its
-  // acquire-side counterpart, which was never written.
-  asm volatile("buffer_inv sc1" ::: "memory");
+  // Worth noting what a stale read here would look like, since it is not a
+  // crash: last layer's expert ids and route values are all in range, so the
+  // token is quietly routed through the wrong experts. That failure mode is
+  // what the ablation's bitwise token comparison would catch -- and did not.
+  asm volatile("buffer_inv" ::: "memory");
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
@@ -986,6 +1114,20 @@ __device__ __noinline__ void
   // simply did not wait.
 #ifndef MPK_NO_LAYER_BARRIER
   {
+    // Who joins the release wait. Default: everyone, a full gang rendezvous.
+    // Under MPK_W2_CONSUMER_GATE: only the workers that read
+    // moe_workspace_f32 in the next layer's Phase 1, which is the same
+    // `xcd_rank < total_qkv_tiles_per_xcd` set that guards the reader itself
+    // (xcd_rank is fixed for the life of the task, so this worker is the one
+    // that will do that read). Everyone still *arrives* either way -- the
+    // arrival tree is what publishes the release, so narrowing it would
+    // deadlock; this narrows only the wait.
+#ifdef MPK_W2_CONSUMER_GATE
+    bool const MPK_LAYER_GATE_JOINS = (xcd_rank < total_qkv_tiles_per_xcd);
+#else
+    bool const MPK_LAYER_GATE_JOINS = true;
+#endif
+
     // Two-level rendezvous. Slot layout, one 16-int line each:
     //   layer_local[x]   : arrivals from XCD x's own workers_per_xcd workers
     //   layer_global[0]  : one arrival per XCD, bumped by that XCD's last
@@ -1006,14 +1148,87 @@ __device__ __noinline__ void
     int *layer_global = layer_local + 8 * 16;
     int *layer_release = layer_global + 16;
 
+    // ── Who *arrives* ────────────────────────────────────────────────────
+    //
+    // Default: all workers_per_xcd. The barrier exists to order this layer's
+    // W2 stores against the next layer's read of moe_workspace_f32, and only
+    // the workers that ran a W2 tile have any such store -- so the rest are
+    // reporting the retirement of nothing, while the release cannot fire
+    // until they do. At the shipped geometry that is 8 of 31 workers per XCD
+    // whose arrival is pure latency: moe_total_tiles_per_xcd is 53, the loop
+    // strides by workers_per_xcd, so ranks 0..21 get a second tile (global
+    // tile >= TOTAL_W13, i.e. a W2 tile) and ranks 22..30 get only their
+    // first, a W13 tile.
+    //
+    // MPK_W2_ONLY_ARRIVE narrows the arrival to exactly those producers,
+    // guarding on `xcd_rank < moe_total_tiles_per_xcd - workers_per_xcd`.
+    //
+    // The non-producers stay ordered for the same reason the non-consumers
+    // do under MPK_W2_CONSUMER_GATE: they cannot outrun the next layer's
+    // Phase 6, whose release requires every XCD's attention chunks, which
+    // requires QKV, which requires this release. What they lose is only the
+    // right to *delay* it.
+    //
+    // The count must be computed exactly as Phase 8's loop bound is, or the
+    // local counter's modulus stops being exact and the release never fires.
+    int const n_w2_workers_per_xcd =
+        moe_total_tiles_per_xcd > workers_per_xcd
+            ? moe_total_tiles_per_xcd - workers_per_xcd
+            : moe_total_tiles_per_xcd;
+#ifdef MPK_W2_ONLY_ARRIVE
+    int const arrivers_per_xcd = n_w2_workers_per_xcd;
+    bool const MPK_LAYER_GATE_ARRIVES = (xcd_rank < arrivers_per_xcd);
+#else
+    int const arrivers_per_xcd = workers_per_xcd;
+    bool const MPK_LAYER_GATE_ARRIVES = true;
+#endif
+    (void)n_w2_workers_per_xcd;
+
     // Every worker must retire its own MoE stores before its arrival is
     // published: vmcnt is per-wave, so neither the release on the atomic nor
     // s_barrier covers the other waves. Drain, then barrier, then arrive --
     // the same ordering the other release sites in this file use.
+    //
+    // MPK_DRAIN_OVERLAP moves that drain to *after* the arrival, so the store
+    // retirement overlaps the barrier spin instead of preceding it. It is a
+    // measurement arm, not a shipping mode: see the correctness note at the
+    // post-arrival site for why it may not be enabled by default.
+    //
+    // TESTED AND REJECTED: dropping this pair on the grounds that Phase 8
+    // already ends in the same two instructions is *wrong*, and wrong in the
+    // silent way. Under it one run in eight produced different generated text
+    // at identical flags. The argument fails on the W13 arm: its arrival
+    // block runs after Phase 8's `__syncthreads()`, and the last arrival's
+    // eight-slot `st_wt_u32` release fan-out is a store issued past it -- so
+    // the block is neither drained nor reconverged on that path. The
+    // `goto w13_arrive` empty-slot path skips Phase 8's drain outright. The
+    // pair stays unconditional.
+#ifdef MPK_DRAIN_STATS
+    unsigned long long _dr0 = __builtin_amdgcn_s_memrealtime();
+#endif
+#ifndef MPK_DRAIN_OVERLAP
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+#ifdef MPK_DRAIN_STATS
+    unsigned long long _dr1 = __builtin_amdgcn_s_memrealtime();
+#endif
     __syncthreads();
+#ifdef MPK_DRAIN_STATS
+    unsigned long long _dr2 = __builtin_amdgcn_s_memrealtime();
+#endif
 
-    if (tid == 0) {
+    // Carries "I am the releaser, publish epoch N" from lane 0 out to lanes
+    // 1..7 of the same wave; see the fan-out below. Zero means not the
+    // releaser, which is unambiguous since a real epoch is >= 8.
+    int lean_rel_epoch = 0;
+
+    __shared__ int s_layer_rel_prev;
+#ifdef MPK_DRAIN_STATS
+    __shared__ unsigned long long s_dr3;
+    __shared__ bool s_was_last_local;
+#endif
+
+    if (tid == 0 && MPK_LAYER_GATE_ARRIVES) {
       // Snapshot this XCD's release line *before* arriving. Layer L's release
       // is written only after all 240 workers arrive, this one included, so
       // at this instant the line still holds layer L-1's value -- and it
@@ -1027,7 +1242,15 @@ __device__ __noinline__ void
       // (pc_iter is __shared__). A layer-derived target would make every
       // relaunch after a warmup wait on a value already in the past and hang
       // all 240 workers. Same reasoning as the attn_global bump above.
-      int const rel_prev = ld_nt_s32(&layer_release[xcd_id * 16]);
+      //
+      // MPK_LEAN_ARRIVE removes this load, and the `local_expected` load
+      // below, from the critical path. Both are inferable from the value the
+      // arrival atomic already returns, so the arrival becomes a single
+      // read-modify-write with nothing in front of it -- see the derivation
+      // at the post-atomic site.
+#ifndef MPK_LEAN_ARRIVE
+      s_layer_rel_prev = ld_nt_s32(&layer_release[xcd_id * 16]);
+#endif
 
       // The two arrival targets are division snapshots for the same reason,
       // and are race-free because the barrier each belongs to bounds it.
@@ -1039,42 +1262,361 @@ __device__ __noinline__ void
       // L+1's arrival without layer L's release, which needs this very
       // arrival (so v < workers_per_xcd * (L+1)). For the global counter the
       // same argument runs one level up, over the 8 XCDs.
+#ifndef MPK_LEAN_ARRIVE
       int local_expected =
           (__atomic_load_n(&layer_local[xcd_id * 16], __ATOMIC_RELAXED) /
-               workers_per_xcd +
+               arrivers_per_xcd +
            1) *
-          workers_per_xcd;
+          arrivers_per_xcd;
+#endif
+      // XCD-private: written and read only at `[xcd_id * 16]`. This is the
+      // hottest arrival in the layer -- 30 workers per XCD, 240 per GPU, every
+      // layer -- and under the default `sc1` every one of them is a cross-die
+      // round trip to a coherency point no other XCD reads through.
+      // `layer_global` below is the level that *is* cross-XCD and keeps its
+      // `sc0 sc1`, so the two-level tree still publishes exactly as before.
+      //
+      // The drain that makes this arrival a release is the explicit
+      // `s_waitcnt vmcnt(0)` above, not the atomic's scope, so weakening the
+      // atomic does not weaken the release: the XCD leader elected here still
+      // executes `atom_add_release_gpu_s32(layer_global)` after every one of
+      // its XCD's workers has both drained and arrived.
       int local_prev =
-          atom_add_release_gpu_s32(&layer_local[xcd_id * 16], 1);
+          MPK_XCD_LOCAL_ATOM_ADD(&layer_local[xcd_id * 16], 1);
 
+#ifdef MPK_LEAN_ARRIVE
+      // ── Everything the two removed loads carried, recovered from local_prev
+      //
+      // Both counters are monotonic and never reset, and the layer barrier
+      // bounds them: no worker reaches layer L+1's arrival without layer L's
+      // release, which needs every layer-L arrival. So when this worker
+      // arrives at layer L the local counter holds
+      // `(L-1) * workers_per_xcd + p` with `0 <= p < workers_per_xcd`, and
+      // one integer division of the value the atomic already returned splits
+      // it into both halves that were previously loaded separately:
+      //
+      //   p == workers_per_xcd - 1        <=>  this is the XCD's last arrival
+      //   local_prev / workers_per_xcd    ==   L - 1
+      //
+      // The release value written for layer L is `8 * L` (the global counter
+      // takes exactly one arrival per XCD per layer), so the previous
+      // release -- what the wait below must beat -- is `8 * (L - 1)`. That is
+      // still derived from the counter block rather than from
+      // task_layer_idx, so it keeps the relaunch-safety the snapshot had:
+      // task_layer_idx restarts at 0 on every dispatch, this does not.
+      //
+      // Net effect: the arrival is one read-modify-write with no dependent
+      // load in front of it.
+      int const lean_layers_done = local_prev / arrivers_per_xcd;
+      s_layer_rel_prev = 8 * lean_layers_done;
+      bool const lean_is_last_local =
+          (local_prev - lean_layers_done * arrivers_per_xcd) ==
+          arrivers_per_xcd - 1;
+#ifdef MPK_DRAIN_STATS
+      s_was_last_local = lean_is_last_local;
+#endif
+      if (lean_is_last_local) {
+        int global_prev = atom_add_release_gpu_s32(layer_global, 1);
+        // Same identity one level up: the counter takes 8 arrivals per layer,
+        // so the last XCD is the one whose pre-increment value is 7 mod 8 and
+        // the release it publishes is its post-increment value.
+        int global_expected = global_prev + 1;
+        bool const is_last_global = (global_prev & 7) == 7;
+#else
+#ifdef MPK_DRAIN_STATS
+      s_was_last_local = (local_prev == local_expected - 1);
+#endif
       if (local_prev == local_expected - 1) {
         // Last worker on this XCD: this XCD's MoE stores are all retired, so
         // publish one arrival on behalf of the whole die.
         int global_expected =
             (__atomic_load_n(layer_global, __ATOMIC_RELAXED) / 8 + 1) * 8;
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
-        if (global_prev == global_expected - 1) {
+        bool const is_last_global = (global_prev == global_expected - 1);
+#endif
+#ifdef MPK_DRAIN_STATS
+        if (is_last_global) {
+          atomicAdd(&g_last_xcd[xcd_id], 1ULL);
+        }
+#endif
+        if (is_last_global) {
           // Last XCD overall: fan the release out with st_wt (write-through,
           // bypasses L2) so every worker polls a line it already owns.
+          //
+          // The eight stores are handed to lanes 0..7 below rather than
+          // issued here, so they become one instruction instead of eight
+          // serial ones from the single most critical lane on the GPU -- 239
+          // workgroups are spinning on flags it has not written yet, and the
+          // eighth XCD would otherwise be released seven store-issues after
+          // the first. The drain that has to precede the flags still runs
+          // here, on the lane that owns the stores being advertised.
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-          for (int x = 0; x < 8; x++) {
-            st_wt_u32((void *)&layer_release[x * 16],
-                      (unsigned)global_expected);
-          }
-          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          lean_rel_epoch = global_expected;
         }
       }
+#ifdef MPK_DRAIN_STATS
+      s_dr3 = __builtin_amdgcn_s_memrealtime();
+#endif
+    }
 
-      while (ld_nt_s32(&layer_release[xcd_id * 16]) <= rel_prev) {
+    // Lanes 0..7 of wave 0 publish the eight release flags in one wave
+    // instruction. readfirstlane rather than LDS: the arrival above runs with
+    // only lane 0 active, so once the `if` closes every lane reads lane 0's
+    // value from the first active lane.
+    lean_rel_epoch = __builtin_amdgcn_readfirstlane(lean_rel_epoch);
+    if (lean_rel_epoch != 0) {
+      if (tid < 8) {
+        st_wt_u32((void *)&layer_release[tid * 16], (unsigned)lean_rel_epoch);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+
+#ifdef MPK_DRAIN_OVERLAP
+    // ── Drain overlapped with the barrier spin (measurement arm) ──────────
+    //
+    // The arrival above has already been published; this retires the stores
+    // it was meant to advertise. Every thread drains, because vmcnt is
+    // per-wave and the arrival speaks for all four waves of this block.
+    //
+    // CORRECTNESS: this is deliberately weaker than the default. The arrival
+    // *is* the statement "my W2 stores are visible", so publishing it before
+    // the drain lets another XCD observe the arrival, clear the barrier, and
+    // read a moe_workspace_f32 slot whose store has not landed -- the exact
+    // race Phase 9 exists to close. It survives in practice only because the
+    // release still has to cross all 8 XCDs, which takes far longer than the
+    // drain; that is a timing accident, not a guarantee. Kept as a flag so
+    // the ceiling of the idea is a measured number rather than an argument.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+
+#ifdef MPK_PREFETCH_NEXT_QKV
+    // ── Next layer's QKV weight DMA, issued into the barrier spin ────────
+    //
+    // Measured, this barrier costs mean_wait=7683 ns per worker per layer
+    // (n=4.39M): 0.277 ms of the 2.49 ms iteration spent waiting on the
+    // slowest XCD. The wait is a scheduling cost, not a bandwidth one, so
+    // weight traffic issued here is close to free -- the memory system is
+    // otherwise idle for those microseconds.
+    //
+    // Placement is load-bearing on both sides:
+    //
+    //   * AFTER the arrival block above, not before it. The last-arriving
+    //     XCD's leader executes `s_waitcnt vmcnt(0)` in its release fan-out,
+    //     which drains *all* of this wave's outstanding vector memory --
+    //     including a prefetch issued earlier. That worker is by definition
+    //     the critical path, so it would stall on its own DMA and delay the
+    //     release for all 240. Issuing after the fan-out keeps it off.
+    //
+    //   * AFTER the `__syncthreads()` that opens this block. buffer_load_lds
+    //     retires under vmcnt while MoE's ds_writes retire under lgkmcnt, so
+    //     the two are not ordered against each other; a Phase 8 LDS write
+    //     still in flight could land on top of the staged weights. The
+    //     s_barrier inside __syncthreads drains lgkmcnt first.
+    //
+    // Only Phase-1 workers stage anything: the rest have no QKV tile next
+    // layer and their LDS would just be dirtied for nothing. tile_idx there
+    // is xcd_rank, and xcd_rank is fixed for the life of the task, so this
+    // worker prefetches exactly the tile it will itself execute.
+    //
+    // input_ptrs[24] is null on the last layer of the iteration -- see the
+    // publish site in persistent_kernel.cuh for why nothing may be staged
+    // across the iteration boundary.
+    if (input_ptrs[24] != nullptr && xcd_rank < total_qkv_tiles_per_xcd
+#ifdef MPK_QKV_PF_WAVE_SPLIT
+        // ── Keep the poller's wave out of the pre-gate DMA ─────────────────
+        //
+        // tid 0 is the only thread that spins on `layer_release` below, and it
+        // is the thread whose latency the whole workgroup then waits on. Its
+        // wave issues 1/4 of this prefetch: NUM_WAVES buffer_load_lds per lane,
+        // all still outstanding when it enters the spin. The poll is itself a
+        // vector load, so it queues behind them in the same wave's memory
+        // pipeline -- the poller pays its own prefetch's latency on every
+        // iteration of the loop, and the release it is looking for is seen late
+        // by exactly the amount.
+        //
+        // Waves 1..3 have nothing to do during the spin, so they keep their
+        // three quarters here; wave 0's quarter is re-issued after the gate,
+        // where it costs the poller nothing. The split is clean because
+        // qkv_prefetch_weights_lds partitions LDS by warp_id (warp_id * 1024)
+        // and each wave's buffer_load_lds writes only its own 1 KiB block, so
+        // deferring one wave defers exactly one quarter of the staged tile and
+        // touches nobody else's bytes.
+        && tid >= 64
+#endif
+    ) {
+      qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                               QKV_OUTPUT_PER_WG,
+                               QKV_REDUCTION_SIZE>(
+          input_ptrs[24], qkv_n_wgs_per_xcd, xcd_rank);
+    }
+#endif
+
+    // ── MPK_W2_CONSUMER_GATE: publish-and-go ─────────────────────────────
+    //
+    // Under this flag the arrival tree above still runs -- every worker still
+    // reports in, the last XCD still fans out `layer_release` -- but nobody
+    // waits here. The wait moves to the one place that needs it: the Phase 1
+    // workspace consumer of the *next* layer.
+    //
+    // Why the rendezvous was never the requirement. The hazard Phase 9 exists
+    // to close is exactly one edge: the next layer's QKV prologue
+    // (gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel) reads
+    // moe_workspace_f32, which this layer's W2 epilogue writes. That reader is
+    // already guarded by `xcd_rank < total_qkv_tiles_per_xcd`, so only
+    // total_qkv_tiles_per_xcd of the workers_per_xcd workers on each XCD ever
+    // touch the buffer. Ordering the other ~20 against a buffer they never
+    // load is synchronization the dependency does not ask for, and the
+    // measured rank spin cliff is that surplus made visible: ranks 0-22 spin
+    // ~5.1 us, ranks 23-29 ~25.2 us.
+    //
+    // What keeps the non-consumers in line is Phase 6. Its attn_release poll
+    // is joined by all workers_per_xcd and its release cannot be published
+    // until every XCD's attention chunks have arrived, which requires QKV,
+    // which requires this release. So the non-consumers are still ordered --
+    // transitively, at a gate they already had to pay -- rather than at a
+    // second gate of their own.
+    //
+    // This is the "weakened" case the note at the top of this file warns
+    // about, so the layer-boundary acquire moves with the wait and returns to
+    // `sc1`: the five sc1 drops in 981e124 were justified by "no worker
+    // reaches layer N+1 until every worker passed Phase 9 for layer N", and
+    // that premise is exactly what this flag retires. Only the consumers pay
+    // the sc1 now, which is what makes it affordable.
+    //
+    // The wait stays here rather than moving to the top of the next layer:
+    // xcd_rank is fixed for the life of the task (same property the QKV
+    // prefetch relies on), so the worker that waits at the end of layer N is
+    // exactly the worker that reads the workspace in layer N+1. Keeping it
+    // here also keeps `s_layer_rel_prev` valid -- it is a snapshot taken in
+    // this invocation, and there is no cross-invocation channel to carry a
+    // release target through.
+    if (tid == 0 && MPK_LAYER_GATE_JOINS) {
+      while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
         __builtin_amdgcn_s_sleep(1);
       }
+#ifndef MPK_W2_CONSUMER_GATE
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
+#ifdef MPK_W2_CONSUMER_GATE
+      // The agent-scope acquire fence is gone from this arm on purpose: it
+      // lowers to `buffer_inv sc1`, the exact instruction below, so the two
+      // together emitted a full L2 invalidate twice back to back (visible in
+      // ATT as the adjacent pair at the gate's exit). The asm carries a
+      // "memory" clobber, so the compiler-side ordering the fence provided is
+      // unchanged; the bare asm with no fence is what this gate wants.
+      //
+      // Layer-boundary acquire, relocated from the top of the layer and
+      // promoted back to `sc1` (vL1 + L2). W2 writes the workspace
+      // write-through from another XCD and MI350 L2 is not coherent across
+      // XCDs, so a line this XCD still holds from last layer's read of the
+      // same address would otherwise be served stale. The default build gets
+      // away with a vL1-only `buffer_inv` because the full rendezvous
+      // guarantees every producer retired before any consumer proceeds; this
+      // arm retires that guarantee, so the L2 invalidate comes back. Only the
+      // gate-joining workers execute it.
+      asm volatile("buffer_inv sc1" ::: "memory");
+#endif
+#ifdef MPK_DRAIN_STATS
+      unsigned long long _dr4 = __builtin_amdgcn_s_memrealtime();
+      // s_memrealtime ticks at 100 MHz -> 10 ns per tick.
+      unsigned long long drain = (_dr1 - _dr0) * 10;
+      unsigned long long sync = (_dr2 - _dr1) * 10;
+      unsigned long long arrive = (s_dr3 - _dr2) * 10;
+      unsigned long long spin = (_dr4 - s_dr3) * 10;
+      unsigned long long n = atomicAdd(&g_drain_n, 1ULL);
+      atomicAdd(&g_drain_sum, drain);
+      atomicAdd(&g_sync_sum, sync);
+      atomicAdd(&g_arrive_sum, arrive);
+      atomicAdd(&g_spin_sum, spin);
+      atomicAdd(&g_spin_xcd[xcd_id], spin);
+      atomicAdd(&g_n_xcd[xcd_id], 1ULL);
+      if (xcd_rank < 64) {
+        atomicAdd(&g_spin_rank[xcd_rank], spin);
+        atomicAdd(&g_n_rank[xcd_rank], 1ULL);
+      }
+      if (s_was_last_local) {
+        atomicAdd(&g_spin_lastlocal, spin);
+        atomicAdd(&g_n_lastlocal, 1ULL);
+      }
+      if (n % 100000 == 0 && n > 0) {
+        printf("[DRAIN] n=%llu drain=%llu sync=%llu arrive=%llu spin=%llu "
+               "tot=%llu\n",
+               n,
+               g_drain_sum / n,
+               g_sync_sum / n,
+               g_arrive_sum / n,
+               g_spin_sum / n,
+               (g_drain_sum + g_sync_sum + g_arrive_sum + g_spin_sum) / n);
+        printf("[XCDSPIN] %llu %llu %llu %llu %llu %llu %llu %llu | last "
+               "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+               g_spin_xcd[0] / (g_n_xcd[0] ? g_n_xcd[0] : 1),
+               g_spin_xcd[1] / (g_n_xcd[1] ? g_n_xcd[1] : 1),
+               g_spin_xcd[2] / (g_n_xcd[2] ? g_n_xcd[2] : 1),
+               g_spin_xcd[3] / (g_n_xcd[3] ? g_n_xcd[3] : 1),
+               g_spin_xcd[4] / (g_n_xcd[4] ? g_n_xcd[4] : 1),
+               g_spin_xcd[5] / (g_n_xcd[5] ? g_n_xcd[5] : 1),
+               g_spin_xcd[6] / (g_n_xcd[6] ? g_n_xcd[6] : 1),
+               g_spin_xcd[7] / (g_n_xcd[7] ? g_n_xcd[7] : 1),
+               g_last_xcd[0],
+               g_last_xcd[1],
+               g_last_xcd[2],
+               g_last_xcd[3],
+               g_last_xcd[4],
+               g_last_xcd[5],
+               g_last_xcd[6],
+               g_last_xcd[7]);
+        printf("[INTER] lastlocal_spin=%llu n=%llu\n",
+               g_spin_lastlocal / (g_n_lastlocal ? g_n_lastlocal : 1),
+               g_n_lastlocal);
+        for (int r0 = 0; r0 < 30; r0 += 10) {
+          printf("[RANK%02d] %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+                 "%llu\n",
+                 r0,
+                 g_spin_rank[r0 + 0] / (g_n_rank[r0 + 0] ? g_n_rank[r0 + 0] : 1),
+                 g_spin_rank[r0 + 1] / (g_n_rank[r0 + 1] ? g_n_rank[r0 + 1] : 1),
+                 g_spin_rank[r0 + 2] / (g_n_rank[r0 + 2] ? g_n_rank[r0 + 2] : 1),
+                 g_spin_rank[r0 + 3] / (g_n_rank[r0 + 3] ? g_n_rank[r0 + 3] : 1),
+                 g_spin_rank[r0 + 4] / (g_n_rank[r0 + 4] ? g_n_rank[r0 + 4] : 1),
+                 g_spin_rank[r0 + 5] / (g_n_rank[r0 + 5] ? g_n_rank[r0 + 5] : 1),
+                 g_spin_rank[r0 + 6] / (g_n_rank[r0 + 6] ? g_n_rank[r0 + 6] : 1),
+                 g_spin_rank[r0 + 7] / (g_n_rank[r0 + 7] ? g_n_rank[r0 + 7] : 1),
+                 g_spin_rank[r0 + 8] / (g_n_rank[r0 + 8] ? g_n_rank[r0 + 8] : 1),
+                 g_spin_rank[r0 + 9] / (g_n_rank[r0 + 9] ? g_n_rank[r0 + 9] : 1));
+        }
+      }
+#endif
     }
+    // Broadcasts the gate to the other 255 threads: only tid 0 waited (and,
+    // under MPK_W2_CONSUMER_GATE, only on gate-joining workers), so this is
+    // what makes the release visible to the whole block.
     __syncthreads();
-    // No invalidate here: the task body re-entered for the next layer opens
-    // with `buffer_inv sc1` (the layer-boundary acquire near the top of this
-    // function), which is the same instruction against the same data. Issuing
-    // it twice per layer costs a full L2 invalidate for nothing.
+
+#if defined(MPK_PREFETCH_NEXT_QKV) && defined(MPK_QKV_PF_WAVE_SPLIT)
+    // Wave 0's deferred quarter of the staged tile. It has to be issued here,
+    // past the gate, because that is the whole point of deferring it: before
+    // the gate it would sit in tid 0's memory pipeline ahead of the poll.
+    //
+    // Issuing it *after* the __syncthreads rather than inside the `tid == 0`
+    // block is required -- buffer_load_lds is per lane, so all 64 lanes of
+    // wave 0 must run it to fill the 1 KiB block, and only lane 0 was inside.
+    //
+    // It is still a prefetch: the consumer in the next layer drains with
+    // `s_waitcnt vmcnt(0)` before its first ds_read, so the DMA has the whole
+    // rest of this layer's epilogue plus the next layer's prologue to land.
+    if (input_ptrs[24] != nullptr && xcd_rank < total_qkv_tiles_per_xcd &&
+        tid < 64) {
+      qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                               QKV_OUTPUT_PER_WG,
+                               QKV_REDUCTION_SIZE>(
+          input_ptrs[24], qkv_n_wgs_per_xcd, xcd_rank);
+    }
+#endif
+    // No invalidate here: in the default build the task body re-entered for
+    // the next layer opens with the layer-boundary acquire near the top of
+    // this function, which is the same instruction against the same data.
+    // Issuing it twice per layer costs a full L2 invalidate for nothing.
+    // Under MPK_W2_CONSUMER_GATE that top-of-layer site is compiled out and
+    // the acquire is the `buffer_inv sc1` above, inside the gate.
   }
 #endif
 

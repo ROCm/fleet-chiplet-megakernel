@@ -40,6 +40,121 @@
 
 namespace kernel {
 
+// ── Shared QKV weight-tile LDS geometry ──────────────────────────────────
+//
+// The DMA below writes where these say and the MFMA in the kvupd kernel reads
+// where these say. They were previously spelled out once, inline; they are now
+// shared with the fused layer's Phase 9 prefetch, which stages the NEXT
+// layer's weights into the same region during the layer-barrier spin. A
+// mismatch between the two callers is silent wrong numerics, so both derive
+// every offset from these functions and neither open-codes any of it.
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+struct QkvWeightLds {
+  static constexpr int NUM_WAVES = 4;
+  static constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  static constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  static constexpr int WG_BYTES = WG_DATA_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+
+  static constexpr int MFMA_N = 16;
+  static constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  static constexpr int MFMA_ITERS = REDUCTION_SIZE / 128;
+  static constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  static constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  static constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  static constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
+
+  static constexpr int TILE_ROWS = 16;
+  static constexpr int TILE_DATA = TILE_ROWS * (REDUCTION_SIZE / 2);
+  static constexpr int TILE_SCALE = TILE_ROWS * NUM_BLOCKS_32;
+  static constexpr int N16_DATA = TILE_DATA / 16;
+  static constexpr int LPT = (N16_DATA + 255) / 256;
+  static constexpr int TILE_DATA_PADDED = LPT * 256 * 16;
+#ifdef MPK_QKV_PREFETCH_SCALES
+  // buffer_load_lds advances the LDS pointer in 1 KiB wave chunks, so a scale
+  // region that is DMA'd rather than scattered has to be a whole number of
+  // them. Costs (pad - TILE_SCALE) bytes of LDS per tile and buys the removal
+  // of the VGPR round trip in Phase B.
+  static constexpr int TILE_SCALE_PADDED = ((TILE_SCALE + 1023) / 1024) * 1024;
+  static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE_PADDED;
+#else
+  static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE;
+#endif
+
+  // Weight region base within the task's dynamic LDS.
+  static constexpr int W_OFF = ((TOK_REGION + SC_REGION + 15) / 16) * 16;
+  // Total LDS the weight staging occupies, from the base of _rnlm_smem.
+  static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
+};
+
+// Issue the HBM->LDS weight DMA for one QKV tile. Does NOT wait: the caller
+// drains with `s_waitcnt vmcnt(0)` once it has something else to do first.
+// `tile_idx` selects the weight group exactly as the kvupd kernel does, so a
+// worker prefetching for the next layer must pass the tile index it will
+// itself execute there (xcd_rank is stable across layers).
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+__device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
+                                                         int n_wgs_per_xcd,
+                                                         int tile_idx) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  extern __shared__ char _rnlm_smem[];
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const wg_idx = tile_idx % n_wgs_per_xcd;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  i32x4_t rsrc = make_w_buffer_rsrc(
+      W, static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
+  uint32_t wg_voff = static_cast<uint32_t>(wg_idx) * G::WG_BYTES;
+
+  auto *lds_warp_base =
+      (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
+                                                     G::W_OFF +
+                                                     warp_id * 1024);
+#pragma unroll
+  for (int t = 0; t < G::NUM_WAVES; t++) {
+#pragma unroll
+    for (int j = 0; j < G::LPT; j++) {
+      int idx = tid + j * 256;
+      int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
+      uint32_t voff =
+          wg_voff +
+          static_cast<uint32_t>(t * G::TILE_ROWS * (REDUCTION_SIZE / 2)) +
+          static_cast<uint32_t>(clamped * 16);
+      auto *lds_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                           lds_warp_base +
+                       t * G::TILE_BYTES + j * 4096);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+    }
+#ifdef MPK_QKV_PREFETCH_SCALES
+    // Stage this tile's block scales straight to LDS as well, so Phase B has
+    // nothing left to do but drain. The default path instead reads the scales
+    // into VGPRs after the data drain and scatters them, which costs a second
+    // HBM round trip serialized behind the first. Only waves 0-1 participate:
+    // TILE_SCALE is 16*NUM_BLOCKS_32 bytes, well under the 2 KiB two waves
+    // move, and every lane past that would just re-fetch the clamped tail.
+    if (warp_id < 2) {
+      constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
+      int const vector = warp_id * 64 + (tid & 63);
+      int const clamped = vector < SCALE_VECTORS ? vector : SCALE_VECTORS - 1;
+      uint32_t voff = wg_voff + static_cast<uint32_t>(G::WG_DATA_BYTES) +
+                      static_cast<uint32_t>(t * G::TILE_SCALE) +
+                      static_cast<uint32_t>(clamped * 16);
+      auto *lds_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                           lds_warp_base +
+                       t * G::TILE_BYTES + G::TILE_DATA_PADDED);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+    }
+#endif
+  }
+}
+
 // Fused RMSNorm + MXFP4 Gang Linear + Bias.
 //
 // Template params:
@@ -2155,7 +2270,12 @@ __device__ __noinline__ void
         int n_wgs_per_xcd,
         int kv_stride,
         int q_ws_stride,
-        int tile_idx) {
+        int tile_idx,
+        // True when the fused layer already staged this exact tile's weights
+        // into this exact LDS region during the previous layer's Phase 9
+        // barrier spin. Defaulted so the standalone generated variant and the
+        // layer-0 / world_size>1 caller need no change.
+        bool weights_preloaded = false) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0);
   static_assert(REDUCTION_SIZE % 128 == 0);
@@ -2225,56 +2345,43 @@ __device__ __noinline__ void
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
   // ── Phase A: Issue HBM→LDS weight prefetch BEFORE RMSNorm ─────────────
-  constexpr int QKV_TILE_ROWS = 16;
-  constexpr int QKV_TILE_DATA = QKV_TILE_ROWS * (REDUCTION_SIZE / 2);
-  constexpr int QKV_TILE_SCALE = QKV_TILE_ROWS * NUM_BLOCKS_32;
-  constexpr int qkv_n16_data = QKV_TILE_DATA / 16;
-  constexpr int QKV_LPT = (qkv_n16_data + 255) / 256;
-  constexpr int QKV_TILE_DATA_PADDED = QKV_LPT * 256 * 16;
-  constexpr int QKV_TILE_BYTES = QKV_TILE_DATA_PADDED + QKV_TILE_SCALE;
+  //
+  // The geometry lives in QkvWeightLds so the fused layer's Phase 9 prefetch
+  // (which stages the NEXT layer's weights into this same region during the
+  // barrier spin) cannot drift from what the MFMA below reads.
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  constexpr int QKV_TILE_SCALE = G::TILE_SCALE;
+  constexpr int QKV_TILE_DATA_PADDED = G::TILE_DATA_PADDED;
+  constexpr int QKV_TILE_BYTES = G::TILE_BYTES;
+  constexpr int QKV_LDS_OFF = G::W_OFF;
 
-  uint32_t qkv_buf_range = static_cast<uint32_t>(n_wgs_per_xcd) * WG_BYTES;
-  // Single definition of the weight-tile base. Phase A (the DMA) and the MFMA
-  // loop below used to spell this out twice as QKV_LDS_OFF_A / QKV_LDS_OFF_M;
-  // if the two ever disagreed the DMA would write where one says and the MFMA
-  // read where the other says, with no crash and no diagnostic.
-  constexpr int QKV_LDS_OFF = ((TOK_REGION + SC_REGION + 15) / 16) * 16;
   // The real budget is 155 KB minus AMD's 3 KB reserve minus the layer-index
   // word the fused wrapper parks at the top; the old 155*1024 bound was
   // permissive by 3 KB.
-  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES <=
-                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
-                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+  static_assert(G::W_END <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                 "QKV LDS weights exceed MI350X LDS budget");
+  // The shared geometry must agree with this kernel's own token-region math,
+  // or the DMA writes where one says and the MFMA reads where the other says.
+  static_assert(G::TOK_REGION == TOK_REGION && G::SC_REGION == SC_REGION,
+                "QkvWeightLds token region disagrees with kvupd kernel");
   // RoPE reuses the token region, which is dead once the MFMA has retired.
   static_assert(TOK_ROWS * HEAD_DIM * 2 <= TOK_REGION,
                 "packed RoPE scratch must fit in the dead token region");
   uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
 
-  {
-    i32x4_t qkv_rsrc = make_w_buffer_rsrc(W, qkv_buf_range);
-    uint32_t qkv_wg_voff = static_cast<uint32_t>(wg_idx) * WG_BYTES;
-    auto *qkv_lds_warp_base = (__attribute__((address_space(3)))
-                               uint32_t *)(qkv_lds_w + warp_id * 1024);
-#pragma unroll
-    for (int t = 0; t < NUM_WAVES; t++) {
-#pragma unroll
-      for (int j = 0; j < QKV_LPT; j++) {
-        int idx = tid + j * 256;
-        int clamped = idx < qkv_n16_data ? idx : qkv_n16_data - 1;
-        uint32_t voff =
-            qkv_wg_voff +
-            static_cast<uint32_t>(t * QKV_TILE_ROWS * (REDUCTION_SIZE / 2)) +
-            static_cast<uint32_t>(clamped * 16);
-        auto *lds_dst = (__attribute__((address_space(3)))
-                         uint32_t *)((uint8_t __attribute__((address_space(
-                                         3))) *)qkv_lds_warp_base +
-                                     t * QKV_TILE_BYTES + j * 4096);
-        __llvm_amdgcn_raw_buffer_load_lds(
-            qkv_rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
-      }
-    }
+  // MPK_ABLATE_QKV_DMA: timing-only upper bound on what any prefetch hoist
+  // could recover. Skipping the load leaves garbage weights in LDS, so the
+  // numerics are meaningless -- but it is safe to run (the garbage stays in
+  // the data path; every address comes from host-built index tables) and the
+  // wall clock is the honest ceiling for hiding this DMA perfectly.
+  // Measured 2.422 vs 2.486/2.491 ms at B=1 seq512: 64 us, 2.6%.
+#ifndef MPK_ABLATE_QKV_DMA
+  if (!weights_preloaded) {
+    qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+        weight_ptr, n_wgs_per_xcd, tile_idx);
   }
+#endif
 
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
@@ -2434,6 +2541,7 @@ __device__ __noinline__ void
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 
+#ifndef MPK_QKV_PREFETCH_SCALES
     constexpr int QKV_SC_DW4_PER_TILE = QKV_TILE_SCALE / 16;
     constexpr int QKV_TOTAL_SC_DW4 = (QKV_TILE_SCALE * NUM_WAVES) / 16;
     constexpr int QKV_SC_LPT = (QKV_TOTAL_SC_DW4 + 255) / 256;
@@ -2463,6 +2571,7 @@ __device__ __noinline__ void
         }
       }
     }
+#endif // MPK_QKV_PREFETCH_SCALES
 
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __syncthreads();

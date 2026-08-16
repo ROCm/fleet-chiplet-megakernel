@@ -51,6 +51,29 @@ __device__ int g_subphase_active;
 __device__ unsigned long long g_subphase_scratch[8];
 #endif
 
+#ifdef MPK_DRAIN_STATS
+// Phase 9 barrier segment attribution: how much of the layer-boundary wait is
+// store drain (s_waitcnt vmcnt(0)) vs rendezvous vs spinning on other XCDs.
+__device__ unsigned long long g_drain_n;
+__device__ unsigned long long g_drain_sum;
+__device__ unsigned long long g_sync_sum;
+__device__ unsigned long long g_arrive_sum;
+__device__ unsigned long long g_spin_sum;
+// Per-XCD spin, to tell a fixed slow die from a rotating one.
+__device__ unsigned long long g_spin_xcd[8];
+__device__ unsigned long long g_n_xcd[8];
+// How often each XCD is the last one to arrive (i.e. is the critical path).
+__device__ unsigned long long g_last_xcd[8];
+// Spin of each XCD's *last local* arriver: that worker has no intra-XCD wait
+// left, so its spin is purely the inter-XCD component.
+__device__ unsigned long long g_spin_lastlocal;
+__device__ unsigned long long g_n_lastlocal;
+// Spin by xcd_rank: the intra-XCD load-imbalance map. Rank determines role
+// (QKV/attn vs MoE tiles), so this says which workers idle and which straggle.
+__device__ unsigned long long g_spin_rank[64];
+__device__ unsigned long long g_n_rank[64];
+#endif
+
 #ifdef MPK_FUSED_PHASE_TIMING
 // Fused O-proj+MoE phase timing: [0]=oproj_ns, [1]=poll_ns, [2]=moe_ns,
 // [3]=count
@@ -196,8 +219,16 @@ __device__ __forceinline__ void
     (void)a3;
   }
 }
+// Gated on MPK_WORKER_STATE like MPK_WS_MARK / MPK_WS_WAIT_BEGIN below. This
+// one was left ungated: the runtime `g_ws_dev != nullptr` test still emits the
+// global load and the branch with tracing off, and these sites sit on the MoE
+// W13->W2 barrier path.
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAIT_AUX(a0, a1, a2, a3)                                        \
   mpk_ws_wait_aux((a0), (a1), (a2), (a3), tid)
+#else
+#define MPK_WS_WAIT_AUX(a0, a1, a2, a3) ((void)0)
+#endif
 
 // Per-wave exit mark for a *thread-divergent* poll.
 //
@@ -230,8 +261,16 @@ __device__ __forceinline__ void mpk_ws_wave_clear(int wave, int tid) {
     __atomic_fetch_and(&b[3], ~(1 << (wave & 31)), __ATOMIC_RELAXED);
   }
 }
+// Same gate. These two are the costliest of the ungated set: with tracing off
+// they still put two dependent global loads and a device-scope atomic between
+// clearing the W13->W2 barrier and the first W2 instruction.
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAVE_EXIT(wave) mpk_ws_wave_exit((wave), tid)
 #define MPK_WS_WAVE_CLEAR(wave) mpk_ws_wave_clear((wave), tid)
+#else
+#define MPK_WS_WAVE_EXIT(wave) ((void)0)
+#define MPK_WS_WAVE_CLEAR(wave) ((void)0)
+#endif
 
 // Same per-wave mask, one slot over, for arrival at a __syncthreads.
 //
@@ -245,7 +284,11 @@ __device__ __forceinline__ void mpk_ws_wave_sync(int wave, int tid) {
     __atomic_fetch_or(&b[2], 1 << (wave & 31), __ATOMIC_RELAXED);
   }
 }
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAVE_SYNC(wave) mpk_ws_wave_sync((wave), tid)
+#else
+#define MPK_WS_WAVE_SYNC(wave) ((void)0)
+#endif
 
 // Straight-line progress mark, for code that is not a spin loop.
 //
@@ -2111,6 +2154,66 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 }
                 __syncthreads();
               }
+
+#ifdef MPK_PREFETCH_NEXT_QKV
+              // Publish the NEXT layer's QKV weight pointer so the fused task
+              // can start its HBM->LDS weight DMA during the Phase 9 barrier
+              // spin instead of at the top of the next layer.
+              //
+              // Slot 24 is free for the plain fused variant: it declares 24
+              // inputs (0..23) and the tables are sized to the TaskDesc
+              // capacity of 28, so the host-side null validator already treats
+              // >= 24 as legitimately unused.
+              //
+              // It is NOT free for the LM-head variant, which really does use
+              // 24..27 -- so the whole publish is gated on the task type. That
+              // variant is dead today (an early return at the top of
+              // gang_full_layer_with_lmhead_fused_mi300.cuh) but FUSE_TAIL is
+              // meant to come back, and writing nullptr over a live input
+              // would fault rather than fail a gate. The gate costs the
+              // prefetch entirely under FUSE_TAIL, which is the right trade
+              // until someone gives that variant a slot of its own.
+              //
+              // Set outside the `ml > 0` guard above: layer 0 skips the table
+              // copy (its pointers come from the precomputed dispatch buffer),
+              // but it still needs to know layer 1's weights.
+              //
+              // Null on the last layer. The next reader would be layer 0 of
+              // the following decode iteration, and tasks that use LDS run in
+              // between (the MoE residual-add tail), so anything staged there
+              // would be clobbered before it could be read.
+              // Two slots, because the producer and the consumer need
+              // different facts at different times and neither can derive the
+              // other's:
+              //
+              //   [24] the NEXT layer's QKV weight pointer -- what Phase 9 of
+              //        *this* layer issues its DMA against. Null on the last
+              //        layer.
+              //   [25] non-null iff the PREVIOUS layer's Phase 9 staged this
+              //        layer's weights -- what Phase 1 keys its skip off. That
+              //        is exactly `ml > 0`, and the value stored is this
+              //        layer's own weight pointer so the two ends can be
+              //        checked against each other.
+              //
+              // Carrying [25] as __shared__ state across the ml loop instead
+              // would look cheaper but has no correct initial value: the very
+              // first layer of the very first iteration would read whatever
+              // was in LDS. Recomputing it host-side from `ml` is stateless.
+              if (threadIdx.x == 0 &&
+                  task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300) {
+                int const next_ml = ml + 1;
+                task_desc->input_ptrs[24] =
+                    (next_ml < config.ml_num_layers)
+                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
+                                                 next_ml) *
+                                                    MAX_INPUTS_PER_TASK +
+                                                4]
+                        : nullptr;
+                task_desc->input_ptrs[25] =
+                    (ml > 0) ? task_desc->input_ptrs[4] : nullptr;
+              }
+              __syncthreads();
+#endif
 #ifdef MPK_NIL_TRIPWIRE
               // Breadcrumb: which layer this worker reached, and whether the
               // pointer set it is about to hand to the kernel contains a null.
@@ -2200,9 +2303,24 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // __syncthreads ensures all threads finish before task_desc is
               // modified for the next layer.
               if (ml < config.ml_num_layers - 1) {
+#ifdef MPK_INTERLAYER_FENCE
+                // Retired by default: this threadfence_gpu had nothing to
+                // flush. It was a buffer_wbl2 sc1 + drain meant to push the
+                // layer's output out of L2, but the layer's output never
+                // enters L2 -- the MoE W2 epilogue writes the workspace with
+                // st_wt_f32x4 (sc0 sc1, write-through straight to HBM), and
+                // Phase 9 then drains with an explicit s_waitcnt vmcnt(0)
+                // before its release atomic. The next layer's consumers still
+                // do their own buffer_inv behind the QKV epoch poll, so the
+                // acquire side is unchanged.
+                //
+                // Measured 2.215 -> 2.204 (n=3 each, 16 tokens) and
+                // 2.233 -> 2.202 (n=6, 128 tokens), output byte-identical
+                // across eight runs. Define MPK_INTERLAYER_FENCE to restore.
                 if (threadIdx.x == 0 && block_xcd_local_rank == 0) {
                   threadfence_gpu();
                 }
+#endif
                 __syncthreads();
               }
             }

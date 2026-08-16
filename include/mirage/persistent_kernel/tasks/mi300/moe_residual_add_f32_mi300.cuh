@@ -67,11 +67,20 @@ __device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
   // this task reads the identical buffer every iteration -- is served straight
   // out of L2 and returns the previous iteration's value.
   //
-  // A plain `buffer_inv` would not do: it drops vL1 only, and vL1 is not where
-  // the stale line lives. Which lines survive depends on inter-XCD L2 eviction
-  // timing, so the corruption is nondeterministic run to run and looks like a
-  // plausible float, never garbage -- the same signature the prologue's comment
-  // describes.
+  // Kept as `sc1` while the five sites in the fused-layer path were reduced to
+  // plain `buffer_inv`. Two reasons, and the first is the real one:
+  //
+  //   * This consumer sits OUTSIDE the fused layer, at the iteration boundary
+  //     (it consumes layer 35 and the next reader is layer 0's QKV prologue on
+  //     the following iteration). The Phase 9 layer barrier is what makes
+  //     vL1-only sufficient for the in-layer sites, and it does not order this
+  //     one. The argument that retires `sc1` there does not reach here.
+  //   * It is free anyway: ablating it measured 3.456 vs 3.455 ms, i.e. within
+  //     run-to-run noise. This task runs once per iteration, not once per
+  //     layer per worker, so there is nothing to recover.
+  //
+  // See the layer-boundary acquire at the top of
+  // gang_full_layer_fused_mi300.cuh for the full ablation.
   asm volatile("buffer_inv sc1" ::: "memory");
 
   for (int row = 0; row < BATCH_SIZE; ++row) {

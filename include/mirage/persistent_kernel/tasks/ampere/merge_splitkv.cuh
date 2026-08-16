@@ -222,6 +222,130 @@ __device__ __forceinline__ void
 
     // Compute all VAL_PER_THREAD dimensions
     float out_vals[VAL_PER_THREAD];
+#ifdef MPK_MERGE_KV_OUTER
+    // KV outer, dim inner. The running softmax state (m_global, d_global, and
+    // both rescale weights) depends only on kv_idx, but the dim-outer nest
+    // below recomputes all of it -- and reloads the same lse element -- once
+    // per dim. Interchanging hoists it: per kv step this does one lse load and
+    // two exp2 instead of VAL_PER_THREAD of each.
+    //
+    // No float reassociation: each accumulator sees the same operations in the
+    // same order over kv. It is NOT bit-identical in practice, though -- the
+    // generated text hash changes (88861a4763c0 -> 2051938f7067, stable across
+    // runs). Naming `w_prev`/`w_other` once instead of recomputing ptx_exp2 per
+    // dim changes which multiply-adds the backend contracts into v_fma, and a
+    // contracted FMA keeps a wider intermediate than mul-then-add.
+    //
+    // Sized, not assumed: on wikitext-2 (4 x 1024-token slices) the two flags
+    // together move mean NLL by +0.033 +/- 0.008, sign-flipping across slices.
+    // The yardstick is CK_FMHA_NUM_KV_CHUNKS 8->16, which is *exact* in real
+    // arithmetic (same keys, merge is an identity) and so measures pure FP
+    // reordering: it moves NLL by -0.107 +/- 0.012, 2.6x further. This is
+    // inside the decode path's own FP-sensitivity band. See
+    // docs/mpk/splitkv-merge.md.
+    //
+    // The redundancy this removes is CSE the compiler cannot do itself,
+    // because the loads sit between the repeated computations and it cannot
+    // prove lse_ptr is unaliased by the stores.
+    //
+    // The o loads also become adjacent within a kv step (o_base + 0..
+    // VAL_PER_THREAD-1) so they merge into one wide load. In the dim-outer
+    // form each lane's o access was 4 B at an 8 B stride -- half of every
+    // cache line fetched and discarded, twice.
+    {
+      float m_global = -inf;
+      float d_global = 1.f;
+      float o_global[VAL_PER_THREAD];
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        o_global[i] = 0.f;
+      }
+#ifdef MPK_MERGE_TWO_PASS
+      // Two-pass form. The running-max version below is a serial chain: step
+      // k's `o` accumulate needs w_prev, which needs m_global from step k-1,
+      // so the 31 chunk loads cannot overlap -- the loop runs at one
+      // load->exp2->fma latency per chunk with the memory system idle.
+      //
+      // Pass 1 reads only the 31 lse values (one dword each, and this thread's
+      // whole set is contiguous in kv) and reduces them to m_max. Pass 2 then
+      // has every weight known up front, so all 31 `o` loads are independent
+      // and issue back-to-back into one long vmcnt queue, and every accumulate
+      // is a plain FMA against a constant weight -- no rescale, no chain.
+      //
+      // Mathematically the standard flash-attention final-merge form: with
+      // m_max fixed, sum_k exp2(m_k - m_max) * o_k over a common base rather
+      // than rescaling a running base. Same result in exact arithmetic and
+      // strictly better conditioned (every weight is <= 1); it differs from
+      // the running form in the low bits for the same FMA-contraction reason
+      // noted above.
+      float lse_log2[NUM_KV_CHUNKS];
+      int const lse_base0 = head_idx +
+                            (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                            lse_kv_offset;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        lse_log2[kv_idx] = lse_ptr[lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV] *
+                           1.44269504088896340736f;
+      }
+      float m_max = -inf;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        m_max = max(m_max, lse_log2[kv_idx]);
+      }
+      float d_sum = 0.f;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w;
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_ptr[o_base + i] * w;
+        }
+      }
+      m_global = m_max;
+      d_global = d_sum;
+#else
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float m_prev = m_global, d_prev = d_global;
+
+        int lse_linear = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
+                         (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                         lse_kv_offset;
+        int o_base = lse_linear * HEAD_DIM + thread_in_group * VAL_PER_THREAD;
+
+        // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
+        float other_m = lse_ptr[lse_linear] * 1.44269504088896340736f,
+              other_d = 1;
+        m_global = max(m_prev, other_m);
+        float const w_prev = ptx_exp2(m_prev - m_global);
+        float const w_other = ptx_exp2(other_m - m_global);
+        d_global = d_prev * w_prev + other_d * w_other;
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] = o_global[i] * w_prev + o_ptr[o_base + i] * w_other;
+        }
+      }
+#endif
+      float corr = 1.0f;
+      if (sinks_ptr != nullptr) {
+        float lse_log2 = m_global + ptx_log2(d_global);
+        float diff = sink_val_log2 - lse_log2;
+        corr = __fdividef(1.0f, 1.0f + ptx_exp2(diff));
+      }
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        float out_f = __fdividef(o_global[i], d_global);
+        if (sinks_ptr != nullptr) {
+          out_f *= corr;
+        }
+        out_vals[i] = out_f;
+      }
+    }
+#else
 #pragma unroll
     for (int i = 0; i < VAL_PER_THREAD; ++i) {
       float m_global = -inf;
@@ -257,6 +381,7 @@ __device__ __forceinline__ void
       }
       out_vals[i] = out_f;
     }
+#endif
 
     // Write output: either write-through (st_wt) or regular global store
     if constexpr (WRITE_THROUGH) {
