@@ -49,7 +49,10 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
     """
     if corpus == "wikitext2":
         from datasets import load_dataset
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        # "Salesforce/wikitext" is the canonical namespaced mirror; the bare
+        # "wikitext" id no longer resolves under datasets>=4 / hub>=1.
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1",
+                          split="test")
         lines = [
             t.strip() for t in ds["text"]
             if t.strip() and not t.strip().startswith("=")
@@ -59,7 +62,16 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
         with open(corpus, "r", encoding="utf-8") as f:
             text = f.read()
     ids = tokenizer(text, return_tensors=None, add_special_tokens=False)["input_ids"]
-    return ids[:max_tokens]
+    # PPL_SLICE=k scores tokens [k*max_tokens, (k+1)*max_tokens) instead of the
+    # first window. Headline PPL on one wikitext window sign-flips between
+    # windows (103..282 across slices), so a single slice cannot size a change;
+    # this is how you get the >=4 independent slices a paired t-test needs.
+    _slice = int(os.environ.get("PPL_SLICE", "0"))
+    off = _slice * max_tokens
+    assert off < len(ids), (
+        f"PPL_SLICE={_slice} starts at token {off} but the corpus only has "
+        f"{len(ids)} tokens")
+    return ids[off:off + max_tokens]
 
 
 def report_perplexity(mode: str, nll_sum: float, n_scored: int, args,
@@ -202,6 +214,47 @@ def pad_weight_3d(w: torch.Tensor, target_dim1: int = None, target_dim2: int = N
 _FP4_MAGNITUDES = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
+
+
+def fp8_act_roundtrip(x: torch.Tensor) -> torch.Tensor:
+    """Round-trip activations through MPK's FP8 activation quantizer.
+
+    MPK feeds the f8f6f4 MFMA quantized *activations*, not just quantized
+    weights: every W13/W2/QKV/O-proj/LM-head GEMM runs
+    `_gang_wave_parallel_fp8_quant` on its input row first
+    (gang_moe_linear_mxfp4_mi300.cuh). A weights-only reference therefore
+    still differs from MPK on every GEMM in the model, which makes it the
+    wrong baseline for an accuracy comparison.
+
+    Mirrors _gang_compute_e8m0_fp8 + __builtin_amdgcn_cvt_scalef32_pk_fp8_f32:
+    per 32-element block along the reduction axis, an E8M0 (power-of-two)
+    scale is chosen as the ceiling exponent of amax/448, and the scaled values
+    are stored as E4M3.
+    """
+    orig_shape, orig_dtype = x.shape, x.dtype
+    K = orig_shape[-1]
+    if K % 32 != 0:
+        return x
+    v = x.detach().float().reshape(-1, K // 32, 32)
+
+    amax = v.abs().amax(dim=-1, keepdim=True)
+    target = amax * (1.0 / 448.0)
+    # E8M0: raw IEEE exponent of `target`, rounded UP when the mantissa is
+    # non-zero -- the integer-arithmetic form the device code uses.
+    u = target.view(torch.int32)
+    raw_exp = (u >> 23) & 0xFF
+    raw_exp = raw_exp + ((u & 0x7FFFFF) != 0).to(torch.int32)
+    raw_exp = raw_exp.clamp(0, 255)
+    scale = torch.where(
+        (amax == 0) | (raw_exp == 0),
+        torch.ones_like(target),
+        (raw_exp << 23).view(torch.float32),
+    )
+
+    # E4M3 (max 448, min normal 2^-6, 3 mantissa bits) applied to v/scale.
+    q = v / scale
+    q = q.to(torch.float8_e4m3fn).float()
+    return (q * scale).reshape(orig_shape).to(orig_dtype)
 
 
 def quantize_bf16_to_mxfp4(weight: torch.Tensor,
@@ -470,6 +523,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # --verify implies the megakernel path. Fold it in *before* the batch-shape
+    # block below, which is what defaults num_requests -- otherwise --verify
+    # leaves num_requests=None and torch.full() dies on the None in the shape
+    # tuple, ~600 lines later.
+    if args.verify:
+        args.use_mirage = True
+
     # ── Batch-shape liveness constraints ──────────────────────────────────
     # These are hang-avoidance, not style. Violating any of them produces a
     # stalled megakernel (all 240 workers spinning on a barrier that can never
@@ -502,8 +562,6 @@ if __name__ == "__main__":
             f"--num-requests ({args.num_requests}) must be >= "
             f"--max-num-batched-requests ({args.max_num_batched_requests})")
 
-    if args.verify:
-        args.use_mirage = True
     if args.use_aiter:
         args.use_mirage = False
 
@@ -1542,8 +1600,12 @@ if __name__ == "__main__":
         # W13: interleaved gate_up with OPW=64 (N-parallel: 4 waves x 16 rows)
         # W2: separate down weights, also OPW=64
         # SwiGLU is fused into W2's input quantization step (no separate task)
-        w13_output_per_wg = 128  # W13: 48→24 tiles/XCD, max 1 tile/worker (no stragglers)
-        w2_output_per_wg = 64   # W2: 24 tiles/XCD (OPW=128 regressed 7% even with prefetch)
+        # Overridable so the W13/W2 tile shape can be swept without an edit.
+        # The defaults are the measured-best pair; W13_OPW=128 gives 2
+        # tile_iters per wave and W2_OPW=64 gives 1 (OPW=128 on W2 regressed 7%
+        # even with prefetch).
+        w13_output_per_wg = int(os.environ.get("W13_OPW", "128"))
+        w2_output_per_wg = int(os.environ.get("W2_OPW", "64"))
         print(f"Packing MXFP4 MoE expert weights ({num_layers} layers, "
               f"W13_OPW={w13_output_per_wg}, W2_OPW={w2_output_per_wg})...")
         moe_gate_up_proj_weights = []  # [E, expert_wgs, wg_bytes] uint8
@@ -2428,12 +2490,138 @@ if __name__ == "__main__":
                     n_rt += 1
             print(f"[PPL] Torch QKV/O-proj round-tripped through MXFP4 "
                   f"({n_rt} weights)")
+
+        # PPL_FP8_ACT=1 -- match MPK's *activation* precision too.
+        #
+        # PPL_MXFP4_MATCH only matches weights, which leaves the reference
+        # feeding bf16 activations into every GEMM while MPK feeds FP8: it
+        # quantizes each GEMM's input row before the f8f6f4 MFMA
+        # (_gang_wave_parallel_fp8_quant). That is ~2.3% mean relative error
+        # on the input of every expert, QKV, O-proj and LM-head GEMM in all
+        # 36 layers, and it is charged to "kernel error" by a weights-only
+        # baseline. Patching the reference's GEMM inputs the same way is what
+        # makes the comparison actually like-for-like.
+        if os.environ.get("PPL_FP8_ACT", "0") == "1":
+            from models.modeling_gpt_oss import (GptOssExperts, GptOssAttention)
+            _q = fp8_act_roundtrip
+
+            _orig_experts_fwd = GptOssExperts.forward
+            _orig_get_gu = GptOssExperts._get_gate_up_weight
+            _orig_get_dn = GptOssExperts._get_down_weight
+
+            # The expert GEMM inputs are `current_state` (into gate_up) and
+            # `activated` (into down). Both are local to the expert loop, so
+            # quantize them by wrapping the weight getters' partner tensor via
+            # a forward that mirrors the original with the two hooks added.
+            def _experts_fwd(self, hidden_states, router_indices,
+                             routing_weights):
+                batch_size = hidden_states.shape[0]
+                hs = hidden_states.reshape(-1, self.hidden_size)
+                num_experts = routing_weights.shape[1]
+                next_states = torch.zeros_like(hs)
+                expert_mask = torch.nn.functional.one_hot(
+                    router_indices, num_classes=num_experts + 1
+                ).permute(2, 1, 0)
+                expert_hit = torch.greater(
+                    expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                for expert_idx in expert_hit:
+                    expert_idx = expert_idx[0].item()
+                    if expert_idx == num_experts:
+                        continue
+                    _, token_idx = torch.where(expert_mask[expert_idx])
+                    current_state = hs[token_idx].to(torch.bfloat16)
+                    current_state = _q(current_state)          # <-- W13 input
+                    gate_up_w = self._get_gate_up_weight(expert_idx)
+                    gate_up = (current_state @ gate_up_w
+                               + self.gate_up_proj_bias[expert_idx])
+                    del gate_up_w
+                    activated = swigluoai(gate_up).to(torch.bfloat16)
+                    activated = _q(activated)                  # <-- W2 input
+                    down_w = self._get_down_weight(expert_idx)
+                    out = (activated @ down_w
+                           + self.down_proj_bias[expert_idx])
+                    del down_w
+                    weighted_output = (out
+                                       * routing_weights[token_idx,
+                                                         expert_idx, None])
+                    next_states.index_add_(
+                        0, token_idx, weighted_output.to(hs.dtype))
+                return next_states.view(batch_size, -1, self.hidden_size)
+
+            GptOssExperts.forward = _experts_fwd
+
+            # QKV / O-proj / LM head: quantize the Linear input.
+            def _wrap_linear(mod):
+                mod.register_forward_pre_hook(
+                    lambda m, inp: (_q(inp[0]),) + inp[1:])
+            for _lyr in model.model.layers:
+                for _m in (_lyr.self_attn.q_proj, _lyr.self_attn.k_proj,
+                           _lyr.self_attn.v_proj, _lyr.self_attn.o_proj):
+                    _wrap_linear(_m)
+            _wrap_linear(model.lm_head)
+
+            # PPL_FP8_ROUTER=1 -- also quantize the MoE *router* GEMM's input.
+            #
+            # Kept separate from the rest because it is categorically
+            # different. Every other FP8 site perturbs a value; this one
+            # perturbs a *decision*. The router picks top-4 of 128 experts by
+            # thresholding its logits, so a small input perturbation flips the
+            # selected set discretely. Measured on the real dumped hidden
+            # states across 12 layers: the top-4 set changes for **12.5%** of
+            # tokens (12.2% on synthetic activations of the same scale), and
+            # the surviving experts' routing weights move by up to 0.077.
+            #
+            # One swapped expert out of four rewrites ~25% of that token's MLP
+            # output, which is the right order of magnitude for the 4-13%
+            # per-layer hidden-state error being chased -- and no amount of
+            # matching *precision* elsewhere models it.
+            _router = os.environ.get("PPL_FP8_ROUTER", "0") == "1"
+            if _router:
+                for _lyr in model.model.layers:
+                    _wrap_linear(_lyr.mlp.router)
+            print("[PPL] Torch activations round-tripped through FP8 "
+                  "(experts W13/W2 + QKV + O-proj + LM head"
+                  + (" + MoE router)" if _router else ")"))
+
+        # PPL_STAGE_DUMP=<path> -- capture each layer's intermediate tensors
+        # at one token position so MPK can be compared op-by-op instead of
+        # only at the logits. The logit-level comparison established that the
+        # error is injected by a single layer; it cannot say *which op* inside
+        # that layer. Hooks are the only way to get the reference's
+        # intermediates without duplicating the forward pass.
+        _stage_path = os.environ.get("PPL_STAGE_DUMP")
+        _stage = {}
+        if _stage_path:
+            _srow = int(os.environ.get("PPL_STAGE_ROW", "-1"))
+
+            def _grab(name):
+                def hook(mod, inp, out):
+                    o = out[0] if isinstance(out, tuple) else out
+                    if not torch.is_tensor(o):
+                        return
+                    f = o.detach().float()
+                    f = f.reshape(-1, f.shape[-1])
+                    _stage[name] = f[_srow].cpu()
+                return hook
+
+            for _li, _lyr in enumerate(model.model.layers):
+                _lyr.input_layernorm.register_forward_hook(
+                    _grab(f"L{_li}.ln1"))
+                _lyr.self_attn.register_forward_hook(_grab(f"L{_li}.attn"))
+                _lyr.post_attention_layernorm.register_forward_hook(
+                    _grab(f"L{_li}.ln2"))
+                _lyr.mlp.register_forward_hook(_grab(f"L{_li}.mlp"))
+                _lyr.register_forward_hook(_grab(f"L{_li}.out"))
+
         ids = tokens[:1, :n_ppl]
         cos_e = position_embeddings[0][:, :n_ppl]
         sin_e = position_embeddings[1][:, :n_ppl]
         hidden, _ = model.model(
             input_ids=ids, position_embeddings=(cos_e, sin_e), step=step,
         )
+        if _stage_path:
+            torch.save(_stage, _stage_path)
+            print(f"[PPL] dumped {len(_stage)} stage tensors to {_stage_path}")
         targets = tokens[0, 1:n_ppl]
         # Chunk the LM head: [n, 201088] float32 logits at once is avoidable
         # memory pressure and the sum is exact either way.
@@ -2773,6 +2961,23 @@ if __name__ == "__main__":
                       f"{bad_idx} index mismatches, {bad_val} value "
                       f"mismatches -> "
                       f"{'OK' if bad_idx == 0 and bad_val == 0 else 'MISMATCH'}")
+            # PPL_STAGE_DUMP -- MPK side. The intermediate buffers are live
+            # single-token scratch: after the megakernel returns they hold the
+            # values from the LAST iteration, i.e. the last token position, for
+            # the LAST layer only. That is enough to compare one layer op-by-op
+            # against the reference's hook dump at the same position (use
+            # --max-layers 1 to make "last layer" mean layer 0).
+            if os.environ.get("PPL_STAGE_DUMP"):
+                _sd = {}
+                for _n in ("embed_out", "rmsnorm_out", "attn_in", "attn_out",
+                           "attn_proj_out", "rmsnorm_out_moe", "moe_gate_out",
+                           "moe_topk_weight", "moe_routing_indices",
+                           "swiglu_out", "mlp_weighted_sum_out", "mlp_final"):
+                    if _n in _tensor_refs:
+                        _sd[_n] = _tensor_refs[_n].detach().float().cpu()
+                torch.save(_sd, os.environ["PPL_STAGE_DUMP"])
+                print(f"[PPL] dumped {len(_sd)} MPK buffers to "
+                      f"{os.environ['PPL_STAGE_DUMP']}")
             if os.environ.get("PPL_DUMP_LOGITS"):
                 rows = [int(x) for x in
                         os.environ.get("PPL_DUMP_ROWS",

@@ -333,6 +333,33 @@ __device__ __noinline__ void
       }
     }
 
+    // Sliding-window head mask.
+    //
+    // kv_start is aligned DOWN to a KV_TILE boundary so the tiling stays
+    // clean, which means the first tile can begin up to KV_TILE-1 tokens
+    // BEFORE the window opens. Without this mask the kernel attends over a
+    // window of sliding_window..sliding_window+15 tokens instead of exactly
+    // sliding_window -- e.g. at seqlen 143 with a 128 window it attends to all
+    // 143 tokens. The reference masks strictly at (row - col) >= window
+    // (models/modeling_gpt_oss.py), so those extra tokens are pure divergence,
+    // and GPT-OSS applies sliding attention on 18 of its 36 layers.
+    //
+    // Only the first tile of the window can straddle the boundary, so this is
+    // a predicated no-op everywhere else.
+#ifndef MPK_NO_SW_MASK
+    if (sliding_window > 0) {
+      int const win_first = seqlen_k - sliding_window; // first allowed token
+      if (win_first > 0) {
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          if (kv_start + tile_start + kgrp * 4 + h < win_first) {
+            scores[h] = -INFINITY;
+          }
+        }
+      }
+    }
+#endif
+
     // Online softmax
     float tile_max =
         fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[2], scores[3]));
@@ -415,31 +442,23 @@ __device__ __noinline__ void
 
   if (midx < NUM_QO_PER_KV) {
     int q_head_local = midx;
-    if constexpr (NUM_KV_CHUNKS == 1) {
-      // Direct bf16 output
-      float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
-      // Fuse per-head attention sink correction:
-      //   out_h *= sigmoid(LSE_h - sink_h) = 1 / (1 + exp(sink_h - LSE_h))
-      // This eliminates the standalone attention_sink_layer task for decode.
-      if (sinks_ptr != nullptr) {
-        float lse_val = (l_sum > 0.0f) ? (m_running + logf(l_sum)) : -1e30f;
-        bf16 const *d_sinks = reinterpret_cast<bf16 const *>(sinks_ptr);
-        float sink_val = static_cast<float>(
-            d_sinks[kv_head_idx * NUM_QO_PER_KV + q_head_local]);
-        float correction = 1.0f / (1.0f + expf(sink_val - lse_val));
-        inv_l *= correction;
-      }
-      bf16 *o = reinterpret_cast<bf16 *>(output_ptr) +
-                static_cast<long>(query_start) * Q_WORKSPACE_STRIDE +
-                static_cast<long>(kv_head_idx * NUM_QO_PER_KV + q_head_local) *
-                    HEAD_DIM;
-#pragma unroll
-      for (int h = 0; h < 4; h++) {
-        int dim_offset = warp_id * 16 + kgrp * 4 + h;
-        o[dim_offset] = static_cast<bf16>(o_acc[h] * inv_l);
-      }
-    } else {
-      // Split-KV partial output: float + LSE for later merge
+    {
+      // Split-KV partial output: float + LSE for later merge.
+      //
+      // This layout is used for EVERY NUM_KV_CHUNKS, including 1. There used
+      // to be a `if constexpr (NUM_KV_CHUNKS == 1)` fast path here that wrote
+      // *bf16* directly at Q_WORKSPACE_STRIDE and skipped the merge. It was
+      // silently wrong: the caller allocates this buffer (ck_fmha_o_acc) as
+      // f32 with stride O_S regardless of chunk count, and the caller's merge
+      // gate is `(chunk % NUM_KV_CHUNKS) == NUM_KV_CHUNKS - 1`, which at
+      // NUM_KV_CHUNKS==1 is `% 1 == 0` -- always true. So the merge ran anyway
+      // and reinterpreted the bf16 bytes as f32. That is the whole explanation
+      // for CK_FMHA_NUM_KV_CHUNKS=1 scoring PPL 128522 while 8 scores 282.
+      //
+      // At NUM_KV_CHUNKS==1 the merge is a mathematical identity (one chunk to
+      // combine), so taking the split path unconditionally is correct, just
+      // marginally slower than the deleted fast path would have been had it
+      // worked. Shipping config is 8 chunks, so this costs nothing in practice.
       constexpr int LSE_S = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
       constexpr int O_S = LSE_S * HEAD_DIM;
       float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
@@ -464,9 +483,36 @@ __device__ __noinline__ void
                        static_cast<long>(query_start) * LSE_STRIDE +
                        kv_head_idx * NUM_KV_CHUNKS * NUM_QO_PER_KV +
                        kv_chunk_idx * NUM_QO_PER_KV + q_head_local;
-      // Match existing CK FMHA convention: m_val + logf(d_val) (kept as-is, not
-      // log2).
+      // LSE in NATURAL log, which is what the merge expects (it multiplies by
+      // log2(e) on load).
+      //
+      // The units here are easy to get wrong. `scale_s` is log2(e)/sqrt(HD)
+      // (0.180337 for HD=64, not 0.125), so the scores, `m_running` and the
+      // exp2-based `l_sum` are all in LOG2 space. The natural-log LSE is
+      // therefore m_running/log2(e) + ln(l_sum), i.e. (m_running +
+      // log2(l_sum)) / log2(e).
+      //
+      // This used to write `m_running + logf(l_sum)` -- a log2 exponent added
+      // to a natural-log mantissa. The merge scales that by log2(e) and gets
+      // log2(e)*m + log2(l) where it needs m + log2(l), so every LSE was too
+      // large by 0.4427*m_running. Two consequences, both silent:
+      //   1. Chunk merge weights are exp2 of *differences* of these values, so
+      //      the inter-chunk spread is stretched by log2(e) and chunks with a
+      //      higher local max are over-weighted.
+      //   2. The sink correction is 1/(1 + exp2(sink_log2 - lse_log2)); an
+      //      inflated lse drives that toward 1, under-applying the sink and
+      //      inflating the attention output (measured: ~5.6% norm inflation,
+      //      8.2% error against the reference at layer 0).
+      constexpr float INV_LOG2E = 0.693147180559945309417f; // ln(2)
+#ifdef MPK_LSE_LOG_BUG
+      // Deliberately reintroduce the pre-49f446b unit bug. This exists so the
+      // layer-comparison test can be shown to FAIL on a known-bad kernel --
+      // a correctness gate nobody has seen go red is not known to work.
       float lse_val = (l_sum > 0.0f) ? (m_running + logf(l_sum)) : -1e30f;
+#else
+      float lse_val =
+          (l_sum > 0.0f) ? ((m_running + __log2f(l_sum)) * INV_LOG2E) : -1e30f;
+#endif
       *lse_out = lse_val;
     }
   }

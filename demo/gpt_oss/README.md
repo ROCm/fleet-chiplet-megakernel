@@ -85,6 +85,25 @@ Prepend these environment variables to the command:
 The default (no flag) build is the **decoupled 512-thread** (4 memory + 4 compute
 wave) path. The oracle build is the working batch-1 reference.
 
+## Checking correctness
+
+```bash
+bash tests/ci-tests/run_ci_tests_gpt_oss.sh               # generated tokens
+bash tests/ci-tests/run_ci_tests_gpt_oss_layer_compare.sh # per-stage, names the op
+bash tests/ci-tests/run_ci_tests_gpt_oss_perplexity.sh    # distribution-level
+```
+
+`docs/mpk/correctness-infra.md` covers all three, plus the diagnostic env flags
+(`PPL_STAGE_DUMP`, `PPL_SLICE`, `PPL_MXFP4_MATCH`, `PPL_FP8_ACT`) and the
+`MPK_LSE_LOG_BUG=1` fault injection used to verify the layer gate still fails on
+a known-bad kernel.
+
+Two rules that outrank everything else here: **never quote a latency number
+without checking the generated text** (a faulted kernel still prints a plausible
+`Decode avg`), and **never run two MPK arms concurrently** — the build dir is
+hardcoded and concurrent arms have been observed emitting bit-identical logits
+from genuinely different binaries.
+
 ## Notes
 
 - **Always `rm -rf demo/gpt_oss/permanent_output_dir` after any kernel/header

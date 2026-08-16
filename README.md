@@ -87,11 +87,26 @@ requests are admitted into the freed slots without leaving the megakernel.
 `PPL_MODE=1` requires `--max-num-batched-requests 1` — the logits sink row is
 derived from request 0's step, so all requests would write the same row.
 
-### Correctness test (Torch vs Mirage)
+### Correctness
+
+Three gates, cheapest first — end-to-end tokens, then per-stage layer
+comparison, then perplexity against a reference matched on both MXFP4 weights
+and FP8 activations:
 
 ```bash
-MODEL_PATH=/path/to/gpt-oss-120b bash tests/ci-tests/run_ci_tests_gpt_oss.sh
+export MODEL_PATH=/path/to/gpt-oss-120b
+bash tests/ci-tests/run_ci_tests_gpt_oss.sh               # tokens, seconds
+bash tests/ci-tests/run_ci_tests_gpt_oss_layer_compare.sh # per-op, ~4 min
+bash tests/ci-tests/run_ci_tests_gpt_oss_perplexity.sh    # ~10 min/arm
 ```
 
-See [`demo/gpt_oss/README.md`](demo/gpt_oss/README.md) for the full set of options
-(prompt selection, build variants, environment, and notes).
+The middle one is the sharp instrument: it gates cosine similarity and relative
+RMSE per stage inside a decoder layer at depth 1 (`sliding_attention`) and
+depth 2 (`full_attention`), so a numerical regression names the op that caused
+it rather than just moving a corpus-wide number. `MPK_LSE_LOG_BUG=1` rebuilds
+with a real historical defect injected to prove the gate still goes red.
+
+See [`docs/mpk/correctness-infra.md`](docs/mpk/correctness-infra.md) for how to
+localize a failure, the `PPL_SLICE` multi-window protocol, and the measured
+noise floor. See [`demo/gpt_oss/README.md`](demo/gpt_oss/README.md) for the full
+set of options (prompt selection, build variants, environment, and notes).

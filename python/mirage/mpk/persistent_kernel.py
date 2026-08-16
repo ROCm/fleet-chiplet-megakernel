@@ -382,6 +382,20 @@ def get_compile_command(
             # plain global_store into a non-coherent L2, so each XCD needs its
             # own writer. Correctness-relevant -- check the generated text.
             flags = flags + ["-DMPK_ONE_NORM_WRITER"]
+        if int(os.environ.get("MPK_NO_SW_MASK", "0")) == 1:
+            # Ablation only: drop the sliding-window head mask in the HD=64
+            # decode kernel, restoring the pre-fix behaviour where kv_start is
+            # tile-aligned down and the kernel over-attends by up to KV_TILE-1
+            # tokens. Lets the fix be A/B'd without editing the tree between
+            # runs. Not a performance knob -- it is strictly less correct.
+            flags = flags + ["-DMPK_NO_SW_MASK"]
+        if int(os.environ.get("MPK_LSE_LOG_BUG", "0")) == 1:
+            # Fault injection, NOT a knob. Restores the pre-49f446b split-KV
+            # LSE unit bug (a log2 exponent added to a natural-log mantissa).
+            # tests/ci-tests/test_gpt_oss_layer_compare.py uses this to prove
+            # the layer-comparison gate actually goes red on a known-bad
+            # kernel -- see docs/mpk/correctness-infra.md.
+            flags = flags + ["-DMPK_LSE_LOG_BUG"]
         if int(os.environ.get("MPK_NDEBUG", "0")) == 1:
             # The ROCm branch never sets -DNDEBUG (only the sm_90 branch does),
             # so every assert in the persistent kernel keeps its OCKL hostcall
