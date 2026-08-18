@@ -35,6 +35,69 @@ def get_scheduler(sm_cnt, worker):
 MAX_NUM_WORKERS = 304
 
 
+# Shipped optimizations that only build at batch 1. Each of these is a
+# *compile error* on the packed multi-row MoE path, not a mistune, so an
+# unconditional default would break every bs>1 build:
+#
+#   MPK_W13_PREQUANT           static_assert "single-token only (BATCH_SIZE
+#                              == 1)" -- its publication is one row, and the
+#                              router's writer election has no notion of which
+#                              tokens an expert drew.
+#   MPK_W13_T1_SPLIT_LDS_STAGE static_assert "split W13 tile-1 stage exceeds
+#                              the worker's LDS budget" -- the stage buffer is
+#                              11 KiB x 4 waves on top of a W13 tile that the
+#                              multi-row path has already widened.
+#
+# Only the DEFAULT is narrowed. Setting one explicitly at bs>1 still reaches
+# the static_assert, which is the intended loud failure rather than a knob
+# that silently does nothing.
+_BS1_ONLY_OPTS = ("MPK_W13_PREQUANT", "MPK_W13_T1_SPLIT_LDS_STAGE")
+
+
+def mpk_opt(name, batch_size=1):
+    """Is a shipped optimization enabled? Default ON; MPK_<name>=0 disables.
+
+    Only for the knobs that ship on. Ablations, probes and fault injection are
+    read directly with a "0" default at their own sites.
+
+    `batch_size` narrows the default for the bs=1-only flags above; pass the
+    build's max_num_batched_tokens wherever it is known.
+    """
+    default = "0" if (batch_size != 1 and name in _BS1_ONLY_OPTS) else "1"
+    return int(os.environ.get(name, default)) == 1
+
+
+def mpk_w13_prequant(batch_size):
+    """Is the FP8 W13 activation prequant active for this build?
+
+    Separate from mpk_opt() because it has a second dependency: the kernel
+    #errors without MPK_ROUTER_FUSED_DP (it publishes from that flag's elected
+    norm writer), so disabling that disables this.
+
+    Callers outside the compiler need this because the flag changes the wire
+    format of `rmsnorm_out_moe` from BF16 to FP8 E4M3 + one E8M0 byte per 128
+    elements. Anything reading that buffer back on the host has to know which.
+    """
+    if not mpk_opt("MPK_ROUTER_FUSED_DP"):
+        return False
+    return mpk_opt("MPK_W13_PREQUANT", batch_size)
+
+
+def mpk_workers_per_xcd():
+    """Worker blocks per XCD on MI350.
+
+    31 is the shipped default: 31*8 workers + 8 scheduler blocks = 256, exactly
+    the CU count. 30 was the MI300X-compatible value and left 8 CUs idle for
+    the whole run; it is still reachable as MPK_WORKERS_PER_XCD=30. 32 would
+    make a scheduler share a CU with a worker.
+
+    Read through this helper, never inline: the value also sizes the MoE tile
+    padding round, and the host and device sides disagreeing there hangs the W2
+    workers (see PAD_MULTIPLE in gang_moe_fused_mxfp4_mi300.cuh).
+    """
+    return int(os.environ.get("MPK_WORKERS_PER_XCD", "31"))
+
+
 # This method auto probe GPUs and return the worker and scheduler count for
 # them.
 def get_configurations_from_gpu(rank):
@@ -63,12 +126,7 @@ def get_configurations_from_gpu(rank):
         elif sm_cnt >= 200:
             # MI350: 256 CUs, 8 XCDs (32 CUs/XCD)
             num_xcds = 8
-            # 240 (30/XCD) is the MI300X-compatible default. It leaves the
-            # machine short: 240 workers + 8 scheduler blocks = 248 of the 256
-            # CUs, so 8 CUs sit empty for the whole run. MPK_WORKERS_PER_XCD
-            # raises it -- 31 fills the idle CU, 32 would need the schedulers
-            # to share a CU with a worker.
-            workers_per_xcd = int(os.environ.get("MPK_WORKERS_PER_XCD", "30"))
+            workers_per_xcd = mpk_workers_per_xcd()
             worker = num_xcds * workers_per_xcd
             scheduler = num_xcds
             worker = min(worker, MAX_NUM_WORKERS)

@@ -257,6 +257,12 @@ __device__ __noinline__ void
                      _fused_t0d = 0, _merge_done = 0;
 #endif
 
+  // Phase slot index. xcd_rank is fixed for the life of the task and xcd_id
+  // is the die, so (xcd, rank) is a stable per-worker identity and the trace's
+  // per-rank bands line up across runs.
+  int const _pslot_w = xcd_id * workers_per_xcd + xcd_rank;
+  MPK_PHASE_MARK(_pslot_w, 0);
+
 #ifdef MPK_ENABLE_MOE_SUBPHASE
   // Activate MoE subphase timing on first decode iteration (nat <= 1).
   if (tid == 0 && num_active_tokens <= 1) {
@@ -419,6 +425,7 @@ __device__ __noinline__ void
     _fused_t0a = __builtin_amdgcn_s_memrealtime();
 #endif
   } // end Phase 1: QKV GEMM
+  MPK_PHASE_MARK(_pslot_w, 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 2: QKV barrier — epoch-based
@@ -481,18 +488,36 @@ __device__ __noinline__ void
 #endif
     }
     __syncthreads();
-    // The acquire for this barrier is the vL1 invalidate below, not the
-    // agent-scope fence above. Both counters here are XCD-private and written
-    // with sc0 (MPK_XCD_LOCAL_ATOM_ADD), so the fence's `buffer_inv sc1` is
-    // over-scoped as well as redundant: it throws away this XCD's whole L2 --
-    // including the weights the next phase is about to read -- to acquire a
-    // line that never left it. MPK_QKV_GATE_NO_AGENT_FENCE drops it.
+    // The agent-scope fence above is LOAD-BEARING. Do not drop it again.
+    //
+    // The argument for dropping it (MPK_QKV_GATE_NO_AGENT_FENCE, now default
+    // off) was: both counters here are XCD-private and written with sc0
+    // (MPK_XCD_LOCAL_ATOM_ADD), so the fence's `buffer_inv sc1` throws away
+    // this XCD's whole L2 -- including the weights the next phase reads -- to
+    // acquire a line that never left it, and the vL1 `buffer_inv` below is the
+    // acquire the *counter* needs.
+    //
+    // Every clause of that is true. The conclusion does not follow. An acquire
+    // fence does not only order the load of the flag; it orders every load
+    // AFTER it against every write the releaser made BEFORE its release. What
+    // this gate publishes is not the counter, it is the QKV output the
+    // attention phase is about to read. The vL1-only `buffer_inv` drops this
+    // CU's stale lines but carries no such ordering, so the reader can observe
+    // the bumped epoch and still miss the writes it was standing for.
+    //
+    // Measured, not argued: at ctx 4096 three byte-identical runs produced
+    // three different token sequences with the fence dropped, and 5/5 runs are
+    // identical with it restored (matching the all-flags-off reference). At
+    // ctx 512 both forms give the same text hash -- the same seq-len
+    // dependence the Phase 4 comment below describes, and the reason an A/B at
+    // 512 scored this as free. It costs 1.945 -> 1.981 ms/tok at bs=1.
     asm volatile("buffer_inv" ::: "memory");
   }
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   _fused_t0b = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_PHASE_MARK(_pslot_w, 2);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 3: Parallel attention chunks
@@ -762,6 +787,12 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
+  // Slot 3 = end of attention chunk compute + merge; slot 4 = the attn_release
+  // wait begins. They are adjacent here because Fleet's O-proj weight DMA is
+  // issued inside the Phase 6 block below, so the DMA overlaps the gate's
+  // spin-wait rather than serializing ahead of it.
+  MPK_PHASE_MARK(_pslot_w, 3);
+  MPK_PHASE_MARK(_pslot_w, 4);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 6: Cross-XCD attention barrier + O-proj weight DMA
@@ -938,6 +969,7 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_PHASE_MARK(_pslot_w, 5);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 7: O-proj + RMSNorm + Router + TopK
@@ -993,6 +1025,7 @@ __device__ __noinline__ void
           nullptr);
     }
   }
+  MPK_PHASE_MARK(_pslot_w, 6);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 7b: wait for TopK (XCD-local release flag)
@@ -1040,6 +1073,7 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_PHASE_MARK(_pslot_w, 7);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 8: MoE (W13+SwiGLU+W2)
@@ -1067,6 +1101,7 @@ __device__ __noinline__ void
                                                             input_ptrs[21],
                                                             moe_t);
   }
+  MPK_PHASE_MARK(_pslot_w, 8);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 9: Layer-boundary GLOBAL barrier
@@ -1171,12 +1206,24 @@ __device__ __noinline__ void
     //
     // The count must be computed exactly as Phase 8's loop bound is, or the
     // local counter's modulus stops being exact and the release never fires.
+    //
+    // `moe_total_tiles_per_xcd - workers_per_xcd` counts the ranks that get a
+    // SECOND tile, which is a producer count only while the loop deals at most
+    // two tiles per rank. Past that it exceeds the worker count and becomes a
+    // modulus no counter can reach: at bs=4 the tile space is 212 per XCD
+    // against 31 workers, so the unclamped form asks for 181 arrivals from a
+    // counter that advances 31 per layer, and every layer gate deadlocks. The
+    // clamp is also the semantically right answer -- once there are at least
+    // as many W2 tiles as workers, every worker is a producer and there is
+    // nobody left to exclude, so this degenerates to the default arrival.
     int const n_w2_workers_per_xcd =
         moe_total_tiles_per_xcd > workers_per_xcd
             ? moe_total_tiles_per_xcd - workers_per_xcd
             : moe_total_tiles_per_xcd;
 #ifdef MPK_W2_ONLY_ARRIVE
-    int const arrivers_per_xcd = n_w2_workers_per_xcd;
+    int const arrivers_per_xcd = n_w2_workers_per_xcd < workers_per_xcd
+                                     ? n_w2_workers_per_xcd
+                                     : workers_per_xcd;
     bool const MPK_LAYER_GATE_ARRIVES = (xcd_rank < arrivers_per_xcd);
 #else
     int const arrivers_per_xcd = workers_per_xcd;
@@ -1222,10 +1269,63 @@ __device__ __noinline__ void
     // releaser, which is unambiguous since a real epoch is >= 8.
     int lean_rel_epoch = 0;
 
+    // Thread-local, not __shared__, and that is the whole point. Every write
+    // (the seed below, the snapshot, the MPK_LEAN_ARRIVE derivation) and the
+    // only read (the gate poll) is guarded by `tid == 0`, so no thread but
+    // lane 0 of wave 0 ever touches it -- LDS was buying nothing.
+    //
+    // What it cost is visible in the asm. As a __shared__ int the compiler
+    // cannot hoist it out of the spin, so the poll loop was
+    //
+    //     global_load_dword v3, v[0:1], off sc0 sc1
+    //     s_waitcnt vmcnt(0)
+    //     ds_read_b32 v4, v2 offset:336      <-- reloaded every iteration
+    //     s_waitcnt lgkmcnt(0)               <-- and serialized behind it
+    //     v_cmp_le_i32 vcc, v3, v4
+    //
+    // an LDS round trip appended to each poll, after the vmcnt wait, on the
+    // one thread whose latency to observe the release is the layer boundary
+    // for its entire workgroup. Holding the previous release in a register
+    // instead removes the round trip: the compare is then just the load and
+    // the cmp.
+    //
+    // The `__syncthreads()` after the seed is kept: it is a barrier the block
+    // needs on this path regardless, and dropping it is a separate change.
+    //
+    // MPK_GATE_PREV_LDS=1 restores the __shared__ form for A/B.
+#ifdef MPK_GATE_PREV_LDS
     __shared__ int s_layer_rel_prev;
+    if (tid == 0) {
+      s_layer_rel_prev = -1;
+    }
+#else
+    int s_layer_rel_prev = -1;
+#endif
+    // Seeded for the workers that do NOT arrive. `s_layer_rel_prev` is written
+    // only under `tid == 0 && MPK_LAYER_GATE_ARRIVES`, but the wait below is
+    // joined by every worker for which MPK_LAYER_GATE_JOINS holds. Those two
+    // sets are equal in the two shipped configurations (both flags on, or both
+    // off), which is why this never bit -- but MPK_W2_ONLY_ARRIVE=1 with
+    // MPK_W2_CONSUMER_GATE=0 makes JOINS a strict superset of ARRIVES, and
+    // ranks 22..30 then spin against uninitialized LDS. Whatever garbage the
+    // slot holds is compared `<=` against a release value that only ever
+    // increases by 8 per layer, so a large positive leaves the gate closed
+    // forever: all 248 workers hang with tasks_done=0 and no error.
+    //
+    // -1 is below every real release value (they are 8*L, L >= 1), so a
+    // non-arriving worker's wait is satisfied by the first release it sees --
+    // which is the correct semantics for a worker that published nothing.
+    // Cost is one LDS store per workgroup per layer on a path that already
+    // does several.
+    __syncthreads();
 #ifdef MPK_DRAIN_STATS
     __shared__ unsigned long long s_dr3;
     __shared__ bool s_was_last_local;
+    __shared__ bool s_was_last_global;
+    if (tid == 0) {
+      s_was_last_global = false;
+    }
+    __syncthreads();
 #endif
 
     if (tid == 0 && MPK_LAYER_GATE_ARRIVES) {
@@ -1337,6 +1437,7 @@ __device__ __noinline__ void
 #ifdef MPK_DRAIN_STATS
         if (is_last_global) {
           atomicAdd(&g_last_xcd[xcd_id], 1ULL);
+          s_was_last_global = true;
         }
 #endif
         if (is_last_global) {
@@ -1490,6 +1591,20 @@ __device__ __noinline__ void
     // here also keeps `s_layer_rel_prev` valid -- it is a snapshot taken in
     // this invocation, and there is no cross-invocation channel to carry a
     // release target through.
+#ifdef MPK_DRAIN_STATS
+    // Splits the "spin" segment. Everything between s_dr3 and here is the
+    // release fan-out plus the next-layer QKV prefetch *issue*, which the
+    // original window silently folded into the wait -- which is why the
+    // worker that publishes the release, and therefore waits on nobody, still
+    // showed ~2 us of "spin".
+    unsigned long long _dr35 = __builtin_amdgcn_s_memrealtime();
+#endif
+    // Same split point MPK_DRAIN_STATS uses: everything before this is the
+    // arrival tree plus the release fan-out and the next-layer QKV prefetch
+    // *issue*; everything after is the poll proper. Only slot 9->10 is a
+    // like-for-like wait span: the pre-gate half is release-publishing work,
+    // not waiting, so folding it in overstates the gate.
+    MPK_PHASE_MARK(_pslot_w, 9);
     if (tid == 0 && MPK_LAYER_GATE_JOINS) {
       while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
         __builtin_amdgcn_s_sleep(1);
@@ -1523,6 +1638,13 @@ __device__ __noinline__ void
       unsigned long long sync = (_dr2 - _dr1) * 10;
       unsigned long long arrive = (s_dr3 - _dr2) * 10;
       unsigned long long spin = (_dr4 - s_dr3) * 10;
+      unsigned long long fanpf = (_dr35 - s_dr3) * 10;
+      unsigned long long poll = (_dr4 - _dr35) * 10;
+      atomicAdd(&g_fanpf_sum, fanpf);
+      atomicAdd(&g_poll_sum, poll);
+      if (s_was_last_global) {
+        atomicAdd(&g_poll_lastglobal, poll);
+      }
       unsigned long long n = atomicAdd(&g_drain_n, 1ULL);
       atomicAdd(&g_drain_sum, drain);
       atomicAdd(&g_sync_sum, sync);
@@ -1537,6 +1659,10 @@ __device__ __noinline__ void
       if (s_was_last_local) {
         atomicAdd(&g_spin_lastlocal, spin);
         atomicAdd(&g_n_lastlocal, 1ULL);
+      }
+      if (s_was_last_global) {
+        atomicAdd(&g_spin_lastglobal, spin);
+        atomicAdd(&g_n_lastglobal, 1ULL);
       }
       if (n % 100000 == 0 && n > 0) {
         printf("[DRAIN] n=%llu drain=%llu sync=%llu arrive=%llu spin=%llu "
@@ -1565,9 +1691,20 @@ __device__ __noinline__ void
                g_last_xcd[5],
                g_last_xcd[6],
                g_last_xcd[7]);
-        printf("[INTER] lastlocal_spin=%llu n=%llu\n",
+        printf("[INTER] lastlocal_spin=%llu n=%llu | lastglobal_spin=%llu "
+               "n=%llu\n",
                g_spin_lastlocal / (g_n_lastlocal ? g_n_lastlocal : 1),
-               g_n_lastlocal);
+               g_n_lastlocal,
+               g_spin_lastglobal / (g_n_lastglobal ? g_n_lastglobal : 1),
+               g_n_lastglobal);
+        printf("[SPLIT] fanout+prefetch=%llu poll=%llu | lastglobal_poll=%llu\n",
+               g_fanpf_sum / n,
+               g_poll_sum / n,
+               g_poll_lastglobal / (g_n_lastglobal ? g_n_lastglobal : 1));
+        printf("[MLPRO] prologue=%llu copy=%llu n=%llu\n",
+               g_mlprologue_sum / (g_mlprologue_n ? g_mlprologue_n : 1),
+               g_mlcopy_sum / (g_mlcopy_n ? g_mlcopy_n : 1),
+               g_mlprologue_n);
         for (int r0 = 0; r0 < 30; r0 += 10) {
           printf("[RANK%02d] %llu %llu %llu %llu %llu %llu %llu %llu %llu "
                  "%llu\n",
@@ -1590,6 +1727,7 @@ __device__ __noinline__ void
     // under MPK_W2_CONSUMER_GATE, only on gate-joining workers), so this is
     // what makes the release visible to the whole block.
     __syncthreads();
+    MPK_PHASE_MARK(_pslot_w, 10);
 
 #if defined(MPK_PREFETCH_NEXT_QKV) && defined(MPK_QKV_PF_WAVE_SPLIT)
     // Wave 0's deferred quarter of the staged tile. It has to be issued here,
@@ -1671,6 +1809,7 @@ __device__ __noinline__ void
            wait_others);
   }
 #endif
+  MPK_PHASE_MARK(_pslot_w, 11);
   MPK_TW_SUB(90, tile_idx);
   MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);
 }

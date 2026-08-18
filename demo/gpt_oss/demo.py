@@ -257,6 +257,33 @@ def fp8_act_roundtrip(x: torch.Tensor) -> torch.Tensor:
     return (q * scale).reshape(orig_shape).to(orig_dtype)
 
 
+def _decode_prequant_row(t):
+    """Read back the FP8 form of `rmsnorm_out_moe` as floats.
+
+    The buffer is declared BF16 [bs, PADDED_HIDDEN_SIZE], but under the W13
+    prequant the router publishes into it a different layout entirely:
+    `output_stride` FP8 E4M3 payload bytes followed by one E8M0 exponent byte
+    per 128-element block. Interpreting those bytes as BF16 gives cos 0.0
+    against the reference -- a format mismatch that looks like a numerical
+    catastrophe. This is the inverse of the publication at the
+    MPK_W13_PREQUANT site in gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh.
+
+    Returns [bs, PADDED_HIDDEN_SIZE] float32, so callers see the same shape as
+    the BF16 path.
+    """
+    n = PADDED_HIDDEN_SIZE
+    raw = t.detach().view(torch.uint8).reshape(t.shape[0], -1).cpu()
+    # Payload then scales, exactly as the kernel stores them: the dword at
+    # byte offset 4*i_cur, the E8M0 byte at output_stride + scale_block.
+    q = raw[:, :n].view(torch.float8_e4m3fn).float()
+    se = raw[:, n:n + n // 128].to(torch.int32)
+    # E8M0 0 means the block was all zeros; the kernel uses scale 1.0 there so
+    # that the multiply below is a no-op rather than a denormal.
+    scale = torch.where(se == 0, torch.ones_like(se, dtype=torch.float32),
+                        (se << 23).view(torch.float32))
+    return q * scale.repeat_interleave(128, dim=1)[:, :n]
+
+
 def quantize_bf16_to_mxfp4(weight: torch.Tensor,
                              target_out_dim: int = None,
                              target_reduction: int = None) -> tuple:
@@ -486,6 +513,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument(
+        "--prompt-file", type=str, default=None,
+        help=("Read --prompt from this UTF-8 file. Required past ~32k tokens: "
+              "the kernel caps a single argv entry at MAX_ARG_STRLEN (128 KB), "
+              "and exec fails with 'Argument list too long' before python "
+              "starts. Overridden by --prompts."),
+    )
+    parser.add_argument(
         "--prompts", nargs="+", default=None,
         help=("Distinct prompts, one per request (cycled if fewer than "
               "--num-requests). Overrides --prompt. This is the multi-request "
@@ -522,6 +556,10 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+
+    if args.prompt_file:
+        with open(args.prompt_file, encoding="utf-8") as _f:
+            args.prompt = _f.read()
 
     # --verify implies the megakernel path. Fold it in *before* the batch-shape
     # block below, which is what defaults num_requests -- otherwise --verify
@@ -1255,6 +1293,7 @@ if __name__ == "__main__":
 
     if args.use_mirage:
         import mirage as mi
+        from mirage.utils import mpk_w13_prequant
 
         # Gang dispatch is required for MXFP4 MoE kernels on MI300/MI350
         os.environ.setdefault("USE_GANG", "1")
@@ -2975,6 +3014,14 @@ if __name__ == "__main__":
                            "swiglu_out", "mlp_weighted_sum_out", "mlp_final"):
                     if _n in _tensor_refs:
                         _sd[_n] = _tensor_refs[_n].detach().float().cpu()
+                # rmsnorm_out_moe is declared BF16, but under the W13 prequant
+                # the kernel publishes FP8 E4M3 + one E8M0 byte per 128
+                # elements into the same allocation. Reading it as BF16 then
+                # gives cos 0.0 against the reference -- a format mismatch that
+                # reads exactly like a numerical catastrophe. Decode instead.
+                if mpk_w13_prequant(bs) and "rmsnorm_out_moe" in _tensor_refs:
+                    _sd["rmsnorm_out_moe"] = _decode_prequant_row(
+                        _tensor_refs["rmsnorm_out_moe"])
                 torch.save(_sd, os.environ["PPL_STAGE_DUMP"])
                 print(f"[PPL] dumped {len(_sd)} MPK buffers to "
                       f"{os.environ['PPL_STAGE_DUMP']}")
@@ -3043,6 +3090,25 @@ if __name__ == "__main__":
         prompt_len = prompt_lengths[0].item()
         total_tokens = step.max().item() + 1
         generated_tokens = total_tokens - prompt_len
+
+        # Machine-readable wall-clock summary.
+        #
+        # This is the host-side cuda event pair around the whole megakernel
+        # launch, covering prefill+decode. It is here for bookkeeping only --
+        # do NOT difference it across two decode lengths to get TPOT. Its
+        # run-to-run spread is ~20 ms, which swamps anything short of a
+        # several-hundred-token decode delta. Use the device-side
+        # [FWD_PASS_TOTAL] total_ms for that; see
+        # tests/ci-tests/run_gpt_oss_seqlen_sweep.sh.
+        #
+        # Note also that the [Decode: ...] line below is derived from the
+        # device per-iter ring, which is emitted by deferred printf at kernel
+        # exit and truncated by the HIP printf FIFO on long runs -- and the
+        # part it drops is the TAIL, i.e. exactly the decode iterations. At a
+        # 512-token prompt the ring reports "no FWD_PASS samples captured" for
+        # decode while happily printing all 512 prefill iterations.
+        print(f"[WALL] prompt_tokens={prompt_len} generated_tokens="
+              f"{generated_tokens} total_ms={run_time:.3f}")
 
         prefill_iterations = math.ceil(prompt_len / args.max_num_batched_tokens)
         decode_iterations = generated_tokens

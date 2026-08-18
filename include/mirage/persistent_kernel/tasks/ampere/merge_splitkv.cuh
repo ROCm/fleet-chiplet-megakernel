@@ -21,6 +21,14 @@
 // the log exp sum as input,
 namespace kernel {
 
+// Native vector types for address-space-qualified loads in the two-pass merge.
+// HIP's float2/float4 are HIP_vector_type class templates and cannot be
+// copy-constructed through an AS(1) pointer; these can. See the comment at
+// their use in merge_splitkv_ck_fmha for why GLOBAL rather than generic FLAT
+// is load-bearing here.
+typedef float _mg_f32x2 __attribute__((ext_vector_type(2)));
+typedef float _mg_f32x4 __attribute__((ext_vector_type(4)));
+
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_KV_HEADS,
@@ -189,6 +197,10 @@ __device__ __forceinline__ void
   constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
   constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
+  static_assert(VAL_PER_THREAD == 1 || VAL_PER_THREAD % 2 == 0,
+                "merge: VAL_PER_THREAD must be 1 or even; the AS(1) vector "
+                "loads in the two-pass arm assume natural alignment at the "
+                "vector width and fall back to scalars otherwise");
 
   int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
   int group_id = threadIdx.x / THREADS_PER_TOKEN;
@@ -282,10 +294,16 @@ __device__ __forceinline__ void
       int const lse_base0 = head_idx +
                             (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
                             lse_kv_offset;
+      // AS(1) for the same reason as the `o` loads below: as generic FLAT
+      // these bump lgkmcnt too, and pass 1 is precisely the part that must
+      // become one deep independent queue -- every value is needed before the
+      // max reduction can finish, and none depends on any other.
 #pragma unroll
       for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
-        lse_log2[kv_idx] = lse_ptr[lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV] *
-                           1.44269504088896340736f;
+        lse_log2[kv_idx] =
+            *(__attribute__((address_space(1))) float const *)(
+                lse_ptr + lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) *
+            1.44269504088896340736f;
       }
       float m_max = -inf;
 #pragma unroll
@@ -300,9 +318,65 @@ __device__ __forceinline__ void
         int const o_base =
             (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
             thread_in_group * VAL_PER_THREAD;
+        // Load this chunk's slice as ONE address-space(1) vector, not
+        // VAL_PER_THREAD scalar dereferences.
+        //
+        // Both halves of this matter, and the second half is the whole point
+        // of the two-pass form.
+        //
+        // A plain `o_ptr[...]` is a *generic* pointer, so clang emits
+        // `flat_load_dwordx2`, and a FLAT load bumps lgkmcnt as well as vmcnt.
+        // The compiler therefore cannot express "wait for chunk k's load but
+        // not chunk k+4's" -- there is no counted wait that covers one counter
+        // and not the other -- so it falls back to full
+        // `s_waitcnt vmcnt(0) lgkmcnt(0)` drains. Verified in the gfx950
+        // disassembly of the shipping build: pass 2 issued its loads in
+        // batches of four separated by full drains, i.e. issue-4, stall,
+        // accumulate, issue-4, ... The 31 loads never formed the single deep
+        // queue this loop was restructured to create, so the two-pass rewrite
+        // was buying nothing over the running-max chain it replaced.
+        //
+        // Through an AS(1) pointer the same access becomes
+        // `global_load_dwordx2`, which touches vmcnt only, and the scheduler
+        // is free to hoist loads and retire them with counted `vmcnt(N)`.
+        //
+        // Bit-identical, deliberately: this changes only how the bytes are
+        // fetched. The floats are the same floats, the FMA order is unchanged,
+        // and no reassociation is introduced -- so it is testable against an
+        // exact hash rather than a perplexity band. (Contrast MERGE_KV_OUTER
+        // and the two-pass form itself, both of which do move the low bits.)
+        //
+        // Alignment is structural, not assumed: o_base's chunk term is a
+        // multiple of HEAD_DIM (64) and its lane term is
+        // thread_in_group * VAL_PER_THREAD, so the offset is a multiple of
+        // VAL_PER_THREAD and the address is naturally aligned for the vector
+        // width. The static_assert below pins the only two widths this
+        // produces (HEAD_DIM/THREADS_PER_TOKEN is 2 or 4 for every shape here);
+        // anything else takes the scalar path rather than misaligning.
+        float o_v[VAL_PER_THREAD];
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr +
+                                                                     o_base);
+          o_v[0] = t.x;
+          o_v[1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr +
+                                                                     o_base);
+          o_v[0] = t.x;
+          o_v[1] = t.y;
+          o_v[2] = t.z;
+          o_v[3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_v[i] = o_ptr[o_base + i];
+          }
+        }
 #pragma unroll
         for (int i = 0; i < VAL_PER_THREAD; ++i) {
-          o_global[i] += o_ptr[o_base + i] * w;
+          o_global[i] += o_v[i] * w;
         }
       }
       m_global = m_max;

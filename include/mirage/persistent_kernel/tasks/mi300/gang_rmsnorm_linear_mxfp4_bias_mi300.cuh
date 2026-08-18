@@ -40,6 +40,14 @@
 
 namespace kernel {
 
+// Native vector types for address-space-qualified loads. HIP's float4/uint2 are
+// class templates (HIP_vector_type), so they cannot be copy-constructed through
+// an AS(1) pointer, and __builtin_memcpy is declared __host__ and rejects one
+// outright. These ext_vector_types can, which is what lets the ResAdd prologue
+// issue GLOBAL rather than generic FLAT loads -- see the comment at its use.
+typedef float _gl_f32x4 __attribute__((ext_vector_type(4)));
+typedef unsigned int _gl_u32x2 __attribute__((ext_vector_type(2)));
+
 // ── Shared QKV weight-tile LDS geometry ──────────────────────────────────
 //
 // The DMA below writes where these say and the MFMA in the kvupd kernel reads
@@ -1889,6 +1897,16 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
           // than an atomicAdd in the W2 epilogue.
           float4 ws4;
           __builtin_memcpy(&ws4, ws_base + off, 16);
+          // MPK_ABLATE_WS_FOLD: timing-only. Reads slot 0 and drops the other
+          // MOE_WS_SLOTS-1 slabs, so the numerics are wrong by three quarters
+          // of the MoE output -- never read tokens from a run with this set.
+          // It exists because this fold is the largest structural cost in the
+          // QKV prologue: the alternative shape is a W2 epilogue that
+          // atomicAdds into one slab so the consumer reads one, while the
+          // row-symmetry fix here (see moe_ws_layout.cuh) moved that sum into
+          // this loop, on every QKV worker, in QKV's serial window. The layout
+          // comment asks for exactly this measurement.
+#ifndef MPK_ABLATE_WS_FOLD
 #pragma unroll
           for (int s = 1; s < MOE_WS_SLOTS; s++) {
             float4 slot4;
@@ -1898,6 +1916,7 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
             ws4.z += slot4.z;
             ws4.w += slot4.w;
           }
+#endif
 
           // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
           uint2 res_packed;
@@ -2399,13 +2418,32 @@ __device__ __noinline__ void
       constexpr int _BLOCK_VEC = 256 * _VEC;
       constexpr int _MAX_ITERS = (REDUCTION_SIZE + _BLOCK_VEC - 1) / _BLOCK_VEC;
       float s_cache[_MAX_ITERS * _VEC];
+      // Pass 2's norm weights, hoisted ahead of the cross-wave reduction. See
+      // the issue loop below the pass-1 body for why.
+      uint64_t prefetched_norm_weights[_MAX_ITERS];
       int n_cached = 0;
       {
         constexpr int VEC = 4;
         constexpr int BLOCK_VEC = 256 * VEC;
-        float const *ws_base =
-            d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE);
-        unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
+        // address_space(1) -- GLOBAL, not generic FLAT. Both buffers are
+        // device-global tensors on every path here (the workspace is
+        // host-allocated, the residual is a model activation), so the cast is
+        // sound; what it buys is that these loads increment vmcnt only. As
+        // generic FLAT they bumped lgkmcnt as well, and the compiler then has
+        // no way to express "wait for the first two slabs but not the rest" --
+        // it must emit a full `s_waitcnt vmcnt(0) lgkmcnt(0)`. The pass-1 body
+        // had four of those, one per slab, so the MOE_WS_SLOTS fold ran fully
+        // serialized: issue, drain, add, issue, drain, add. With GLOBAL the
+        // waits become counted vmcnt(N) and the four slabs overlap.
+        //
+        // Same reasoning applies to the norm-weight prefetch below, with
+        // more force here, because this loop reads MOE_WS_SLOTS slabs where
+        // the single-slab shape reads one.
+        auto const *ws_base = (__attribute__((address_space(1))) float const *)(
+            d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE));
+        auto const *res_base =
+            (__attribute__((address_space(1))) unsigned short const *)(
+                d_residual + b * REDUCTION_SIZE);
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
 #pragma unroll
@@ -2416,19 +2454,50 @@ __device__ __noinline__ void
           // depend on the order experts happened to retire, nor on what else
           // is in the batch. That is what makes identical prompts in different
           // slots produce identical output. See moe_ws_layout.cuh.
+          // Typed AS(1) vector loads rather than __builtin_memcpy: the builtin
+          // is declared __host__ and rejects an address-space qualified
+          // pointer, and dereferencing the AS(1) type is what makes the
+          // backend pick global_load_dwordx4 over flat_load_dwordx4.
+          _gl_f32x4 const ws_v =
+              *(__attribute__((address_space(1))) _gl_f32x4 const *)(ws_base +
+                                                                     off);
           float4 ws4;
-          __builtin_memcpy(&ws4, ws_base + off, 16);
+          ws4.x = ws_v[0];
+          ws4.y = ws_v[1];
+          ws4.z = ws_v[2];
+          ws4.w = ws_v[3];
+          // MPK_ABLATE_WS_FOLD: timing-only. Reads slot 0 and drops the other
+          // MOE_WS_SLOTS-1 slabs, so the numerics are wrong by three quarters
+          // of the MoE output -- never read tokens from a run with this set.
+          // It exists because this fold is the largest structural cost in the
+          // QKV prologue: the alternative shape is a W2 epilogue that
+          // atomicAdds into one slab so the consumer reads one, while the
+          // row-symmetry fix here (see moe_ws_layout.cuh) moved that sum into
+          // this loop, on every QKV worker, in QKV's serial window. The layout
+          // comment asks for exactly this measurement.
+#ifndef MPK_ABLATE_WS_FOLD
 #pragma unroll
           for (int s = 1; s < MOE_WS_SLOTS; s++) {
+            _gl_f32x4 const sv =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + s * REDUCTION_SIZE + off);
             float4 slot4;
-            __builtin_memcpy(&slot4, ws_base + s * REDUCTION_SIZE + off, 16);
+            slot4.x = sv[0];
+            slot4.y = sv[1];
+            slot4.z = sv[2];
+            slot4.w = sv[3];
             ws4.x += slot4.x;
             ws4.y += slot4.y;
             ws4.z += slot4.z;
             ws4.w += slot4.w;
           }
+#endif
+          _gl_u32x2 const rv_v =
+              *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
+                                                                     off);
           uint2 res_packed;
-          __builtin_memcpy(&res_packed, res_base + off, 8);
+          res_packed.x = rv_v[0];
+          res_packed.y = rv_v[1];
 
           unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
           unsigned r1 = res_packed.x & 0xFFFF0000u;
@@ -2468,6 +2537,35 @@ __device__ __noinline__ void
         }
       }
 
+      // ── Pass 2's norm weights, issued here rather than at their use ──────
+      //
+      // The RMSNorm weights are immutable and pass 2 cannot consume them until
+      // after the cross-wave reduction and the two __syncthreads below. Issued
+      // here, that whole tree covers the HBM latency; left at the use site
+      // (where this used to be) every iteration of pass 2 pays an exposed
+      // round trip, and this kernel sits in QKV's serial window on the
+      // critical path.
+      //
+      // `global_load_dwordx2` in asm rather than a plain dereference is
+      // load-bearing, not a micro-optimisation. norm_weight_ptr is a
+      // device-global tensor on every path, but a generic-pointer FLAT load
+      // increments lgkmcnt as well as vmcnt -- so the very first
+      // `s_waitcnt lgkmcnt(0)` in the reduction (there is one, for the LDS
+      // s_red write) would drain these too and collapse the overlap this
+      // exists to create. GLOBAL touches vmcnt only.
+#pragma unroll
+      for (int iter = 0; iter < _MAX_ITERS; ++iter) {
+        int const off = tid * _VEC + iter * _BLOCK_VEC;
+        if (off < REDUCTION_SIZE) {
+          uint64_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(d_norm_w + off)
+                       : "memory");
+          prefetched_norm_weights[iter] = value;
+        }
+      }
+
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
@@ -2499,13 +2597,20 @@ __device__ __noinline__ void
       {
         using bf16 = __hip_bfloat16;
         constexpr int VEC = 4;
-        bf16 const *w_in = (bf16 const *)d_norm_w;
         bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
         int ci = 0;
+        int wi = 0;
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += _BLOCK_VEC) {
-          uint64_t wv;
-          __builtin_memcpy(&wv, &w_in[off], 8);
+          // The inline-asm load that produced this is opaque to the compiler,
+          // so nothing here makes it insert a vmcnt wait. What does is the
+          // second __syncthreads between the issue site and this use: its
+          // fence emits `s_waitcnt vmcnt(0)` ahead of the barrier. That is a
+          // property of the generated code rather than of the source, so it is
+          // verified in the disassembly -- look for a vmcnt(0) between the
+          // global_load_dwordx2 block and this loop before trusting a number
+          // from this path.
+          uint64_t wv = prefetched_norm_weights[wi++];
           bf16 const *wa = (bf16 const *)&wv;
           bf16 ov[VEC];
 #pragma unroll

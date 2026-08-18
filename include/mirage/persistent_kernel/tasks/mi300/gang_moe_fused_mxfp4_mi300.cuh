@@ -212,16 +212,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int const g = lane_id >> 4;
 
   // ── Tile decode (phase-ordered: padded W13 then all W2) ─────────────────
-  // Pad total_w13 to next multiple of 240 (30 workers × 8 XCDs) so every
-  // worker's first tile is a W13 tile. This eliminates compute imbalance
-  // where W2 workers would otherwise start polling the barrier immediately
-  // while W13 is still running (~7.8 us wasted per layer).
+  // Pad total_w13 to the next multiple of 240 so every worker's first tile is
+  // a W13 tile. This eliminates compute imbalance where W2 workers would
+  // otherwise start polling the barrier immediately while W13 is still
+  // running (~7.8 us wasted per layer).
   // Padding tiles (expert_idx >= num_activated) early-return in ~0 cycles.
-  // A "round" is workers_per_xcd * 8, so the constant is only correct at the
-  // default 30 workers. Under MPK_WORKERS_PER_XCD=31 the round is 248 and a
-  // 240-tile W13 space leaves 8 slots of the first round to be filled by W2
-  // tiles -- which is precisely the imbalance the padding was added to remove:
-  // those 8 workers start polling the W13->W2 barrier before W13 has run.
+  // A "round" is workers_per_xcd * 8, so 240 is exact only at 30 workers/XCD.
+  // The shipped default is 31, where the round is 248 and a 240-tile W13 space
+  // leaves 8 slots of the first round to be filled by W2 tiles -- precisely
+  // the imbalance the padding was added to remove: those 8 workers start
+  // polling the W13->W2 barrier before W13 has run. Correcting it to 248
+  // (MPK_MOE_PAD_ROUND=1) is worth ~0.01 ms and flakes the generated text one
+  // run in four, so 240 stays; see the host-side note for why.
   // MPK_MOE_PAD_MULTIPLE is set from the same env var on the host, so the two
   // sides cannot drift (a drift here does not merely mistune -- the `%
   // W13_TILES` release stops firing and the W2 workers spin forever).

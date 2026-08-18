@@ -1248,15 +1248,58 @@ oproj_barrier :
       // ── Pass 1: Pipelined hidden load + ssq accumulation ────────────
       // Gamma and router weights already prefetched before O-proj barrier
       // (g_pf_buf / w_pf_buf). Only hidden state needs fresh loads here.
+      //
+      // All MAX_ITERS loads are issued up front rather than one iteration
+      // ahead. The depth-1 version that used to be here drained with
+      // `s_waitcnt vmcnt(0)` at the top of every trip, and vmcnt(0) is *all*
+      // outstanding loads, not just the one being consumed -- so the load
+      // issued for iteration i+1 was waited on at iteration i, and the three
+      // round trips serialized end to end instead of overlapping. Issuing the
+      // whole set first lets each trip wait on `vmcnt(MAX_ITERS-1-iter)`,
+      // which retires exactly the one load it needs and leaves the rest in
+      // flight.
+      //
+      // Costs nothing in registers: every value already had to be live in
+      // h_cache[] for pass 2, so this only moves where the load is issued,
+      // not how long the result lives. MAX_ITERS is 3 at hidden 2880.
+      //
+      // This sits on the strictly serial part of the layer -- TopK cannot
+      // start until the router logits are written, and no MoE worker can
+      // start until TopK publishes -- so latency here is layer latency.
+      // The counted waits below name a nonzero vmcnt, which is only sound if
+      // nothing this thread issued *earlier* is still outstanding. At b == 0
+      // the O-proj barrier's drain already guarantees that, but at b > 0 the
+      // previous token's pass-2 normed-row stores are vector memory ops too
+      // and sit in the same counter -- an undrained store would make
+      // vmcnt(2) retire the store instead of the load, and this loop would
+      // consume an unwritten register. One drain per token closes that; it is
+      // dead code at BATCH_SIZE == 1, where n_tok_router is a compile-time 1.
+      if (BATCH_SIZE != 1) {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
 
-      // Prefetch first hidden iteration
-      i32x2_t h_pf;
-      if (tid < H4) {
-        int byte_off = tid * 8;
+      // The wait-count switch below enumerates 0, 1 and 2 outstanding loads.
+      // vmcnt takes an immediate, so the arms cannot be generated from a
+      // runtime expression -- a deeper pipeline needs more arms, and getting
+      // that wrong reads a register the load has not written yet, which is
+      // silent wrong numerics in the routing logits rather than a fault.
+      static_assert(MAX_ITERS <= 3,
+                    "pass-1 hidden prefetch: the s_waitcnt vmcnt switch below "
+                    "only covers up to 3 in-flight loads; add arms before "
+                    "raising ACTUAL_HIDDEN_DIM past 3*256*4");
+      i32x2_t h_pf[MAX_ITERS];
+      int n_issued = 0;
+#pragma unroll
+      for (int iter = 0; iter < MAX_ITERS; iter++) {
+        int i_cur = tid + iter * 256;
+        if (i_cur >= H4) {
+          break;
+        }
         asm volatile("global_load_dwordx2 %0, %1, off"
-                     : "=v"(h_pf)
-                     : "v"(h_base + byte_off)
+                     : "=v"(h_pf[iter])
+                     : "v"(h_base + i_cur * 8)
                      : "memory");
+        n_issued = iter + 1;
       }
 
 #pragma unroll
@@ -1266,19 +1309,25 @@ oproj_barrier :
           break;
         }
 
-        // Wait for hidden load (gamma+router already in VGPRs from pre-barrier)
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        i32x2_t h_v = h_pf;
-
-        // Prefetch next hidden iteration
-        int i_next = i_cur + 256;
-        if (i_next < H4) {
-          int byte_off_next = i_next * 8;
-          asm volatile("global_load_dwordx2 %0, %1, off"
-                       : "=v"(h_pf)
-                       : "v"(h_base + byte_off_next)
-                       : "memory");
+        // Retire this iteration's load and leave the later ones outstanding.
+        // The count is `n_issued - 1 - iter` -- how many of *these* loads are
+        // still in flight behind the one being consumed. It is safe to name a
+        // nonzero count only because nothing else this thread issued can be
+        // outstanding here: gamma and the router weights were drained by the
+        // `s_waitcnt vmcnt(0)` that follows the O-proj barrier's buffer_inv,
+        // which every path into this block has already executed.
+        //
+        // vmcnt is an immediate, so the count has to be a compile-time
+        // constant -- hence the switch rather than an expression. Both bounds
+        // are constexpr, so exactly one arm survives per unrolled trip.
+        if (n_issued - 1 - iter == 0) {
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        } else if (n_issued - 1 - iter == 1) {
+          asm volatile("s_waitcnt vmcnt(1)" ::: "memory");
+        } else {
+          asm volatile("s_waitcnt vmcnt(2)" ::: "memory");
         }
+        i32x2_t h_v = h_pf[iter];
 
         // Cache: hidden from the fresh load, gamma+router from the
         // pre-barrier prefetch. Both of the latter are token-invariant, but

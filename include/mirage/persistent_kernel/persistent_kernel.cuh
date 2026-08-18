@@ -68,10 +68,145 @@ __device__ unsigned long long g_last_xcd[8];
 // left, so its spin is purely the inter-XCD component.
 __device__ unsigned long long g_spin_lastlocal;
 __device__ unsigned long long g_n_lastlocal;
+// Spin of the worker that itself published the global release -- the last
+// local arriver on the last global XCD. By construction it waits on nobody:
+// no intra-XCD straggler (it is the last local) and no other XCD (its own
+// arrival was the eighth). Whatever it still spins is the irreducible
+// store-to-poll-observe latency of the release line, so it splits the spin
+// total into propagation (this) and skew (the rest).
+__device__ unsigned long long g_spin_lastglobal;
+__device__ unsigned long long g_n_lastglobal;
+// The spin segment split at the poll loop: `fanpf` is the release fan-out
+// plus the next-layer QKV prefetch issue that sits in front of the gate,
+// `poll` is the gate loop proper.
+__device__ unsigned long long g_fanpf_sum;
+__device__ unsigned long long g_poll_sum;
+__device__ unsigned long long g_poll_lastglobal;
+// The inter-layer prologue (ml pointer-table copy + its two __syncthreads),
+// which runs after the previous layer's gate cleared and before any of the
+// next layer's work.
+__device__ unsigned long long g_mlprologue_sum;
+__device__ unsigned long long g_mlprologue_n;
+// The table read alone, without the two __syncthreads that publish it.
+__device__ unsigned long long g_mlcopy_sum;
+__device__ unsigned long long g_mlcopy_n;
 // Spin by xcd_rank: the intra-XCD load-imbalance map. Rank determines role
 // (QKV/attn vs MoE tiles), so this says which workers idle and which straggle.
 __device__ unsigned long long g_spin_rank[64];
 __device__ unsigned long long g_n_rank[64];
+#endif
+
+#ifdef MPK_PHASE_SLOTS
+// Per-worker phase timestamps: one dword pair per slot per layer, reduced
+// into per-slot-pair spans.
+//
+// Why not reuse MPK_DEVICE_TIMING: that path prints one [FUSED_PHASE] line per
+// layer per iteration (~262k printfs), which inflates the iteration to ~56 ms
+// and dumps the skew into whichever phase happens to hold the barrier -- the
+// numbers it produces are of the instrumented kernel, not of the real one.
+// This writes one dword pair per slot per layer with no printf on the hot
+// path.
+//
+// Slots:
+//   0  layer entry (also accumulates the inter-layer span; see below)
+//   1  end of QKV GEMM                    (Phase 1 exit)
+//   2  end of QKV epoch barrier
+//   3  end of attention chunk compute
+//   4  attn_release wait begin
+//   5  attn_release wait end
+//   6  end of O-proj + router
+//   7  end of TopK routing wait
+//   8  end of MoE tiles (pre-Phase 9)
+//   9  Phase 9 arrival done
+//   10 Phase 9 gate cleared
+//   11 layer exit
+#define MPK_PHASE_SLOT_COUNT 12
+#define MPK_PHASE_MAX_WORKERS 256
+__device__ unsigned long long
+    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+// Accumulated per-slot-pair spans, so the reduction is over every layer of
+// every decode iteration rather than whichever layer happened to be last in
+// the buffer. Accumulating rather than sampling one captured layer is
+// strictly more robust and costs one atomic per slot.
+__device__ unsigned long long
+    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+__device__ unsigned long long g_phase_n[MPK_PHASE_MAX_WORKERS];
+// Only sample steady-state decode.
+//
+// `volatile` is load-bearing, not decoration. The whole layer body is inlined
+// into the persistent `ml` loop inside one dispatch, so a plain __device__ int
+// that no thread in this wave writes is a loop-invariant load: clang hoists it
+// out, every mark tests the value read on the very first iteration -- zero --
+// and the recorder silently reports nothing at all. Volatile also gets the
+// cross-XCD visibility this needs, since only worker 0 ever writes it.
+__device__ volatile int g_phase_arm;
+
+// Which iteration to start on. There is no device-side signal that separates
+// prefill from decode here: the sweep runs prefill at
+// --max-num-batched-tokens 1, so `num_active_tokens == 1` on *every* iteration
+// of both phases. Arming on that would average 512 prefill layers into the
+// answer and bias every span toward short-context. So the caller states the
+// boundary, and `[PSLOT] layers_per_worker` is the check: it must equal
+// 36 * (total_iters - MPK_PHASE_START_ITER) against the [FWD_PASS] tail.
+#ifndef MPK_PHASE_START_ITER
+#define MPK_PHASE_START_ITER 600
+#endif
+
+// Per-worker "this layer started while armed". The arm fires between two
+// layers, so without this the layer straddling it contributes spans for its
+// late slots only, yet still bumps g_phase_n at slot 11 -- every early-slot
+// mean would then be divided by one layer too many. Set at slot 0, required by
+// every other slot.
+__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS];
+
+__device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
+  if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  if (slot == 0) {
+    if (!g_phase_arm) {
+      return;
+    }
+    g_phase_live[worker] = 1;
+  } else if (!g_phase_live[worker]) {
+    return;
+  }
+  asm volatile("" ::: "memory");
+  unsigned long long const t = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  int const base = worker * MPK_PHASE_SLOT_COUNT;
+  // Slot 0 accumulates the *inter-layer* span: last layer's slot 11 to this
+  // layer's slot 0. It used to record only a timestamp, which left everything
+  // between two layers outside the trace -- and that hole is not small. At
+  // ctx 512 the eleven measured spans sum to 1.935 ms/token against a measured
+  // 2.021, so ~0.09 ms/token -- a significant share of the per-token budget --
+  // was being attributed to nothing at all. Anything the persistent worker loop
+  // does between the inlined layer bodies (the `ml` loop's own bookkeeping,
+  // the per-layer task dispatch, the inter-layer threadfence/syncthreads
+  // pair) lands here.
+  //
+  // Guarded on g_phase_live having been set by a *previous* layer, which is
+  // why the read is of slot 11's timestamp rather than slot -1: on the first
+  // armed layer there is no predecessor and prev is 0, which the existing
+  // `prev != 0` test already rejects. n is bumped at slot 11, so this span is
+  // accumulated over one fewer layer than the others -- at 7560 layers the
+  // resulting bias is 0.01%, far below anything read off this table.
+  unsigned long long const prev =
+      g_phase_ts[base + (slot > 0 ? slot - 1 : MPK_PHASE_SLOT_COUNT - 1)];
+  g_phase_ts[base + slot] = t;
+  if (prev != 0 && t >= prev) {
+    g_phase_span[base + slot] += (t - prev) * 10; // 100 MHz -> ns
+  }
+  if (slot == MPK_PHASE_SLOT_COUNT - 1) {
+    g_phase_n[worker]++;
+    g_phase_live[worker] = 0;
+  }
+}
+#define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
+#else
+#define MPK_PHASE_MARK(worker, slot)                                           \
+  do {                                                                         \
+  } while (0)
 #endif
 
 #ifdef MPK_FUSED_PHASE_TIMING
@@ -2125,7 +2260,51 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int ml_n_tile_start = (int)task_desc->task_metadata.n_tile_start;
             int ml_n_tile_count = (int)task_desc->task_metadata.n_tile_count;
 
+#ifdef MPK_ML_TABLE_PREFETCH
+            // ── Hide the inter-layer pointer-table read ────────────────────
+            //
+            // The copy below is 41 pointers (28 in + 13 out) read from two
+            // device-global tables, and it sits between the previous layer's
+            // Phase 9 gate and the next layer's first instruction -- pure
+            // serial latency with nothing to overlap it. Measured at ctx 512
+            // it is 765 ns of a 1679 ns inter-layer prologue, 0.028 ms over
+            // 36 layers. It is one dependent HBM round trip, not bandwidth:
+            // 328 bytes spread over 256 threads.
+            //
+            // The tables are built once on the host and are invariant for the
+            // life of the kernel, so layer ml+1's row can be read during layer
+            // ml's body instead. Each thread holds at most one input and one
+            // output pointer (MAX_INPUTS_PER_TASK is 28, MAX_OUTPUTS 13, both
+            // well under the 256-thread block), so the whole prefetch is two
+            // VGPR pairs carried across the layer call.
+            //
+            // Correctness rests on the tables being read-only after launch and
+            // on xcd_id being fixed for the life of the task -- the same
+            // property MPK_PREFETCH_NEXT_QKV already relies on. If either ever
+            // becomes false this must go back to a post-gate read.
+            void *_pf_in = nullptr;
+            void *_pf_out = nullptr;
+            void *_pf_cur = nullptr;
+            bool const _pf_ok =
+                (blockDim.x >= (unsigned)MAX_INPUTS_PER_TASK) &&
+                config.ml_num_layers > 1;
+            if (_pf_ok) {
+              int _pf_base = (xcd_id * config.ml_num_layers + 1);
+              if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
+                _pf_in = config.ml_input_table[_pf_base * MAX_INPUTS_PER_TASK +
+                                               threadIdx.x];
+              }
+              if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
+                _pf_out =
+                    config.ml_output_table[_pf_base * MAX_OUTPUTS_PER_TASK +
+                                           threadIdx.x];
+              }
+            }
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
+#ifdef MPK_DRAIN_STATS
+              unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
+#endif
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
               if (ml > 0) {
@@ -2139,20 +2318,76 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     (xcd_id * config.ml_num_layers + ml) * MAX_INPUTS_PER_TASK;
                 int ml_out_base =
                     (xcd_id * config.ml_num_layers + ml) * MAX_OUTPUTS_PER_TASK;
-                for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
-                     i += blockDim.x) {
-                  task_desc->input_ptrs[i] =
-                      config.ml_input_table[ml_in_base + i];
-                }
-                for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
-                     i += blockDim.x) {
-                  task_desc->output_ptrs[i] =
-                      config.ml_output_table[ml_out_base + i];
+#ifdef MPK_ML_TABLE_PREFETCH
+                if (_pf_ok) {
+                  // Retire the values loaded a layer ago, then immediately
+                  // re-issue for ml+1 so the next iteration finds them
+                  // resident too. The store must precede the re-issue: both
+                  // touch the same registers, and the compiler will otherwise
+                  // sink the store past the load and serialize them again.
+                  if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
+                    task_desc->input_ptrs[threadIdx.x] = _pf_in;
+                  }
+                  if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
+                    task_desc->output_ptrs[threadIdx.x] = _pf_out;
+                  }
+                  // Layer ml's own slot-4 value, kept before the re-issue
+                  // below overwrites it. Slot 25 is exactly this, so holding
+                  // it here lets thread 4 write both slot 24 and slot 25 from
+                  // its own registers instead of thread 0 reading slot 4 back
+                  // out of the task descriptor.
+                  _pf_cur = _pf_in;
+                  int _nl = ml + 1;
+                  if (_nl < config.ml_num_layers) {
+                    int _nb = (xcd_id * config.ml_num_layers + _nl);
+                    if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
+                      _pf_in = config.ml_input_table[_nb * MAX_INPUTS_PER_TASK +
+                                                     threadIdx.x];
+                    }
+                    if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
+                      _pf_out =
+                          config.ml_output_table[_nb * MAX_OUTPUTS_PER_TASK +
+                                                 threadIdx.x];
+                    }
+                  }
+                } else
+#endif
+                {
+                  for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
+                       i += blockDim.x) {
+                    task_desc->input_ptrs[i] =
+                        config.ml_input_table[ml_in_base + i];
+                  }
+                  for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
+                       i += blockDim.x) {
+                    task_desc->output_ptrs[i] =
+                        config.ml_output_table[ml_out_base + i];
+                  }
                 }
                 if (threadIdx.x == 0) {
                   task_desc->variant_id = config.ml_variant_ids[ml];
                 }
-                __syncthreads();
+#ifdef MPK_DRAIN_STATS
+                // Before the first __syncthreads: isolates the table read from
+                // the two block rendezvous that publish it.
+                if (threadIdx.x == 0) {
+                  unsigned long long _mltc =
+                      __builtin_amdgcn_s_memrealtime();
+                  atomicAdd(&g_mlcopy_sum, (_mltc - _mlt0) * 10);
+                  atomicAdd(&g_mlcopy_n, 1ULL);
+                }
+#endif
+#ifdef MPK_ML_TABLE_PREFETCH
+                // Under the prefetch path the only reader of a slot written by
+                // another thread was the slot-25 publish, and that now comes
+                // from thread 4's own register. Every remaining store lands in
+                // task_desc and is consumed after the single __syncthreads
+                // below, so this rendezvous has nothing left to order.
+                // Measured, the two of them were 914 ns of the 1679 ns
+                // inter-layer prologue -- more than the table read itself.
+                if (!_pf_ok)
+#endif
+                  __syncthreads();
               }
 
 #ifdef MPK_PREFETCH_NEXT_QKV
@@ -2199,8 +2434,34 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // would look cheaper but has no correct initial value: the very
               // first layer of the very first iteration would read whatever
               // was in LDS. Recomputing it host-side from `ml` is stateless.
-              if (threadIdx.x == 0 &&
-                  task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300) {
+#ifdef MPK_ML_TABLE_PREFETCH
+              // With the table prefetch running, slot 24 needs no HBM read:
+              // thread 4 is already holding layer ml+1's input_ptrs[4] in a
+              // register (it prefetched that exact element above), which is
+              // precisely the next layer's QKV weight pointer. Writing it from
+              // thread 4 also removes the cross-thread dependency that forced
+              // the second __syncthreads -- slot 25 is thread 4's own
+              // register too, so both stores come from the one thread that
+              // owns the value and the block rendezvouses once, not twice.
+              if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 &&
+                  _pf_ok) {
+                if (threadIdx.x == 4) {
+                  // _pf_in was re-issued for ml+1 in the copy block above, so
+                  // on the last layer it still holds layer ml's value and must
+                  // be suppressed -- same "null on the last layer" rule as the
+                  // non-prefetch path, for the same reason.
+                  task_desc->input_ptrs[24] =
+                      (ml + 1 < config.ml_num_layers) ? _pf_in : nullptr;
+                  // _pf_cur is this layer's slot 4, held from before the
+                  // re-issue, so this needs no read of input_ptrs[4] and
+                  // therefore no rendezvous with the thread that wrote it.
+                  task_desc->input_ptrs[25] = (ml > 0) ? _pf_cur : nullptr;
+                }
+              } else
+#endif
+                  if (threadIdx.x == 0 &&
+                      task_desc->task_type ==
+                          TASK_GANG_FULL_LAYER_FUSED_MI300) {
                 int const next_ml = ml + 1;
                 task_desc->input_ptrs[24] =
                     (next_ml < config.ml_num_layers)
@@ -2213,6 +2474,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     (ml > 0) ? task_desc->input_ptrs[4] : nullptr;
               }
               __syncthreads();
+#endif
+#ifdef MPK_DRAIN_STATS
+              // The inter-layer prologue: the ml_input_table / ml_output_table
+              // copy plus the two __syncthreads that publish it. This runs
+              // AFTER the previous layer's Phase 9 gate cleared, so it is
+              // serial critical-path latency between layers -- and it is an
+              // HBM read (the tables are device globals), not an LDS one.
+              // Passing the pointers as template/function arguments, with the
+              // gate *inside* the layer body after the pointers are known,
+              // would remove this prologue entirely.
+              if (threadIdx.x == 0 && ml > 0) {
+                unsigned long long _mlt1 = __builtin_amdgcn_s_memrealtime();
+                atomicAdd(&g_mlprologue_sum, (_mlt1 - _mlt0) * 10);
+                atomicAdd(&g_mlprologue_n, 1ULL);
+              }
 #endif
 #ifdef MPK_NIL_TRIPWIRE
               // Breadcrumb: which layer this worker reached, and whether the
@@ -3179,6 +3455,31 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           // ones past the end of the ring.
           g_fwdpass_total_ns += dur;
           g_fwdpass_total_iters++;
+#ifdef MPK_PHASE_SLOTS
+          // Arm the phase recorder here and nowhere else.
+          //
+          // The obvious site -- the worker loop's TASK_BEGIN_TASK_GRAPH branch
+          // -- is dead: workers never receive that task type, so an arm placed
+          // there leaves g_phase_arm at 0 forever while all 97M marks fall
+          // through. This handler is the one place that ticks exactly once per
+          // forward pass, and scheduler 0 owns it.
+          //
+          // Arming between forward passes rather than mid-pass is what makes
+          // the slot-0 liveness guard sufficient: every worker sees the flag
+          // set before it enters its next layer 0.
+          //
+          // No sched_id guard: which scheduler drains the global queue's end
+          // event is not fixed, and pinning this to sched_id 0 left the flag
+          // at 0 for a whole 910-iteration run. Any scheduler reaching here
+          // has ticked the counter, and the store is an idempotent 1, so a
+          // race between two of them writes the same value.
+          if (!g_phase_arm &&
+              g_fwdpass_total_iters >= MPK_PHASE_START_ITER) {
+            __threadfence();
+            g_phase_arm = 1;
+            __threadfence();
+          }
+#endif
           // Stride-decimate rather than truncate.
           //
           // The old code kept iterations 0..8191 and dropped every one after,
@@ -3249,6 +3550,44 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                            (double)g_fwdpass_total_iters
                      : 0.0,
                  g_fwdpass_dropped);
+#ifdef MPK_PHASE_SLOTS
+          // One line per (xcd_rank band, slot): mean ns of each slot-to-slot
+          // span over every steady-state decode layer. Printed once at
+          // termination so nothing lands on the hot path.
+          //
+          // Emitted per rank band because rank is role here: ranks
+          // 0..total_qkv_tiles_per_xcd-1 run QKV and attention, the rest go
+          // straight to Phase 6 and only ever run MoE tiles. Averaging the two
+          // together reports a worker that does not exist -- the same mistake
+          // that made the barrier look uniformly expensive.
+          {
+            // layers_per_worker must equal 36 * (iters - START_ITER) against
+            // the [FWD_PASS_TOTAL] line; arm=0 means the recorder never
+            // started and every number below is meaningless.
+            printf("[PSLOT] slots=%d layers_per_worker=%llu arm=%d "
+                   "total_iters=%d start_iter=%d\n",
+                   MPK_PHASE_SLOT_COUNT,
+                   g_phase_n[0],
+                   (int)g_phase_arm,
+                   g_fwdpass_total_iters,
+                   MPK_PHASE_START_ITER);
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned long long n = g_phase_n[w];
+              if (n == 0) {
+                continue;
+              }
+              // From s=0, not s=1: slot 0 now carries the inter-layer span
+              // (see mpk_phase_mark). Emitting it is what makes the row sum
+              // to the real per-layer cost instead of leaving a hole.
+              printf("[PSLOTW] w=%d n=%llu", w, n);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu",
+                       g_phase_span[w * MPK_PHASE_SLOT_COUNT + s] / n);
+              }
+              printf("\n");
+            }
+          }
+#endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,
           // [4]=after_compute, [2]=after_barrier

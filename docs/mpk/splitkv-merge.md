@@ -5,9 +5,18 @@ Status: **shipped**, both flags opt-in (`MPK_MERGE_KV_OUTER`,
 `include/mirage/persistent_kernel/tasks/ampere/merge_splitkv.cuh`.
 
 This is the largest single Fleet-vs-Fleet win in the effort on GPT-OSS 120B,
-batch 1, MI350X, TP1: **1.986 ms**. It is also the change we should have
+batch 1, MI350X, TP1: **2.35 -> 1.986 ms**. It is also the change we should have
 found months earlier, and the second half of this document is about why we
 didn't.
+
+**Always read the 1.986 with its context length.** It was measured at the
+default 72-token prompt (KV 72->200) -- `demo.py` clamps `--max-seq-length` to
+`prompt_len + max_new_tokens`, so a larger flag value on the default prompt
+does not lengthen the run. At a true 512-token KV the same build is **2.006**.
+The improvement is real and holds at every context, but an earlier revision of
+this paragraph claimed parity with an external engine on numbers measured at
+two different context lengths, and that claim did not survive a matched
+measurement. Any latency comparison must state the KV length.
 
 ---
 
@@ -123,7 +132,9 @@ not by total time.
 **Performance.** 9 interleaved A/B pairs, 8 wins / 1 loss, plus a 3-pair A==A
 self-check (both arms 1.985 ms, spread ±0.011). Interleaving is mandatory here:
 run-to-run bias is ~±0.015 ms, which exceeds most single-change effects.
-Pooled over 15 runs of the final build: **1.986 ms**.
+Pooled over 15 runs of the final build: **1.986 ms** at KV 72->200 (see the
+context-length caveat in the header -- this is a same-engine before/after
+figure).
 
 **Numerics.** Neither flag is bit-identical, and that is expected. There is no
 float reassociation — each accumulator sees the same operations in the same

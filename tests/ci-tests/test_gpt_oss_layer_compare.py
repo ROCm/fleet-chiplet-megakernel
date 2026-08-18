@@ -32,8 +32,20 @@ Every pair below was established by cross-correlating every MPK buffer against
 every reference stage, not by matching names:
 
     attn (L=1 only)      <-> L0.attn    cos 0.9998  -- see residual note
-    rmsnorm_out_moe      <-> L<i>.ln2   cos 0.9994  (next best 0.5606)
+    rmsnorm_out_moe      <-> L<i>.ln2   cos 0.9990  (next best 0.5606)
     mlp_weighted_sum_out <-> L<i>.out   cos 0.9999  (next best 0.9155)
+
+`rmsnorm_out_moe` is the loosest of the three, and by design: with the W13
+prequant on (the default at bs=1) that buffer holds FP8 E4M3 + E8M0 block
+scales, not BF16, so the compared values carry one extra quantization the
+other two stages do not. demo.py decodes the layout before dumping -- reading
+those bytes as BF16 gives cos 0.0, which reads as catastrophe rather than as
+the format mismatch it is. L1.ln2 lands at 0.99901 against a 0.999 WARN line,
+so this stage will flip to WARN on small FP changes; that is the format's
+noise, not a regression. The stage that matters downstream is layer_out, which
+is bit-identical with the prequant on and off (0.999871 both ways) -- the
+prequant is exact by construction and only the handoff buffer differs.
+MPK_W13_PREQUANT=0 restores the BF16 buffer and moves ln2 to 0.9994.
 
 The attention pair needs care. MPK's `attn_proj_out` carries the residual
 already added, so it is compared as `attn_proj_out - <layer input>`. At depth 1
