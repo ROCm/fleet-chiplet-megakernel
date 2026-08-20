@@ -243,9 +243,49 @@ __device__ __noinline__ void
   // MPK_W2_CONSUMER_GATE is exactly the "weakened" case this warning names, so
   // under that flag the acquire moves to the consumer gate in Phase 1 and goes
   // back to `sc1`. See the gate site for the full argument.
+  //
+  // ── The bs>1 arm: one system-scope acquire for the whole layer ────────────
+  //
+  // Everything above is a bs=1 argument. It leans on Phase 9 having drained
+  // every producer's write-through stores before any consumer reaches this
+  // line, which is true for the workspace but says nothing about data
+  // published *within* a layer by one XCD and read by another -- and at bs>1
+  // there is such data: rmsnorm_out_moe, written by one router worker per XCD
+  // with a plain global_store into that XCD's non-coherent L2, then read in
+  // Phase 8 by workers that never entered Phase 7 (xcd_rank >=
+  // oproj_topk_tiles_per_xcd) and so never touched the line on their own die.
+  //
+  // That was the bs>1 MoE W13 corruption. It was first fixed with a scoped
+  // `sc1` at the Phase 7b acquire, patching the one site that reproduced.
+  // What ships instead is one system-scope acquire for the whole layer, and
+  // the difference in shape is the point.
+  //
+  // Why the broad form is preferable to the narrow patch: the per-site fix is
+  // only known-correct at the site that happened to reproduce. This file has
+  // seven bare `buffer_inv` sites, all argued safe from bs=1 ablations, and
+  // the bs=4 evidence shows how weak that kind of argument is here -- with the
+  // scoped fix REMOVED, bs=4 still reports 0/720 bad weight groups across
+  // three reps, not because it is safe but because twelve active experts
+  // stream enough MXFP4 weight to evict the stale line by L2 capacity before
+  // it is read. The same capacity accident the `--max-layers 2` ablation above
+  // was designed to defeat. Correctness that depends on cache pressure is not
+  // correctness, so gate a coherence fix at the LOWEST batch that reproduces
+  // (bs=2 here), never the highest: bad-group counts fall 30 / 27 / 0 as the
+  // batch grows.
+  //
+  // Cost: `sc0 sc1` here drops L2 once per layer, at a point where the layer is
+  // about to stream its weights in anyway, rather than mid-Phase-7 after the
+  // MXFP4 expert weights are already resident -- which is what made the
+  // unconditional form at that site cost +0.259 ms/token. QKV_BATCH_SIZE is a
+  // template parameter, so the bs=1 build compiles to exactly the `#else` and
+  // pays nothing.
+  if (QKV_BATCH_SIZE > 1) {
+    asm volatile("buffer_inv sc0 sc1" ::: "memory");
+  } else {
 #ifndef MPK_W2_CONSUMER_GATE
-  asm volatile("buffer_inv" ::: "memory");
+    asm volatile("buffer_inv" ::: "memory");
 #endif
+  }
 
   // NOTE: the layer counter that the MoE W13->W2 barrier derives its release
   // value from is published further down, once qkv_epoch_expected is known.
@@ -1028,6 +1068,78 @@ __device__ __noinline__ void
   MPK_PHASE_MARK(_pslot_w, 6);
 
   // ══════════════════════════════════════════════════════════════════
+  // Phase 7a': O-proj barrier for the workers that skipped Phase 7
+  // ══════════════════════════════════════════════════════════════════
+  // `xcd_rank < oproj_topk_tiles_per_xcd` above is 23 at this model (184
+  // O-proj weight groups / 8 XCDs), while the dispatch is 31 workers/XCD. The
+  // other 8 never enter the Phase 7 kernel at all -- so they never reach its
+  // O-proj hierarchical barrier -- and then draw MoE tiles in Phase 8 that
+  // read rmsnorm_out_moe.
+  //
+  // Phase 7b below does not cover them. It gates on routing_ready, which
+  // publishes active_expert_ids / routing_indices; nothing in that release
+  // orders the *normed row* those workers are about to consume, and the
+  // `buffer_inv` after it invalidates vL1 only, not the per-XCD L2 the plain
+  // global_store under MPK_ONE_NORM_WRITER lands in.
+  //
+  // Measured, 2 layers at bs=2, against an offline MXFP4+SwiGLU oracle with
+  // the error normalized by the per-slot scale: the corrupt W13 weight groups
+  // are exactly the tiles owned by xcd_rank >= 23, in three separate
+  // geometries --
+  //
+  //   workers/XCD 31 -> skippers 23..30 -> corrupt ranks 26..30 -> 33/360 bad
+  //   workers/XCD 26 -> skippers 23..25 -> corrupt ranks 23..25 -> 14/360 bad
+  //   workers/XCD 23 -> skippers none   -> corrupt ranks none   ->  0/360 bad
+  //
+  // Ranks 16..22 also skip the RMSNorm (`local_tile >= router_tile_n`, 16) and
+  // are clean in every config, so the discriminator is entering this barrier,
+  // not running the norm.
+  //
+  // bs=1 is clean because the Phase 7 kernel's per-token loop is a
+  // compile-time 1 there and its closing __syncthreads compiles out, so there
+  // is no partially written multi-token row to catch. The corrupt reads are
+  // uncorrelated noise that scores *worse* than all-zeros, which is what a
+  // half-filled row looks like -- not a coherent wrong input.
+  //
+  // Arrival is unchanged: these workers have no O-proj columns to publish, so
+  // they must not bump the counter (`tiles_per_xcd` arrivals per XCD is what
+  // the release fires on, and an extra arrival would desynchronize the
+  // modular release). They only wait.
+  //
+  // ── This is a PARTIAL fix; the rest of the race is still open ─────────
+  //
+  // Matched control in one build, gate vs MPK_NO_OPROJ_SKIP_GATE=1: 32 bad
+  // weight groups against 52, with XCDs 4 and 5 going 12+8 -> 0. Real, and
+  // reproducible. But XCDs 1, 6 and 7 are untouched, and the residual sits in
+  // expert slots 4 and 5 -- the last two *real* slots of the 8-slot
+  // MAX_ACTIVATED space at bs=2 (6 real, 2 padding).
+  //
+  // The reason this cannot be the whole fix: the barrier polled here releases
+  // *before* the RMSNorm that writes rmsnorm_out_moe, which runs afterwards in
+  // the Phase 7 kernel's own Phase 3. So it orders the O-proj columns, not the
+  // normed row. What makes the residual genuinely puzzling is that Phase 7b
+  // below already polls routing_ready, which the router workers publish only
+  // after draining their norm stores -- if that release were sufficient there
+  // would be no residual at all, so something about it does not order the norm
+  // for these consumers.
+  //
+  // rmsnorm_out_moe is *correct* in the final dump (max err 0.0039 against a
+  // 0.35 scale, zero bad elements) while swiglu_out is wrong, so the MoE reads
+  // it transiently before it settles. The buffer is fine; the ordering is not.
+  //
+  // Counts move run to run (33/22/32/32 across reps at the shipped geometry),
+  // so do not size a change here off a single run -- always rebuild with the
+  // ablation flag and compare inside one build.
+#ifndef MPK_NO_OPROJ_SKIP_GATE
+  if (xcd_rank >= oproj_topk_tiles_per_xcd) {
+    int *oproj_hier = static_cast<int *>(input_ptrs[16]);
+    while (MPK_LD_GATE2(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+#endif
+
+  // ══════════════════════════════════════════════════════════════════
   // Phase 7b: wait for TopK (XCD-local release flag)
   // ══════════════════════════════════════════════════════════════════
   // Cross-workgroup sync: the last OProj workgroup runs TopK and
@@ -1056,18 +1168,63 @@ __device__ __noinline__ void
     __syncthreads();
 #endif
   }
-  // Cross-XCD ACQUIRE for the routing data. Plain `buffer_inv`, not `sc1`.
+  // Cross-XCD ACQUIRE for the routing data. Bare `buffer_inv`, deliberately.
   //
-  // What this poll gates is active_expert_ids / routing_indices / topk_weight,
-  // all written by the single TopK worker with st_wt (sc0 sc1) -- straight to
-  // HBM, bypassing L2 -- and read by every MoE worker on the other seven XCDs.
-  // This was `sc1` on that reasoning; see the layer-boundary acquire at the
-  // top of this function for why vL1-only suffices under the Phase 9 barrier.
+  // Read the gfx950 rule first, because it is the opposite of what the
+  // mnemonic suggests: an *unscoped* buffer_inv invalidates nothing. It is an
+  // architectural NOP. `sc1` invalidates L2; `sc0 sc1` is system scope.
+  // The disassembly confirms this is the understood rule elsewhere in the
+  // kernel -- 376 of the 396 buffer_inv sites in the built binary already
+  // carry `sc0 sc1`; this one was among the few that did not.
   //
-  // Worth noting what a stale read here would look like, since it is not a
-  // crash: last layer's expert ids and route values are all in range, so the
-  // token is quietly routed through the wrong experts. That failure mode is
-  // what the ablation's bitwise token comparison would catch -- and did not.
+  // So this instruction does nothing, and that is fine *here*: everything the
+  // poll gates -- active_expert_ids / routing_indices / topk_weight -- is
+  // written st_wt (sc0 sc1) straight to HBM, bypassing L2, and needs no
+  // invalidate to be seen.
+  //
+  // What is NOT fine, and was the bs>1 MoE W13 corruption, is that Phase 8
+  // also reads rmsnorm_out_moe, which under MPK_ONE_NORM_WRITER is published
+  // by one router worker *per XCD* with a plain global_store into that XCD's
+  // non-coherent L2. That line needs a real acquire, and this NOP was standing
+  // in for one. What that line needs, and what the branch below gives it, is
+  // an `sc1` invalidate. Applying it to every worker here is correct -- it
+  // takes the bs=2 two-layer dump from 32 bad weight groups to 0/360 -- but
+  // costs +0.259 ms/token (2.196 vs 1.937 at ctx 512), because dropping all of
+  // L2 also throws away the streamed MXFP4 expert weights Phase 8 is about to
+  // read. So it is applied only to the workers that need it.
+  //
+  // Which workers those are is not a guess. The corrupt tiles were exactly the
+  // ranks at or past oproj_topk_tiles_per_xcd -- {23..28} at the shipped
+  // geometry -- the same set the Phase 7a' gate above singles out, because
+  // those are the workers that never entered Phase 7 and so never touched the
+  // norm row on their own die. Every other rank read it while producing it.
+  //
+  // A cheaper form was tried and does not work: passing NT_LOAD to the W13
+  // activation gather. `__builtin_nontemporal_load` emits the `nt` cache-
+  // replacement hint, not a coherence scope, and left 30 of 32 groups bad.
+  //
+  // How the defect was localized, since the shape is worth recognizing again:
+  // it hit 100% of the affected weight groups on XCDs 1, 6 and 7 and 0% on the
+  // other five, was bit-identical under MPK_MOE_ENTRY_DELAY=2000 (2000 x
+  // s_sleep(127) before Phase 8), and was unchanged by making the producer's
+  // store write-through. A defect that survives an unbounded consumer delay
+  // and a write-through producer, while staying deterministic per XCD, is a
+  // consumer-side stale line -- not a race, and not a producer visibility gap.
+  //
+  // The acquire rmsnorm_out_moe needs is NO LONGER HERE. It moved to the top
+  // of the layer, as a single `buffer_inv sc0 sc1` under QKV_BATCH_SIZE > 1.
+  // See the long note at that site for why the layer-top form is preferred to
+  // scoping this one.
+  //
+  // The scoped form that used to be here was:
+  //
+  //   if (QKV_BATCH_SIZE > 1 && xcd_rank >= oproj_topk_tiles_per_xcd)
+  //     buffer_inv sc1;   else   buffer_inv;
+  //
+  // measuring 1.940 ms/token against a 1.937 pre-fix baseline, with the three
+  // arms at ctx 512 being: unconditional flush at this site 2.196, selective
+  // by rank 1.997, selective + batch-gated 1.940. It was correct (0/360 at
+  // bs=2) but only at the site that happened to reproduce.
   asm volatile("buffer_inv" ::: "memory");
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
@@ -1078,6 +1235,17 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   // Phase 8: MoE (W13+SwiGLU+W2)
   // ══════════════════════════════════════════════════════════════════
+#ifdef MPK_MOE_ENTRY_DELAY
+  // Diagnostic only: stall every MoE worker before it reads rmsnorm_out_moe.
+  // Separates "reads too early" from "reads the wrong thing". If the bs>1 W13
+  // corruption is a race, a delay long enough to let every producer finish
+  // makes it go away; if the corrupt tiles survive an unbounded wait, no
+  // amount of ordering will fix them and the defect is in what is read, not
+  // when. Costs a full stall on the hot path -- never ship this on.
+  for (int _d = 0; _d < MPK_MOE_ENTRY_DELAY; _d++) {
+    __builtin_amdgcn_s_sleep(127);
+  }
+#endif
   for (int moe_t = xcd_rank; moe_t < moe_total_tiles_per_xcd;
        moe_t += workers_per_xcd) {
     MPK_TW_SUB(80, moe_t);

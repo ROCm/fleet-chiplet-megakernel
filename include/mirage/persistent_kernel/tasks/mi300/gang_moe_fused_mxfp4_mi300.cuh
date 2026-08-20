@@ -831,6 +831,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #endif
       // Gather: only the tokens routed to this expert, in N-column order.
       // s_row_off was published by the compaction's __syncthreads above.
+      //
+      // NT_LOAD is deliberately NOT passed here, unlike the W2 gather below.
+      // It was tried as a cheap fix for the bs>1 W13 corruption and does not
+      // work: `__builtin_nontemporal_load` emits the `nt` cache-*replacement*
+      // hint, not a coherence scope, so it does not force a stale L2 line to
+      // be re-fetched. Measured 30 bad weight groups against 32 without it,
+      // which is inside the run-to-run spread at this geometry. The acquire in
+      // gang_full_layer_fused_mi300.cuh is what actually fixes it.
       _gang_multirow_fp8_quant_gather<W13_K, TOK_ROWS, W13_TOK_ROW_STRIDE,
                                       W13_SC_STRIDE>(
           A, s_row_off, n_tok, s_tok_fp8, s_tok_scales);

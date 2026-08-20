@@ -852,6 +852,35 @@ __global__ void prepare_kernel(RuntimeConfig config,
       config.precomp_gang_barrier[i] = 0;
     }
   }
+  // Reset the iteration-release / termination state.
+  //
+  // These are cudaMemset once at precompute time and were never touched again,
+  // which is invisible as long as the process launches the kernel exactly once
+  // (the offline demo). A server launches it per request, and launch N+1 then
+  // starts with terminate=1 and iter_ready at the previous run's terminal
+  // value, so every worker takes the terminate branch at its first queue wrap
+  // and the host polls a kernel that has already exited. Workers restart at
+  // pc_iter=1 and wait for iter_ready >= pc_iter, so 0 is the correct base:
+  // the first END_OF_TASK_GRAPH bump enables iteration 1.
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (config.precomp_iter_ready != nullptr) {
+      *config.precomp_iter_ready = 0ULL;
+    }
+    if (config.precomp_terminate != nullptr) {
+      *config.precomp_terminate = 0;
+    }
+    if (config.precomp_dbg_tasks_done != nullptr) {
+      *config.precomp_dbg_tasks_done = 0ULL;
+    }
+  }
+  // Per-XCD release flags mirror iter_ready and are polled with ld_nt, so a
+  // stale non-zero here would release iteration 1 before it is ready.
+  if (config.precomp_iter_xcd_release != nullptr) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 8 * 16;
+         i += blockDim.x * gridDim.x) {
+      config.precomp_iter_xcd_release[i] = 0;
+    }
+  }
 #endif
   // Reset combined kernel election state
   if (config.xcd_scheduler_claimed != nullptr && blockIdx.x == 0) {
@@ -929,6 +958,52 @@ __device__ __forceinline__ bool
     smem_kv_indices[i] = config.paged_kv_indices_buffer[i];
   }
 
+  // Step 2.5: fair-share prefill budget.
+  //
+  // MPK_MAX_NUM_BATCHED_TOKENS is both the admission pool and the GEMM M
+  // dimension, so it cannot be raised to make room (budget 8 is
+  // nondeterministic and slower per iteration, 16 hangs). With the pool fixed
+  // at B, letting one prefiller take up to MPK_MAX_TOKENS_PER_REQUEST (28)
+  // drains it: request 0 grabs the whole pool, requests 1..B-1 get nothing
+  // and enter only after it finishes prefilling. Three 512-token prompts
+  // therefore prefill *serially* and the "bs=3" decode tail is 255 iterations
+  // of one decoder, not three -- 1.803 tok/iter instead of 3.000.
+  //
+  // Capping each prefiller at its share of the pool makes the requests enter
+  // and advance in lockstep. Prefill takes more iterations (each request gets
+  // budget/demand tokens per pass instead of up to 28); decode, which is what
+  // TPOT measures, goes fully concurrent. At B=1 demand is 1 and the share is
+  // the whole budget, so this is structurally a no-op there.
+  int prefill_share = MPK_MAX_TOKENS_PER_REQUEST;
+#ifndef MPK_NO_FAIR_PREFILL
+  {
+    int num_live = 0;
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      if (config.request_ids[i] != -1) {
+        num_live++;
+      }
+    }
+    int queued = config.total_num_requests - *config.next_request_id;
+    if (queued < 0) {
+      queued = 0;
+    }
+    int demand = num_live + queued;
+    if (demand > MPK_MAX_NUM_BATCHED_REQUESTS) {
+      demand = MPK_MAX_NUM_BATCHED_REQUESTS;
+    }
+    if (demand < 1) {
+      demand = 1;
+    }
+    int share = MPK_MAX_NUM_BATCHED_TOKENS / demand;
+    if (share < 1) {
+      share = 1;
+    }
+    if (share < prefill_share) {
+      prefill_share = share;
+    }
+  }
+#endif
+
   // Step 3: prepare next batch
   int num_reqs = 0, num_tokens = 0;
   num_pages = 0;
@@ -944,9 +1019,9 @@ __device__ __forceinline__ bool
       int num_new_tokens = config.prompt_length[request_id] - step;
       if (num_new_tokens > 0) {
         // Prefill requests: cap per-request tokens to avoid attention LDS
-        // overflow
+        // overflow, and to this request's fair share of the pool
         num_new_tokens = min(num_new_tokens,
-                             min(MPK_MAX_TOKENS_PER_REQUEST,
+                             min(prefill_share,
                                  MPK_MAX_NUM_BATCHED_TOKENS - num_tokens));
       } else {
         // Decode requests
@@ -990,9 +1065,10 @@ __device__ __forceinline__ bool
     config.request_ids[num_reqs] = next_request_id;
     config.qo_indptr_buffer[num_reqs] = num_tokens;
     config.paged_kv_indptr_buffer[num_reqs] = num_pages;
-    // Prefill request: cap per-request tokens to avoid attention LDS overflow
+    // Prefill request: cap per-request tokens to avoid attention LDS overflow,
+    // and to this request's fair share of the pool (see Step 2.5)
     int num_new_tokens = min(config.prompt_length[next_request_id],
-                             min(MPK_MAX_TOKENS_PER_REQUEST,
+                             min(prefill_share,
                                  MPK_MAX_NUM_BATCHED_TOKENS - num_tokens));
     // Move tokens to input tokens
     for (int j = 0; j < num_new_tokens; j++) {
@@ -2109,6 +2185,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifndef MPK_ENABLE_PROFILING
         int num_active_tokens =
             config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+        // Inline per-iteration trace. Under MPK_QUIET_FWDPASS this is off: a
+        // device printf drains over PCIe inside the iteration it reports, so
+        // on the serving path it perturbs the very inter-token latency the
+        // benchmark is measuring.
+#ifndef MPK_QUIET_FWDPASS
         if (prev_begin_clk != 0 &&
             (fwd_pass_count < 10 || fwd_pass_count % 50 == 0)) {
           printf("[FWD_PASS] iter=%d time_ms=%.3f num_active_tokens=%d\n",
@@ -2116,6 +2197,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                  (double)(cur_clk - prev_begin_clk) / 1000000.0,
                  num_active_tokens);
         }
+#else
+        (void)num_active_tokens;
+#endif
 #endif
         prev_begin_clk = cur_clk;
         fwd_pass_count++;
@@ -3516,6 +3600,33 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         }
         prev_end_of_graph_clk = iter_end_clk;
         end_of_graph_count++;
+        // Publish decode progress to pinned host memory.
+        //
+        // config.step[0] -- request 0's token position -- not the iteration
+        // count: prefill packs up to MPK_MAX_NUM_BATCHED_TOKENS positions into
+        // a single iteration, so iterations and tokens are not the same unit.
+        // Publishing iterations made a 1024-token prefill look like 64 steps,
+        // and the streaming server then held back every token until the launch
+        // was nearly over.
+        //
+        // step[0] is updated by the *previous* iteration's prepare_next_batch,
+        // so at this point it names the positions already written to
+        // config.tokens -- a host reader that sees N may safely read N.
+        // Written before the continue-check so the final iteration is
+        // published even on the terminating path. Release ordering pairs with
+        // the host's acquire load: the token stores must be visible before the
+        // count that advertises them.
+        //
+        // One entry per request, not just request 0: a batch coalesces
+        // prompts of different lengths, so each request reaches its first
+        // output token at a different absolute position.
+        if (config.progress_host != nullptr) {
+          __threadfence_system();
+          for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
+            __atomic_store_n(
+                &config.progress_host[r], config.step[r], __ATOMIC_RELEASE);
+          }
+        }
         // Check if we want to continue
 #ifdef MODE_ONLINE_NOTOKEN
         if (!prepare_next_batch(config, iteration_num))
@@ -3523,6 +3634,22 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         if (!prepare_next_batch(config))
 #endif
         {
+          // Republish after the terminating prepare_next_batch.
+          //
+          // The publish above runs BEFORE prepare_next_batch, so it reports
+          // the step count as of the previous iteration -- the final token is
+          // written by this last call and would never be advertised. A
+          // streaming reader would then sit on the second-to-last token until
+          // the launch ended and the poll loop fell through to its flush,
+          // charging the whole FWD_PASS log dump and teardown (~150-490 ms) to
+          // the last inter-token gap.
+          if (config.progress_host != nullptr) {
+            __threadfence_system();
+            for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
+              __atomic_store_n(
+                  &config.progress_host[r], config.step[r], __ATOMIC_RELEASE);
+            }
+          }
           unsigned long long prep_done_clk = get_wallclock_ns();
 #ifndef MPK_ENABLE_PROFILING
           printf("[ITER_TIME] sched=%d iter=%llu prep_us=%.1f DONE\n",
@@ -3532,12 +3659,21 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #endif
           // Dump deferred FWD_PASS log (after timing, before terminate).
           // iter is reconstructed from the decimation stride.
+          //
+          // Skipped under MPK_QUIET_FWDPASS. The dump is thousands of device
+          // printfs drained over PCIe, which costs ~150-500 ms of teardown --
+          // negligible once per offline run, but a server pays it on every
+          // request, where it lands inside the measured end-to-end latency.
+          // The [FWD_PASS_TOTAL] summary below still reports the real
+          // per-iteration average, so nothing needed for timing is lost.
+#ifndef MPK_QUIET_FWDPASS
           for (int i = 1; i < g_fwdpass_count && i < FWDPASS_LOG_MAX; i++) {
             printf("[FWD_PASS] iter=%d time_ms=%.3f num_active_tokens=%d\n",
                    i * g_fwdpass_stride,
                    (double)g_fwdpass_time_ns[i] / 1000000.0,
                    g_fwdpass_tokens[i]);
           }
+#endif
           // Untruncated summary. dropped>0 means the per-iter lines above are
           // only the first FWDPASS_LOG_MAX iterations and must not be averaged
           // as if they were the whole run -- use total_ms/iters instead.
@@ -4042,6 +4178,8 @@ static unsigned long long *g_dbg_h_tasks_done =
 static int *g_dbg_h_worker_state =
     nullptr; // [num_workers*4] host-mapped debug state
 static int g_dbg_num_workers = 0;
+// Host-side view of the decode-progress counter (pinned, device-mapped).
+static int *g_progress_host = nullptr;
 static EventCounter *g_dbg_h_event_counters =
     nullptr; // host-mapped event counters
 static EventCounter *g_dbg_h_xcd_local_counters =
@@ -4199,6 +4337,50 @@ extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
       global_runtime_config);
   (void)cudaStreamSynchronize(NULL);
+}
+
+// Zero the progress counters from the host, synchronously.
+//
+// launch_persistent_kernel already clears them, but that runs on the GPU
+// worker thread *after* the streaming poller has started. The poller would
+// then read the previous request's terminal position, conclude the whole
+// response was already generated, and emit every token at once -- which
+// reports a near-zero TTFT and a near-zero inter-token latency for every
+// request after the first. Call this before the poller starts.
+extern "C" void reset_decode_progress() {
+  if (g_progress_host == nullptr) {
+    return;
+  }
+  for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+    __atomic_store_n(&g_progress_host[i], 0, __ATOMIC_RELEASE);
+  }
+}
+
+// Token position reached by batch slot `slot` in the currently-running launch,
+// or -1 if unavailable. Safe to call from another thread while the kernel runs
+// -- that is the point.
+extern "C" int get_decode_progress(int slot) {
+  if (g_progress_host == nullptr || slot < 0 ||
+      slot >= MPK_MAX_NUM_BATCHED_REQUESTS) {
+    return -1;
+  }
+  return __atomic_load_n(&g_progress_host[slot], __ATOMIC_ACQUIRE);
+}
+
+// Per-launch stop bound. prepare_next_batch retires a request at
+// `step + num_tokens + 1 >= config.max_seq_length` and has no other length
+// control, so the generated length is whatever the arena allows. That is fine
+// offline, where the arena is sized for the one run, but a server gets a
+// different max_tokens per request and cannot recompile. config.max_seq_length
+// is a plain int in the by-value config, distinct from the compile-time
+// MPK_MAX_SEQ_LENGTH that fixes the token-array stride -- lowering it before a
+// launch shortens generation without touching any layout.
+//
+// Must be <= MPK_MAX_SEQ_LENGTH; a larger value would index past the arena.
+extern "C" void set_max_seq_length(int max_seq_length) {
+  if (max_seq_length > 0 && max_seq_length <= MPK_MAX_SEQ_LENGTH) {
+    global_runtime_config.max_seq_length = max_seq_length;
+  }
 }
 
 extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
@@ -4988,6 +5170,40 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       global_runtime_config.tripwire = nullptr;
 #endif
 
+      // Decode-progress counters in pinned host memory, one per batch slot.
+      // Always allocated (one page, one store per slot per iteration); the
+      // serving path reads them to stream tokens while the launch is still
+      // running, and nothing else touches them.
+      //
+      // Per-slot, not a single counter: a batch coalesces requests with
+      // different prompt lengths, so slot r's first *output* token lands at a
+      // different absolute position than slot 0's. One shared counter would
+      // make every request in the batch inherit request 0's schedule and
+      // report the wrong TTFT for all the others.
+      {
+        int *pg_host = nullptr;
+        if (hipHostMalloc(reinterpret_cast<void **>(&pg_host),
+                          sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS,
+                          hipHostMallocMapped | hipHostMallocNonCoherent) ==
+                hipSuccess &&
+            pg_host != nullptr) {
+          for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+            pg_host[i] = 0;
+          }
+          g_progress_host = pg_host;
+          int *pg_dev = nullptr;
+          if (hipHostGetDevicePointer(
+                  reinterpret_cast<void **>(&pg_dev), pg_host, 0) ==
+              hipSuccess) {
+            global_runtime_config.progress_host = pg_dev;
+          } else {
+            (void)hipHostFree(pg_host);
+            g_progress_host = nullptr;
+            global_runtime_config.progress_host = nullptr;
+          }
+        }
+      }
+
       // Clear host debug pointers (no longer host-mapped)
       g_dbg_h_iter_ready = nullptr;
       g_dbg_h_terminate = nullptr;
@@ -5318,6 +5534,14 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 // TODO: change launch config
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
+  // Progress is per-launch, so clear it before the kernel starts rather than
+  // after it ends: a streaming reader polling from another thread must never
+  // see the previous request's count and emit tokens that do not exist yet.
+  if (g_progress_host != nullptr) {
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      __atomic_store_n(&g_progress_host[i], 0, __ATOMIC_RELEASE);
+    }
+  }
   // Prepare next persistent kernel by resetting queue pointers
   {
     int end_of_task_graph_event_pos = global_runtime_config.num_events - 1;
@@ -5367,9 +5591,29 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         default_stream, global_runtime_config.scheduler_done_event, 0);
 
 #ifdef MPK_PRECOMPUTED_DISPATCH
-    // Debug: poll device memory via async memcpy on a separate stream
-    fprintf(stderr, "[HOST_DBG] Starting poll loop...\n");
-    if (global_runtime_config.precomp_iter_ready &&
+    // Hang-diagnosis watchdog. OFF unless MPK_HOST_WATCHDOG=1.
+    //
+    // This loop gates when launch_persistent_kernel returns, so it is not
+    // free: it ticks, and the kernel finishes mid-tick, so every launch pays
+    // out the remainder of the current tick before the response can be sent.
+    // At the original 1 s granularity that was a median 498 ms per request at
+    // conc=1, landing entirely on the final inter-token gap -- +0.55 ms/token
+    // once TPOT averages it over ~900 tokens, or 22% of the reported figure.
+    // A 12-token coherence check paid 974 ms of it. No compute happens in
+    // that window; it is pure sleep.
+    //
+    // It exists for real failures (see the 32k-hang notes below) and stays
+    // available, but a serving run should not carry a debug poller in the
+    // response path. The tick is also 5 ms now rather than 1 s, so enabling
+    // it costs ~5 ms instead of ~500.
+    static bool const dbg_watchdog = [] {
+      char const *e = getenv("MPK_HOST_WATCHDOG");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (dbg_watchdog) {
+      fprintf(stderr, "[HOST_DBG] Starting poll loop...\n");
+    }
+    if (dbg_watchdog && global_runtime_config.precomp_iter_ready &&
         global_runtime_config.precomp_terminate) {
       hipStream_t dbg_stream;
       (void)hipStreamCreate(&dbg_stream);
@@ -5390,6 +5634,18 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       static std::atomic<unsigned long long> dbg_a_td{0};
       static std::atomic<unsigned long long> dbg_a_polls{0};
       static std::atomic<bool> dbg_a_stop{false};
+      // Re-arm for this launch. These are function-static so the detached poll
+      // thread can outlive the call, which also means launch N+1 inherits
+      // launch N's terminal values: dbg_a_stop=true made the new poll thread
+      // exit on its first predicate test, and dbg_a_term=1 made the tick loop
+      // break at t=1s. That is exactly the misleading
+      // "iter_ready=<terminal> terminate=1 dev_polls=1" a server run reports
+      // one second after a relaunch, whatever the kernel is actually doing.
+      dbg_a_stop.store(false, std::memory_order_relaxed);
+      dbg_a_ir.store(0, std::memory_order_relaxed);
+      dbg_a_term.store(0, std::memory_order_relaxed);
+      dbg_a_td.store(0, std::memory_order_relaxed);
+      dbg_a_polls.store(0, std::memory_order_relaxed);
       // Detached, and every object it touches has static storage duration --
       // a thread blocked in HIP outlives this scope and must not dangle.
       std::thread([dbg_stream]() {
@@ -5432,9 +5688,22 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       // reports terminate (the `if (term) break` at the bottom), bounded only
       // by a generous ceiling so a wedged run still exits the loop and lets
       // the enclosing `timeout` reap it.
-      int const dbg_max_ticks = 900;
+      // Tick at 5 ms, not 1 s. This loop gates when launch_persistent_kernel
+      // returns, so its sleep granularity lands directly on the client: the
+      // kernel finishes mid-tick and the response waits out the remainder of
+      // the sleep. Measured at conc=1, that was 1000 - (finish_ms % 1000) on
+      // every launch -- a median 498 ms charged to the final inter-token gap,
+      // which TPOT then averages over ~900 tokens as +0.55 ms/token. A
+      // 12-token request paid 974 ms of it. Nothing was computing during that
+      // window.
+      //
+      // The reporting cadence is deliberately decoupled below (dbg_ticks_per_s)
+      // so the log keeps its once-a-second rhythm and the same 900 s ceiling.
+      int const dbg_tick_ms = 5;
+      int const dbg_ticks_per_s = 1000 / dbg_tick_ms;
+      int const dbg_max_ticks = 900 * dbg_ticks_per_s;
       for (int dbg_i = 0; dbg_i < dbg_max_ticks; dbg_i++) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(dbg_tick_ms));
         unsigned long long ir = dbg_a_ir.load(std::memory_order_relaxed);
         int term = dbg_a_term.load(std::memory_order_relaxed);
         unsigned long long td = dbg_a_td.load(std::memory_order_relaxed);
@@ -5448,19 +5717,23 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         // The real liveness signal is the per-worker `done` counter in the
         // dump below: it lives in pinned host memory and advances even while
         // HIP is blocked. Frozen `done` across ticks = actually stuck.
-        if (dbg_i % 30 == 0 || term) {
+        // dbg_i counts 5 ms ticks now, so both the 30 s reporting interval and
+        // the printed timestamp have to be converted back into seconds.
+        if (dbg_i % (30 * dbg_ticks_per_s) == 0 || term) {
           fprintf(
               stderr,
               "[HOST_DBG] t=%ds iter_ready=%llu terminate=%d "
               "tasks_done=%llu dev_polls=%llu (0 is normal; watch `done`)\n",
-              dbg_i + 1,
+              (dbg_i / dbg_ticks_per_s) + 1,
               ir,
               term,
               td,
               polls);
         }
         // Dump per-worker state + summary
-        if (g_dbg_h_worker_state && dbg_i >= 2) {
+        // Was `dbg_i >= 2`, i.e. "after 2 s of ticks"; keep that wall-clock
+        // meaning rather than letting it fire 10 ms in.
+        if (g_dbg_h_worker_state && dbg_i >= 2 * dbg_ticks_per_s) {
           int phase_hist[4] = {};
           // Fused-layer phase histogram over ALL workers, not just the 32
           // printed individually. A stall where 239 workers sit on one barrier
@@ -5508,7 +5781,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           // per-worker lines would be ~32 lines/sec of healthy-run noise and
           // would bury the failure. Print them only while a stall is building
           // or on a periodic checkpoint.
-          bool verbose = (stall_ticks >= 1) || (dbg_i % 30 == 0);
+          bool verbose =
+              (stall_ticks >= 1) || (dbg_i % (30 * dbg_ticks_per_s) == 0);
           for (int w = 0; w < g_dbg_num_workers; w++) {
             int *ws = g_dbg_h_worker_state + w * 4;
             int tpos = __atomic_load_n(&ws[0], __ATOMIC_RELAXED);
@@ -6034,7 +6308,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           } // verbose
         }
         // Dump event counters to diagnose which events haven't fired
-        if (g_dbg_h_event_counters && dbg_i == 5) {
+        if (g_dbg_h_event_counters && dbg_i == 5 * dbg_ticks_per_s) {
           fprintf(stderr,
                   "  === Event counters: last 20 events + event 158 ===\n");
           // Show events 140-158 (the tail where workers are stuck)

@@ -77,8 +77,28 @@ static PyObject *launch_func(PyObject *self, PyObject *args) {
     return NULL;
   }
   stream = (cudaStream_t)PyLong_AsVoidPtr(py_stream);
+  // Drop the GIL for the duration of the launch. It is a blocking call that
+  // owns the GPU for the whole request, so holding the GIL would freeze every
+  // other Python thread -- including the server thread that polls
+  // get_decode_progress() to stream tokens as they are produced.
+  Py_BEGIN_ALLOW_THREADS
   launch_persistent_kernel(stream);
+  Py_END_ALLOW_THREADS
 
+  Py_RETURN_NONE;
+}
+
+static PyObject *decode_progress_func(PyObject *self, PyObject *args) {
+  int slot = 0;
+  if (!PyArg_ParseTuple(args, "|i", &slot)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (slot,) or ()");
+    return NULL;
+  }
+  return PyLong_FromLong(get_decode_progress(slot));
+}
+
+static PyObject *reset_decode_progress_func(PyObject *self, PyObject *args) {
+  reset_decode_progress();
   Py_RETURN_NONE;
 }
 
@@ -100,10 +120,23 @@ static PyObject *set_rope_tables_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *set_max_seq_length_func(PyObject *self, PyObject *args) {
+  int max_seq_length;
+  if (!PyArg_ParseTuple(args, "i", &max_seq_length)) {
+    PyErr_SetString(PyExc_TypeError, "Expected (max_seq_length,)");
+    return NULL;
+  }
+  set_max_seq_length(max_seq_length);
+  Py_RETURN_NONE;
+}
+
 static PyMethodDef ModuleMethods[] = {
   {"init_func", init_func, METH_VARARGS, "initialize persistent kernel"},
+  {"set_max_seq_length_func", set_max_seq_length_func, METH_VARARGS, "set the per-launch generation stop bound"},
   {"init_request_func", init_request_func, METH_VARARGS, "initialize request resources"},
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
+  {"decode_progress_func", decode_progress_func, METH_VARARGS, "token position reached by batch slot N in the running launch (-1 if unavailable)"},
+  {"reset_decode_progress_func", reset_decode_progress_func, METH_VARARGS, "zero the decode-progress counters before a launch"},
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {"set_rope_tables_func", set_rope_tables_func, METH_VARARGS, "set RoPE cos/sin tables"},
   {NULL, NULL, 0, NULL} // sentinel
@@ -362,6 +395,12 @@ def get_compile_command(
 
         if int(os.environ.get("MPK_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_TIMING"]
+        # Drop the per-iteration [FWD_PASS] trace and its end-of-launch dump.
+        # Device printf drains over PCIe: inline it perturbs the iteration it
+        # measures, and the dump adds ~150-500 ms of teardown. Both are free
+        # once per offline run and both land inside a served request's latency.
+        if int(os.environ.get("MPK_QUIET_FWDPASS", "0")) == 1:
+            flags = flags + ["-DMPK_QUIET_FWDPASS"]
         if int(os.environ.get("MPK_DEVICE_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_DEVICE_TASK_TIMING"]
         if int(os.environ.get("MPK_DEVICE_ACCUM", "0")) == 1:
@@ -395,6 +434,12 @@ def get_compile_command(
             flags = flags + ["-DMPK_ABLATE_W13_QUANT"]
         if _opt("MPK_OPROJ_NO_WB"):
             flags = flags + ["-DMPK_OPROJ_NO_WB"]
+        # Ablation for fair-share prefill admission (default ON). Set to 1 to
+        # restore the greedy rule where one prefiller may take the entire
+        # MPK_MAX_NUM_BATCHED_TOKENS pool, which serializes prefill at B>1 and
+        # leaves the decode tail running one request per iteration.
+        if int(os.environ.get("MPK_NO_FAIR_PREFILL", "0")) == 1:
+            flags = flags + ["-DMPK_NO_FAIR_PREFILL"]
         # Ablation for the wave-local long-context attention scan (default ON).
         # Set to 1 to fall back to the shared-LDS loop that redundantly
         # computes QK on all four waves and barriers twice per 16-token tile.
@@ -442,6 +487,20 @@ def get_compile_command(
             # plain global_store into a non-coherent L2, so each XCD needs its
             # own writer. Correctness-relevant -- check the generated text.
             flags = flags + ["-DMPK_ONE_NORM_WRITER"]
+        _moe_delay = int(os.environ.get("MPK_MOE_ENTRY_DELAY", "0"))
+        if _moe_delay > 0:
+            # Diagnostic only: N x s_sleep(127) before Phase 8 reads
+            # rmsnorm_out_moe. Tells a read-too-early race apart from a
+            # read-the-wrong-address defect -- see the probe site for the
+            # argument. Never ship this on; it stalls the hot path.
+            flags = flags + ["-DMPK_MOE_ENTRY_DELAY=%d" % _moe_delay]
+        if int(os.environ.get("MPK_NO_OPROJ_SKIP_GATE", "0")) == 1:
+            # Ablation only: drop the Phase 7a' O-proj barrier poll for the
+            # workers with xcd_rank >= oproj_topk_tiles_per_xcd, restoring the
+            # defect where they read rmsnorm_out_moe ungated in Phase 8. Only
+            # bites at bs>1; see the comment at that gate for the three-point
+            # workers-per-XCD ablation that localized it.
+            flags = flags + ["-DMPK_NO_OPROJ_SKIP_GATE"]
         if int(os.environ.get("MPK_NO_SW_MASK", "0")) == 1:
             # Ablation only: drop the sliding-window head mask in the HD=64
             # decode kernel, restoring the pre-fix behaviour where kv_start is
@@ -852,9 +911,6 @@ def get_compile_command(
             flags = flags + ["-DEMBED_DEBUG"]
         if int(os.environ.get("MPK_DEBUG_LAYERS", "0")) == 1:
             flags = flags + ["-DMPK_DEBUG_RMSNORM", "-DMPK_DEBUG_MOE_MUL_SUM"]
-        if int(os.environ.get("CK_FMHA_1TOK", "0")) == 1:
-            # Force seqlen_q=1: uses merge path only (faster decode, slower prefill)
-            flags = flags + ["-DMPK_MAX_TOKENS_PER_REQUEST=1"]
         amdgpu_target = os.environ.get("AMDGPU_TARGETS", "gfx950")
         specific_cmd = [
             f"--offload-arch={amdgpu_target}",
@@ -5085,6 +5141,11 @@ class PersistentKernel:
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
         self._set_rope_tables_func = getattr(mod, "set_rope_tables_func", None)
+        self.decode_progress_func = getattr(mod, "decode_progress_func", None)
+        self.set_max_seq_length_func = getattr(
+            mod, "set_max_seq_length_func", None)
+        self.reset_decode_progress_func = getattr(
+            mod, "reset_decode_progress_func", None)
         print("Finished megakernel compilation...")
 
         #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]

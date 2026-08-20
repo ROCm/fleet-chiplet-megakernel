@@ -14,17 +14,26 @@ export PYTHONPATH="$FLEET_HOME/python:${PYTHONPATH:-}"
 
 export USE_FP8_ACT=1
 
-export MODEL_PATH="${MODEL_PATH:-/root/schowdha/models/gpt-oss-120b}"
+# Set MODEL_PATH in your shell, or point HF_HOME at a cache holding the model.
+export MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to the gpt-oss-120b directory}"
 
 # rocSHMEM + the MPI it was built against. rocSHMEM's IPC backend only needs
-# MPI for bootstrap (rank exchange), not for the data path.
-export ROCSHMEM_INC_PATH="${ROCSHMEM_INC_PATH:-/home/claudeuser/rocshmem/include}"
-export ROCSHMEM_LIB_PATH="${ROCSHMEM_LIB_PATH:-/home/claudeuser/rocshmem/lib}"
-if [ -d /home/claudeuser/ompi/lib ]; then
-  export MPI_INC_PATH="${MPI_INC_PATH:-/home/claudeuser/ompi/include}"
-  export MPI_LIB_PATH="${MPI_LIB_PATH:-/home/claudeuser/ompi/lib}"
-  export PATH="/home/claudeuser/ompi/bin:$PATH"
-  export LD_LIBRARY_PATH="/home/claudeuser/ompi/lib:/home/claudeuser/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+# MPI for bootstrap (rank exchange), not for the data path. Only the
+# multi-GPU scripts need these; a single-GPU run never reads them.
+#
+# ROCSHMEM_HOME / OMPI_HOME default to $HOME/rocshmem and $HOME/ompi, which is
+# where the build instructions put them. Override either if yours live
+# elsewhere; if $OMPI_HOME/lib is absent we fall back to the distro OpenMPI.
+ROCSHMEM_HOME="${ROCSHMEM_HOME:-$HOME/rocshmem}"
+OMPI_HOME="${OMPI_HOME:-$HOME/ompi}"
+UCX_HOME="${UCX_HOME:-$HOME/ucx}"
+export ROCSHMEM_INC_PATH="${ROCSHMEM_INC_PATH:-$ROCSHMEM_HOME/include}"
+export ROCSHMEM_LIB_PATH="${ROCSHMEM_LIB_PATH:-$ROCSHMEM_HOME/lib}"
+if [ -d "$OMPI_HOME/lib" ]; then
+  export MPI_INC_PATH="${MPI_INC_PATH:-$OMPI_HOME/include}"
+  export MPI_LIB_PATH="${MPI_LIB_PATH:-$OMPI_HOME/lib}"
+  export PATH="$OMPI_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$OMPI_HOME/lib:$UCX_HOME/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
 else
   export MPI_INC_PATH="${MPI_INC_PATH:-/usr/lib/x86_64-linux-gnu/openmpi/include}"
   export MPI_LIB_PATH="${MPI_LIB_PATH:-/usr/lib/x86_64-linux-gnu/openmpi/lib}"
@@ -49,10 +58,12 @@ MPK_FORWARD_VARS=(
   MPK_DRAIN_STATS MPK_ML_TABLE_PREFETCH MPK_PHASE_SLOTS MPK_PHASE_START_ITER
   MPK_PREFETCH_NEXT_QKV MPK_ABLATE_QKV_DMA MPK_ABLATE_WS_FOLD
   MPK_OPROJ_NO_WB MPK_OPROJ_INNER_TIMING MPK_MOE_INNER_TIMING MPK_ATTN_NO_WAVE_LOCAL
+  MPK_NO_FAIR_PREFILL
   MPK_XCD_LOCAL_BARRIER MPK_MFMA_PINGPONG_SCHED MPK_OPROJ_TREE_BARRIER MPK_GATE_PREV_LDS
   MPK_ATTN_SCALAR_PAGE MPK_ATTN_WAVE_LOCAL_MIN_TILES
   MPK_WORKERS_PER_XCD MPK_DRAIN_OVERLAP MPK_W13_LINEAR_LOAD MPK_W2_LINEAR_LOAD
   MPK_W13_T1_LINEAR_LOAD MPK_MOE_INNER_WIDE MPK_NDEBUG MPK_NO_SW_MASK MPK_LSE_LOG_BUG MPK_INTERLAYER_FENCE MPK_ONE_NORM_WRITER
+  MPK_NO_OPROJ_SKIP_GATE MPK_MOE_ENTRY_DELAY
   MPK_W13_T1_EARLY_SCALE_LOAD MPK_QKV_PREFETCH_SCALES MPK_W13_T1_SPLIT_LDS_STAGE
   MPK_SYS_POLL_LOAD MPK_QKV_GATE_NO_AGENT_FENCE MPK_NARROW_GATE_POLL MPK_W13_BIAS_PREFETCH
   MPK_W13_BIAS_PF_T0_ONLY MPK_LEAN_ARRIVE MPK_W2_ONLY_ARRIVE MPK_ROUTER_FUSED_DP MPK_QKV_PF_WAVE_SPLIT MPK_OPROJ_LEAN_ACQUIRE MPK_MOE_PAD_ROUND MPK_W13_PREQUANT MPK_OPROJ_ARRIVE_ONLY MPK_ROUTING_LANE_RELEASE MPK_ROUTING_DERIVED_EPOCH MPK_MERGE_KV_OUTER MPK_MERGE_TWO_PASS

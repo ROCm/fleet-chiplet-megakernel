@@ -447,6 +447,14 @@ struct RuntimeConfig {
   // so breadcrumbs survive the abort that a memory fault triggers. Null
   // unless built with MPK_NIL_TRIPWIRE. See persistent_kernel.cuh.
   unsigned long long *tripwire;
+  // Decode progress, published to *pinned host* memory once per iteration by
+  // the scheduler. The megakernel runs a whole request inside one blocking
+  // launch, so device memory tells the host nothing until that launch returns
+  // -- which is too late for a server that has to stream tokens as they are
+  // produced. Writes here land in host RAM over PCIe as they happen, the same
+  // property the nil tripwire relies on. Null unless the host allocated it.
+  //   [r] = token position reached by batch slot r (reset per launch)
+  int *progress_host;
   // Cross-XCD gang barrier: workers sync before executing gang tasks with
   // internal barriers
   unsigned long long

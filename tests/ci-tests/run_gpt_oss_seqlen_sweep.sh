@@ -42,12 +42,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MIRAGE_HOME="${MIRAGE_HOME:-$ROOT}"
-# MUST come first: there is another mirage checkout at ~/mirage that `import
-# mirage` resolves to otherwise, and it is missing this tree's kernel APIs.
-# Benchmarking it silently would measure the wrong repo.
+# MUST come first: any other mirage checkout on PYTHONPATH, or an editable
+# install pointing at one, is what `import mirage` resolves to otherwise --
+# and benchmarking it would silently measure the wrong repo.
 export PYTHONPATH="$ROOT/python:${PYTHONPATH:-}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
-MODEL_PATH="${MODEL_PATH:-/root/schowdha/models/gpt-oss-120b}"
+MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to the gpt-oss-120b directory}"
 # 65536 and 131072 are deliberately not in the default: prefill is 1 tok/iter,
 # so 128k costs ~5 min of prefill per point. Pass SEQ_LENS explicitly for those.
 SEQ_LENS="${SEQ_LENS:-512 1024 2048 4096 8192 32768}"

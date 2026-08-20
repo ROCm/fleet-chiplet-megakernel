@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import argparse
 import os
+import sys
 import math
 import json
 
@@ -485,6 +486,468 @@ def dequant_mxfp4_to_bf16(blocks: torch.Tensor, scales: torch.Tensor,
     return result.contiguous()
 
 
+def serve_mpk(*, args, mpk, tokenizer, tokens, prompt_lengths, step,
+              num_new_tokens, config, reset_device_barriers):
+    """Serve the compiled megakernel over an OpenAI-compatible HTTP endpoint.
+
+    Exists so the InferenceX benchmark harness -- which only speaks HTTP to
+    /v1/completions -- can drive MPK through the exact same client, sampler
+    and metric code that measures vLLM. Anything less than a real endpoint
+    would compare MPK's in-process timing against vLLM's end-to-end serving
+    numbers, which is not a like-for-like comparison.
+
+    Deliberately minimal, and NOT a production server:
+      * A single worker thread owns the GPU. MPK's tensors (`tokens`, `step`,
+        `prompt_lengths`) are one fixed-size arena bound into the compiled
+        kernel by pointer, so overlapping launches would corrupt each other.
+        Concurrency is expressed as a batch WITHIN one launch: the worker
+        coalesces up to max_num_batched_requests pending requests and runs
+        them in a single megakernel launch. Serializing instead would make
+        every concurrency level measure bs=1 with a queue in front of it.
+      * The kernel has no runtime decode-step bound -- it stops only on
+        `step + num_tokens + 1 >= max_seq_length` -- so generation length is
+        fixed by the compiled arena, not by per-request max_tokens. Every
+        request in a batch therefore generates the same number of tokens, and
+        the benchmark must use fixed-length prompts (random-range-ratio 1.0)
+        for the arena to match what was asked for.
+      * No streaming, no sampling parameters, no EOS handling beyond
+        ignore_eos -- the benchmark runs with --ignore-eos.
+    """
+    import gc
+    import time
+    import queue
+    import asyncio
+    import threading
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    # Take the loaded model out of GC's reach before serving.
+    #
+    # Streaming allocates steadily (one dict + one JSON string per token), so
+    # the generational thresholds trip mid-response. A gen-2 pass then has to
+    # walk the whole 120B model's object graph, which measured ~400-500 ms --
+    # landing at a reproducible token index and dwarfing the 3.4 ms it sits
+    # between. gc.freeze() moves everything currently alive to a permanent
+    # generation that collection skips; per-request garbage is all acyclic and
+    # is still freed immediately by refcounting.
+    gc.collect()
+    gc.freeze()
+
+    # MPK_SERVE_TRACE=1 prints a per-launch breakdown of where the tail time
+    # goes (kernel, sync, device->host copy, detokenize).
+    _serve_trace = os.environ.get("MPK_SERVE_TRACE", "0") == "1"
+
+    app = FastAPI()
+    pending = queue.Queue()
+
+    max_seq = tokens.size(1)
+    max_batch = args.max_num_batched_requests
+    served_name = args.model_path
+
+    @app.get("/health")
+    def health():
+        return JSONResponse({"status": "ok"})
+
+    @app.get("/v1/models")
+    def models():
+        return JSONResponse(
+            {"object": "list",
+             "data": [{"id": served_name, "object": "model",
+                       "owned_by": "fleet-mpk"}]})
+
+    def _run_batch(prompt_id_lists, max_tokens):
+        """Run one megakernel launch over a batch of prompts.
+
+        Returns (completions, elapsed_s). The launch generates until every
+        request hits max_seq_length, so max_tokens is enforced by sizing the
+        arena, matching how --max-new-tokens is translated on the batch path.
+        """
+        bs = len(prompt_id_lists)
+        lens = [len(p) for p in prompt_id_lists]
+
+        # The kernel stops on `step + num_tokens + 1 >= config.max_seq_length`
+        # and on nothing else. That bound is a runtime field, so the generated
+        # length is set here per launch rather than by the compiled arena --
+        # which matters because the harness draws prompt lengths from a range
+        # (--random-range-ratio 0.8) while asking for a fixed output length.
+        # With a compile-time bound, a short prompt would silently generate
+        # extra tokens and a long one would come up short.
+        need = max(lens) + max_tokens
+        if need > max_seq:
+            raise ValueError(
+                f"prompt {max(lens)} + max_tokens {max_tokens} = {need} "
+                f"exceeds the compiled arena of {max_seq}; restart the server "
+                f"with a larger --max-seq-length")
+        if getattr(mpk, "set_max_seq_length_func", None) is not None:
+            # +1: the bound is exclusive of the last accepted position.
+            mpk.set_max_seq_length_func(need + 1)
+
+        tokens.zero_()
+        for r, ids in enumerate(prompt_id_lists):
+            tokens[r, :len(ids)] = torch.tensor(
+                ids, dtype=torch.long, device="cuda")
+        # Every row of the fixed arena is live for the whole launch, including
+        # rows beyond this batch. Padding them to the same prompt length keeps
+        # them retiring in step instead of spinning against a zero-length
+        # prompt.
+        for r in range(bs, tokens.size(0)):
+            tokens[r, :lens[0]] = tokens[0, :lens[0]]
+
+        pl = lens + [lens[0]] * (prompt_lengths.numel() - bs)
+        prompt_lengths.copy_(
+            torch.tensor(pl[:prompt_lengths.numel()], dtype=torch.int32))
+        step.zero_()
+        num_new_tokens.fill_(1)
+
+        # Per-request device state (step, request_ids, the page free list,
+        # qo/kv indptr) lives in host-allocated buffers that persist across
+        # launches -- the batch demo only ever launched once, so nothing reset
+        # them. Without this the second request decodes from a page queue that
+        # is already drained and every position comes back as token 0.
+        mpk.init_request_func()
+        # ...and the same is true of the per-layer barrier counters, which are
+        # monotonic by design and would otherwise deadlock this launch against
+        # the previous request's terminal values. See reset_device_barriers.
+        reset_device_barriers()
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        mpk()
+        t_launch = time.perf_counter()
+        torch.cuda.synchronize()
+        t_sync = time.perf_counter()
+        elapsed = t_sync - t0
+
+        out = []
+        host = tokens.cpu()
+        t_copy = time.perf_counter()
+        for r in range(bs):
+            gen = host[r, lens[r]:need].tolist()
+            out.append(tokenizer.decode(gen, skip_special_tokens=True))
+        t_dec = time.perf_counter()
+        if _serve_trace:
+            print(f"[SERVE_T] launch={t_launch-t0:.3f}s sync={t_sync-t_launch:.3f}s "
+                  f"copy={t_copy-t_sync:.3f}s decode={t_dec-t_copy:.3f}s",
+                  flush=True)
+        return out, elapsed
+
+    def _run_batch_streaming(prompt_id_lists, max_tokens, on_token):
+        """_run_batch, but publish tokens to `on_token` as they are produced.
+
+        The harness computes TPOT as (latency - ttft) / (output_len - 1) from
+        SSE chunk arrival times, so a server that returns everything in one
+        response reports its entire launch as TTFT and a TPOT of ~0. To be
+        measured the same way vLLM is, tokens have to leave the process as the
+        kernel produces them.
+
+        The kernel generates a whole request inside ONE blocking launch, so
+        there is no host-side per-token loop to hook. Instead the scheduler
+        publishes each request's token position to pinned host memory once per
+        iteration (RuntimeConfig::progress_host), which is visible to the host
+        over PCIe while the launch is still running. The launch itself runs on
+        a separate thread with the GIL released, and this thread polls those
+        counters.
+
+        `on_token(request_index, token_index)` is called once per newly
+        produced token, per request. Reading token text per step would mean a
+        device->host copy per token, so the tokens are decoded once at the end
+        and the callback carries only indices: what the benchmark measures is
+        chunk *timing*, and the text is reassembled in order regardless.
+        """
+        bs = len(prompt_id_lists)
+        lens = [len(p) for p in prompt_id_lists]
+        need = max(lens) + max_tokens
+
+        result = {}
+
+        def _launch():
+            try:
+                result["value"] = _run_batch(prompt_id_lists, max_tokens)
+            except BaseException as exc:
+                result["error"] = exc
+
+        # Clear the counters HERE, on this thread, before the launch thread
+        # starts. launch_persistent_kernel clears them too, but that happens
+        # after this poller is already running: it would read the previous
+        # request's terminal position, believe the response was complete, and
+        # dump every chunk at once -- a ~0 ms TTFT and a ~0 ms inter-token
+        # latency for every request but the first.
+        if getattr(mpk, "reset_decode_progress_func", None) is not None:
+            mpk.reset_decode_progress_func()
+
+        th = threading.Thread(target=_launch, daemon=True)
+        t0 = time.perf_counter()
+        th.start()
+
+        # Progress[r] is request r's token position with the prompt included,
+        # so anything at or below its own prompt length is still prefill and
+        # produces no output token. Each request has its own prompt length, so
+        # they leave prefill at different iterations -- tracking them together
+        # would report request 0's TTFT for the whole batch.
+        #
+        # Poll rather than block: at ~3.4 ms/token a 200 us poll adds at most
+        # ~6% of one token time to a chunk's timestamp and costs one
+        # uncontended atomic load per request.
+        emitted = [0] * bs
+        # Every request runs until the shared launch bound, so they all
+        # produce the same count -- but each starts from its own prompt end.
+        n_expected = [need - lens[r] for r in range(bs)]
+        progress = getattr(mpk, "decode_progress_func", None)
+        while th.is_alive():
+            if progress is None:
+                break
+            done_all = True
+            for r in range(bs):
+                if emitted[r] >= n_expected[r]:
+                    continue
+                pos = progress(r)
+                if pos < 0:
+                    done_all = True  # built without the progress counter
+                    break
+                # pos is the index of the last token WRITTEN, not a count:
+                # prepare_next_batch stores tokens[step+j+1] and then sets
+                # step to that same index. Request r's first output token
+                # lands at index lens[r], so pos == lens[r] already means one
+                # token exists -- hence the +1. Without it the poller stays
+                # exactly one token behind forever, and the final token is
+                # only flushed after th.join(), charging the whole ~0.7 s of
+                # kernel teardown to the last inter-token gap.
+                avail = pos - lens[r] + 1
+                while emitted[r] < min(avail, n_expected[r]):
+                    on_token(r, emitted[r])
+                    emitted[r] += 1
+                if emitted[r] < n_expected[r]:
+                    done_all = False
+            if done_all:
+                break
+            time.sleep(0.0002)
+
+        t_last_progress = time.perf_counter()
+        th.join()
+        if _serve_trace:
+            print(f"[SERVE_T] poll_exit_at={t_last_progress-t0:.3f}s "
+                  f"join_at={time.perf_counter()-t0:.3f}s "
+                  f"emitted={emitted} expected={n_expected}", flush=True)
+        if "error" in result:
+            raise result["error"]
+        texts, _ = result["value"]
+        # Whatever the poll loop missed (it exits as soon as the launch ends,
+        # and a fast tail can outrun a 200 us poll) still has to be emitted, or
+        # the client's token count disagrees with the text it received.
+        for r in range(bs):
+            while emitted[r] < n_expected[r]:
+                on_token(r, emitted[r])
+                emitted[r] += 1
+        return texts, time.perf_counter() - t0
+
+    async def _sse(slot, done, id_lists, max_tokens):
+        """Emit one SSE chunk per generated token, then usage, then [DONE].
+
+        Chunk *timing* is the measurement: the harness timestamps each chunk to
+        get TTFT and the inter-token latencies it averages into TPOT. The text
+        is only known once the launch finishes (it lives in device memory until
+        then), so each chunk carries an empty string and the full text is
+        attached to the last one. The harness concatenates `text` across chunks
+        and counts tokens from the `usage` block, so the totals it reports are
+        the real ones -- see `output.output_tokens` in its backend.
+        """
+        loop = asyncio.get_running_loop()
+        q = slot["stream"]
+        head = json.dumps({
+            "id": "cmpl-mpk", "object": "text_completion",
+            "created": int(time.time()), "model": served_name,
+            "choices": [{"index": 0, "text": "", "finish_reason": None,
+                         "logprobs": None}],
+        })
+        # Emit each token one behind: hold the newest and flush the previous.
+        # The text only exists once the launch ends, so it has to ride the
+        # final chunk -- and a final chunk *in addition to* one per token would
+        # add a spurious inter-token gap to every measurement. Delaying by one
+        # keeps the chunk count equal to the token count, with each chunk
+        # timestamped when its token was actually produced.
+        #
+        # Drain via an asyncio.Queue fed by call_soon_threadsafe rather than
+        # `await run_in_executor(None, q.get)` per token. That form costs a
+        # threadpool dispatch plus an event-loop wakeup for every single token,
+        # which measured ~1.6 ms on top of a ~1.9 ms token -- the server would
+        # have reported nearly double MPK's real inter-token latency.
+        n_emitted = 0
+        held = False
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            if held:
+                n_emitted += 1
+                yield f"data: {head}\n\n"
+            held = True
+
+        await loop.run_in_executor(None, done.wait)
+        if "error" in slot:
+            yield ("data: " + json.dumps({"error": slot["error"]}) + "\n\n")
+            yield "data: [DONE]\n\n"
+            return
+
+        text = slot["texts"][0]
+        n_prompt = sum(len(x) for x in id_lists)
+        if held:
+            n_emitted += 1
+        tail = json.dumps({
+            "id": "cmpl-mpk", "object": "text_completion",
+            "created": int(time.time()), "model": served_name,
+            "choices": [{"index": 0, "text": text, "finish_reason": "length",
+                         "logprobs": None}],
+        })
+        yield f"data: {tail}\n\n"
+        usage = json.dumps({
+            "id": "cmpl-mpk", "object": "text_completion",
+            "created": int(time.time()), "model": served_name,
+            "choices": [],
+            "usage": {"prompt_tokens": n_prompt,
+                      "completion_tokens": n_emitted,
+                      "total_tokens": n_prompt + n_emitted},
+        })
+        yield f"data: {usage}\n\n"
+        yield "data: [DONE]\n\n"
+
+    @app.post("/v1/completions")
+    async def completions(body: dict):
+        prompt = body.get("prompt")
+        max_tokens = int(body.get("max_tokens", 16))
+        # `prompt` is overloaded in the OpenAI schema: a str, a list of strs, a
+        # list of token ids, or a list of lists of ids. A flat list of ints is
+        # ONE pre-tokenized prompt, not a batch of prompts -- reading it as a
+        # batch feeds each integer to the tokenizer and 500s.
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
+            prompts = [prompt]
+        else:
+            prompts = prompt if isinstance(prompt, list) else [prompt]
+
+        # Accept pre-tokenized prompts (the harness sends token ids when it
+        # controls the input length exactly) as well as text.
+        id_lists = []
+        for p in prompts:
+            if isinstance(p, list):
+                id_lists.append([int(t) for t in p])
+            else:
+                id_lists.append(
+                    tokenizer(p, add_special_tokens=False)["input_ids"])
+
+        if len(id_lists) > max_batch:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"batch of {len(id_lists)} exceeds the "
+                                  f"compiled max_num_batched_requests "
+                                  f"{max_batch}"})
+
+        # Hand off to the GPU worker and wait. Concurrent HTTP requests land in
+        # the same queue and get coalesced into one launch, which is what makes
+        # a concurrency sweep measure MPK's batching rather than a lock.
+        done = threading.Event()
+        slot = {}
+        if bool(body.get("stream", False)):
+            # asyncio.Queue + the owning loop: the GPU worker thread pushes
+            # through loop.call_soon_threadsafe (see _tick), so the generator
+            # can await directly instead of paying a threadpool hop per token.
+            slot["stream"] = asyncio.Queue()
+            slot["loop"] = asyncio.get_running_loop()
+            pending.put((id_lists, max_tokens, done, slot))
+            return StreamingResponse(
+                _sse(slot, done, id_lists, max_tokens),
+                media_type="text/event-stream")
+        pending.put((id_lists, max_tokens, done, slot))
+        await asyncio.get_running_loop().run_in_executor(None, done.wait)
+        if "error" in slot:
+            return JSONResponse(status_code=500,
+                                content={"error": slot["error"]})
+        texts, elapsed = slot["texts"], slot["elapsed"]
+
+        n_prompt = sum(len(x) for x in id_lists)
+        n_out = max_tokens * len(id_lists)
+        return JSONResponse({
+            "id": "cmpl-mpk",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": served_name,
+            "choices": [
+                {"index": i, "text": t, "finish_reason": "length",
+                 "logprobs": None}
+                for i, t in enumerate(texts)
+            ],
+            "usage": {"prompt_tokens": n_prompt,
+                      "completion_tokens": n_out,
+                      "total_tokens": n_prompt + n_out},
+            "mpk_launch_s": elapsed,
+        })
+
+    def _worker():
+        """Own the GPU: drain the queue into batches and launch.
+
+        Blocks for the first request, then fills the batch up to max_batch,
+        waiting up to BATCH_FILL_S for stragglers. Under a closed-loop
+        benchmark at concurrency C, all C clients are released by the same
+        launch and re-issue within a few ms of each other -- but not
+        simultaneously, and a purely non-blocking drain would sometimes see
+        only the first one and run a bs=1 launch. That would report MPK's
+        concurrency-C throughput as its bs=1 throughput. The window is ~1% of
+        a 1024-token launch, so paying it to keep the batch full is free.
+        """
+        BATCH_FILL_S = 0.05
+        while True:
+            first = pending.get()
+            batch = [first]
+            deadline = time.perf_counter() + BATCH_FILL_S
+            while len(batch) < max_batch:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(pending.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            id_lists = [b[0][0] for b in batch]
+            max_tokens = max(b[1] for b in batch)
+
+            # Requests share a launch but not a schedule: a shorter prompt
+            # clears prefill earlier and starts emitting sooner. The tick is
+            # therefore routed to the one request it belongs to.
+            def _tick(_req_index, _token_index):
+                s = batch[_req_index][3]
+                q = s.get("stream")
+                if q is not None:
+                    # asyncio.Queue is not thread-safe; this runs on the GPU
+                    # worker thread, so hand the put to the loop.
+                    s["loop"].call_soon_threadsafe(q.put_nowait, _token_index)
+
+            try:
+                texts, elapsed = _run_batch_streaming(
+                    id_lists, max_tokens, _tick)
+                for i, (_, _, done, slot) in enumerate(batch):
+                    slot["texts"] = [texts[i]]
+                    slot["elapsed"] = elapsed
+                    q = slot.get("stream")
+                    if q is not None:
+                        # end-of-stream sentinel, same loop hand-off as _tick
+                        slot["loop"].call_soon_threadsafe(q.put_nowait, None)
+                    done.set()
+            except Exception as exc:  # surface to the client, keep serving
+                for _, _, done, slot in batch:
+                    slot["error"] = repr(exc)
+                    q = slot.get("stream")
+                    if q is not None:
+                        slot["loop"].call_soon_threadsafe(q.put_nowait, None)
+                    done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    port = int(os.environ.get("MPK_SERVE_PORT", "8892"))
+    print(f"[SERVE] MPK OpenAI endpoint on :{port} "
+          f"(max_batch={max_batch}, arena={max_seq} tokens)", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
@@ -510,6 +973,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq-length", default=512, type=int)
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--serve", action="store_true",
+                        help="Serve an OpenAI-compatible /v1/completions "
+                             "endpoint instead of running the batch demo, so "
+                             "the InferenceX harness can benchmark MPK the "
+                             "same way it benchmarks vLLM.")
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
     parser.add_argument(
@@ -556,6 +1024,13 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+
+    # Serving measures per-token latency, and the [FWD_PASS] trace is device
+    # printf: inline it perturbs the iteration it reports, and its end-of-launch
+    # dump costs ~150-500 ms that lands inside the request. Off by default when
+    # serving; set MPK_QUIET_FWDPASS=0 explicitly to get the trace back.
+    if args.serve:
+        os.environ.setdefault("MPK_QUIET_FWDPASS", "1")
 
     if args.prompt_file:
         with open(args.prompt_file, encoding="utf-8") as _f:
@@ -771,7 +1246,13 @@ if __name__ == "__main__":
         # Longest prompt, not request 0's: max_seq_length is a single global
         # bound shared by every request, so sizing it off a shorter prompt
         # would truncate the longer ones mid-generation.
-        if args.use_mirage and args.max_new_tokens is not None:
+        # Not in --serve: the shrink is sized off the demo's own built-in
+        # prompt, but a server's prompts arrive over HTTP long after the arena
+        # is compiled. Shrinking to (built-in prompt + max_new_tokens) would
+        # cap every future request at an arena that has nothing to do with it.
+        # Under --serve, --max-seq-length is the arena, verbatim.
+        if args.use_mirage and args.max_new_tokens is not None \
+                and not getattr(args, "serve", False):
             _needed = max(_lens) + args.max_new_tokens
             if _needed < args.max_seq_length:
                 args.max_seq_length = _needed
@@ -1580,6 +2061,33 @@ if __name__ == "__main__":
         # happened and deadlocking the W2 workers for that expert. See the
         # layout note in gang_moe_fused_mxfp4_mi300.cuh (MOE_BAR_*).
         moe_fused_barrier = make_tensor("moe_fused_barrier", (160 * num_experts,), torch_dtype=torch.int32)
+
+        def reset_device_barriers():
+            """Zero every monotonic barrier counter. Required before a relaunch.
+
+            These counters are deliberately never reset *within* a run: each
+            per-layer barrier derives its release value as
+            (iteration * num_layers + layer) + 1 and compares against a counter
+            that only ever grows, which is what removes the read-ordering race
+            between producer and consumer (see gang_full_layer_fused_mi300.cuh).
+
+            A relaunch breaks that invariant. task_layer_idx restarts at 0, so
+            launch 2 recomputes small expected values against flags still
+            holding launch 1's terminal ones -- early layers sail through
+            barriers that were satisfied by the *previous* request, and the run
+            desynchronizes until some XCD's fan-out writes a low value back over
+            a high one and every worker expecting the high value spins forever.
+            The observed signature is workers parked in P6-attn-xcd-barrier with
+            obs < exp, spread across an impossible epoch range (1..36 in a
+            single dump).
+
+            Only correct between launches, never during one.
+            """
+            for _n in ("oproj_topk_counters", "qkv_attn_barrier",
+                       "moe_fused_barrier", "router_topk_counter"):
+                _t = _tensor_refs.get(_n)
+                if _t is not None:
+                    _t.zero_()
         # W13+SwiGLU fused output: [bs, top_k, padded_intermediate]
         # (SwiGLU is fused into W13 epilogue — no separate mlp_mid buffer)
         swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
@@ -2483,6 +2991,24 @@ if __name__ == "__main__":
             print(f"[DEBUG] Setting RoPE tables: cos_padded ptr=0x{cos_padded.data_ptr():x} shape={cos_padded.shape}, sin_padded ptr=0x{sin_padded.data_ptr():x} shape={sin_padded.shape}")
             mpk.set_rope_tables(cos_padded, sin_padded)
 
+    # --- OpenAI-compatible serving mode ---
+    #
+    # The InferenceX benchmark harness only speaks HTTP to an OpenAI
+    # /v1/completions endpoint, so comparing MPK against vLLM on their
+    # methodology requires MPK to be reachable the same way. Everything above
+    # -- weights, tensors, the compiled megakernel -- is already resident, so
+    # serving hangs off this point rather than duplicating the setup.
+    if getattr(args, "serve", False):
+        serve_mpk(
+            args=args, mpk=mpk, tokenizer=tokenizer, tokens=tokens,
+            prompt_lengths=prompt_lengths, step=step,
+            num_new_tokens=num_new_tokens, config=config,
+            reset_device_barriers=reset_device_barriers,
+        )
+        # Module-level scope (this is under `if __name__ == "__main__"`, not
+        # inside a function), so exit rather than return.
+        sys.exit(0)
+
     # --- Execution loop ---
     stream = torch.cuda.Stream()
     warmup = 0
@@ -2800,9 +3326,20 @@ if __name__ == "__main__":
         # while every __shared__ per-launch counter restarts at 0. Any barrier
         # target derived from a per-launch value (rather than snapshotted from
         # the persistent counter) hangs on the second launch.
+        #
+        # MPK_WARMUP_REINIT=1 additionally calls init_request_resources()
+        # between launches, which is what a server does: without it the second
+        # launch decodes from an already-drained page queue. That reset is the
+        # difference between the two relaunch paths, so exercise it here rather
+        # than only through the serving shim.
+        _warmup_reinit = os.environ.get("MPK_WARMUP_REINIT", "0") == "1"
         for _w in range(int(os.environ.get("MPK_WARMUP_LAUNCHES", "0"))):
             mpk()
             torch.cuda.synchronize()
+            if _warmup_reinit:
+                mpk.init_request_func()
+                reset_device_barriers()
+                torch.cuda.synchronize()
 
         starter.record()
         mpk()
@@ -3238,6 +3775,54 @@ if __name__ == "__main__":
                 torch.save(_dump, os.environ["MPK_DUMP_TENSORS"])
                 print(f"[FP] dumped tensors to {os.environ['MPK_DUMP_TENSORS']}")
 
+        # Row-symmetry sweep. Every captured tensor is [rows, ...] with one
+        # row per batch slot. Run with identical prompts in every slot: any
+        # tensor whose rows differ names a reduction whose result depends on
+        # arrival order or on batch composition. The FIRST such tensor in
+        # dataflow order is the defect; everything after it is downstream.
+        #
+        # Deliberately OUTSIDE the MPK_FP_ONLY guard below. This sweep compares
+        # rows against each other, never against Torch, so the reference pass
+        # it used to sit inside was pure cost -- and that pass OOMs at full
+        # --max-layers, which is exactly the configuration the defect needs.
+        #
+        # Know what this sweep CANNOT see, or it will read as an all-clear it
+        # has not earned: any defect that corrupts every row the same way. The
+        # bs>1 MoE W13 stale-line bug (see the Phase 7b acquire in
+        # gang_full_layer_fused_mi300.cuh) is exactly that shape -- both rows
+        # are routed through the same experts, so both read the same stale
+        # norm row, and every tensor here reported max|row_i-row_0| == 0 with
+        # the bug present. Verified by ablating the fix and re-running: the
+        # sweep stayed green while the offline MXFP4+SwiGLU oracle counted 32
+        # bad weight groups. Row symmetry catches order-dependent reductions;
+        # it does not catch a wrong value that is wrong identically per row.
+        if args.verify and verify_tensors and bs > 1:
+            torch.cuda.synchronize()
+            print("\n--- Row symmetry (identical prompts => rows must match) ---")
+            for _nm in sorted(verify_tensors):
+                _t = verify_tensors[_nm]
+                if _t.dim() < 1 or _t.shape[0] < 2:
+                    continue
+                # Only dim 0 == bs is a batch axis. moe_mask (NUM_EXPERTS+1),
+                # moe_routing_indices (NUM_EXPERTS), the KV caches (pages) and
+                # the barrier/counter arrays are indexed by something else
+                # entirely, so "row 0 vs row 1" there compares expert 0 to
+                # expert 1 and always DIFFERS. Reported as false positives for
+                # a full day before this filter existed.
+                if _t.shape[0] != bs:
+                    continue
+                _r0 = _t[0].float()
+                _worst, _worst_r = 0.0, -1
+                for _r in range(1, _t.shape[0]):
+                    _d = (_t[_r].float() - _r0).abs().max().item()
+                    if _d > _worst:
+                        _worst, _worst_r = _d, _r
+                _flag = "  <-- DIFFERS" if _worst > 0 else ""
+                _norms = [f"{_t[_i].float().norm().item():.4g}"
+                          for _i in range(min(_t.shape[0], 4))]
+                print(f"  {_nm:28s} rows={_t.shape[0]} max|row_i-row_0|="
+                      f"{_worst:.6g} (row {_worst_r}) norms={_norms}{_flag}")
+
         # === Verification: compare Mirage intermediates with PyTorch reference ===
         # MPK_FP_ONLY skips the Torch reference pass below. That pass builds a
         # second full copy of the model's activations and OOMs at larger
@@ -3249,29 +3834,6 @@ if __name__ == "__main__":
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)
             torch.cuda.synchronize()
-
-            # Row-symmetry sweep. Every captured tensor is [rows, ...] with one
-            # row per batch slot. Run with identical prompts in every slot: any
-            # tensor whose rows differ names a reduction whose result depends on
-            # arrival order or on batch composition. The FIRST such tensor in
-            # dataflow order is the defect; everything after it is downstream.
-            if bs > 1:
-                print("\n--- Row symmetry (identical prompts => rows must match) ---")
-                for _nm in sorted(verify_tensors):
-                    _t = verify_tensors[_nm]
-                    if _t.dim() < 1 or _t.shape[0] < 2:
-                        continue
-                    _r0 = _t[0].float()
-                    _worst, _worst_r = 0.0, -1
-                    for _r in range(1, _t.shape[0]):
-                        _d = (_t[_r].float() - _r0).abs().max().item()
-                        if _d > _worst:
-                            _worst, _worst_r = _d, _r
-                    _flag = "  <-- DIFFERS" if _worst > 0 else ""
-                    _norms = [f"{_t[_i].float().norm().item():.4g}"
-                              for _i in range(min(_t.shape[0], 4))]
-                    print(f"  {_nm:28s} rows={_t.shape[0]} max|row_i-row_0|="
-                          f"{_worst:.6g} (row {_worst_r}) norms={_norms}{_flag}")
 
             # Debug: check q_workspace and k_cache values
             q_ws_nz = (ck_fmha_q_ws_tensor.abs() > 1e-6).sum().item()
