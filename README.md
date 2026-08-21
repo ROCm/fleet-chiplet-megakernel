@@ -34,6 +34,34 @@ python3 demo/gpt_oss/demo.py --use-mirage \
 Read the **`Decode avg`** line for per-token decode latency (~2.0 ms/tok). Drop
 `--use-mirage` to run the PyTorch reference instead.
 
+### Run (multiple concurrent requests)
+
+Two independent knobs. `--max-num-batched-requests` is how many requests are
+in flight; `--max-num-batched-tokens` is how many tokens one megakernel pass
+consumes, which is what makes prefill cheaper. Both cap at the values in
+[Batching](#batching) below.
+
+```bash
+HIP_VISIBLE_DEVICES=$GPU \
+python3 demo/gpt_oss/demo.py --use-mirage \
+  --model-path "$MODEL_PATH" \
+  --max-num-batched-requests 4 \
+  --max-num-batched-tokens 4 \
+  --max-seq-length 512 \
+  --prompts "What is the capital of Japan?" \
+            "Who wrote Romeo and Juliet?" \
+            "Name three prime numbers." \
+            "What is 12 times 12?"
+```
+
+`--num-requests N` runs more requests than there are slots: requests retire as
+they finish and queued requests are admitted into the freed slots without
+leaving the megakernel. `--ignore-eos` forces every request to the full
+`--max-new-tokens`.
+
+Do **not** read `Decode avg` at B>1 — see [Batching](#batching) for what to
+measure instead.
+
 ### Decode latency vs context length
 
 ![decode latency vs context](docs/img/seqlen_sweep.svg)
@@ -141,18 +169,26 @@ The measured numbers are checked in under
 TPOT here is a two-point difference of the device clock across two decode
 lengths, which cancels prefill exactly. Do **not** read `Decode avg` at B>1: it
 assumes `ceil(prompt_len / max_num_batched_tokens)` prefill iterations, which
-only holds at B=1, so it misclassifies prefill iterations as decode.
+only holds at B=1, so it misclassifies prefill iterations as decode and reports
+a prefill/decode blend. To measure a single configuration by hand, run it at
+two decode lengths and difference the device-side `[FWD_PASS_TOTAL]` line:
 
 ```bash
-python3 demo/gpt_oss/demo.py --use-mirage --model-path "$MODEL_PATH" \
-  --max-num-batched-requests 4 --max-num-batched-tokens 4 \
-  --prompts "What is the capital of Japan?" "Who wrote Romeo and Juliet?" \
-            "Name three prime numbers." "What is 12 times 12?"
+for GEN in 128 256; do
+  rm -rf demo/gpt_oss/permanent_output_dir
+  python3 demo/gpt_oss/demo.py --use-mirage --model-path "$MODEL_PATH" \
+    --max-num-batched-requests 4 --max-num-batched-tokens 4 \
+    --max-new-tokens $GEN --ignore-eos \
+    --prompts "What is the capital of Japan?" "Who wrote Romeo and Juliet?" \
+              "Name three prime numbers." "What is 12 times 12?" \
+  | grep -E '^\[FWD_PASS_TOTAL\]'
+done
+# ms/step = (total_ms@256 - total_ms@128) / 128;  ms/token = ms/step / B
 ```
 
-`--num-requests N` runs more requests than there are batch slots: requests
-retire as they finish, their KV pages return to the free list, and queued
-requests are admitted into the freed slots without leaving the megakernel.
+`iters=` in that line is the diagnostic worth watching: `iters` should advance
+by exactly one per decode step. More than that means prefill is contending with
+decode for the admission budget.
 
 `PPL_MODE=1` requires `--max-num-batched-requests 1` — the logits sink row is
 derived from request 0's step, so all requests would write the same row.
