@@ -228,7 +228,8 @@ def test_gpt_oss_layer_stages(num_layers):
             f"reference:\n  " + "\n  ".join(failures) + "\n"
             f"Both arms ran the same tokens with MXFP4 weights and FP8 "
             f"activations, so this is kernel error, not quantization. "
-            f"See docs/mpk/correctness-infra.md for how to localize it."
+            f"PPL_STAGE_DUMP=1 dumps every stage tensor for op-by-op "
+            f"localization."
         )
 
 

@@ -513,7 +513,7 @@ def get_compile_command(
             # LSE unit bug (a log2 exponent added to a natural-log mantissa).
             # tests/ci-tests/test_gpt_oss_layer_compare.py uses this to prove
             # the layer-comparison gate actually goes red on a known-bad
-            # kernel -- see docs/mpk/correctness-infra.md.
+            # kernel.
             flags = flags + ["-DMPK_LSE_LOG_BUG"]
         if _opt("MPK_NDEBUG"):
             # The ROCm branch never sets -DNDEBUG (only the sm_90 branch does),

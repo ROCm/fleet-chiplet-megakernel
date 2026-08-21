@@ -144,7 +144,6 @@ depth 2 (`full_attention`), so a numerical regression names the op that caused
 it rather than just moving a corpus-wide number. `MPK_LSE_LOG_BUG=1` rebuilds
 with a real historical defect injected to prove the gate still goes red.
 
-See [`docs/mpk/correctness-infra.md`](docs/mpk/correctness-infra.md) for how to
-localize a failure, the `PPL_SLICE` multi-window protocol, and the measured
-noise floor. See [`demo/gpt_oss/README.md`](demo/gpt_oss/README.md) for the full
-set of options (prompt selection, build variants, environment, and notes).
+See [`demo/gpt_oss/README.md`](demo/gpt_oss/README.md) for the full set of
+options — prompt selection, build variants, environment, the diagnostic flags
+for localizing a failure, and the multi-window perplexity protocol.

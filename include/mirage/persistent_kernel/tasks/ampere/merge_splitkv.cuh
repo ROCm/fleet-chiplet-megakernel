@@ -253,8 +253,7 @@ __device__ __forceinline__ void
     // The yardstick is CK_FMHA_NUM_KV_CHUNKS 8->16, which is *exact* in real
     // arithmetic (same keys, merge is an identity) and so measures pure FP
     // reordering: it moves NLL by -0.107 +/- 0.012, 2.6x further. This is
-    // inside the decode path's own FP-sensitivity band. See
-    // docs/mpk/splitkv-merge.md.
+    // inside the decode path's own FP-sensitivity band.
     //
     // The redundancy this removes is CSE the compiler cannot do itself,
     // because the loads sit between the repeated computations and it cannot

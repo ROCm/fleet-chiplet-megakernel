@@ -23,7 +23,7 @@
 #                         takes either.
 #   MPK_LSE_LOG_BUG=1     fault injection: rebuild MPK with the pre-49f446b
 #                         split-KV LSE unit bug so the gate can be watched
-#                         going red. See docs/mpk/correctness-infra.md.
+#                         going red. This run MUST fail.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
