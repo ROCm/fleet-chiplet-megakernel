@@ -1,9 +1,17 @@
 # B>1 row symmetry: identical prompts, different continuations
 
-Status: **open defect**, root cause narrowed but not proven. No code change yet.
+Status: **RESOLVED** in `3bf8c32` (the bs>1 W13 coherence fix). Verified at
+`5cd5682`; see [Resolution](#resolution-2026-08-21-at-5cd5682) at the end for
+the measurements and the ablation that proves the check bites.
 
-Applies to the fused megakernel decode path at
-`--max-num-batched-requests > 1` (commit `5680625`).
+Everything between here and that section is the investigation as it stood
+while the defect was open. It is kept because most of it is still true and the
+eliminations are worth not re-running -- but **the running commentary below
+predates the fix**, and several passages assert the defect is still live. Read
+the Resolution section first.
+
+Applied to the fused megakernel decode path at
+`--max-num-batched-requests > 1` (first characterized at commit `5680625`).
 
 ## Symptom
 
@@ -104,6 +112,10 @@ to an accumulator it shares with other rows.
   *unfixed* code.
 
 ## The MoE atomicAdd was fixed and did NOT fix this (2026-08-19)
+
+> **Superseded.** "Still broken at HEAD" below meant HEAD on 2026-08-19
+> (`e0d8000`), which predates `3bf8c32`. The atomicAdd fix genuinely did not
+> resolve the symptom -- that part stands -- but the symptom is resolved now.
 
 **Read this before re-reading the suspect section below.** The fix described
 there was implemented and shipped in `826039e` ("MoE: row-private f32
@@ -225,6 +237,14 @@ Also still open: the FP8 activation quantizer under `USE_FP8_ACT=1`
 
 ## The same defect shows up with DISTINCT prompts (2026-08-19, at b97ac60)
 
+> **Superseded by the Resolution section.** This was the most useful
+> observation in the whole investigation -- it made the defect reproducible
+> without an identical-prompt setup, which is what eventually let the offline
+> oracle localize it. All four rows of the table below now read "identical" at
+> `5cd5682`. In particular the conclusion "a text hash is not a usable
+> correctness gate at bs>1" is **no longer true**, and a text hash is exactly
+> what the resolution measurements use.
+
 Row symmetry needs identical prompts to observe, which made it look like a
 narrow curiosity. It is not. Run the same build twice with *distinct* prompts
 and the continuations differ run to run:
@@ -296,13 +316,85 @@ the fix -- if row symmetry does not return, the suspect was wrong.
   was luck against a 5/6 rate, and an early "divergence tracks chunk count"
   correlation dissolved at 3 reps per config.
 
-## Current gate
+## Resolution (2026-08-21, at 5cd5682)
 
-Until this is fixed:
+The cause was **not** in the list of suspects above. It was the bs>1 W13
+coherence defect root-caused separately: `xcd_rank < oproj_topk_tiles_per_xcd`
+lets 8 workers per XCD skip Phase 7 and its barrier, then draw Phase 8 MoE
+tiles that read `rmsnorm_out_moe` -- which the Phase 7b acquire failed to
+invalidate, because a bare `buffer_inv` is an architectural NOP on gfx950 and
+`sc1` is what drops L2. Fixed in `3bf8c32` by running one system-scope
+`buffer_inv sc0 sc1` at the top of each layer under `QKV_BATCH_SIZE > 1`.
 
-- Serving (independent requests, sampling anyway): B>1 is fine.
-- Reproducibility-sensitive work -- eval harnesses, regression baselines,
-  bitwise A/B: use B=1.
-- PPL mode already asserts `B == 1`, which is required for a different reason:
-  `task_register.cc:1242` emits `runtime_config.step[0] + 1` as the logits sink
-  row, so at B>1 every request would write the same row.
+That explains why the depth table showed 0 diffs at 1-2 layers and 11-12 from
+4 layers on: a stale line has to survive long enough to be read, and it needs
+the layer loop to get there. It also explains the "different row, different
+magnitude" run-to-run signature that ruled out deterministic batch-composition
+dependence -- consumer-side staleness is timing-dependent without being a
+data race in the usual sense.
+
+Measured at `5cd5682`, HIP device 1, ctx 512 unless noted, 96 new tokens,
+comparing md5 of each row's continuation:
+
+| arm | reps | result |
+|---|---|---|
+| bs=2, distinct prompts | 4 | identical |
+| bs=3, distinct prompts | 3 | identical |
+| bs=4, distinct prompts | 2 | identical |
+| bs=2, distinct prompts, **ctx 4096** | 3 | identical |
+| bs=2/3/4, identical prompts (row symmetry) | 2 each | all rows identical, and identical across runs |
+
+Row symmetry holds and so does batch invariance at these sizes: every row of
+the identical-prompt arm hashes `f3e128ef00`, which is also the bs=1
+continuation.
+
+ctx 4096 is included deliberately. Short contexts hide this whole race class
+(see [[long-context-determinism-gate]]), so a ctx-512-only pass would not have
+been sufficient evidence.
+
+**The check bites.** Replacing the `QKV_BATCH_SIZE > 1` guard with `false` to
+disable the fix, rebuilding, and re-running bs=2 three times gives three
+different outputs (`060f351...`, `2bac26b...`, `f3e128e...`); restoring it
+gives 4/4 identical. A gate nobody has watched go red is not known to work.
+
+### What is still not gated
+
+Reproducibility is not accuracy. The three CI gates
+(`run_ci_tests_gpt_oss*.sh`) are all bs=1, and PPL mode asserts `B == 1` for an
+unrelated structural reason: `task_register.cc:1242` emits
+`runtime_config.step[0] + 1` as the logits sink row, so at B>1 every request
+would write the same row. So bs>1 is now known to be *reproducible* and is
+still not known to be *numerically correct* against a reference. The offline
+MXFP4+SwiGLU oracle is what covers the W13 path specifically; wiring a bs>1
+arm into CI is open work. See [[bs-gt-1-accuracy-gating]].
+
+### Cross-engine context
+
+The vLLM comparison above stands as recorded. Run-to-run reproducibility is
+not a universal property of production decode engines, and it is worth being
+precise about why we have it rather than treating it as a baseline everyone
+meets.
+
+Fleet pins its split-KV partition: `num_kv_chunks` is a function of context and
+worker topology, not of scheduling, so the FP summation order is fixed run to
+run and the output is bit-identical. An engine that lets its scheduler choose
+the partition -- varying quantum length or chunk count with arrival timing --
+gets a different reduction order per run and therefore different tokens, with
+no bug involved. Float addition is not associative; that is the whole
+mechanism.
+
+vLLM has exactly this property, which is what `VLLM_BATCH_INVARIANT` exists to
+switch off, and it is off by default. Another gfx950 persistent-decoder
+megakernel measured on this box on 2026-08-21 behaves the same way: 5 fresh
+processes at concurrency 1 produced 4 distinct outputs, and concurrency 2
+diverged on all 3 reps with row symmetry broken within each run (its own
+dispatch counters confirmed the megakernel served those tokens, so it was not a
+fallback artifact). Its published optimization log independently describes
+run-to-run drift as material enough to reject candidate optimizations that fall
+below it.
+
+No claim is made about whether such engines can be *configured* to be
+deterministic; only default configurations were measured. The point is narrower:
+determinism here is a deliberate consequence of fixing the partition, so any
+future change that makes chunking schedule-dependent trades it away and should
+say so.

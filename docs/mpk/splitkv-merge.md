@@ -340,6 +340,8 @@ confirm the two terms are commensurable.
 
 ## See also
 
-- `docs/mpk/row-symmetry-b-gt-1.md` — related open numerical defect at B>1
+- `docs/mpk/row-symmetry-b-gt-1.md` — the B>1 row-symmetry defect, resolved in
+  `3bf8c32`; also why the fixed split-KV partition is what makes decode
+  bit-reproducible run to run
 - memory: `splitkv-merge-serial-chain`, `moe-phase8-roofline`,
   `correctness-check-txthash`

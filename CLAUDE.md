@@ -81,5 +81,5 @@ Each of these cost a day or more. They are not style preferences.
 
 - [`docs/mpk/correctness-infra.md`](docs/mpk/correctness-infra.md) — the three gates, in detail
 - [`docs/mpk/splitkv-merge.md`](docs/mpk/splitkv-merge.md) — split-KV merge, and how a profiler misread hid 0.024 ms
-- [`docs/mpk/row-symmetry-b-gt-1.md`](docs/mpk/row-symmetry-b-gt-1.md) — the B>1 row-symmetry defect
+- [`docs/mpk/row-symmetry-b-gt-1.md`](docs/mpk/row-symmetry-b-gt-1.md) — the B>1 row-symmetry defect and its fix; what bs>1 is and is not gated for
 - [`demo/gpt_oss/README.md`](demo/gpt_oss/README.md) — flags, build variants, prompt handling
