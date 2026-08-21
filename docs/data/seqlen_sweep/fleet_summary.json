@@ -1,0 +1,254 @@
+[
+  {
+    "ctx": 512,
+    "points": {
+      "4": {
+        "dev_total_ms": 990.878,
+        "dev_avg_ms": 1.928,
+        "dev_dropped": 0,
+        "wall_total_ms": 1062.295,
+        "generated": 4,
+        "n_saved": 4,
+        "txthash": "a374c33bd30b",
+        "decode": {
+          "n": 2,
+          "median_ms": 1.9645000000000001,
+          "min_ms": 1.964,
+          "max_ms": 1.965,
+          "sd_ms": 0.000500000000000056
+        }
+      },
+      "400": {
+        "dev_total_ms": 1763.745,
+        "dev_avg_ms": 1.938,
+        "dev_dropped": 0,
+        "wall_total_ms": 1874.671,
+        "generated": 400,
+        "n_saved": 100,
+        "txthash": "e4061d93d834",
+        "decode": {
+          "n": 19,
+          "median_ms": 1.968,
+          "min_ms": 1.957,
+          "max_ms": 1.99,
+          "sd_ms": 0.008424670275570282
+        }
+      }
+    },
+    "kv_chunks": 8,
+    "tpot_ms": 1.968,
+    "tpot_sd_ms": 0.008424670275570282,
+    "tpot_n": 19,
+    "tpot_gen": 400,
+    "prefill_ms": 976.5449999999998
+  },
+  {
+    "ctx": 1024,
+    "points": {
+      "4": {
+        "dev_total_ms": 2032.542,
+        "dev_avg_ms": 1.981,
+        "dev_dropped": 0,
+        "wall_total_ms": 2154.484,
+        "generated": 4,
+        "n_saved": 4,
+        "txthash": "a374c33bd30b",
+        "decode": {
+          "n": 2,
+          "median_ms": 1.9955,
+          "min_ms": 1.983,
+          "max_ms": 2.008,
+          "sd_ms": 0.012499999999999956
+        }
+      },
+      "400": {
+        "dev_total_ms": 2803.049,
+        "dev_avg_ms": 1.971,
+        "dev_dropped": 0,
+        "wall_total_ms": 2966.051,
+        "generated": 400,
+        "n_saved": 100,
+        "txthash": "791d30b7c445",
+        "decode": {
+          "n": 7,
+          "median_ms": 1.993,
+          "min_ms": 1.991,
+          "max_ms": 1.998,
+          "sd_ms": 0.0020303814862216675
+        }
+      }
+    },
+    "kv_chunks": 8,
+    "tpot_ms": 1.993,
+    "tpot_sd_ms": 0.0020303814862216675,
+    "tpot_n": 7,
+    "tpot_gen": 400,
+    "prefill_ms": 2005.849
+  },
+  {
+    "ctx": 2048,
+    "points": {
+      "4": {
+        "dev_total_ms": 4054.107,
+        "dev_avg_ms": 1.978,
+        "dev_dropped": 0,
+        "wall_total_ms": 4277.906,
+        "generated": 4,
+        "n_saved": 4,
+        "txthash": "a374c33bd30b",
+        "decode": {
+          "n": 2,
+          "median_ms": 2.021,
+          "min_ms": 2.02,
+          "max_ms": 2.022,
+          "sd_ms": 0.0009999999999998899
+        }
+      },
+      "400": {
+        "dev_total_ms": 4919.171,
+        "dev_avg_ms": 2.011,
+        "dev_dropped": 0,
+        "wall_total_ms": 5181.017,
+        "generated": 400,
+        "n_saved": 100,
+        "txthash": "c5f53c2508b2",
+        "decode": {
+          "n": 63,
+          "median_ms": 2.045,
+          "min_ms": 2.031,
+          "max_ms": 2.064,
+          "sd_ms": 0.008682467136460238
+        }
+      }
+    },
+    "kv_chunks": 16,
+    "tpot_ms": 2.045,
+    "tpot_sd_ms": 0.008682467136460238,
+    "tpot_n": 63,
+    "tpot_gen": 400,
+    "prefill_ms": 4101.171
+  },
+  {
+    "ctx": 4096,
+    "points": {
+      "4": {
+        "dev_total_ms": 8614.182,
+        "dev_avg_ms": 2.102,
+        "dev_dropped": 0,
+        "wall_total_ms": 9010.773,
+        "generated": 4,
+        "n_saved": 4,
+        "txthash": "a374c33bd30b",
+        "decode": {
+          "n": 2,
+          "median_ms": 2.1494999999999997,
+          "min_ms": 2.148,
+          "max_ms": 2.151,
+          "sd_ms": 0.0014999999999998348
+        }
+      },
+      "400": {
+        "dev_total_ms": 9417.149,
+        "dev_avg_ms": 2.095,
+        "dev_dropped": 0,
+        "wall_total_ms": 9890.642,
+        "generated": 400,
+        "n_saved": 100,
+        "txthash": "8f20e495094f",
+        "decode": {
+          "n": 26,
+          "median_ms": 2.1355,
+          "min_ms": 2.126,
+          "max_ms": 2.144,
+          "sd_ms": 0.004601903388044947
+        }
+      }
+    },
+    "kv_chunks": 31,
+    "tpot_ms": 2.1355,
+    "tpot_sd_ms": 0.004601903388044947,
+    "tpot_n": 26,
+    "tpot_gen": 400,
+    "prefill_ms": 8562.948999999999
+  },
+  {
+    "ctx": 8192,
+    "points": {
+      "4": {
+        "dev_total_ms": 17338.944,
+        "dev_avg_ms": 2.116,
+        "dev_dropped": 0,
+        "wall_total_ms": 17773.537,
+        "generated": 4,
+        "n_saved": 4,
+        "txthash": "a374c33bd30b",
+        "decode": {
+          "n": 1,
+          "median_ms": 2.188,
+          "min_ms": 2.188,
+          "max_ms": 2.188,
+          "sd_ms": 0.0
+        }
+      },
+      "400": {
+        "dev_total_ms": 18456.586,
+        "dev_avg_ms": 2.149,
+        "dev_dropped": 0,
+        "wall_total_ms": 18905.551,
+        "generated": 400,
+        "n_saved": 100,
+        "txthash": "51dd17499c07",
+        "decode": {
+          "n": 60,
+          "median_ms": 2.2255000000000003,
+          "min_ms": 2.216,
+          "max_ms": 2.24,
+          "sd_ms": 0.005245394805604888
+        }
+      }
+    },
+    "kv_chunks": 31,
+    "tpot_ms": 2.2255000000000003,
+    "tpot_sd_ms": 0.005245394805604888,
+    "tpot_n": 60,
+    "tpot_gen": 400,
+    "prefill_ms": 17566.386
+  },
+  {
+    "ctx": 32768,
+    "points": {
+      "4": {
+        "dev_total_ms": 75668.095,
+        "dev_avg_ms": 2.309,
+        "dev_dropped": 0,
+        "wall_total_ms": 76093.891,
+        "generated": 4,
+        "n_saved": 4,
+        "txthash": "a374c33bd30b",
+        "decode": null
+      },
+      "400": {
+        "dev_total_ms": 76752.401,
+        "dev_avg_ms": 2.314,
+        "dev_dropped": 0,
+        "wall_total_ms": 77187.758,
+        "generated": 400,
+        "n_saved": 100,
+        "txthash": "8e757a4ee6b0",
+        "decode": {
+          "n": 44,
+          "median_ms": 2.545,
+          "min_ms": 2.533,
+          "max_ms": 2.558,
+          "sd_ms": 0.005129873212229885
+        }
+      }
+    },
+    "kv_chunks": 31,
+    "tpot_ms": 2.545,
+    "tpot_sd_ms": 0.005129873212229885,
+    "tpot_n": 44,
+    "tpot_gen": 400,
+    "prefill_ms": 75734.401
+  }
+]

@@ -12,6 +12,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MIRAGE_HOME="${MIRAGE_HOME:-$ROOT}"
+# MUST come first: another mirage checkout at ~/mirage otherwise wins the
+# `import mirage` and is missing this tree's kernel APIs.
+export PYTHONPATH="$ROOT/python:${PYTHONPATH:-}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 MODEL_PATH="${MODEL_PATH:-${GPT_OSS_MODEL_PATH:-openai/gpt-oss-120b}}"
 PROMPT="${GPT_OSS_PROMPT:-Tell me the history of america}"

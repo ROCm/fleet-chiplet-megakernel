@@ -85,6 +85,40 @@ Prepend these environment variables to the command:
 The default (no flag) build is the **decoupled 512-thread** (4 memory + 4 compute
 wave) path. The oracle build is the working batch-1 reference.
 
+## Checking correctness
+
+```bash
+bash tests/ci-tests/run_ci_tests_gpt_oss.sh               # generated tokens
+bash tests/ci-tests/run_ci_tests_gpt_oss_layer_compare.sh # per-stage, names the op
+bash tests/ci-tests/run_ci_tests_gpt_oss_perplexity.sh    # distribution-level
+```
+
+The middle one is the sharp instrument: it gates cosine similarity and relative
+RMSE per stage inside a decoder layer, so a numerical regression names the op
+that caused it instead of just moving a corpus-wide number. Diagnostic flags:
+
+| flag | effect |
+|---|---|
+| `PPL_STAGE_DUMP=1` | dump every per-stage tensor, for op-by-op localization |
+| `PPL_SLICE=k` | score corpus window `k` — use >=4 windows, never one |
+| `PPL_MXFP4_MATCH=1` | quantize the reference's weights to MXFP4 too |
+| `PPL_FP8_ACT=1` | quantize the reference's activations to FP8 too |
+| `MPK_LSE_LOG_BUG=1` | fault injection: rebuild with a real historical defect. The layer-compare run **must** go red — this is how the gate is proven to still bite |
+
+Two sizing rules. Never size an accuracy change on a single perplexity window:
+the windows of a given corpus score very differently on the *same* reference and
+the MPK-minus-reference delta can sign-flip between them. And know the noise
+floor before calling something a defect — MPK is bit-deterministic, so the floor
+is FP-reordering sensitivity, not run variance. Probe it with
+`CK_FMHA_NUM_KV_CHUNKS=8` vs `16`, which is exact in real arithmetic, so
+whatever it moves is noise.
+
+Two rules that outrank everything else here: **never quote a latency number
+without checking the generated text** (a faulted kernel still prints a plausible
+`Decode avg`), and **never run two MPK arms concurrently** — the build dir is
+hardcoded and concurrent arms have been observed emitting bit-identical logits
+from genuinely different binaries.
+
 ## Notes
 
 - **Always `rm -rf demo/gpt_oss/permanent_output_dir` after any kernel/header

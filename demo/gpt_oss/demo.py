@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import argparse
 import os
+import sys
 import math
 import json
 
@@ -49,7 +50,10 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
     """
     if corpus == "wikitext2":
         from datasets import load_dataset
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        # "Salesforce/wikitext" is the canonical namespaced mirror; the bare
+        # "wikitext" id no longer resolves under datasets>=4 / hub>=1.
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1",
+                          split="test")
         lines = [
             t.strip() for t in ds["text"]
             if t.strip() and not t.strip().startswith("=")
@@ -59,7 +63,16 @@ def load_ppl_corpus(tokenizer, corpus: str, max_tokens: int):
         with open(corpus, "r", encoding="utf-8") as f:
             text = f.read()
     ids = tokenizer(text, return_tensors=None, add_special_tokens=False)["input_ids"]
-    return ids[:max_tokens]
+    # PPL_SLICE=k scores tokens [k*max_tokens, (k+1)*max_tokens) instead of the
+    # first window. Headline PPL on one wikitext window sign-flips between
+    # windows (103..282 across slices), so a single slice cannot size a change;
+    # this is how you get the >=4 independent slices a paired t-test needs.
+    _slice = int(os.environ.get("PPL_SLICE", "0"))
+    off = _slice * max_tokens
+    assert off < len(ids), (
+        f"PPL_SLICE={_slice} starts at token {off} but the corpus only has "
+        f"{len(ids)} tokens")
+    return ids[off:off + max_tokens]
 
 
 def report_perplexity(mode: str, nll_sum: float, n_scored: int, args,
@@ -202,6 +215,74 @@ def pad_weight_3d(w: torch.Tensor, target_dim1: int = None, target_dim2: int = N
 _FP4_MAGNITUDES = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
+
+
+def fp8_act_roundtrip(x: torch.Tensor) -> torch.Tensor:
+    """Round-trip activations through MPK's FP8 activation quantizer.
+
+    MPK feeds the f8f6f4 MFMA quantized *activations*, not just quantized
+    weights: every W13/W2/QKV/O-proj/LM-head GEMM runs
+    `_gang_wave_parallel_fp8_quant` on its input row first
+    (gang_moe_linear_mxfp4_mi300.cuh). A weights-only reference therefore
+    still differs from MPK on every GEMM in the model, which makes it the
+    wrong baseline for an accuracy comparison.
+
+    Mirrors _gang_compute_e8m0_fp8 + __builtin_amdgcn_cvt_scalef32_pk_fp8_f32:
+    per 32-element block along the reduction axis, an E8M0 (power-of-two)
+    scale is chosen as the ceiling exponent of amax/448, and the scaled values
+    are stored as E4M3.
+    """
+    orig_shape, orig_dtype = x.shape, x.dtype
+    K = orig_shape[-1]
+    if K % 32 != 0:
+        return x
+    v = x.detach().float().reshape(-1, K // 32, 32)
+
+    amax = v.abs().amax(dim=-1, keepdim=True)
+    target = amax * (1.0 / 448.0)
+    # E8M0: raw IEEE exponent of `target`, rounded UP when the mantissa is
+    # non-zero -- the integer-arithmetic form the device code uses.
+    u = target.view(torch.int32)
+    raw_exp = (u >> 23) & 0xFF
+    raw_exp = raw_exp + ((u & 0x7FFFFF) != 0).to(torch.int32)
+    raw_exp = raw_exp.clamp(0, 255)
+    scale = torch.where(
+        (amax == 0) | (raw_exp == 0),
+        torch.ones_like(target),
+        (raw_exp << 23).view(torch.float32),
+    )
+
+    # E4M3 (max 448, min normal 2^-6, 3 mantissa bits) applied to v/scale.
+    q = v / scale
+    q = q.to(torch.float8_e4m3fn).float()
+    return (q * scale).reshape(orig_shape).to(orig_dtype)
+
+
+def _decode_prequant_row(t):
+    """Read back the FP8 form of `rmsnorm_out_moe` as floats.
+
+    The buffer is declared BF16 [bs, PADDED_HIDDEN_SIZE], but under the W13
+    prequant the router publishes into it a different layout entirely:
+    `output_stride` FP8 E4M3 payload bytes followed by one E8M0 exponent byte
+    per 128-element block. Interpreting those bytes as BF16 gives cos 0.0
+    against the reference -- a format mismatch that looks like a numerical
+    catastrophe. This is the inverse of the publication at the
+    MPK_W13_PREQUANT site in gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh.
+
+    Returns [bs, PADDED_HIDDEN_SIZE] float32, so callers see the same shape as
+    the BF16 path.
+    """
+    n = PADDED_HIDDEN_SIZE
+    raw = t.detach().view(torch.uint8).reshape(t.shape[0], -1).cpu()
+    # Payload then scales, exactly as the kernel stores them: the dword at
+    # byte offset 4*i_cur, the E8M0 byte at output_stride + scale_block.
+    q = raw[:, :n].view(torch.float8_e4m3fn).float()
+    se = raw[:, n:n + n // 128].to(torch.int32)
+    # E8M0 0 means the block was all zeros; the kernel uses scale 1.0 there so
+    # that the multiply below is a no-op rather than a denormal.
+    scale = torch.where(se == 0, torch.ones_like(se, dtype=torch.float32),
+                        (se << 23).view(torch.float32))
+    return q * scale.repeat_interleave(128, dim=1)[:, :n]
 
 
 def quantize_bf16_to_mxfp4(weight: torch.Tensor,
@@ -405,6 +486,468 @@ def dequant_mxfp4_to_bf16(blocks: torch.Tensor, scales: torch.Tensor,
     return result.contiguous()
 
 
+def serve_mpk(*, args, mpk, tokenizer, tokens, prompt_lengths, step,
+              num_new_tokens, config, reset_device_barriers):
+    """Serve the compiled megakernel over an OpenAI-compatible HTTP endpoint.
+
+    Exists so the InferenceX benchmark harness -- which only speaks HTTP to
+    /v1/completions -- can drive MPK through the exact same client, sampler
+    and metric code that measures vLLM. Anything less than a real endpoint
+    would compare MPK's in-process timing against vLLM's end-to-end serving
+    numbers, which is not a like-for-like comparison.
+
+    Deliberately minimal, and NOT a production server:
+      * A single worker thread owns the GPU. MPK's tensors (`tokens`, `step`,
+        `prompt_lengths`) are one fixed-size arena bound into the compiled
+        kernel by pointer, so overlapping launches would corrupt each other.
+        Concurrency is expressed as a batch WITHIN one launch: the worker
+        coalesces up to max_num_batched_requests pending requests and runs
+        them in a single megakernel launch. Serializing instead would make
+        every concurrency level measure bs=1 with a queue in front of it.
+      * The kernel has no runtime decode-step bound -- it stops only on
+        `step + num_tokens + 1 >= max_seq_length` -- so generation length is
+        fixed by the compiled arena, not by per-request max_tokens. Every
+        request in a batch therefore generates the same number of tokens, and
+        the benchmark must use fixed-length prompts (random-range-ratio 1.0)
+        for the arena to match what was asked for.
+      * No streaming, no sampling parameters, no EOS handling beyond
+        ignore_eos -- the benchmark runs with --ignore-eos.
+    """
+    import gc
+    import time
+    import queue
+    import asyncio
+    import threading
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    # Take the loaded model out of GC's reach before serving.
+    #
+    # Streaming allocates steadily (one dict + one JSON string per token), so
+    # the generational thresholds trip mid-response. A gen-2 pass then has to
+    # walk the whole 120B model's object graph, which measured ~400-500 ms --
+    # landing at a reproducible token index and dwarfing the 3.4 ms it sits
+    # between. gc.freeze() moves everything currently alive to a permanent
+    # generation that collection skips; per-request garbage is all acyclic and
+    # is still freed immediately by refcounting.
+    gc.collect()
+    gc.freeze()
+
+    # MPK_SERVE_TRACE=1 prints a per-launch breakdown of where the tail time
+    # goes (kernel, sync, device->host copy, detokenize).
+    _serve_trace = os.environ.get("MPK_SERVE_TRACE", "0") == "1"
+
+    app = FastAPI()
+    pending = queue.Queue()
+
+    max_seq = tokens.size(1)
+    max_batch = args.max_num_batched_requests
+    served_name = args.model_path
+
+    @app.get("/health")
+    def health():
+        return JSONResponse({"status": "ok"})
+
+    @app.get("/v1/models")
+    def models():
+        return JSONResponse(
+            {"object": "list",
+             "data": [{"id": served_name, "object": "model",
+                       "owned_by": "fleet-mpk"}]})
+
+    def _run_batch(prompt_id_lists, max_tokens):
+        """Run one megakernel launch over a batch of prompts.
+
+        Returns (completions, elapsed_s). The launch generates until every
+        request hits max_seq_length, so max_tokens is enforced by sizing the
+        arena, matching how --max-new-tokens is translated on the batch path.
+        """
+        bs = len(prompt_id_lists)
+        lens = [len(p) for p in prompt_id_lists]
+
+        # The kernel stops on `step + num_tokens + 1 >= config.max_seq_length`
+        # and on nothing else. That bound is a runtime field, so the generated
+        # length is set here per launch rather than by the compiled arena --
+        # which matters because the harness draws prompt lengths from a range
+        # (--random-range-ratio 0.8) while asking for a fixed output length.
+        # With a compile-time bound, a short prompt would silently generate
+        # extra tokens and a long one would come up short.
+        need = max(lens) + max_tokens
+        if need > max_seq:
+            raise ValueError(
+                f"prompt {max(lens)} + max_tokens {max_tokens} = {need} "
+                f"exceeds the compiled arena of {max_seq}; restart the server "
+                f"with a larger --max-seq-length")
+        if getattr(mpk, "set_max_seq_length_func", None) is not None:
+            # +1: the bound is exclusive of the last accepted position.
+            mpk.set_max_seq_length_func(need + 1)
+
+        tokens.zero_()
+        for r, ids in enumerate(prompt_id_lists):
+            tokens[r, :len(ids)] = torch.tensor(
+                ids, dtype=torch.long, device="cuda")
+        # Every row of the fixed arena is live for the whole launch, including
+        # rows beyond this batch. Padding them to the same prompt length keeps
+        # them retiring in step instead of spinning against a zero-length
+        # prompt.
+        for r in range(bs, tokens.size(0)):
+            tokens[r, :lens[0]] = tokens[0, :lens[0]]
+
+        pl = lens + [lens[0]] * (prompt_lengths.numel() - bs)
+        prompt_lengths.copy_(
+            torch.tensor(pl[:prompt_lengths.numel()], dtype=torch.int32))
+        step.zero_()
+        num_new_tokens.fill_(1)
+
+        # Per-request device state (step, request_ids, the page free list,
+        # qo/kv indptr) lives in host-allocated buffers that persist across
+        # launches -- the batch demo only ever launched once, so nothing reset
+        # them. Without this the second request decodes from a page queue that
+        # is already drained and every position comes back as token 0.
+        mpk.init_request_func()
+        # ...and the same is true of the per-layer barrier counters, which are
+        # monotonic by design and would otherwise deadlock this launch against
+        # the previous request's terminal values. See reset_device_barriers.
+        reset_device_barriers()
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        mpk()
+        t_launch = time.perf_counter()
+        torch.cuda.synchronize()
+        t_sync = time.perf_counter()
+        elapsed = t_sync - t0
+
+        out = []
+        host = tokens.cpu()
+        t_copy = time.perf_counter()
+        for r in range(bs):
+            gen = host[r, lens[r]:need].tolist()
+            out.append(tokenizer.decode(gen, skip_special_tokens=True))
+        t_dec = time.perf_counter()
+        if _serve_trace:
+            print(f"[SERVE_T] launch={t_launch-t0:.3f}s sync={t_sync-t_launch:.3f}s "
+                  f"copy={t_copy-t_sync:.3f}s decode={t_dec-t_copy:.3f}s",
+                  flush=True)
+        return out, elapsed
+
+    def _run_batch_streaming(prompt_id_lists, max_tokens, on_token):
+        """_run_batch, but publish tokens to `on_token` as they are produced.
+
+        The harness computes TPOT as (latency - ttft) / (output_len - 1) from
+        SSE chunk arrival times, so a server that returns everything in one
+        response reports its entire launch as TTFT and a TPOT of ~0. To be
+        measured the same way vLLM is, tokens have to leave the process as the
+        kernel produces them.
+
+        The kernel generates a whole request inside ONE blocking launch, so
+        there is no host-side per-token loop to hook. Instead the scheduler
+        publishes each request's token position to pinned host memory once per
+        iteration (RuntimeConfig::progress_host), which is visible to the host
+        over PCIe while the launch is still running. The launch itself runs on
+        a separate thread with the GIL released, and this thread polls those
+        counters.
+
+        `on_token(request_index, token_index)` is called once per newly
+        produced token, per request. Reading token text per step would mean a
+        device->host copy per token, so the tokens are decoded once at the end
+        and the callback carries only indices: what the benchmark measures is
+        chunk *timing*, and the text is reassembled in order regardless.
+        """
+        bs = len(prompt_id_lists)
+        lens = [len(p) for p in prompt_id_lists]
+        need = max(lens) + max_tokens
+
+        result = {}
+
+        def _launch():
+            try:
+                result["value"] = _run_batch(prompt_id_lists, max_tokens)
+            except BaseException as exc:
+                result["error"] = exc
+
+        # Clear the counters HERE, on this thread, before the launch thread
+        # starts. launch_persistent_kernel clears them too, but that happens
+        # after this poller is already running: it would read the previous
+        # request's terminal position, believe the response was complete, and
+        # dump every chunk at once -- a ~0 ms TTFT and a ~0 ms inter-token
+        # latency for every request but the first.
+        if getattr(mpk, "reset_decode_progress_func", None) is not None:
+            mpk.reset_decode_progress_func()
+
+        th = threading.Thread(target=_launch, daemon=True)
+        t0 = time.perf_counter()
+        th.start()
+
+        # Progress[r] is request r's token position with the prompt included,
+        # so anything at or below its own prompt length is still prefill and
+        # produces no output token. Each request has its own prompt length, so
+        # they leave prefill at different iterations -- tracking them together
+        # would report request 0's TTFT for the whole batch.
+        #
+        # Poll rather than block: at ~3.4 ms/token a 200 us poll adds at most
+        # ~6% of one token time to a chunk's timestamp and costs one
+        # uncontended atomic load per request.
+        emitted = [0] * bs
+        # Every request runs until the shared launch bound, so they all
+        # produce the same count -- but each starts from its own prompt end.
+        n_expected = [need - lens[r] for r in range(bs)]
+        progress = getattr(mpk, "decode_progress_func", None)
+        while th.is_alive():
+            if progress is None:
+                break
+            done_all = True
+            for r in range(bs):
+                if emitted[r] >= n_expected[r]:
+                    continue
+                pos = progress(r)
+                if pos < 0:
+                    done_all = True  # built without the progress counter
+                    break
+                # pos is the index of the last token WRITTEN, not a count:
+                # prepare_next_batch stores tokens[step+j+1] and then sets
+                # step to that same index. Request r's first output token
+                # lands at index lens[r], so pos == lens[r] already means one
+                # token exists -- hence the +1. Without it the poller stays
+                # exactly one token behind forever, and the final token is
+                # only flushed after th.join(), charging the whole ~0.7 s of
+                # kernel teardown to the last inter-token gap.
+                avail = pos - lens[r] + 1
+                while emitted[r] < min(avail, n_expected[r]):
+                    on_token(r, emitted[r])
+                    emitted[r] += 1
+                if emitted[r] < n_expected[r]:
+                    done_all = False
+            if done_all:
+                break
+            time.sleep(0.0002)
+
+        t_last_progress = time.perf_counter()
+        th.join()
+        if _serve_trace:
+            print(f"[SERVE_T] poll_exit_at={t_last_progress-t0:.3f}s "
+                  f"join_at={time.perf_counter()-t0:.3f}s "
+                  f"emitted={emitted} expected={n_expected}", flush=True)
+        if "error" in result:
+            raise result["error"]
+        texts, _ = result["value"]
+        # Whatever the poll loop missed (it exits as soon as the launch ends,
+        # and a fast tail can outrun a 200 us poll) still has to be emitted, or
+        # the client's token count disagrees with the text it received.
+        for r in range(bs):
+            while emitted[r] < n_expected[r]:
+                on_token(r, emitted[r])
+                emitted[r] += 1
+        return texts, time.perf_counter() - t0
+
+    async def _sse(slot, done, id_lists, max_tokens):
+        """Emit one SSE chunk per generated token, then usage, then [DONE].
+
+        Chunk *timing* is the measurement: the harness timestamps each chunk to
+        get TTFT and the inter-token latencies it averages into TPOT. The text
+        is only known once the launch finishes (it lives in device memory until
+        then), so each chunk carries an empty string and the full text is
+        attached to the last one. The harness concatenates `text` across chunks
+        and counts tokens from the `usage` block, so the totals it reports are
+        the real ones -- see `output.output_tokens` in its backend.
+        """
+        loop = asyncio.get_running_loop()
+        q = slot["stream"]
+        head = json.dumps({
+            "id": "cmpl-mpk", "object": "text_completion",
+            "created": int(time.time()), "model": served_name,
+            "choices": [{"index": 0, "text": "", "finish_reason": None,
+                         "logprobs": None}],
+        })
+        # Emit each token one behind: hold the newest and flush the previous.
+        # The text only exists once the launch ends, so it has to ride the
+        # final chunk -- and a final chunk *in addition to* one per token would
+        # add a spurious inter-token gap to every measurement. Delaying by one
+        # keeps the chunk count equal to the token count, with each chunk
+        # timestamped when its token was actually produced.
+        #
+        # Drain via an asyncio.Queue fed by call_soon_threadsafe rather than
+        # `await run_in_executor(None, q.get)` per token. That form costs a
+        # threadpool dispatch plus an event-loop wakeup for every single token,
+        # which measured ~1.6 ms on top of a ~1.9 ms token -- the server would
+        # have reported nearly double MPK's real inter-token latency.
+        n_emitted = 0
+        held = False
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            if held:
+                n_emitted += 1
+                yield f"data: {head}\n\n"
+            held = True
+
+        await loop.run_in_executor(None, done.wait)
+        if "error" in slot:
+            yield ("data: " + json.dumps({"error": slot["error"]}) + "\n\n")
+            yield "data: [DONE]\n\n"
+            return
+
+        text = slot["texts"][0]
+        n_prompt = sum(len(x) for x in id_lists)
+        if held:
+            n_emitted += 1
+        tail = json.dumps({
+            "id": "cmpl-mpk", "object": "text_completion",
+            "created": int(time.time()), "model": served_name,
+            "choices": [{"index": 0, "text": text, "finish_reason": "length",
+                         "logprobs": None}],
+        })
+        yield f"data: {tail}\n\n"
+        usage = json.dumps({
+            "id": "cmpl-mpk", "object": "text_completion",
+            "created": int(time.time()), "model": served_name,
+            "choices": [],
+            "usage": {"prompt_tokens": n_prompt,
+                      "completion_tokens": n_emitted,
+                      "total_tokens": n_prompt + n_emitted},
+        })
+        yield f"data: {usage}\n\n"
+        yield "data: [DONE]\n\n"
+
+    @app.post("/v1/completions")
+    async def completions(body: dict):
+        prompt = body.get("prompt")
+        max_tokens = int(body.get("max_tokens", 16))
+        # `prompt` is overloaded in the OpenAI schema: a str, a list of strs, a
+        # list of token ids, or a list of lists of ids. A flat list of ints is
+        # ONE pre-tokenized prompt, not a batch of prompts -- reading it as a
+        # batch feeds each integer to the tokenizer and 500s.
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
+            prompts = [prompt]
+        else:
+            prompts = prompt if isinstance(prompt, list) else [prompt]
+
+        # Accept pre-tokenized prompts (the harness sends token ids when it
+        # controls the input length exactly) as well as text.
+        id_lists = []
+        for p in prompts:
+            if isinstance(p, list):
+                id_lists.append([int(t) for t in p])
+            else:
+                id_lists.append(
+                    tokenizer(p, add_special_tokens=False)["input_ids"])
+
+        if len(id_lists) > max_batch:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"batch of {len(id_lists)} exceeds the "
+                                  f"compiled max_num_batched_requests "
+                                  f"{max_batch}"})
+
+        # Hand off to the GPU worker and wait. Concurrent HTTP requests land in
+        # the same queue and get coalesced into one launch, which is what makes
+        # a concurrency sweep measure MPK's batching rather than a lock.
+        done = threading.Event()
+        slot = {}
+        if bool(body.get("stream", False)):
+            # asyncio.Queue + the owning loop: the GPU worker thread pushes
+            # through loop.call_soon_threadsafe (see _tick), so the generator
+            # can await directly instead of paying a threadpool hop per token.
+            slot["stream"] = asyncio.Queue()
+            slot["loop"] = asyncio.get_running_loop()
+            pending.put((id_lists, max_tokens, done, slot))
+            return StreamingResponse(
+                _sse(slot, done, id_lists, max_tokens),
+                media_type="text/event-stream")
+        pending.put((id_lists, max_tokens, done, slot))
+        await asyncio.get_running_loop().run_in_executor(None, done.wait)
+        if "error" in slot:
+            return JSONResponse(status_code=500,
+                                content={"error": slot["error"]})
+        texts, elapsed = slot["texts"], slot["elapsed"]
+
+        n_prompt = sum(len(x) for x in id_lists)
+        n_out = max_tokens * len(id_lists)
+        return JSONResponse({
+            "id": "cmpl-mpk",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": served_name,
+            "choices": [
+                {"index": i, "text": t, "finish_reason": "length",
+                 "logprobs": None}
+                for i, t in enumerate(texts)
+            ],
+            "usage": {"prompt_tokens": n_prompt,
+                      "completion_tokens": n_out,
+                      "total_tokens": n_prompt + n_out},
+            "mpk_launch_s": elapsed,
+        })
+
+    def _worker():
+        """Own the GPU: drain the queue into batches and launch.
+
+        Blocks for the first request, then fills the batch up to max_batch,
+        waiting up to BATCH_FILL_S for stragglers. Under a closed-loop
+        benchmark at concurrency C, all C clients are released by the same
+        launch and re-issue within a few ms of each other -- but not
+        simultaneously, and a purely non-blocking drain would sometimes see
+        only the first one and run a bs=1 launch. That would report MPK's
+        concurrency-C throughput as its bs=1 throughput. The window is ~1% of
+        a 1024-token launch, so paying it to keep the batch full is free.
+        """
+        BATCH_FILL_S = 0.05
+        while True:
+            first = pending.get()
+            batch = [first]
+            deadline = time.perf_counter() + BATCH_FILL_S
+            while len(batch) < max_batch:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(pending.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            id_lists = [b[0][0] for b in batch]
+            max_tokens = max(b[1] for b in batch)
+
+            # Requests share a launch but not a schedule: a shorter prompt
+            # clears prefill earlier and starts emitting sooner. The tick is
+            # therefore routed to the one request it belongs to.
+            def _tick(_req_index, _token_index):
+                s = batch[_req_index][3]
+                q = s.get("stream")
+                if q is not None:
+                    # asyncio.Queue is not thread-safe; this runs on the GPU
+                    # worker thread, so hand the put to the loop.
+                    s["loop"].call_soon_threadsafe(q.put_nowait, _token_index)
+
+            try:
+                texts, elapsed = _run_batch_streaming(
+                    id_lists, max_tokens, _tick)
+                for i, (_, _, done, slot) in enumerate(batch):
+                    slot["texts"] = [texts[i]]
+                    slot["elapsed"] = elapsed
+                    q = slot.get("stream")
+                    if q is not None:
+                        # end-of-stream sentinel, same loop hand-off as _tick
+                        slot["loop"].call_soon_threadsafe(q.put_nowait, None)
+                    done.set()
+            except Exception as exc:  # surface to the client, keep serving
+                for _, _, done, slot in batch:
+                    slot["error"] = repr(exc)
+                    q = slot.get("stream")
+                    if q is not None:
+                        slot["loop"].call_soon_threadsafe(q.put_nowait, None)
+                    done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    port = int(os.environ.get("MPK_SERVE_PORT", "8892"))
+    print(f"[SERVE] MPK OpenAI endpoint on :{port} "
+          f"(max_batch={max_batch}, arena={max_seq} tokens)", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
@@ -414,6 +957,14 @@ if __name__ == "__main__":
                         help="Use AITER fused MoE (CK-tile MXFP4 path)")
     parser.add_argument("--max-num-batched-tokens", default=1, type=int)
     parser.add_argument("--max-num-batched-requests", default=1, type=int)
+    parser.add_argument(
+        "--num-requests", default=None, type=int,
+        help=("Total requests to run. Defaults to --max-num-batched-requests. "
+              "Set it higher to exercise request rotation: requests retire as "
+              "they finish, their pages return to the free list, and queued "
+              "requests are admitted into the freed slots by "
+              "prepare_next_batch."),
+    )
     parser.add_argument("--page-size", default=4096, type=int)
     parser.add_argument("--max-num-pages", default=16, type=int)
     parser.add_argument("--output-dir", help="Output files directory")
@@ -422,8 +973,27 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq-length", default=512, type=int)
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--serve", action="store_true",
+                        help="Serve an OpenAI-compatible /v1/completions "
+                             "endpoint instead of running the batch demo, so "
+                             "the InferenceX harness can benchmark MPK the "
+                             "same way it benchmarks vLLM.")
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--prompt", type=str, default="The capital of France is")
+    parser.add_argument(
+        "--prompt-file", type=str, default=None,
+        help=("Read --prompt from this UTF-8 file. Required past ~32k tokens: "
+              "the kernel caps a single argv entry at MAX_ARG_STRLEN (128 KB), "
+              "and exec fails with 'Argument list too long' before python "
+              "starts. Overridden by --prompts."),
+    )
+    parser.add_argument(
+        "--prompts", nargs="+", default=None,
+        help=("Distinct prompts, one per request (cycled if fewer than "
+              "--num-requests). Overrides --prompt. This is the multi-request "
+              "correctness gate: with identical prompts a request reading the "
+              "wrong KV cache produces the right answer anyway."),
+    )
     parser.add_argument(
         "--save-tokens", nargs="?", const="auto", default=None,
         help=("Dump generated token_ids to JSON for the correctness test. If the "
@@ -454,8 +1024,57 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+
+    # Serving measures per-token latency, and the [FWD_PASS] trace is device
+    # printf: inline it perturbs the iteration it reports, and its end-of-launch
+    # dump costs ~150-500 ms that lands inside the request. Off by default when
+    # serving; set MPK_QUIET_FWDPASS=0 explicitly to get the trace back.
+    if args.serve:
+        os.environ.setdefault("MPK_QUIET_FWDPASS", "1")
+
+    if args.prompt_file:
+        with open(args.prompt_file, encoding="utf-8") as _f:
+            args.prompt = _f.read()
+
+    # --verify implies the megakernel path. Fold it in *before* the batch-shape
+    # block below, which is what defaults num_requests -- otherwise --verify
+    # leaves num_requests=None and torch.full() dies on the None in the shape
+    # tuple, ~600 lines later.
     if args.verify:
         args.use_mirage = True
+
+    # ── Batch-shape liveness constraints ──────────────────────────────────
+    # These are hang-avoidance, not style. Violating any of them produces a
+    # stalled megakernel (all 240 workers spinning on a barrier that can never
+    # be satisfied), which looks identical to a hardware hang.
+    if args.use_mirage:
+        assert 1 <= args.max_num_batched_tokens <= 16, (
+            f"--max-num-batched-tokens must be in 1..16 (tokens ride the N "
+            f"axis of the 16x16x128 MFMA); got {args.max_num_batched_tokens}")
+        assert 1 <= args.max_num_batched_requests <= 8, (
+            f"--max-num-batched-requests must be in 1..8; got "
+            f"{args.max_num_batched_requests}. Above 8 the per-request chunk "
+            f"budget (30 workers/XCD // B) drops below 3 and the split-KV "
+            f"attention decomposition stops paying for itself.")
+        assert args.max_num_batched_tokens >= args.max_num_batched_requests, (
+            f"--max-num-batched-tokens ({args.max_num_batched_tokens}) must be "
+            f">= --max-num-batched-requests ({args.max_num_batched_requests}). "
+            f"prepare_next_batch gives each request min(1, budget-left) tokens, "
+            f"so trailing requests would get 0 tokens forever, never advance "
+            f"their step, and never retire.")
+        _pages_per_req = (args.max_seq_length + args.page_size - 1) // args.page_size
+        _pages_needed = args.max_num_batched_requests * _pages_per_req
+        assert args.max_num_pages >= _pages_needed, (
+            f"--max-num-pages={args.max_num_pages} is too small: "
+            f"{args.max_num_batched_requests} requests x {_pages_per_req} pages "
+            f"of {args.page_size} tokens needs {_pages_needed}. The page free "
+            f"list would run dry mid-run.")
+        if args.num_requests is None:
+            args.num_requests = args.max_num_batched_requests
+        assert args.num_requests >= args.max_num_batched_requests, (
+            f"--num-requests ({args.num_requests}) must be >= "
+            f"--max-num-batched-requests ({args.max_num_batched_requests})")
+
     if args.use_aiter:
         args.use_mirage = False
 
@@ -516,7 +1135,10 @@ if __name__ == "__main__":
         # without this the Torch path silently keeps running all 36 layers and
         # any MPK-vs-Torch comparison under --max-layers is meaningless.
         model.model.layers = model.model.layers[:num_layers]
-    total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
+    # total_num_requests may exceed max_num_batched_requests: the extra ones
+    # queue behind the batch slots and are admitted by prepare_next_batch as
+    # earlier requests retire.
+    total_num_requests = 1 if not args.use_mirage else args.num_requests
 
     # ── Perplexity mode ───────────────────────────────────────────────────
     # Score a fixed corpus instead of generating. The megakernel already does
@@ -529,15 +1151,25 @@ if __name__ == "__main__":
     ppl_mode = os.environ.get("PPL_MODE", "0") == "1"
     ppl_token_ids = None
     if ppl_mode:
-        if args.use_mirage and args.max_num_batched_tokens != 1:
-            # The LM head task RMSNorms batch_count rows but feeds only row 0
-            # to the GEMM, so a multi-token iteration would emit one logit row
-            # for a batch of positions. Perplexity needs one row per position.
+        # The bs==1 restriction that used to live here is gone: the LM head
+        # RMSNormed batch_count rows but fed only row 0 to the GEMM, so a
+        # multi-token iteration emitted one logit row for a whole batch of
+        # positions. It now packs tokens onto the MFMA's N axis (token `col`
+        # occupies column `col`) and writes one row per position with
+        # argmax_row_stride, which is exactly what perplexity needs.
+        #
+        # Multiple *requests* are still excluded, and unlike the token case
+        # this one cannot be lifted from the host. task_register.cc emits the
+        # logits sink row as `runtime_config.step[0] + 1` -- request 0's step,
+        # for every request. At B>1 all requests would write the same row.
+        # Since every request is loaded with the same corpus, the result would
+        # look entirely plausible while actually being a race.
+        if args.use_mirage and args.max_num_batched_requests > 1:
             raise ValueError(
-                "PPL_MODE requires --max-num-batched-tokens 1; the LM head "
-                f"emits one logit row per iteration (got "
-                f"{args.max_num_batched_tokens})."
-            )
+                f"PPL_MODE requires --max-num-batched-requests 1 (got "
+                f"{args.max_num_batched_requests}); the logits sink row is "
+                f"derived from request 0's step, so all requests would race "
+                f"on the same row.")
         if args.use_mirage and os.environ.get("FUSE_TAIL", "0") == "1":
             # The fused tail never dereferences its lm_logits output pointer,
             # so it has no logits sink to attach.
@@ -568,22 +1200,71 @@ if __name__ == "__main__":
             (total_num_requests,), n_ppl, dtype=torch.int, device="cuda"
         )
     else:
-        # Tokenize prompt (apply chat template if available)
-        text = args.prompt
-        if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
-            messages = [{"role": "user", "content": text}]
-            formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            model_inputs = tokenizer([formatted], return_tensors="pt", add_special_tokens=False).to("cuda")
-            print(f"Chat template applied: {len(model_inputs.input_ids[0])} tokens")
+        def _tokenize_prompt(text):
+            """Tokenize one prompt, applying the chat template if there is one."""
+            if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+                messages = [{"role": "user", "content": text}]
+                formatted = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+                enc = tokenizer([formatted], return_tensors="pt",
+                                add_special_tokens=False).to("cuda")
+            else:
+                enc = tokenizer([text], return_tensors="pt").to("cuda")
+            return enc.input_ids[0]
+
+        # One prompt per request. Distinct prompts are what make a
+        # cross-request KV leak observable -- with identical prompts every
+        # request produces the same tokens whether or not attention read the
+        # right cache.
+        _prompt_texts = args.prompts if args.prompts else [args.prompt]
+        _req_ids = [_tokenize_prompt(_prompt_texts[r % len(_prompt_texts)])
+                    for r in range(total_num_requests)]
+        _lens = [int(t.numel()) for t in _req_ids]
+        if max(_lens) > args.max_seq_length:
+            raise ValueError(
+                f"prompt of {max(_lens)} tokens exceeds "
+                f"--max-seq-length {args.max_seq_length}")
+        for r, ids_r in enumerate(_req_ids):
+            tokens[r, :ids_r.numel()] = ids_r
+        prompt_lengths = torch.tensor(_lens, dtype=torch.int, device="cuda")
+        if len(_prompt_texts) > 1 or total_num_requests > 1:
+            print(f"Prompt lengths per request: {_lens}")
         else:
-            model_inputs = tokenizer([text], return_tensors="pt").to("cuda")
-        for r in range(total_num_requests):
-            for i in range(model_inputs.input_ids.shape[-1]):
-                tokens[r, i] = model_inputs.input_ids[0, i]
-        prompt_lengths = torch.full(
-            (total_num_requests,), model_inputs.input_ids.shape[-1],
-            dtype=torch.int, device="cuda"
-        )
+            print(f"Chat template applied: {_lens[0]} tokens")
+
+        # --max-new-tokens on the MPK path.
+        #
+        # MPK has no runtime decode-step bound. prepare_next_batch stops on
+        # `step + num_tokens + 1 >= config.max_seq_length`
+        # (persistent_kernel.cuh:728) and on nothing else -- the only other
+        # exit, profiling_num_iters, comes from the compile-time
+        # -DMPK_PROFILING_NUM_ITERS and has no runtime setter. So the flag was
+        # silently ignored here while the Torch branch honoured it through
+        # `decode_limit`, and step counts had to be controlled by hand via
+        # --max-seq-length. Translate it into the bound MPK actually reads.
+        #
+        # Longest prompt, not request 0's: max_seq_length is a single global
+        # bound shared by every request, so sizing it off a shorter prompt
+        # would truncate the longer ones mid-generation.
+        # Not in --serve: the shrink is sized off the demo's own built-in
+        # prompt, but a server's prompts arrive over HTTP long after the arena
+        # is compiled. Shrinking to (built-in prompt + max_new_tokens) would
+        # cap every future request at an arena that has nothing to do with it.
+        # Under --serve, --max-seq-length is the arena, verbatim.
+        if args.use_mirage and args.max_new_tokens is not None \
+                and not getattr(args, "serve", False):
+            _needed = max(_lens) + args.max_new_tokens
+            if _needed < args.max_seq_length:
+                args.max_seq_length = _needed
+                tokens = tokens[:, :_needed].contiguous()
+                print(f"[CFG] --max-new-tokens {args.max_new_tokens} -> "
+                      f"max_seq_length={_needed} "
+                      f"(prompt {max(_lens)} + {args.max_new_tokens})")
+            else:
+                print(f"[CFG] --max-new-tokens {args.max_new_tokens} needs "
+                      f"max_seq_length {_needed}, but --max-seq-length is "
+                      f"{args.max_seq_length}; generation stops at "
+                      f"{args.max_seq_length - max(_lens)} new tokens.")
 
     # Position embeddings
     positions = torch.arange(args.max_seq_length).unsqueeze(0).to("cuda")
@@ -1093,6 +1774,7 @@ if __name__ == "__main__":
 
     if args.use_mirage:
         import mirage as mi
+        from mirage.utils import mpk_w13_prequant
 
         # Gang dispatch is required for MXFP4 MoE kernels on MI300/MI350
         os.environ.setdefault("USE_GANG", "1")
@@ -1142,29 +1824,50 @@ if __name__ == "__main__":
         # decode kernel already stamps LSE=-inf for chunks that get no KV tiles,
         # so over-provisioning chunks at short seqlen is safe (just wasteful).
         #
-        # KV_TILE=64 in paged_attention_decode_minimal_hd64_mi300.cuh; aim for
-        # >=2 tiles per chunk so a chunk is worth its merge overhead.
+        # KV_TILE=16 in paged_attention_decode_minimal_hd64_mi300.cuh; the /64
+        # below is a coarse "is this sequence long enough to be worth splitting"
+        # heuristic, not a tile count.
+        #
+        # With B > 1 requests in flight the 30 workers/XCD are shared between
+        # requests and chunks: xcd_rank decomposes as
+        # (request, chunk) = (xcd_rank / NUM_KV_CHUNKS, xcd_rank % NUM_KV_CHUNKS),
+        # so the chunk budget per request is 30 // B. This is the same
+        # occupancy-driven split-K decision vLLM makes (partition only when the
+        # machine is not already full), just expressed as a compile-time shape.
         _nw, _ = mi.get_configurations_from_gpu(rank)
-        MAX_KV_CHUNKS = _nw // 8  # workers per XCD (240/8 = 30 on MI350)
+        _workers_per_xcd = _nw // 8  # 240/8 = 30 on MI350
+        MAX_KV_CHUNKS = _workers_per_xcd // args.max_num_batched_requests
+        assert MAX_KV_CHUNKS >= 1, (
+            f"max_num_batched_requests={args.max_num_batched_requests} exceeds "
+            f"the {_workers_per_xcd} workers per XCD; no chunk budget left."
+        )
         _env_chunks = os.environ.get("CK_FMHA_NUM_KV_CHUNKS")
         if _env_chunks is not None:
             ck_fmha_num_kv_chunks = int(_env_chunks)
         else:
             _kv_tiles = max(1, (args.max_seq_length + 63) // 64)
-            ck_fmha_num_kv_chunks = max(8, min(MAX_KV_CHUNKS, _kv_tiles // 2))
+            # Floor of 8 chunks: below that the merge overhead is cheaper than
+            # the serialization, so short sequences still want the split. The
+            # floor is then clamped to the per-request budget rather than
+            # dropped -- clamping keeps B<=3 (budget >= 10) bit-identical to
+            # the single-request path, and only B>=4 gives up chunk depth.
+            _want = max(8, min(MAX_KV_CHUNKS, _kv_tiles // 2))
+            ck_fmha_num_kv_chunks = max(1, min(MAX_KV_CHUNKS, _want))
         assert ck_fmha_num_kv_chunks >= 1
         use_split_attn_chunks = (ck_fmha_num_kv_chunks > 1)
         fuse_full_layer = os.environ.get("FUSE_FULL_LAYER", "1") == "1"
         if fuse_full_layer and ck_fmha_num_kv_chunks > MAX_KV_CHUNKS:
             raise ValueError(
-                f"CK_FMHA_NUM_KV_CHUNKS={ck_fmha_num_kv_chunks} exceeds the "
-                f"{MAX_KV_CHUNKS} workers per XCD available to claim chunks in "
-                f"the fused full-layer gang task; the split-KV merge would "
-                f"never fire and the kernel would hang."
+                f"CK_FMHA_NUM_KV_CHUNKS={ck_fmha_num_kv_chunks} x "
+                f"max_num_batched_requests={args.max_num_batched_requests} "
+                f"exceeds the {_workers_per_xcd} workers per XCD available to "
+                f"claim (request, chunk) pairs in the fused full-layer gang "
+                f"task; the split-KV merge would never fire and the kernel "
+                f"would hang."
             )
         print(f"[CFG] max_seq_length={args.max_seq_length} "
               f"ck_fmha_num_kv_chunks={ck_fmha_num_kv_chunks} "
-              f"(max {MAX_KV_CHUNKS})")
+              f"(max {MAX_KV_CHUNKS}, B={args.max_num_batched_requests})")
         fuse_tail = os.environ.get("FUSE_TAIL", "0") == "1"
 
         if args.profiling:
@@ -1262,6 +1965,9 @@ if __name__ == "__main__":
             bs, lse_dim1, dtype=torch.float32, device="cuda")
         ck_fmha_lse_acc = mpk.attach_input(
             torch_tensor=ck_fmha_lse_acc_tensor, name="ck_fmha_lse_acc")
+        if args.verify:
+            verify_tensors["ck_fmha_lse_acc"] = ck_fmha_lse_acc_tensor
+            verify_tensors["ck_fmha_q_workspace"] = ck_fmha_q_ws_tensor
 
         attn_out = make_tensor("attn_out", (bs, num_local_q_heads * head_dim))
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
@@ -1272,6 +1978,8 @@ if __name__ == "__main__":
                 bs, o_acc_dim1, dtype=torch.float32, device="cuda")
             ck_fmha_o_acc = mpk.attach_input(
                 torch_tensor=ck_fmha_o_acc_tensor, name="ck_fmha_o_acc")
+            if args.verify:
+                verify_tensors["ck_fmha_o_acc"] = ck_fmha_o_acc_tensor
         else:
             ck_fmha_o_acc = None
         attn_proj_out = make_tensor("attn_proj_out", (bs, PADDED_HIDDEN_SIZE))
@@ -1311,13 +2019,25 @@ if __name__ == "__main__":
         if fuse_oproj_moe:
             fuse_oproj_topk = True  # fused O-proj+MoE implies fused O-proj+TopK
         if fuse_oproj_topk:
-            # 704 int32: full-layer fusion counter buffer layout:
+            # full-layer fusion counter buffer layout:
             #   0..18*16-1:  type 215 counters
             #   19*16 (304): attn_global_counter (cross-XCD sync)
             #   20*16 (320): qkv_epoch[0..7] per-XCD epoch flags
-            #   28*16 (448): chunk_barrier[0..7] per-XCD chunk arrival
             #   36*16 (576): attn_xcd_release[0..7] per-XCD release flags
-            counter_size = 896 if fuse_tail else 832
+            #   44*16 (704): fused-tail counters (moe/resadd/lmhead/argmax),
+            #                4 slots ending at 48*16
+            #   48*16 (768): chunk_barrier[xcd][req], 8*B slots of 16 ints
+            #                -> 128*B ints
+            # The chunk barrier lives *above* the tail counters (rather than at
+            # its historical 28*16) precisely because it is the only region
+            # that grows with B; keeping it last means every other slot address
+            # is unchanged at any batch width.
+            # + 272 ints on top for the layer-boundary global barrier: 8
+            # per-XCD arrival lines, one global arrival line, and 8 per-XCD
+            # release lines, 16 ints each. It sits immediately above the chunk
+            # barrier -- see FULL_LAYER_LAYER_BARRIER_SLOT in
+            # gang_full_layer_fused_mi300.cuh.
+            counter_size = 768 + 128 * args.max_num_batched_requests + 272
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -1341,13 +2061,45 @@ if __name__ == "__main__":
         # happened and deadlocking the W2 workers for that expert. See the
         # layout note in gang_moe_fused_mxfp4_mi300.cuh (MOE_BAR_*).
         moe_fused_barrier = make_tensor("moe_fused_barrier", (160 * num_experts,), torch_dtype=torch.int32)
+
+        def reset_device_barriers():
+            """Zero every monotonic barrier counter. Required before a relaunch.
+
+            These counters are deliberately never reset *within* a run: each
+            per-layer barrier derives its release value as
+            (iteration * num_layers + layer) + 1 and compares against a counter
+            that only ever grows, which is what removes the read-ordering race
+            between producer and consumer (see gang_full_layer_fused_mi300.cuh).
+
+            A relaunch breaks that invariant. task_layer_idx restarts at 0, so
+            launch 2 recomputes small expected values against flags still
+            holding launch 1's terminal ones -- early layers sail through
+            barriers that were satisfied by the *previous* request, and the run
+            desynchronizes until some XCD's fan-out writes a low value back over
+            a high one and every worker expecting the high value spins forever.
+            The observed signature is workers parked in P6-attn-xcd-barrier with
+            obs < exp, spread across an impossible epoch range (1..36 in a
+            single dump).
+
+            Only correct between launches, never during one.
+            """
+            for _n in ("oproj_topk_counters", "qkv_attn_barrier",
+                       "moe_fused_barrier", "router_topk_counter"):
+                _t = _tensor_refs.get(_n)
+                if _t is not None:
+                    _t.zero_()
         # W13+SwiGLU fused output: [bs, top_k, padded_intermediate]
         # (SwiGLU is fused into W13 epilogue — no separate mlp_mid buffer)
         swiglu_out = make_tensor("swiglu_out", (bs, num_experts_per_tok, PADDED_INTERMEDIATE_SIZE))
         # W2 output: [bs, top_k, padded_hidden]
         mlp_out = make_tensor("mlp_out", (bs, num_experts_per_tok, PADDED_HIDDEN_SIZE))
-        # F32 workspace for W2 atomicAdd: replaces MulSumAdd standalone task
-        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # F32 workspace for W2 output: one private slab per (token, topk slot),
+        # laid out [bs, top_k, padded_hidden] but kept 2-D so the existing
+        # num_dims == 2 asserts hold. The slot axis is what makes the reduction
+        # deterministic -- W2 stores (no atomicAdd) and the consumer sums the
+        # slots of its own row in fixed order. See moe_ws_layout.cuh, whose
+        # MOE_WS_SLOTS must equal num_experts_per_tok.
+        moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
         mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
@@ -1395,8 +2147,12 @@ if __name__ == "__main__":
         # W13: interleaved gate_up with OPW=64 (N-parallel: 4 waves x 16 rows)
         # W2: separate down weights, also OPW=64
         # SwiGLU is fused into W2's input quantization step (no separate task)
-        w13_output_per_wg = 128  # W13: 48→24 tiles/XCD, max 1 tile/worker (no stragglers)
-        w2_output_per_wg = 64   # W2: 24 tiles/XCD (OPW=128 regressed 7% even with prefetch)
+        # Overridable so the W13/W2 tile shape can be swept without an edit.
+        # The defaults are the measured-best pair; W13_OPW=128 gives 2
+        # tile_iters per wave and W2_OPW=64 gives 1 (OPW=128 on W2 regressed 7%
+        # even with prefetch).
+        w13_output_per_wg = int(os.environ.get("W13_OPW", "128"))
+        w2_output_per_wg = int(os.environ.get("W2_OPW", "64"))
         print(f"Packing MXFP4 MoE expert weights ({num_layers} layers, "
               f"W13_OPW={w13_output_per_wg}, W2_OPW={w2_output_per_wg})...")
         moe_gate_up_proj_weights = []  # [E, expert_wgs, wg_bytes] uint8
@@ -1546,6 +2302,12 @@ if __name__ == "__main__":
             w_k_norm = None
             k_cache = _attach_input_keep(model.model.kv_cache[0][i], f"layer_{i}_k_cache")
             v_cache = _attach_input_keep(model.model.kv_cache[1][i], f"layer_{i}_v_cache")
+            if args.verify and (i < 2 or os.environ.get("MPK_KV_ALL")):
+                # Layers 0-1 only: the KV cache is the one attention input
+                # written by a different task than the one that reads it, so a
+                # stale or racy read shows up here first.
+                verify_tensors[f"L{i}_k_cache"] = model.model.kv_cache[0][i]
+                verify_tensors[f"L{i}_v_cache"] = model.model.kv_cache[1][i]
 
             # Per-head attention sinks (GPT-OSS specific)
             w_sinks = _attach_input_keep(
@@ -2229,6 +2991,24 @@ if __name__ == "__main__":
             print(f"[DEBUG] Setting RoPE tables: cos_padded ptr=0x{cos_padded.data_ptr():x} shape={cos_padded.shape}, sin_padded ptr=0x{sin_padded.data_ptr():x} shape={sin_padded.shape}")
             mpk.set_rope_tables(cos_padded, sin_padded)
 
+    # --- OpenAI-compatible serving mode ---
+    #
+    # The InferenceX benchmark harness only speaks HTTP to an OpenAI
+    # /v1/completions endpoint, so comparing MPK against vLLM on their
+    # methodology requires MPK to be reachable the same way. Everything above
+    # -- weights, tensors, the compiled megakernel -- is already resident, so
+    # serving hangs off this point rather than duplicating the setup.
+    if getattr(args, "serve", False):
+        serve_mpk(
+            args=args, mpk=mpk, tokenizer=tokenizer, tokens=tokens,
+            prompt_lengths=prompt_lengths, step=step,
+            num_new_tokens=num_new_tokens, config=config,
+            reset_device_barriers=reset_device_barriers,
+        )
+        # Module-level scope (this is under `if __name__ == "__main__"`, not
+        # inside a function), so exit rather than return.
+        sys.exit(0)
+
     # --- Execution loop ---
     stream = torch.cuda.Stream()
     warmup = 0
@@ -2275,12 +3055,138 @@ if __name__ == "__main__":
                     n_rt += 1
             print(f"[PPL] Torch QKV/O-proj round-tripped through MXFP4 "
                   f"({n_rt} weights)")
+
+        # PPL_FP8_ACT=1 -- match MPK's *activation* precision too.
+        #
+        # PPL_MXFP4_MATCH only matches weights, which leaves the reference
+        # feeding bf16 activations into every GEMM while MPK feeds FP8: it
+        # quantizes each GEMM's input row before the f8f6f4 MFMA
+        # (_gang_wave_parallel_fp8_quant). That is ~2.3% mean relative error
+        # on the input of every expert, QKV, O-proj and LM-head GEMM in all
+        # 36 layers, and it is charged to "kernel error" by a weights-only
+        # baseline. Patching the reference's GEMM inputs the same way is what
+        # makes the comparison actually like-for-like.
+        if os.environ.get("PPL_FP8_ACT", "0") == "1":
+            from models.modeling_gpt_oss import (GptOssExperts, GptOssAttention)
+            _q = fp8_act_roundtrip
+
+            _orig_experts_fwd = GptOssExperts.forward
+            _orig_get_gu = GptOssExperts._get_gate_up_weight
+            _orig_get_dn = GptOssExperts._get_down_weight
+
+            # The expert GEMM inputs are `current_state` (into gate_up) and
+            # `activated` (into down). Both are local to the expert loop, so
+            # quantize them by wrapping the weight getters' partner tensor via
+            # a forward that mirrors the original with the two hooks added.
+            def _experts_fwd(self, hidden_states, router_indices,
+                             routing_weights):
+                batch_size = hidden_states.shape[0]
+                hs = hidden_states.reshape(-1, self.hidden_size)
+                num_experts = routing_weights.shape[1]
+                next_states = torch.zeros_like(hs)
+                expert_mask = torch.nn.functional.one_hot(
+                    router_indices, num_classes=num_experts + 1
+                ).permute(2, 1, 0)
+                expert_hit = torch.greater(
+                    expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                for expert_idx in expert_hit:
+                    expert_idx = expert_idx[0].item()
+                    if expert_idx == num_experts:
+                        continue
+                    _, token_idx = torch.where(expert_mask[expert_idx])
+                    current_state = hs[token_idx].to(torch.bfloat16)
+                    current_state = _q(current_state)          # <-- W13 input
+                    gate_up_w = self._get_gate_up_weight(expert_idx)
+                    gate_up = (current_state @ gate_up_w
+                               + self.gate_up_proj_bias[expert_idx])
+                    del gate_up_w
+                    activated = swigluoai(gate_up).to(torch.bfloat16)
+                    activated = _q(activated)                  # <-- W2 input
+                    down_w = self._get_down_weight(expert_idx)
+                    out = (activated @ down_w
+                           + self.down_proj_bias[expert_idx])
+                    del down_w
+                    weighted_output = (out
+                                       * routing_weights[token_idx,
+                                                         expert_idx, None])
+                    next_states.index_add_(
+                        0, token_idx, weighted_output.to(hs.dtype))
+                return next_states.view(batch_size, -1, self.hidden_size)
+
+            GptOssExperts.forward = _experts_fwd
+
+            # QKV / O-proj / LM head: quantize the Linear input.
+            def _wrap_linear(mod):
+                mod.register_forward_pre_hook(
+                    lambda m, inp: (_q(inp[0]),) + inp[1:])
+            for _lyr in model.model.layers:
+                for _m in (_lyr.self_attn.q_proj, _lyr.self_attn.k_proj,
+                           _lyr.self_attn.v_proj, _lyr.self_attn.o_proj):
+                    _wrap_linear(_m)
+            _wrap_linear(model.lm_head)
+
+            # PPL_FP8_ROUTER=1 -- also quantize the MoE *router* GEMM's input.
+            #
+            # Kept separate from the rest because it is categorically
+            # different. Every other FP8 site perturbs a value; this one
+            # perturbs a *decision*. The router picks top-4 of 128 experts by
+            # thresholding its logits, so a small input perturbation flips the
+            # selected set discretely. Measured on the real dumped hidden
+            # states across 12 layers: the top-4 set changes for **12.5%** of
+            # tokens (12.2% on synthetic activations of the same scale), and
+            # the surviving experts' routing weights move by up to 0.077.
+            #
+            # One swapped expert out of four rewrites ~25% of that token's MLP
+            # output, which is the right order of magnitude for the 4-13%
+            # per-layer hidden-state error being chased -- and no amount of
+            # matching *precision* elsewhere models it.
+            _router = os.environ.get("PPL_FP8_ROUTER", "0") == "1"
+            if _router:
+                for _lyr in model.model.layers:
+                    _wrap_linear(_lyr.mlp.router)
+            print("[PPL] Torch activations round-tripped through FP8 "
+                  "(experts W13/W2 + QKV + O-proj + LM head"
+                  + (" + MoE router)" if _router else ")"))
+
+        # PPL_STAGE_DUMP=<path> -- capture each layer's intermediate tensors
+        # at one token position so MPK can be compared op-by-op instead of
+        # only at the logits. The logit-level comparison established that the
+        # error is injected by a single layer; it cannot say *which op* inside
+        # that layer. Hooks are the only way to get the reference's
+        # intermediates without duplicating the forward pass.
+        _stage_path = os.environ.get("PPL_STAGE_DUMP")
+        _stage = {}
+        if _stage_path:
+            _srow = int(os.environ.get("PPL_STAGE_ROW", "-1"))
+
+            def _grab(name):
+                def hook(mod, inp, out):
+                    o = out[0] if isinstance(out, tuple) else out
+                    if not torch.is_tensor(o):
+                        return
+                    f = o.detach().float()
+                    f = f.reshape(-1, f.shape[-1])
+                    _stage[name] = f[_srow].cpu()
+                return hook
+
+            for _li, _lyr in enumerate(model.model.layers):
+                _lyr.input_layernorm.register_forward_hook(
+                    _grab(f"L{_li}.ln1"))
+                _lyr.self_attn.register_forward_hook(_grab(f"L{_li}.attn"))
+                _lyr.post_attention_layernorm.register_forward_hook(
+                    _grab(f"L{_li}.ln2"))
+                _lyr.mlp.register_forward_hook(_grab(f"L{_li}.mlp"))
+                _lyr.register_forward_hook(_grab(f"L{_li}.out"))
+
         ids = tokens[:1, :n_ppl]
         cos_e = position_embeddings[0][:, :n_ppl]
         sin_e = position_embeddings[1][:, :n_ppl]
         hidden, _ = model.model(
             input_ids=ids, position_embeddings=(cos_e, sin_e), step=step,
         )
+        if _stage_path:
+            torch.save(_stage, _stage_path)
+            print(f"[PPL] dumped {len(_stage)} stage tensors to {_stage_path}")
         targets = tokens[0, 1:n_ppl]
         # Chunk the LM head: [n, 201088] float32 logits at once is avoidable
         # memory pressure and the sum is exact either way.
@@ -2413,6 +3319,27 @@ if __name__ == "__main__":
         _fwd_pass_log_path = _fwd_pass_log.name
         _saved_stdout_fd = os.dup(1)
         os.dup2(_fwd_pass_log.fileno(), 1)
+
+        # MPK_WARMUP_LAUNCHES: launch the megakernel N extra times before the
+        # timed run. This is the regression test for cross-launch barrier
+        # state: the counter buffers are host-allocated once and never reset,
+        # while every __shared__ per-launch counter restarts at 0. Any barrier
+        # target derived from a per-launch value (rather than snapshotted from
+        # the persistent counter) hangs on the second launch.
+        #
+        # MPK_WARMUP_REINIT=1 additionally calls init_request_resources()
+        # between launches, which is what a server does: without it the second
+        # launch decodes from an already-drained page queue. That reset is the
+        # difference between the two relaunch paths, so exercise it here rather
+        # than only through the serving shim.
+        _warmup_reinit = os.environ.get("MPK_WARMUP_REINIT", "0") == "1"
+        for _w in range(int(os.environ.get("MPK_WARMUP_LAUNCHES", "0"))):
+            mpk()
+            torch.cuda.synchronize()
+            if _warmup_reinit:
+                mpk.init_request_func()
+                reset_device_barriers()
+                torch.cuda.synchronize()
 
         starter.record()
         mpk()
@@ -2556,29 +3483,47 @@ if __name__ == "__main__":
                       f"kernel_token={kernel_top} -> {ok}")
 
                 # Stronger: the same last iteration also left 240 per-worker
-                # (max, abs_idx) pairs in argmax_part_*. Each worker owns a
-                # known set of 64-column tiles, so recomputing its max from
-                # the sink and comparing checks every column of the row, not
-                # just the single winner above.
-                pv = _tensor_refs["argmax_part_value"][0].float()
-                pi = _tensor_refs["argmax_part_index"][0]
+                # (max, abs_idx) pairs in argmax_part_* for EACH of its token
+                # rows. Each worker owns a known set of 64-column tiles, so
+                # recomputing its max from the sink and comparing checks every
+                # column of the row, not just the single winner above.
+                #
+                # argmax_part_* is [batch, num_workers] and row `t` holds the
+                # partials for the token the last iteration placed at sink row
+                # `last_base + t`. Indexing it at [0] and comparing against
+                # sink row n_ppl is only correct at bs==1, where the last
+                # iteration carried a single token and those two coincide; at
+                # bs>1 row 0 belongs to the *first* token of the final chunk
+                # and mismatches every column. Derive the base instead and
+                # check all the rows the last iteration actually wrote.
+                bt = args.max_num_batched_tokens
+                # Scored sink rows are 1..n_ppl. Prefill consumes `bt` tokens
+                # per iteration, so the final chunk covers the last
+                # `n_last = ((n_ppl - 1) % bt) + 1` of them.
+                n_last = ((n_ppl - 1) % bt) + 1
+                last_base = n_ppl - n_last + 1
                 wpx = mpk.num_workers // 8               # workers per XCD
                 nwg = (vocab_size // lm_head_output_per_wg) // 8
-                sink_row = ppl_logits_torch[n_ppl]
-                bad_idx = bad_val = 0
+                # Column sets are token-independent -- build them once.
+                col_sets = []
                 for p in range(8):
                     pstart = p * nwg * lm_head_output_per_wg
                     for r in range(wpx):
-                        cols = torch.cat([
+                        col_sets.append(torch.cat([
                             torch.arange(
                                 pstart + wg * lm_head_output_per_wg,
                                 pstart + (wg + 1) * lm_head_output_per_wg,
                                 device="cuda")
                             for wg in range(r, nwg, wpx)
-                        ])
+                        ]))
+                bad_idx = bad_val = 0
+                for t in range(n_last):
+                    pv = _tensor_refs["argmax_part_value"][t].float()
+                    pi = _tensor_refs["argmax_part_index"][t]
+                    sink_row = ppl_logits_torch[last_base + t]
+                    for w, cols in enumerate(col_sets):
                         vals = sink_row[cols]
                         k = int(vals.argmax().item())
-                        w = p * wpx + r
                         if int(cols[k].item()) != int(pi[w].item()):
                             bad_idx += 1
                         # argmax_part_value is bf16: 8 mantissa bits, so
@@ -2587,10 +3532,36 @@ if __name__ == "__main__":
                                 0.02 * max(1.0, abs(float(pv[w]))):
                             bad_val += 1
                 print(f"[PPL] sink/per-worker-argmax check over all "
-                      f"{mpk.num_workers} workers: "
+                      f"{mpk.num_workers} workers x {n_last} token rows "
+                      f"(sink rows {last_base}..{last_base + n_last - 1}): "
                       f"{bad_idx} index mismatches, {bad_val} value "
                       f"mismatches -> "
                       f"{'OK' if bad_idx == 0 and bad_val == 0 else 'MISMATCH'}")
+            # PPL_STAGE_DUMP -- MPK side. The intermediate buffers are live
+            # single-token scratch: after the megakernel returns they hold the
+            # values from the LAST iteration, i.e. the last token position, for
+            # the LAST layer only. That is enough to compare one layer op-by-op
+            # against the reference's hook dump at the same position (use
+            # --max-layers 1 to make "last layer" mean layer 0).
+            if os.environ.get("PPL_STAGE_DUMP"):
+                _sd = {}
+                for _n in ("embed_out", "rmsnorm_out", "attn_in", "attn_out",
+                           "attn_proj_out", "rmsnorm_out_moe", "moe_gate_out",
+                           "moe_topk_weight", "moe_routing_indices",
+                           "swiglu_out", "mlp_weighted_sum_out", "mlp_final"):
+                    if _n in _tensor_refs:
+                        _sd[_n] = _tensor_refs[_n].detach().float().cpu()
+                # rmsnorm_out_moe is declared BF16, but under the W13 prequant
+                # the kernel publishes FP8 E4M3 + one E8M0 byte per 128
+                # elements into the same allocation. Reading it as BF16 then
+                # gives cos 0.0 against the reference -- a format mismatch that
+                # reads exactly like a numerical catastrophe. Decode instead.
+                if mpk_w13_prequant(bs) and "rmsnorm_out_moe" in _tensor_refs:
+                    _sd["rmsnorm_out_moe"] = _decode_prequant_row(
+                        _tensor_refs["rmsnorm_out_moe"])
+                torch.save(_sd, os.environ["PPL_STAGE_DUMP"])
+                print(f"[PPL] dumped {len(_sd)} MPK buffers to "
+                      f"{os.environ['PPL_STAGE_DUMP']}")
             if os.environ.get("PPL_DUMP_LOGITS"):
                 rows = [int(x) for x in
                         os.environ.get("PPL_DUMP_ROWS",
@@ -2624,7 +3595,18 @@ if __name__ == "__main__":
             #for tid in gen_ids.tolist():
             #    print(f"  {tid} -> '{tokenizer.decode([tid])}'")
             response = tokenizer.decode(valid_ids, skip_special_tokens=True)
-            print(response)
+            if total_num_requests > 1:
+                # Print the continuation separately from the prompt: with
+                # distinct prompts per request this is what shows that each
+                # request attended to its own KV cache rather than request 0's.
+                cont = tokenizer.decode(valid_ids[prompt_len_r:],
+                                        skip_special_tokens=True)
+                print(f"----- request {r} (step={step[r].item()}, "
+                      f"prompt_len={prompt_len_r}) -----")
+                print(f"[prompt] {tokenizer.decode(valid_ids[:prompt_len_r], skip_special_tokens=True)!r}")
+                print(f"[cont  ] {cont!r}")
+            else:
+                print(response)
 
         if save_path and rank == 0:
             gen0 = tokens[0, : step[0].item() + 1]
@@ -2645,6 +3627,25 @@ if __name__ == "__main__":
         prompt_len = prompt_lengths[0].item()
         total_tokens = step.max().item() + 1
         generated_tokens = total_tokens - prompt_len
+
+        # Machine-readable wall-clock summary.
+        #
+        # This is the host-side cuda event pair around the whole megakernel
+        # launch, covering prefill+decode. It is here for bookkeeping only --
+        # do NOT difference it across two decode lengths to get TPOT. Its
+        # run-to-run spread is ~20 ms, which swamps anything short of a
+        # several-hundred-token decode delta. Use the device-side
+        # [FWD_PASS_TOTAL] total_ms for that; see
+        # tests/ci-tests/run_gpt_oss_seqlen_sweep.sh.
+        #
+        # Note also that the [Decode: ...] line below is derived from the
+        # device per-iter ring, which is emitted by deferred printf at kernel
+        # exit and truncated by the HIP printf FIFO on long runs -- and the
+        # part it drops is the TAIL, i.e. exactly the decode iterations. At a
+        # 512-token prompt the ring reports "no FWD_PASS samples captured" for
+        # decode while happily printing all 512 prefill iterations.
+        print(f"[WALL] prompt_tokens={prompt_len} generated_tokens="
+              f"{generated_tokens} total_ms={run_time:.3f}")
 
         prefill_iterations = math.ceil(prompt_len / args.max_num_batched_tokens)
         decode_iterations = generated_tokens
@@ -2722,8 +3723,113 @@ if __name__ == "__main__":
                   f"over {_fwd_total_iters} iters")
         print("=" * 80)
 
+        # Run-to-run bitwise fingerprint. MPK is nondeterministic even at B=1,
+        # and the divergence accumulates over ~20 tokens, so generated text is
+        # a terrible oracle: it says "differs" long after the first bad bit.
+        # Dump a hash of every captured intermediate plus the token ids, run
+        # twice, and diff -- the FIRST differing tensor localizes the defect.
+        # Pair with --max-seq-length == prompt_len+1 for a prefill-only run,
+        # which has no autoregressive feedback at all.
+        if os.environ.get("MPK_FINGERPRINT") and verify_tensors:
+            torch.cuda.synchronize()
+            import hashlib as _hl
+            _fp = {}
+            for _nm in sorted(verify_tensors):
+                _t = verify_tensors[_nm].detach().cpu()
+                # view as uint8 -- bf16 has no numpy dtype, and we want the
+                # raw bits anyway, not a value-preserving cast.
+                _b = _t.contiguous().view(torch.uint8).numpy().tobytes()
+                _fp[_nm] = _hl.sha1(_b).hexdigest()[:16]
+            _fp["__tokens__"] = _hl.sha1(
+                tokens.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+            _fp["__step__"] = str(step.tolist())
+            with open(os.environ["MPK_FINGERPRINT"], "w") as _f:
+                for _k in sorted(_fp):
+                    _f.write(f"{_k} {_fp[_k]}\n")
+            print(f"[FP] wrote {os.environ['MPK_FINGERPRINT']}")
+            if os.environ.get("MPK_DUMP_TENSORS"):
+                # MPK_KV_ONLY_DUMP: keep only the KV caches. With MPK_KV_ALL
+                # the full dump is ~4.8GB per run at 36 layers, and comparing
+                # two runs means holding both. The KV caches are the only
+                # per-step history in the dump -- every other tensor is
+                # last-iteration scratch -- so for a multi-step divergence
+                # hunt they are the entire signal.
+                _kv_only = os.environ.get("MPK_KV_ONLY_DUMP")
+                _dump = {_k: verify_tensors[_k].detach().cpu()
+                         for _k in verify_tensors
+                         if not _kv_only or "_cache" in _k}
+                # The token ids and per-request step are what make a dump
+                # interpretable: without them a row-to-row difference in
+                # embed_out cannot be told apart from "these rows embedded
+                # different tokens", which is expected once any request has
+                # generated even one token of its own.
+                _dump["__step_t__"] = step.detach().cpu().clone()
+                # The tokens actually consumed by the *last* forward pass.
+                # embed_out rows can only be compared against each other once
+                # these are known equal; at the end of a run that generated a
+                # token they are not, and every downstream row difference is
+                # then legitimate rather than a defect.
+                _dump["__input_tokens_t__"] = input_tokens.detach().cpu().clone()
+                _dump["__tokens_t__"] = tokens.detach().cpu().clone()
+                _dump["__plen_t__"] = prompt_lengths.detach().cpu().clone()
+                torch.save(_dump, os.environ["MPK_DUMP_TENSORS"])
+                print(f"[FP] dumped tensors to {os.environ['MPK_DUMP_TENSORS']}")
+
+        # Row-symmetry sweep. Every captured tensor is [rows, ...] with one
+        # row per batch slot. Run with identical prompts in every slot: any
+        # tensor whose rows differ names a reduction whose result depends on
+        # arrival order or on batch composition. The FIRST such tensor in
+        # dataflow order is the defect; everything after it is downstream.
+        #
+        # Deliberately OUTSIDE the MPK_FP_ONLY guard below. This sweep compares
+        # rows against each other, never against Torch, so the reference pass
+        # it used to sit inside was pure cost -- and that pass OOMs at full
+        # --max-layers, which is exactly the configuration the defect needs.
+        #
+        # Know what this sweep CANNOT see, or it will read as an all-clear it
+        # has not earned: any defect that corrupts every row the same way. The
+        # bs>1 MoE W13 stale-line bug (see the Phase 7b acquire in
+        # gang_full_layer_fused_mi300.cuh) is exactly that shape -- both rows
+        # are routed through the same experts, so both read the same stale
+        # norm row, and every tensor here reported max|row_i-row_0| == 0 with
+        # the bug present. Verified by ablating the fix and re-running: the
+        # sweep stayed green while the offline MXFP4+SwiGLU oracle counted 32
+        # bad weight groups. Row symmetry catches order-dependent reductions;
+        # it does not catch a wrong value that is wrong identically per row.
+        if args.verify and verify_tensors and bs > 1:
+            torch.cuda.synchronize()
+            print("\n--- Row symmetry (identical prompts => rows must match) ---")
+            for _nm in sorted(verify_tensors):
+                _t = verify_tensors[_nm]
+                if _t.dim() < 1 or _t.shape[0] < 2:
+                    continue
+                # Only dim 0 == bs is a batch axis. moe_mask (NUM_EXPERTS+1),
+                # moe_routing_indices (NUM_EXPERTS), the KV caches (pages) and
+                # the barrier/counter arrays are indexed by something else
+                # entirely, so "row 0 vs row 1" there compares expert 0 to
+                # expert 1 and always DIFFERS. Reported as false positives for
+                # a full day before this filter existed.
+                if _t.shape[0] != bs:
+                    continue
+                _r0 = _t[0].float()
+                _worst, _worst_r = 0.0, -1
+                for _r in range(1, _t.shape[0]):
+                    _d = (_t[_r].float() - _r0).abs().max().item()
+                    if _d > _worst:
+                        _worst, _worst_r = _d, _r
+                _flag = "  <-- DIFFERS" if _worst > 0 else ""
+                _norms = [f"{_t[_i].float().norm().item():.4g}"
+                          for _i in range(min(_t.shape[0], 4))]
+                print(f"  {_nm:28s} rows={_t.shape[0]} max|row_i-row_0|="
+                      f"{_worst:.6g} (row {_worst_r}) norms={_norms}{_flag}")
+
         # === Verification: compare Mirage intermediates with PyTorch reference ===
-        if args.verify and verify_tensors:
+        # MPK_FP_ONLY skips the Torch reference pass below. That pass builds a
+        # second full copy of the model's activations and OOMs at larger
+        # --max-layers, which kills the process *before* the fingerprint above
+        # is written. When all you want is the run-to-run bitwise fingerprint,
+        # the reference is dead weight.
+        if args.verify and verify_tensors and not os.environ.get("MPK_FP_ONLY"):
             print("\n" + "=" * 80)
             print("VERIFICATION: Comparing Mirage intermediates with PyTorch reference")
             print("=" * 80)
@@ -3136,16 +4242,20 @@ if __name__ == "__main__":
                     nonzero_k = (mg_mlp_out[0, k].abs() > 1e-6).sum().item()
                     print(f"  Slot {k}[:8]: {vals}  (nonzero: {nonzero_k}/{mg_mlp_out.shape[-1]})")
 
-            # 9d. MoE workspace_f32 (atomicAdd accumulator used in fused path)
+            # 9d. MoE workspace_f32 (per-(token, topk slot) W2 output, fused path)
             mg_ws_f32 = verify_tensors.get("moe_workspace_f32")
             if mg_ws_f32 is not None:
-                print(f"\n--- MoE workspace_f32 (atomicAdd output) ---")
-                ws_vals = mg_ws_f32[0, :8].float().tolist()
-                ws_nonzero = (mg_ws_f32[0].abs() > 1e-6).sum().item()
-                ws_norm = mg_ws_f32[0, :hidden_size].float().norm().item()
+                # Stored flat as [bs, top_k * PADDED_HIDDEN_SIZE]; the consumer
+                # sums the slot axis, so do the same here before comparing.
+                ws_slots = mg_ws_f32[0].view(num_experts_per_tok, -1).float()
+                ws_sum = ws_slots.sum(dim=0)
+                print(f"\n--- MoE workspace_f32 (slot-summed W2 output) ---")
+                ws_vals = ws_sum[:8].tolist()
+                ws_nonzero = (ws_sum.abs() > 1e-6).sum().item()
+                ws_norm = ws_sum[:hidden_size].norm().item()
                 print(f"  ws_f32[:8]: {ws_vals}")
-                print(f"  nonzero: {ws_nonzero}/{mg_ws_f32.shape[-1]}, norm: {ws_norm:.4f}")
-                print(f"  pad region [{hidden_size}:] max: {mg_ws_f32[0, hidden_size:].abs().max().item():.6f}")
+                print(f"  nonzero: {ws_nonzero}/{ws_sum.shape[-1]}, norm: {ws_norm:.4f}")
+                print(f"  pad region [{hidden_size}:] max: {ws_sum[hidden_size:].abs().max().item():.6f}")
 
                 # Note: mlp_mid (W13 output) is also available for debugging if needed
 

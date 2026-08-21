@@ -37,7 +37,14 @@
 namespace kernel {
 
 // Type 216 uses slots 0..43*16 (attn_xcd_release[7] ends at 44*16-1 = 703).
-// Tail counters start at 44*16 = 704.
+// Tail counters start at 44*16 = 704 and run to 48*16 = 768.
+//
+// Type 216's chunk barrier is the one region that scales with
+// MPK_MAX_NUM_BATCHED_REQUESTS, and it deliberately sits *above* these four
+// slots (FULL_LAYER_CHUNK_BARRIER_SLOT = 48*16) rather than at its historical
+// 28*16 -- at 28*16 it would span 128*NUM_REQS ints and silently overwrite
+// every counter below the moment NUM_REQS reached 3. Anything new added here
+// must stay under 48*16 or move the chunk barrier again.
 static constexpr int FUSED_TAIL_MOE_DONE_SLOT = 44 * 16;
 static constexpr int FUSED_TAIL_RESADD_DONE_SLOT = 45 * 16;
 static constexpr int FUSED_TAIL_LMHEAD_DONE_SLOT = 46 * 16;
@@ -68,7 +75,8 @@ template <int QKV_BATCH_SIZE,
           int MOE_W13_OUTPUT_PER_WG,
           int MOE_W2_OUTPUT_PER_WG,
           int LM_OUTPUT_PER_WG,
-          int LM_REDUCTION_SIZE>
+          int LM_REDUCTION_SIZE,
+          int NUM_REQS = 1>
 __device__ __noinline__ void
     gang_full_layer_with_lmhead_fused_kernel_mi300(void *const *input_ptrs,
                                                    void *const *output_ptrs,
@@ -122,7 +130,9 @@ __device__ __noinline__ void
                                      MOE_INTERMEDIATE_SIZE,
                                      MOE_HIDDEN_SIZE,
                                      MOE_W13_OUTPUT_PER_WG,
-                                     MOE_W2_OUTPUT_PER_WG>(
+                                     MOE_W2_OUTPUT_PER_WG,
+                                     /*DECODE_ONLY=*/false,
+                                     NUM_REQS>(
       input_ptrs,
       output_ptrs,
       cos_ptr,

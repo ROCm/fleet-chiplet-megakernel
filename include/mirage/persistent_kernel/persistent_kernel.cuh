@@ -51,6 +51,164 @@ __device__ int g_subphase_active;
 __device__ unsigned long long g_subphase_scratch[8];
 #endif
 
+#ifdef MPK_DRAIN_STATS
+// Phase 9 barrier segment attribution: how much of the layer-boundary wait is
+// store drain (s_waitcnt vmcnt(0)) vs rendezvous vs spinning on other XCDs.
+__device__ unsigned long long g_drain_n;
+__device__ unsigned long long g_drain_sum;
+__device__ unsigned long long g_sync_sum;
+__device__ unsigned long long g_arrive_sum;
+__device__ unsigned long long g_spin_sum;
+// Per-XCD spin, to tell a fixed slow die from a rotating one.
+__device__ unsigned long long g_spin_xcd[8];
+__device__ unsigned long long g_n_xcd[8];
+// How often each XCD is the last one to arrive (i.e. is the critical path).
+__device__ unsigned long long g_last_xcd[8];
+// Spin of each XCD's *last local* arriver: that worker has no intra-XCD wait
+// left, so its spin is purely the inter-XCD component.
+__device__ unsigned long long g_spin_lastlocal;
+__device__ unsigned long long g_n_lastlocal;
+// Spin of the worker that itself published the global release -- the last
+// local arriver on the last global XCD. By construction it waits on nobody:
+// no intra-XCD straggler (it is the last local) and no other XCD (its own
+// arrival was the eighth). Whatever it still spins is the irreducible
+// store-to-poll-observe latency of the release line, so it splits the spin
+// total into propagation (this) and skew (the rest).
+__device__ unsigned long long g_spin_lastglobal;
+__device__ unsigned long long g_n_lastglobal;
+// The spin segment split at the poll loop: `fanpf` is the release fan-out
+// plus the next-layer QKV prefetch issue that sits in front of the gate,
+// `poll` is the gate loop proper.
+__device__ unsigned long long g_fanpf_sum;
+__device__ unsigned long long g_poll_sum;
+__device__ unsigned long long g_poll_lastglobal;
+// The inter-layer prologue (ml pointer-table copy + its two __syncthreads),
+// which runs after the previous layer's gate cleared and before any of the
+// next layer's work.
+__device__ unsigned long long g_mlprologue_sum;
+__device__ unsigned long long g_mlprologue_n;
+// The table read alone, without the two __syncthreads that publish it.
+__device__ unsigned long long g_mlcopy_sum;
+__device__ unsigned long long g_mlcopy_n;
+// Spin by xcd_rank: the intra-XCD load-imbalance map. Rank determines role
+// (QKV/attn vs MoE tiles), so this says which workers idle and which straggle.
+__device__ unsigned long long g_spin_rank[64];
+__device__ unsigned long long g_n_rank[64];
+#endif
+
+#ifdef MPK_PHASE_SLOTS
+// Per-worker phase timestamps: one dword pair per slot per layer, reduced
+// into per-slot-pair spans.
+//
+// Why not reuse MPK_DEVICE_TIMING: that path prints one [FUSED_PHASE] line per
+// layer per iteration (~262k printfs), which inflates the iteration to ~56 ms
+// and dumps the skew into whichever phase happens to hold the barrier -- the
+// numbers it produces are of the instrumented kernel, not of the real one.
+// This writes one dword pair per slot per layer with no printf on the hot
+// path.
+//
+// Slots:
+//   0  layer entry (also accumulates the inter-layer span; see below)
+//   1  end of QKV GEMM                    (Phase 1 exit)
+//   2  end of QKV epoch barrier
+//   3  end of attention chunk compute
+//   4  attn_release wait begin
+//   5  attn_release wait end
+//   6  end of O-proj + router
+//   7  end of TopK routing wait
+//   8  end of MoE tiles (pre-Phase 9)
+//   9  Phase 9 arrival done
+//   10 Phase 9 gate cleared
+//   11 layer exit
+#define MPK_PHASE_SLOT_COUNT 12
+#define MPK_PHASE_MAX_WORKERS 256
+__device__ unsigned long long
+    g_phase_ts[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+// Accumulated per-slot-pair spans, so the reduction is over every layer of
+// every decode iteration rather than whichever layer happened to be last in
+// the buffer. Accumulating rather than sampling one captured layer is
+// strictly more robust and costs one atomic per slot.
+__device__ unsigned long long
+    g_phase_span[MPK_PHASE_MAX_WORKERS * MPK_PHASE_SLOT_COUNT];
+__device__ unsigned long long g_phase_n[MPK_PHASE_MAX_WORKERS];
+// Only sample steady-state decode.
+//
+// `volatile` is load-bearing, not decoration. The whole layer body is inlined
+// into the persistent `ml` loop inside one dispatch, so a plain __device__ int
+// that no thread in this wave writes is a loop-invariant load: clang hoists it
+// out, every mark tests the value read on the very first iteration -- zero --
+// and the recorder silently reports nothing at all. Volatile also gets the
+// cross-XCD visibility this needs, since only worker 0 ever writes it.
+__device__ volatile int g_phase_arm;
+
+// Which iteration to start on. There is no device-side signal that separates
+// prefill from decode here: the sweep runs prefill at
+// --max-num-batched-tokens 1, so `num_active_tokens == 1` on *every* iteration
+// of both phases. Arming on that would average 512 prefill layers into the
+// answer and bias every span toward short-context. So the caller states the
+// boundary, and `[PSLOT] layers_per_worker` is the check: it must equal
+// 36 * (total_iters - MPK_PHASE_START_ITER) against the [FWD_PASS] tail.
+#ifndef MPK_PHASE_START_ITER
+#define MPK_PHASE_START_ITER 600
+#endif
+
+// Per-worker "this layer started while armed". The arm fires between two
+// layers, so without this the layer straddling it contributes spans for its
+// late slots only, yet still bumps g_phase_n at slot 11 -- every early-slot
+// mean would then be divided by one layer too many. Set at slot 0, required by
+// every other slot.
+__device__ int g_phase_live[MPK_PHASE_MAX_WORKERS];
+
+__device__ __forceinline__ void mpk_phase_mark(int worker, int slot) {
+  if (threadIdx.x != 0 || worker >= MPK_PHASE_MAX_WORKERS) {
+    return;
+  }
+  if (slot == 0) {
+    if (!g_phase_arm) {
+      return;
+    }
+    g_phase_live[worker] = 1;
+  } else if (!g_phase_live[worker]) {
+    return;
+  }
+  asm volatile("" ::: "memory");
+  unsigned long long const t = __builtin_amdgcn_s_memrealtime();
+  asm volatile("" ::: "memory");
+  int const base = worker * MPK_PHASE_SLOT_COUNT;
+  // Slot 0 accumulates the *inter-layer* span: last layer's slot 11 to this
+  // layer's slot 0. It used to record only a timestamp, which left everything
+  // between two layers outside the trace -- and that hole is not small. At
+  // ctx 512 the eleven measured spans sum to 1.935 ms/token against a measured
+  // 2.021, so ~0.09 ms/token -- a significant share of the per-token budget --
+  // was being attributed to nothing at all. Anything the persistent worker loop
+  // does between the inlined layer bodies (the `ml` loop's own bookkeeping,
+  // the per-layer task dispatch, the inter-layer threadfence/syncthreads
+  // pair) lands here.
+  //
+  // Guarded on g_phase_live having been set by a *previous* layer, which is
+  // why the read is of slot 11's timestamp rather than slot -1: on the first
+  // armed layer there is no predecessor and prev is 0, which the existing
+  // `prev != 0` test already rejects. n is bumped at slot 11, so this span is
+  // accumulated over one fewer layer than the others -- at 7560 layers the
+  // resulting bias is 0.01%, far below anything read off this table.
+  unsigned long long const prev =
+      g_phase_ts[base + (slot > 0 ? slot - 1 : MPK_PHASE_SLOT_COUNT - 1)];
+  g_phase_ts[base + slot] = t;
+  if (prev != 0 && t >= prev) {
+    g_phase_span[base + slot] += (t - prev) * 10; // 100 MHz -> ns
+  }
+  if (slot == MPK_PHASE_SLOT_COUNT - 1) {
+    g_phase_n[worker]++;
+    g_phase_live[worker] = 0;
+  }
+}
+#define MPK_PHASE_MARK(worker, slot) mpk_phase_mark((worker), (slot))
+#else
+#define MPK_PHASE_MARK(worker, slot)                                           \
+  do {                                                                         \
+  } while (0)
+#endif
+
 #ifdef MPK_FUSED_PHASE_TIMING
 // Fused O-proj+MoE phase timing: [0]=oproj_ns, [1]=poll_ns, [2]=moe_ns,
 // [3]=count
@@ -196,8 +354,16 @@ __device__ __forceinline__ void
     (void)a3;
   }
 }
+// Gated on MPK_WORKER_STATE like MPK_WS_MARK / MPK_WS_WAIT_BEGIN below. This
+// one was left ungated: the runtime `g_ws_dev != nullptr` test still emits the
+// global load and the branch with tracing off, and these sites sit on the MoE
+// W13->W2 barrier path.
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAIT_AUX(a0, a1, a2, a3)                                        \
   mpk_ws_wait_aux((a0), (a1), (a2), (a3), tid)
+#else
+#define MPK_WS_WAIT_AUX(a0, a1, a2, a3) ((void)0)
+#endif
 
 // Per-wave exit mark for a *thread-divergent* poll.
 //
@@ -230,8 +396,16 @@ __device__ __forceinline__ void mpk_ws_wave_clear(int wave, int tid) {
     __atomic_fetch_and(&b[3], ~(1 << (wave & 31)), __ATOMIC_RELAXED);
   }
 }
+// Same gate. These two are the costliest of the ungated set: with tracing off
+// they still put two dependent global loads and a device-scope atomic between
+// clearing the W13->W2 barrier and the first W2 instruction.
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAVE_EXIT(wave) mpk_ws_wave_exit((wave), tid)
 #define MPK_WS_WAVE_CLEAR(wave) mpk_ws_wave_clear((wave), tid)
+#else
+#define MPK_WS_WAVE_EXIT(wave) ((void)0)
+#define MPK_WS_WAVE_CLEAR(wave) ((void)0)
+#endif
 
 // Same per-wave mask, one slot over, for arrival at a __syncthreads.
 //
@@ -245,7 +419,11 @@ __device__ __forceinline__ void mpk_ws_wave_sync(int wave, int tid) {
     __atomic_fetch_or(&b[2], 1 << (wave & 31), __ATOMIC_RELAXED);
   }
 }
+#ifdef MPK_WORKER_STATE
 #define MPK_WS_WAVE_SYNC(wave) mpk_ws_wave_sync((wave), tid)
+#else
+#define MPK_WS_WAVE_SYNC(wave) ((void)0)
+#endif
 
 // Straight-line progress mark, for code that is not a spin loop.
 //
@@ -674,6 +852,35 @@ __global__ void prepare_kernel(RuntimeConfig config,
       config.precomp_gang_barrier[i] = 0;
     }
   }
+  // Reset the iteration-release / termination state.
+  //
+  // These are cudaMemset once at precompute time and were never touched again,
+  // which is invisible as long as the process launches the kernel exactly once
+  // (the offline demo). A server launches it per request, and launch N+1 then
+  // starts with terminate=1 and iter_ready at the previous run's terminal
+  // value, so every worker takes the terminate branch at its first queue wrap
+  // and the host polls a kernel that has already exited. Workers restart at
+  // pc_iter=1 and wait for iter_ready >= pc_iter, so 0 is the correct base:
+  // the first END_OF_TASK_GRAPH bump enables iteration 1.
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (config.precomp_iter_ready != nullptr) {
+      *config.precomp_iter_ready = 0ULL;
+    }
+    if (config.precomp_terminate != nullptr) {
+      *config.precomp_terminate = 0;
+    }
+    if (config.precomp_dbg_tasks_done != nullptr) {
+      *config.precomp_dbg_tasks_done = 0ULL;
+    }
+  }
+  // Per-XCD release flags mirror iter_ready and are polled with ld_nt, so a
+  // stale non-zero here would release iteration 1 before it is ready.
+  if (config.precomp_iter_xcd_release != nullptr) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 8 * 16;
+         i += blockDim.x * gridDim.x) {
+      config.precomp_iter_xcd_release[i] = 0;
+    }
+  }
 #endif
   // Reset combined kernel election state
   if (config.xcd_scheduler_claimed != nullptr && blockIdx.x == 0) {
@@ -751,6 +958,52 @@ __device__ __forceinline__ bool
     smem_kv_indices[i] = config.paged_kv_indices_buffer[i];
   }
 
+  // Step 2.5: fair-share prefill budget.
+  //
+  // MPK_MAX_NUM_BATCHED_TOKENS is both the admission pool and the GEMM M
+  // dimension, so it cannot be raised to make room (budget 8 is
+  // nondeterministic and slower per iteration, 16 hangs). With the pool fixed
+  // at B, letting one prefiller take up to MPK_MAX_TOKENS_PER_REQUEST (28)
+  // drains it: request 0 grabs the whole pool, requests 1..B-1 get nothing
+  // and enter only after it finishes prefilling. Three 512-token prompts
+  // therefore prefill *serially* and the "bs=3" decode tail is 255 iterations
+  // of one decoder, not three -- 1.803 tok/iter instead of 3.000.
+  //
+  // Capping each prefiller at its share of the pool makes the requests enter
+  // and advance in lockstep. Prefill takes more iterations (each request gets
+  // budget/demand tokens per pass instead of up to 28); decode, which is what
+  // TPOT measures, goes fully concurrent. At B=1 demand is 1 and the share is
+  // the whole budget, so this is structurally a no-op there.
+  int prefill_share = MPK_MAX_TOKENS_PER_REQUEST;
+#ifndef MPK_NO_FAIR_PREFILL
+  {
+    int num_live = 0;
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      if (config.request_ids[i] != -1) {
+        num_live++;
+      }
+    }
+    int queued = config.total_num_requests - *config.next_request_id;
+    if (queued < 0) {
+      queued = 0;
+    }
+    int demand = num_live + queued;
+    if (demand > MPK_MAX_NUM_BATCHED_REQUESTS) {
+      demand = MPK_MAX_NUM_BATCHED_REQUESTS;
+    }
+    if (demand < 1) {
+      demand = 1;
+    }
+    int share = MPK_MAX_NUM_BATCHED_TOKENS / demand;
+    if (share < 1) {
+      share = 1;
+    }
+    if (share < prefill_share) {
+      prefill_share = share;
+    }
+  }
+#endif
+
   // Step 3: prepare next batch
   int num_reqs = 0, num_tokens = 0;
   num_pages = 0;
@@ -766,9 +1019,9 @@ __device__ __forceinline__ bool
       int num_new_tokens = config.prompt_length[request_id] - step;
       if (num_new_tokens > 0) {
         // Prefill requests: cap per-request tokens to avoid attention LDS
-        // overflow
+        // overflow, and to this request's fair share of the pool
         num_new_tokens = min(num_new_tokens,
-                             min(MPK_MAX_TOKENS_PER_REQUEST,
+                             min(prefill_share,
                                  MPK_MAX_NUM_BATCHED_TOKENS - num_tokens));
       } else {
         // Decode requests
@@ -812,9 +1065,10 @@ __device__ __forceinline__ bool
     config.request_ids[num_reqs] = next_request_id;
     config.qo_indptr_buffer[num_reqs] = num_tokens;
     config.paged_kv_indptr_buffer[num_reqs] = num_pages;
-    // Prefill request: cap per-request tokens to avoid attention LDS overflow
+    // Prefill request: cap per-request tokens to avoid attention LDS overflow,
+    // and to this request's fair share of the pool (see Step 2.5)
     int num_new_tokens = min(config.prompt_length[next_request_id],
-                             min(MPK_MAX_TOKENS_PER_REQUEST,
+                             min(prefill_share,
                                  MPK_MAX_NUM_BATCHED_TOKENS - num_tokens));
     // Move tokens to input tokens
     for (int j = 0; j < num_new_tokens; j++) {
@@ -1931,6 +2185,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifndef MPK_ENABLE_PROFILING
         int num_active_tokens =
             config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+        // Inline per-iteration trace. Under MPK_QUIET_FWDPASS this is off: a
+        // device printf drains over PCIe inside the iteration it reports, so
+        // on the serving path it perturbs the very inter-token latency the
+        // benchmark is measuring.
+#ifndef MPK_QUIET_FWDPASS
         if (prev_begin_clk != 0 &&
             (fwd_pass_count < 10 || fwd_pass_count % 50 == 0)) {
           printf("[FWD_PASS] iter=%d time_ms=%.3f num_active_tokens=%d\n",
@@ -1938,6 +2197,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                  (double)(cur_clk - prev_begin_clk) / 1000000.0,
                  num_active_tokens);
         }
+#else
+        (void)num_active_tokens;
+#endif
 #endif
         prev_begin_clk = cur_clk;
         fwd_pass_count++;
@@ -2082,7 +2344,51 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             int ml_n_tile_start = (int)task_desc->task_metadata.n_tile_start;
             int ml_n_tile_count = (int)task_desc->task_metadata.n_tile_count;
 
+#ifdef MPK_ML_TABLE_PREFETCH
+            // ── Hide the inter-layer pointer-table read ────────────────────
+            //
+            // The copy below is 41 pointers (28 in + 13 out) read from two
+            // device-global tables, and it sits between the previous layer's
+            // Phase 9 gate and the next layer's first instruction -- pure
+            // serial latency with nothing to overlap it. Measured at ctx 512
+            // it is 765 ns of a 1679 ns inter-layer prologue, 0.028 ms over
+            // 36 layers. It is one dependent HBM round trip, not bandwidth:
+            // 328 bytes spread over 256 threads.
+            //
+            // The tables are built once on the host and are invariant for the
+            // life of the kernel, so layer ml+1's row can be read during layer
+            // ml's body instead. Each thread holds at most one input and one
+            // output pointer (MAX_INPUTS_PER_TASK is 28, MAX_OUTPUTS 13, both
+            // well under the 256-thread block), so the whole prefetch is two
+            // VGPR pairs carried across the layer call.
+            //
+            // Correctness rests on the tables being read-only after launch and
+            // on xcd_id being fixed for the life of the task -- the same
+            // property MPK_PREFETCH_NEXT_QKV already relies on. If either ever
+            // becomes false this must go back to a post-gate read.
+            void *_pf_in = nullptr;
+            void *_pf_out = nullptr;
+            void *_pf_cur = nullptr;
+            bool const _pf_ok =
+                (blockDim.x >= (unsigned)MAX_INPUTS_PER_TASK) &&
+                config.ml_num_layers > 1;
+            if (_pf_ok) {
+              int _pf_base = (xcd_id * config.ml_num_layers + 1);
+              if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
+                _pf_in = config.ml_input_table[_pf_base * MAX_INPUTS_PER_TASK +
+                                               threadIdx.x];
+              }
+              if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
+                _pf_out =
+                    config.ml_output_table[_pf_base * MAX_OUTPUTS_PER_TASK +
+                                           threadIdx.x];
+              }
+            }
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
+#ifdef MPK_DRAIN_STATS
+              unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
+#endif
               // Layer 0: task_desc already loaded from precomputed dispatch
               // buffer with correct per-XCD pointers. Skip the copy.
               if (ml > 0) {
@@ -2096,21 +2402,178 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                     (xcd_id * config.ml_num_layers + ml) * MAX_INPUTS_PER_TASK;
                 int ml_out_base =
                     (xcd_id * config.ml_num_layers + ml) * MAX_OUTPUTS_PER_TASK;
-                for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
-                     i += blockDim.x) {
-                  task_desc->input_ptrs[i] =
-                      config.ml_input_table[ml_in_base + i];
-                }
-                for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
-                     i += blockDim.x) {
-                  task_desc->output_ptrs[i] =
-                      config.ml_output_table[ml_out_base + i];
+#ifdef MPK_ML_TABLE_PREFETCH
+                if (_pf_ok) {
+                  // Retire the values loaded a layer ago, then immediately
+                  // re-issue for ml+1 so the next iteration finds them
+                  // resident too. The store must precede the re-issue: both
+                  // touch the same registers, and the compiler will otherwise
+                  // sink the store past the load and serialize them again.
+                  if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
+                    task_desc->input_ptrs[threadIdx.x] = _pf_in;
+                  }
+                  if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
+                    task_desc->output_ptrs[threadIdx.x] = _pf_out;
+                  }
+                  // Layer ml's own slot-4 value, kept before the re-issue
+                  // below overwrites it. Slot 25 is exactly this, so holding
+                  // it here lets thread 4 write both slot 24 and slot 25 from
+                  // its own registers instead of thread 0 reading slot 4 back
+                  // out of the task descriptor.
+                  _pf_cur = _pf_in;
+                  int _nl = ml + 1;
+                  if (_nl < config.ml_num_layers) {
+                    int _nb = (xcd_id * config.ml_num_layers + _nl);
+                    if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
+                      _pf_in = config.ml_input_table[_nb * MAX_INPUTS_PER_TASK +
+                                                     threadIdx.x];
+                    }
+                    if ((int)threadIdx.x < MAX_OUTPUTS_PER_TASK) {
+                      _pf_out =
+                          config.ml_output_table[_nb * MAX_OUTPUTS_PER_TASK +
+                                                 threadIdx.x];
+                    }
+                  }
+                } else
+#endif
+                {
+                  for (int i = threadIdx.x; i < MAX_INPUTS_PER_TASK;
+                       i += blockDim.x) {
+                    task_desc->input_ptrs[i] =
+                        config.ml_input_table[ml_in_base + i];
+                  }
+                  for (int i = threadIdx.x; i < MAX_OUTPUTS_PER_TASK;
+                       i += blockDim.x) {
+                    task_desc->output_ptrs[i] =
+                        config.ml_output_table[ml_out_base + i];
+                  }
                 }
                 if (threadIdx.x == 0) {
                   task_desc->variant_id = config.ml_variant_ids[ml];
                 }
-                __syncthreads();
+#ifdef MPK_DRAIN_STATS
+                // Before the first __syncthreads: isolates the table read from
+                // the two block rendezvous that publish it.
+                if (threadIdx.x == 0) {
+                  unsigned long long _mltc =
+                      __builtin_amdgcn_s_memrealtime();
+                  atomicAdd(&g_mlcopy_sum, (_mltc - _mlt0) * 10);
+                  atomicAdd(&g_mlcopy_n, 1ULL);
+                }
+#endif
+#ifdef MPK_ML_TABLE_PREFETCH
+                // Under the prefetch path the only reader of a slot written by
+                // another thread was the slot-25 publish, and that now comes
+                // from thread 4's own register. Every remaining store lands in
+                // task_desc and is consumed after the single __syncthreads
+                // below, so this rendezvous has nothing left to order.
+                // Measured, the two of them were 914 ns of the 1679 ns
+                // inter-layer prologue -- more than the table read itself.
+                if (!_pf_ok)
+#endif
+                  __syncthreads();
               }
+
+#ifdef MPK_PREFETCH_NEXT_QKV
+              // Publish the NEXT layer's QKV weight pointer so the fused task
+              // can start its HBM->LDS weight DMA during the Phase 9 barrier
+              // spin instead of at the top of the next layer.
+              //
+              // Slot 24 is free for the plain fused variant: it declares 24
+              // inputs (0..23) and the tables are sized to the TaskDesc
+              // capacity of 28, so the host-side null validator already treats
+              // >= 24 as legitimately unused.
+              //
+              // It is NOT free for the LM-head variant, which really does use
+              // 24..27 -- so the whole publish is gated on the task type. That
+              // variant is dead today (an early return at the top of
+              // gang_full_layer_with_lmhead_fused_mi300.cuh) but FUSE_TAIL is
+              // meant to come back, and writing nullptr over a live input
+              // would fault rather than fail a gate. The gate costs the
+              // prefetch entirely under FUSE_TAIL, which is the right trade
+              // until someone gives that variant a slot of its own.
+              //
+              // Set outside the `ml > 0` guard above: layer 0 skips the table
+              // copy (its pointers come from the precomputed dispatch buffer),
+              // but it still needs to know layer 1's weights.
+              //
+              // Null on the last layer. The next reader would be layer 0 of
+              // the following decode iteration, and tasks that use LDS run in
+              // between (the MoE residual-add tail), so anything staged there
+              // would be clobbered before it could be read.
+              // Two slots, because the producer and the consumer need
+              // different facts at different times and neither can derive the
+              // other's:
+              //
+              //   [24] the NEXT layer's QKV weight pointer -- what Phase 9 of
+              //        *this* layer issues its DMA against. Null on the last
+              //        layer.
+              //   [25] non-null iff the PREVIOUS layer's Phase 9 staged this
+              //        layer's weights -- what Phase 1 keys its skip off. That
+              //        is exactly `ml > 0`, and the value stored is this
+              //        layer's own weight pointer so the two ends can be
+              //        checked against each other.
+              //
+              // Carrying [25] as __shared__ state across the ml loop instead
+              // would look cheaper but has no correct initial value: the very
+              // first layer of the very first iteration would read whatever
+              // was in LDS. Recomputing it host-side from `ml` is stateless.
+#ifdef MPK_ML_TABLE_PREFETCH
+              // With the table prefetch running, slot 24 needs no HBM read:
+              // thread 4 is already holding layer ml+1's input_ptrs[4] in a
+              // register (it prefetched that exact element above), which is
+              // precisely the next layer's QKV weight pointer. Writing it from
+              // thread 4 also removes the cross-thread dependency that forced
+              // the second __syncthreads -- slot 25 is thread 4's own
+              // register too, so both stores come from the one thread that
+              // owns the value and the block rendezvouses once, not twice.
+              if (task_desc->task_type == TASK_GANG_FULL_LAYER_FUSED_MI300 &&
+                  _pf_ok) {
+                if (threadIdx.x == 4) {
+                  // _pf_in was re-issued for ml+1 in the copy block above, so
+                  // on the last layer it still holds layer ml's value and must
+                  // be suppressed -- same "null on the last layer" rule as the
+                  // non-prefetch path, for the same reason.
+                  task_desc->input_ptrs[24] =
+                      (ml + 1 < config.ml_num_layers) ? _pf_in : nullptr;
+                  // _pf_cur is this layer's slot 4, held from before the
+                  // re-issue, so this needs no read of input_ptrs[4] and
+                  // therefore no rendezvous with the thread that wrote it.
+                  task_desc->input_ptrs[25] = (ml > 0) ? _pf_cur : nullptr;
+                }
+              } else
+#endif
+                  if (threadIdx.x == 0 &&
+                      task_desc->task_type ==
+                          TASK_GANG_FULL_LAYER_FUSED_MI300) {
+                int const next_ml = ml + 1;
+                task_desc->input_ptrs[24] =
+                    (next_ml < config.ml_num_layers)
+                        ? config.ml_input_table[(xcd_id * config.ml_num_layers +
+                                                 next_ml) *
+                                                    MAX_INPUTS_PER_TASK +
+                                                4]
+                        : nullptr;
+                task_desc->input_ptrs[25] =
+                    (ml > 0) ? task_desc->input_ptrs[4] : nullptr;
+              }
+              __syncthreads();
+#endif
+#ifdef MPK_DRAIN_STATS
+              // The inter-layer prologue: the ml_input_table / ml_output_table
+              // copy plus the two __syncthreads that publish it. This runs
+              // AFTER the previous layer's Phase 9 gate cleared, so it is
+              // serial critical-path latency between layers -- and it is an
+              // HBM read (the tables are device globals), not an LDS one.
+              // Passing the pointers as template/function arguments, with the
+              // gate *inside* the layer body after the pointers are known,
+              // would remove this prologue entirely.
+              if (threadIdx.x == 0 && ml > 0) {
+                unsigned long long _mlt1 = __builtin_amdgcn_s_memrealtime();
+                atomicAdd(&g_mlprologue_sum, (_mlt1 - _mlt0) * 10);
+                atomicAdd(&g_mlprologue_n, 1ULL);
+              }
+#endif
 #ifdef MPK_NIL_TRIPWIRE
               // Breadcrumb: which layer this worker reached, and whether the
               // pointer set it is about to hand to the kernel contains a null.
@@ -2200,9 +2663,24 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // __syncthreads ensures all threads finish before task_desc is
               // modified for the next layer.
               if (ml < config.ml_num_layers - 1) {
+#ifdef MPK_INTERLAYER_FENCE
+                // Retired by default: this threadfence_gpu had nothing to
+                // flush. It was a buffer_wbl2 sc1 + drain meant to push the
+                // layer's output out of L2, but the layer's output never
+                // enters L2 -- the MoE W2 epilogue writes the workspace with
+                // st_wt_f32x4 (sc0 sc1, write-through straight to HBM), and
+                // Phase 9 then drains with an explicit s_waitcnt vmcnt(0)
+                // before its release atomic. The next layer's consumers still
+                // do their own buffer_inv behind the QKV epoch poll, so the
+                // acquire side is unchanged.
+                //
+                // Measured 2.215 -> 2.204 (n=3 each, 16 tokens) and
+                // 2.233 -> 2.202 (n=6, 128 tokens), output byte-identical
+                // across eight runs. Define MPK_INTERLAYER_FENCE to restore.
                 if (threadIdx.x == 0 && block_xcd_local_rank == 0) {
                   threadfence_gpu();
                 }
+#endif
                 __syncthreads();
               }
             }
@@ -2246,6 +2724,40 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           } else {
             // ===== Original fast-loop: per-layer dispatch =====
             while (true) {
+              // Publish the layer counter here too.
+              //
+              // The multi-layer branch above stores this once per `ml`, and the
+              // fused-layer task derives all four of its barrier release values
+              // from it (qkv_epoch, attn_release, routing_ready, and the MoE
+              // W13->W2 layer_epoch). This branch never did -- so on any run
+              // where multi-layer batching is off (it needs >1 fused layer;
+              // `--max-layers 1` disables it, and the host prints "Multi-layer
+              // table: disabled"), the field kept the ~0ull that
+              // FullTaskDesc's constructor writes into raw_payload.
+              //
+              // That made task_layer_idx == -1, so every expected value was
+              // layer_counter + 1 == 0, and *every* barrier in the fused layer
+              // became a no-op: the counters are host allocations that start at
+              // 0, so `while (observed < 0)` never spins even once. Verified
+              // directly -- an instrumented Phase 6 poll reported
+              // ALREADY-PAST on 101440 of 101440 entries, none waiting.
+              //
+              // With the cross-XCD attention barrier disabled, O-proj reads
+              // attn_out while the merges are still running. The damage is
+              // silent and lands on the requests whose merges finish last and
+              // the workers that reach Phase 6 first (xcd_rank >=
+              // total_qkv_tiles_per_xcd) -- the row>=2 x wg>=10 block seen in
+              // attn_proj_out, and the reason a delay anywhere in Phase 6 made
+              // it disappear while no cache fence on either side helped.
+              //
+              // Same expression as the ml branch: monotonic, never reset, one
+              // bump per layer. There is exactly one fused layer per iteration
+              // on this path, so the layer term is 0.
+              if (threadIdx.x == 0) {
+                task_desc->task_metadata._linear_reserved =
+                    (int32_t)(pc_iter - 1);
+              }
+              __syncthreads();
               int n_tile_start = (int)task_desc->task_metadata.n_tile_start;
               int n_tile_count = (int)task_desc->task_metadata.n_tile_count;
               int my_tiles = 0;
@@ -3027,6 +3539,31 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
           // ones past the end of the ring.
           g_fwdpass_total_ns += dur;
           g_fwdpass_total_iters++;
+#ifdef MPK_PHASE_SLOTS
+          // Arm the phase recorder here and nowhere else.
+          //
+          // The obvious site -- the worker loop's TASK_BEGIN_TASK_GRAPH branch
+          // -- is dead: workers never receive that task type, so an arm placed
+          // there leaves g_phase_arm at 0 forever while all 97M marks fall
+          // through. This handler is the one place that ticks exactly once per
+          // forward pass, and scheduler 0 owns it.
+          //
+          // Arming between forward passes rather than mid-pass is what makes
+          // the slot-0 liveness guard sufficient: every worker sees the flag
+          // set before it enters its next layer 0.
+          //
+          // No sched_id guard: which scheduler drains the global queue's end
+          // event is not fixed, and pinning this to sched_id 0 left the flag
+          // at 0 for a whole 910-iteration run. Any scheduler reaching here
+          // has ticked the counter, and the store is an idempotent 1, so a
+          // race between two of them writes the same value.
+          if (!g_phase_arm &&
+              g_fwdpass_total_iters >= MPK_PHASE_START_ITER) {
+            __threadfence();
+            g_phase_arm = 1;
+            __threadfence();
+          }
+#endif
           // Stride-decimate rather than truncate.
           //
           // The old code kept iterations 0..8191 and dropped every one after,
@@ -3063,6 +3600,33 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         }
         prev_end_of_graph_clk = iter_end_clk;
         end_of_graph_count++;
+        // Publish decode progress to pinned host memory.
+        //
+        // config.step[0] -- request 0's token position -- not the iteration
+        // count: prefill packs up to MPK_MAX_NUM_BATCHED_TOKENS positions into
+        // a single iteration, so iterations and tokens are not the same unit.
+        // Publishing iterations made a 1024-token prefill look like 64 steps,
+        // and the streaming server then held back every token until the launch
+        // was nearly over.
+        //
+        // step[0] is updated by the *previous* iteration's prepare_next_batch,
+        // so at this point it names the positions already written to
+        // config.tokens -- a host reader that sees N may safely read N.
+        // Written before the continue-check so the final iteration is
+        // published even on the terminating path. Release ordering pairs with
+        // the host's acquire load: the token stores must be visible before the
+        // count that advertises them.
+        //
+        // One entry per request, not just request 0: a batch coalesces
+        // prompts of different lengths, so each request reaches its first
+        // output token at a different absolute position.
+        if (config.progress_host != nullptr) {
+          __threadfence_system();
+          for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
+            __atomic_store_n(
+                &config.progress_host[r], config.step[r], __ATOMIC_RELEASE);
+          }
+        }
         // Check if we want to continue
 #ifdef MODE_ONLINE_NOTOKEN
         if (!prepare_next_batch(config, iteration_num))
@@ -3070,6 +3634,22 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         if (!prepare_next_batch(config))
 #endif
         {
+          // Republish after the terminating prepare_next_batch.
+          //
+          // The publish above runs BEFORE prepare_next_batch, so it reports
+          // the step count as of the previous iteration -- the final token is
+          // written by this last call and would never be advertised. A
+          // streaming reader would then sit on the second-to-last token until
+          // the launch ended and the poll loop fell through to its flush,
+          // charging the whole FWD_PASS log dump and teardown (~150-490 ms) to
+          // the last inter-token gap.
+          if (config.progress_host != nullptr) {
+            __threadfence_system();
+            for (int r = 0; r < MPK_MAX_NUM_BATCHED_REQUESTS; r++) {
+              __atomic_store_n(
+                  &config.progress_host[r], config.step[r], __ATOMIC_RELEASE);
+            }
+          }
           unsigned long long prep_done_clk = get_wallclock_ns();
 #ifndef MPK_ENABLE_PROFILING
           printf("[ITER_TIME] sched=%d iter=%llu prep_us=%.1f DONE\n",
@@ -3079,12 +3659,21 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #endif
           // Dump deferred FWD_PASS log (after timing, before terminate).
           // iter is reconstructed from the decimation stride.
+          //
+          // Skipped under MPK_QUIET_FWDPASS. The dump is thousands of device
+          // printfs drained over PCIe, which costs ~150-500 ms of teardown --
+          // negligible once per offline run, but a server pays it on every
+          // request, where it lands inside the measured end-to-end latency.
+          // The [FWD_PASS_TOTAL] summary below still reports the real
+          // per-iteration average, so nothing needed for timing is lost.
+#ifndef MPK_QUIET_FWDPASS
           for (int i = 1; i < g_fwdpass_count && i < FWDPASS_LOG_MAX; i++) {
             printf("[FWD_PASS] iter=%d time_ms=%.3f num_active_tokens=%d\n",
                    i * g_fwdpass_stride,
                    (double)g_fwdpass_time_ns[i] / 1000000.0,
                    g_fwdpass_tokens[i]);
           }
+#endif
           // Untruncated summary. dropped>0 means the per-iter lines above are
           // only the first FWDPASS_LOG_MAX iterations and must not be averaged
           // as if they were the whole run -- use total_ms/iters instead.
@@ -3097,6 +3686,44 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                            (double)g_fwdpass_total_iters
                      : 0.0,
                  g_fwdpass_dropped);
+#ifdef MPK_PHASE_SLOTS
+          // One line per (xcd_rank band, slot): mean ns of each slot-to-slot
+          // span over every steady-state decode layer. Printed once at
+          // termination so nothing lands on the hot path.
+          //
+          // Emitted per rank band because rank is role here: ranks
+          // 0..total_qkv_tiles_per_xcd-1 run QKV and attention, the rest go
+          // straight to Phase 6 and only ever run MoE tiles. Averaging the two
+          // together reports a worker that does not exist -- the same mistake
+          // that made the barrier look uniformly expensive.
+          {
+            // layers_per_worker must equal 36 * (iters - START_ITER) against
+            // the [FWD_PASS_TOTAL] line; arm=0 means the recorder never
+            // started and every number below is meaningless.
+            printf("[PSLOT] slots=%d layers_per_worker=%llu arm=%d "
+                   "total_iters=%d start_iter=%d\n",
+                   MPK_PHASE_SLOT_COUNT,
+                   g_phase_n[0],
+                   (int)g_phase_arm,
+                   g_fwdpass_total_iters,
+                   MPK_PHASE_START_ITER);
+            for (int w = 0; w < MPK_PHASE_MAX_WORKERS; w++) {
+              unsigned long long n = g_phase_n[w];
+              if (n == 0) {
+                continue;
+              }
+              // From s=0, not s=1: slot 0 now carries the inter-layer span
+              // (see mpk_phase_mark). Emitting it is what makes the row sum
+              // to the real per-layer cost instead of leaving a hole.
+              printf("[PSLOTW] w=%d n=%llu", w, n);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu",
+                       g_phase_span[w * MPK_PHASE_SLOT_COUNT + s] / n);
+              }
+              printf("\n");
+            }
+          }
+#endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,
           // [4]=after_compute, [2]=after_barrier
@@ -3551,6 +4178,8 @@ static unsigned long long *g_dbg_h_tasks_done =
 static int *g_dbg_h_worker_state =
     nullptr; // [num_workers*4] host-mapped debug state
 static int g_dbg_num_workers = 0;
+// Host-side view of the decode-progress counter (pinned, device-mapped).
+static int *g_progress_host = nullptr;
 static EventCounter *g_dbg_h_event_counters =
     nullptr; // host-mapped event counters
 static EventCounter *g_dbg_h_xcd_local_counters =
@@ -3708,6 +4337,50 @@ extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
       global_runtime_config);
   (void)cudaStreamSynchronize(NULL);
+}
+
+// Zero the progress counters from the host, synchronously.
+//
+// launch_persistent_kernel already clears them, but that runs on the GPU
+// worker thread *after* the streaming poller has started. The poller would
+// then read the previous request's terminal position, conclude the whole
+// response was already generated, and emit every token at once -- which
+// reports a near-zero TTFT and a near-zero inter-token latency for every
+// request after the first. Call this before the poller starts.
+extern "C" void reset_decode_progress() {
+  if (g_progress_host == nullptr) {
+    return;
+  }
+  for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+    __atomic_store_n(&g_progress_host[i], 0, __ATOMIC_RELEASE);
+  }
+}
+
+// Token position reached by batch slot `slot` in the currently-running launch,
+// or -1 if unavailable. Safe to call from another thread while the kernel runs
+// -- that is the point.
+extern "C" int get_decode_progress(int slot) {
+  if (g_progress_host == nullptr || slot < 0 ||
+      slot >= MPK_MAX_NUM_BATCHED_REQUESTS) {
+    return -1;
+  }
+  return __atomic_load_n(&g_progress_host[slot], __ATOMIC_ACQUIRE);
+}
+
+// Per-launch stop bound. prepare_next_batch retires a request at
+// `step + num_tokens + 1 >= config.max_seq_length` and has no other length
+// control, so the generated length is whatever the arena allows. That is fine
+// offline, where the arena is sized for the one run, but a server gets a
+// different max_tokens per request and cannot recompile. config.max_seq_length
+// is a plain int in the by-value config, distinct from the compile-time
+// MPK_MAX_SEQ_LENGTH that fixes the token-array stride -- lowering it before a
+// launch shortens generation without touching any layout.
+//
+// Must be <= MPK_MAX_SEQ_LENGTH; a larger value would index past the arena.
+extern "C" void set_max_seq_length(int max_seq_length) {
+  if (max_seq_length > 0 && max_seq_length <= MPK_MAX_SEQ_LENGTH) {
+    global_runtime_config.max_seq_length = max_seq_length;
+  }
 }
 
 extern "C" void set_rope_tables(void *cos_ptr, void *sin_ptr) {
@@ -4497,6 +5170,40 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       global_runtime_config.tripwire = nullptr;
 #endif
 
+      // Decode-progress counters in pinned host memory, one per batch slot.
+      // Always allocated (one page, one store per slot per iteration); the
+      // serving path reads them to stream tokens while the launch is still
+      // running, and nothing else touches them.
+      //
+      // Per-slot, not a single counter: a batch coalesces requests with
+      // different prompt lengths, so slot r's first *output* token lands at a
+      // different absolute position than slot 0's. One shared counter would
+      // make every request in the batch inherit request 0's schedule and
+      // report the wrong TTFT for all the others.
+      {
+        int *pg_host = nullptr;
+        if (hipHostMalloc(reinterpret_cast<void **>(&pg_host),
+                          sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS,
+                          hipHostMallocMapped | hipHostMallocNonCoherent) ==
+                hipSuccess &&
+            pg_host != nullptr) {
+          for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+            pg_host[i] = 0;
+          }
+          g_progress_host = pg_host;
+          int *pg_dev = nullptr;
+          if (hipHostGetDevicePointer(
+                  reinterpret_cast<void **>(&pg_dev), pg_host, 0) ==
+              hipSuccess) {
+            global_runtime_config.progress_host = pg_dev;
+          } else {
+            (void)hipHostFree(pg_host);
+            g_progress_host = nullptr;
+            global_runtime_config.progress_host = nullptr;
+          }
+        }
+      }
+
       // Clear host debug pointers (no longer host-mapped)
       g_dbg_h_iter_ready = nullptr;
       g_dbg_h_terminate = nullptr;
@@ -4827,6 +5534,14 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
 // TODO: change launch config
 extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
   fprintf(stderr, "[HOST_DBG] launch_persistent_kernel ENTER\n");
+  // Progress is per-launch, so clear it before the kernel starts rather than
+  // after it ends: a streaming reader polling from another thread must never
+  // see the previous request's count and emit tokens that do not exist yet.
+  if (g_progress_host != nullptr) {
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      __atomic_store_n(&g_progress_host[i], 0, __ATOMIC_RELEASE);
+    }
+  }
   // Prepare next persistent kernel by resetting queue pointers
   {
     int end_of_task_graph_event_pos = global_runtime_config.num_events - 1;
@@ -4876,9 +5591,29 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         default_stream, global_runtime_config.scheduler_done_event, 0);
 
 #ifdef MPK_PRECOMPUTED_DISPATCH
-    // Debug: poll device memory via async memcpy on a separate stream
-    fprintf(stderr, "[HOST_DBG] Starting poll loop...\n");
-    if (global_runtime_config.precomp_iter_ready &&
+    // Hang-diagnosis watchdog. OFF unless MPK_HOST_WATCHDOG=1.
+    //
+    // This loop gates when launch_persistent_kernel returns, so it is not
+    // free: it ticks, and the kernel finishes mid-tick, so every launch pays
+    // out the remainder of the current tick before the response can be sent.
+    // At the original 1 s granularity that was a median 498 ms per request at
+    // conc=1, landing entirely on the final inter-token gap -- +0.55 ms/token
+    // once TPOT averages it over ~900 tokens, or 22% of the reported figure.
+    // A 12-token coherence check paid 974 ms of it. No compute happens in
+    // that window; it is pure sleep.
+    //
+    // It exists for real failures (see the 32k-hang notes below) and stays
+    // available, but a serving run should not carry a debug poller in the
+    // response path. The tick is also 5 ms now rather than 1 s, so enabling
+    // it costs ~5 ms instead of ~500.
+    static bool const dbg_watchdog = [] {
+      char const *e = getenv("MPK_HOST_WATCHDOG");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (dbg_watchdog) {
+      fprintf(stderr, "[HOST_DBG] Starting poll loop...\n");
+    }
+    if (dbg_watchdog && global_runtime_config.precomp_iter_ready &&
         global_runtime_config.precomp_terminate) {
       hipStream_t dbg_stream;
       (void)hipStreamCreate(&dbg_stream);
@@ -4899,6 +5634,18 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       static std::atomic<unsigned long long> dbg_a_td{0};
       static std::atomic<unsigned long long> dbg_a_polls{0};
       static std::atomic<bool> dbg_a_stop{false};
+      // Re-arm for this launch. These are function-static so the detached poll
+      // thread can outlive the call, which also means launch N+1 inherits
+      // launch N's terminal values: dbg_a_stop=true made the new poll thread
+      // exit on its first predicate test, and dbg_a_term=1 made the tick loop
+      // break at t=1s. That is exactly the misleading
+      // "iter_ready=<terminal> terminate=1 dev_polls=1" a server run reports
+      // one second after a relaunch, whatever the kernel is actually doing.
+      dbg_a_stop.store(false, std::memory_order_relaxed);
+      dbg_a_ir.store(0, std::memory_order_relaxed);
+      dbg_a_term.store(0, std::memory_order_relaxed);
+      dbg_a_td.store(0, std::memory_order_relaxed);
+      dbg_a_polls.store(0, std::memory_order_relaxed);
       // Detached, and every object it touches has static storage duration --
       // a thread blocked in HIP outlives this scope and must not dangle.
       std::thread([dbg_stream]() {
@@ -4941,9 +5688,22 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
       // reports terminate (the `if (term) break` at the bottom), bounded only
       // by a generous ceiling so a wedged run still exits the loop and lets
       // the enclosing `timeout` reap it.
-      int const dbg_max_ticks = 900;
+      // Tick at 5 ms, not 1 s. This loop gates when launch_persistent_kernel
+      // returns, so its sleep granularity lands directly on the client: the
+      // kernel finishes mid-tick and the response waits out the remainder of
+      // the sleep. Measured at conc=1, that was 1000 - (finish_ms % 1000) on
+      // every launch -- a median 498 ms charged to the final inter-token gap,
+      // which TPOT then averages over ~900 tokens as +0.55 ms/token. A
+      // 12-token request paid 974 ms of it. Nothing was computing during that
+      // window.
+      //
+      // The reporting cadence is deliberately decoupled below (dbg_ticks_per_s)
+      // so the log keeps its once-a-second rhythm and the same 900 s ceiling.
+      int const dbg_tick_ms = 5;
+      int const dbg_ticks_per_s = 1000 / dbg_tick_ms;
+      int const dbg_max_ticks = 900 * dbg_ticks_per_s;
       for (int dbg_i = 0; dbg_i < dbg_max_ticks; dbg_i++) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(dbg_tick_ms));
         unsigned long long ir = dbg_a_ir.load(std::memory_order_relaxed);
         int term = dbg_a_term.load(std::memory_order_relaxed);
         unsigned long long td = dbg_a_td.load(std::memory_order_relaxed);
@@ -4957,19 +5717,23 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
         // The real liveness signal is the per-worker `done` counter in the
         // dump below: it lives in pinned host memory and advances even while
         // HIP is blocked. Frozen `done` across ticks = actually stuck.
-        if (dbg_i % 30 == 0 || term) {
+        // dbg_i counts 5 ms ticks now, so both the 30 s reporting interval and
+        // the printed timestamp have to be converted back into seconds.
+        if (dbg_i % (30 * dbg_ticks_per_s) == 0 || term) {
           fprintf(
               stderr,
               "[HOST_DBG] t=%ds iter_ready=%llu terminate=%d "
               "tasks_done=%llu dev_polls=%llu (0 is normal; watch `done`)\n",
-              dbg_i + 1,
+              (dbg_i / dbg_ticks_per_s) + 1,
               ir,
               term,
               td,
               polls);
         }
         // Dump per-worker state + summary
-        if (g_dbg_h_worker_state && dbg_i >= 2) {
+        // Was `dbg_i >= 2`, i.e. "after 2 s of ticks"; keep that wall-clock
+        // meaning rather than letting it fire 10 ms in.
+        if (g_dbg_h_worker_state && dbg_i >= 2 * dbg_ticks_per_s) {
           int phase_hist[4] = {};
           // Fused-layer phase histogram over ALL workers, not just the 32
           // printed individually. A stall where 239 workers sit on one barrier
@@ -5017,7 +5781,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           // per-worker lines would be ~32 lines/sec of healthy-run noise and
           // would bury the failure. Print them only while a stall is building
           // or on a periodic checkpoint.
-          bool verbose = (stall_ticks >= 1) || (dbg_i % 30 == 0);
+          bool verbose =
+              (stall_ticks >= 1) || (dbg_i % (30 * dbg_ticks_per_s) == 0);
           for (int w = 0; w < g_dbg_num_workers; w++) {
             int *ws = g_dbg_h_worker_state + w * 4;
             int tpos = __atomic_load_n(&ws[0], __ATOMIC_RELAXED);
@@ -5543,7 +6308,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
           } // verbose
         }
         // Dump event counters to diagnose which events haven't fired
-        if (g_dbg_h_event_counters && dbg_i == 5) {
+        if (g_dbg_h_event_counters && dbg_i == 5 * dbg_ticks_per_s) {
           fprintf(stderr,
                   "  === Event counters: last 20 events + event 158 ===\n");
           // Show events 140-158 (the tail where workers are stuck)

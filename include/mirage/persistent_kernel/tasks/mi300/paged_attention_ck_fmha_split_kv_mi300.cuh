@@ -400,15 +400,26 @@ __device__ __noinline__ void
   }
 #endif
 
-  // Write LSE (log-sum-exp) for attention sink correction
-  // LSE = m_val + log(d_val)
+  // Write LSE (log-sum-exp) in NATURAL log, for the sink correction and the
+  // split-KV merge (both of which scale it by log2(e) on load).
+  //
+  // `scale_s` carries the log2(e) factor (CK_TILE_FMHA_FWD_FAST_EXP2=1), so
+  // `score`, `m_val` and the exp2-based `d_val` are all in LOG2 space and the
+  // natural-log LSE is (m_val + log2(d_val)) / log2(e). Writing
+  // `m_val + logf(d_val)` mixes a log2 exponent with a natural-log mantissa
+  // and overstates every LSE by 0.4427*m_val -- see the same fix (and its
+  // measured impact) in paged_attention_decode_minimal_hd64_mi300.cuh.
+  // This scalar path is the HEAD_DIM != 64 fallback, so GPT-OSS does not
+  // reach it, but the convention has to match or the merge is inconsistent.
   // Layout: lse_acc[token, q_head] where q_head is global across all KV heads
   if (lane == 0) {
     constexpr int LSE_STRIDE = NUM_KV_HEADS_T * NUM_KV_CHUNKS * NUM_QO_PER_KV;
     float *lse_out = reinterpret_cast<float *>(lse_acc_ptr) +
                      query_start * LSE_STRIDE + kv_head_idx * NUM_QO_PER_KV +
                      q_head_local;
-    float lse_val = (d_val > 0.0f) ? (m_val + logf(d_val)) : -1e30f;
+    constexpr float INV_LOG2E = 0.693147180559945309417f; // ln(2)
+    float lse_val =
+        (d_val > 0.0f) ? ((m_val + __log2f(d_val)) * INV_LOG2E) : -1e30f;
     *lse_out = lse_val;
   }
 }

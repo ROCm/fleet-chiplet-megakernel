@@ -36,8 +36,132 @@
 #pragma once
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
+#include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
 
 namespace kernel {
+
+// Native vector types for address-space-qualified loads. HIP's float4/uint2 are
+// class templates (HIP_vector_type), so they cannot be copy-constructed through
+// an AS(1) pointer, and __builtin_memcpy is declared __host__ and rejects one
+// outright. These ext_vector_types can, which is what lets the ResAdd prologue
+// issue GLOBAL rather than generic FLAT loads -- see the comment at its use.
+typedef float _gl_f32x4 __attribute__((ext_vector_type(4)));
+typedef unsigned int _gl_u32x2 __attribute__((ext_vector_type(2)));
+
+// ── Shared QKV weight-tile LDS geometry ──────────────────────────────────
+//
+// The DMA below writes where these say and the MFMA in the kvupd kernel reads
+// where these say. They were previously spelled out once, inline; they are now
+// shared with the fused layer's Phase 9 prefetch, which stages the NEXT
+// layer's weights into the same region during the layer-barrier spin. A
+// mismatch between the two callers is silent wrong numerics, so both derive
+// every offset from these functions and neither open-codes any of it.
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+struct QkvWeightLds {
+  static constexpr int NUM_WAVES = 4;
+  static constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  static constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  static constexpr int WG_BYTES = WG_DATA_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+
+  static constexpr int MFMA_N = 16;
+  static constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  static constexpr int MFMA_ITERS = REDUCTION_SIZE / 128;
+  static constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  static constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  static constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  static constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
+
+  static constexpr int TILE_ROWS = 16;
+  static constexpr int TILE_DATA = TILE_ROWS * (REDUCTION_SIZE / 2);
+  static constexpr int TILE_SCALE = TILE_ROWS * NUM_BLOCKS_32;
+  static constexpr int N16_DATA = TILE_DATA / 16;
+  static constexpr int LPT = (N16_DATA + 255) / 256;
+  static constexpr int TILE_DATA_PADDED = LPT * 256 * 16;
+#ifdef MPK_QKV_PREFETCH_SCALES
+  // buffer_load_lds advances the LDS pointer in 1 KiB wave chunks, so a scale
+  // region that is DMA'd rather than scattered has to be a whole number of
+  // them. Costs (pad - TILE_SCALE) bytes of LDS per tile and buys the removal
+  // of the VGPR round trip in Phase B.
+  static constexpr int TILE_SCALE_PADDED = ((TILE_SCALE + 1023) / 1024) * 1024;
+  static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE_PADDED;
+#else
+  static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE;
+#endif
+
+  // Weight region base within the task's dynamic LDS.
+  static constexpr int W_OFF = ((TOK_REGION + SC_REGION + 15) / 16) * 16;
+  // Total LDS the weight staging occupies, from the base of _rnlm_smem.
+  static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
+};
+
+// Issue the HBM->LDS weight DMA for one QKV tile. Does NOT wait: the caller
+// drains with `s_waitcnt vmcnt(0)` once it has something else to do first.
+// `tile_idx` selects the weight group exactly as the kvupd kernel does, so a
+// worker prefetching for the next layer must pass the tile index it will
+// itself execute there (xcd_rank is stable across layers).
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+__device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
+                                                         int n_wgs_per_xcd,
+                                                         int tile_idx) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  extern __shared__ char _rnlm_smem[];
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const wg_idx = tile_idx % n_wgs_per_xcd;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  i32x4_t rsrc = make_w_buffer_rsrc(
+      W, static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
+  uint32_t wg_voff = static_cast<uint32_t>(wg_idx) * G::WG_BYTES;
+
+  auto *lds_warp_base =
+      (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
+                                                     G::W_OFF +
+                                                     warp_id * 1024);
+#pragma unroll
+  for (int t = 0; t < G::NUM_WAVES; t++) {
+#pragma unroll
+    for (int j = 0; j < G::LPT; j++) {
+      int idx = tid + j * 256;
+      int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
+      uint32_t voff =
+          wg_voff +
+          static_cast<uint32_t>(t * G::TILE_ROWS * (REDUCTION_SIZE / 2)) +
+          static_cast<uint32_t>(clamped * 16);
+      auto *lds_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                           lds_warp_base +
+                       t * G::TILE_BYTES + j * 4096);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+    }
+#ifdef MPK_QKV_PREFETCH_SCALES
+    // Stage this tile's block scales straight to LDS as well, so Phase B has
+    // nothing left to do but drain. The default path instead reads the scales
+    // into VGPRs after the data drain and scatters them, which costs a second
+    // HBM round trip serialized behind the first. Only waves 0-1 participate:
+    // TILE_SCALE is 16*NUM_BLOCKS_32 bytes, well under the 2 KiB two waves
+    // move, and every lane past that would just re-fetch the clamped tail.
+    if (warp_id < 2) {
+      constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
+      int const vector = warp_id * 64 + (tid & 63);
+      int const clamped = vector < SCALE_VECTORS ? vector : SCALE_VECTORS - 1;
+      uint32_t voff = wg_voff + static_cast<uint32_t>(G::WG_DATA_BYTES) +
+                      static_cast<uint32_t>(t * G::TILE_SCALE) +
+                      static_cast<uint32_t>(clamped * 16);
+      auto *lds_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                           lds_warp_base +
+                       t * G::TILE_BYTES + G::TILE_DATA_PADDED);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+    }
+#endif
+  }
+}
 
 // Fused RMSNorm + MXFP4 Gang Linear + Bias.
 //
@@ -899,6 +1023,101 @@ __device__ __forceinline__ void _kvupd_rope_epilogue(
   }
 }
 
+// ── N-axis-packed RoPE epilogue ─────────────────────────────────────────
+// Same three steps as above, with a token dimension. The MFMA produced
+// D[m][n] for all 16 n columns; lane (g, col) holds m = wave_tile*16 + g*4 + i
+// for token n = col, so step 1 writes s_rope[col][d0+i] instead of
+// s_rope[d0+i]. Steps 2 and 3 flatten (token, element) into one strided loop
+// so all 256 threads stay busy -- HALF = 32, so the single-token version left
+// 224 of them idle.
+//
+// Positions are per token, so cos/sin rows come from s_global_pos[t] rather
+// than one precomputed row pointer.
+template <int HEAD_DIM, int TOK_ROWS>
+__device__ __forceinline__ void _kvupd_rope_epilogue_packed(
+    float const *acc,             // [4] accumulator values for this lane
+    unsigned short const *bias,   // bias array (partitioned per XCD)
+    int wg_idx,                   // workgroup index within XCD
+    int wave_tile,                // wave_tile index
+    int g,                        // lane group (0..3)
+    int col,                      // lane column (0..15) == this lane's token
+    int tid,                      // threadIdx.x
+    bool tok_active,              // col names a real token
+    int n_valid,                  // number of real tokens in this block
+    unsigned short const *cos_base, // cos[max_pos][HEAD_DIM] bf16
+    unsigned short const *sin_base, // sin[max_pos][HEAD_DIM] bf16
+    int const *s_global_pos,        // LDS [TOK_ROWS] absolute positions
+    unsigned short *dst,            // destination array
+    int dst_stride,                 // stride between tokens in dst
+    int tok_row_base,               // first token row of this column block
+    int head_offset,                // head offset within dst row
+    int output_per_wg,              // OUTPUT_PER_WG
+    unsigned short *s_rope)         // LDS buffer [TOK_ROWS][HEAD_DIM] bf16
+{
+  // Step 1: each lane writes its own token's slice.
+  //
+  // This guard sits strictly AFTER the caller's MFMA asm block has retired.
+  // Masking inactive lanes any earlier would let the compiler sink the exec
+  // mask up over the ds_read_b128 that feeds the MFMA, and then 60 of 64 lanes
+  // read stale B operands -- which corrupts the *active* lanes too, because a
+  // 16x16x128 MFMA is a whole-wave operation.
+  if (tok_active) {
+    int d0 = wave_tile * 16 + g * 4;
+    uint64_t bias4;
+    __builtin_memcpy(&bias4, &bias[wg_idx * output_per_wg + d0], 8);
+    unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      unsigned bt = (unsigned)b4[i] << 16;
+      float bv;
+      __builtin_memcpy(&bv, &bt, 4);
+      s_rope[col * HEAD_DIM + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+    }
+  }
+  __syncthreads();
+
+  // Step 2: rotate in place; element d of token t pairs with d + HEAD_DIM/2.
+  constexpr int HALF = HEAD_DIM / 2;
+  for (int idx = tid; idx < TOK_ROWS * HALF; idx += 256) {
+    int const t = idx / HALF;
+    if (t >= n_valid) {
+      continue;
+    }
+    int const d = idx - t * HALF;
+    unsigned short *row = s_rope + t * HEAD_DIM;
+    int const pos = s_global_pos[t];
+    unsigned short const *cos_data = cos_base + (long long)pos * HEAD_DIM;
+    unsigned short const *sin_data = sin_base + (long long)pos * HEAD_DIM;
+
+    unsigned v0_bits = (unsigned)row[d] << 16;
+    unsigned v1_bits = (unsigned)row[d + HALF] << 16;
+    float v0, v1;
+    __builtin_memcpy(&v0, &v0_bits, 4);
+    __builtin_memcpy(&v1, &v1_bits, 4);
+
+    unsigned c_bits = (unsigned)cos_data[d] << 16;
+    unsigned s_bits = (unsigned)sin_data[d] << 16;
+    float c, s;
+    __builtin_memcpy(&c, &c_bits, 4);
+    __builtin_memcpy(&s, &s_bits, 4);
+
+    row[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+    row[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+  }
+  __syncthreads();
+
+  // Step 3: write TOK_ROWS * HEAD_DIM bf16 values out.
+  for (int idx = tid; idx < TOK_ROWS * HEAD_DIM; idx += 256) {
+    int const t = idx / HEAD_DIM;
+    if (t >= n_valid) {
+      continue;
+    }
+    int const d = idx - t * HEAD_DIM;
+    dst[(long long)(tok_row_base + t) * dst_stride + head_offset + d] =
+        s_rope[idx];
+  }
+}
+
 // ── Layer 0 variant (no MulSumAdd) ─────────────────────────────────────
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
@@ -1666,15 +1885,38 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
         // REDUCTION_SIZE / (blockDim.x * VEC) iterations per thread
         // e.g. 3072 / (256 * 4) = 3 iterations — fully unrollable
         constexpr int BLOCK_VEC = 256 * VEC; // elements per block per iteration
-        float *ws_base = d_ws + b * REDUCTION_SIZE;
+        float const *ws_base = d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE);
         unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
-          // Vectorized load: 4 f32 from workspace (flat_load_dwordx4)
+          // Vectorized load: 4 f32 from workspace (flat_load_dwordx4), then
+          // sum the remaining expert slots in fixed slot order. See
+          // moe_ws_layout.cuh for why this is a per-slot reduction here rather
+          // than an atomicAdd in the W2 epilogue.
           float4 ws4;
           __builtin_memcpy(&ws4, ws_base + off, 16);
+          // MPK_ABLATE_WS_FOLD: timing-only. Reads slot 0 and drops the other
+          // MOE_WS_SLOTS-1 slabs, so the numerics are wrong by three quarters
+          // of the MoE output -- never read tokens from a run with this set.
+          // It exists because this fold is the largest structural cost in the
+          // QKV prologue: the alternative shape is a W2 epilogue that
+          // atomicAdds into one slab so the consumer reads one, while the
+          // row-symmetry fix here (see moe_ws_layout.cuh) moved that sum into
+          // this loop, on every QKV worker, in QKV's serial window. The layout
+          // comment asks for exactly this measurement.
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+          for (int s = 1; s < MOE_WS_SLOTS; s++) {
+            float4 slot4;
+            __builtin_memcpy(&slot4, ws_base + s * REDUCTION_SIZE + off, 16);
+            ws4.x += slot4.x;
+            ws4.y += slot4.y;
+            ws4.z += slot4.z;
+            ws4.w += slot4.w;
+          }
+#endif
 
           // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
           uint2 res_packed;
@@ -1994,28 +2236,11 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
     }
   }
 
-  // ── Zero workspace_f32 for next iteration ──────────────────────────────
-  // Done AFTER all MFMA computation so all gang workers have finished reading.
-  // Only one worker (tile_idx % n_wgs_per_xcd == 0) does this to avoid races.
-  // Vectorized: float4 zero stores (flat_store_dwordx4).
-  {
-    int wg_idx = tile_idx % n_wgs_per_xcd;
-    if (wg_idx == 0) {
-      float *d_ws = (float *)workspace_f32_ptr;
-      int batch_count_z =
-          (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
-      constexpr int VEC = 4;
-      constexpr int BLOCK_VEC = 256 * VEC;
-      float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
-      for (int b = 0; b < batch_count_z; b++) {
-        float *ws_row = d_ws + b * REDUCTION_SIZE;
-#pragma unroll
-        for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
-          __builtin_memcpy(ws_row + off, &zero4, 16);
-        }
-      }
-    }
-  }
+  // ── No workspace zeroing ───────────────────────────────────────────────
+  // Every (token, slot, hidden) element is assigned by exactly one W2 tile per
+  // layer, so nothing stale survives and there is nothing to clear. The old
+  // per-token layout needed this pass because it accumulated with atomicAdd.
+  // See moe_ws_layout.cuh.
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
@@ -2064,7 +2289,12 @@ __device__ __noinline__ void
         int n_wgs_per_xcd,
         int kv_stride,
         int q_ws_stride,
-        int tile_idx) {
+        int tile_idx,
+        // True when the fused layer already staged this exact tile's weights
+        // into this exact LDS region during the previous layer's Phase 9
+        // barrier spin. Defaulted so the standalone generated variant and the
+        // layer-0 / world_size>1 caller need no change.
+        bool weights_preloaded = false) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0);
   static_assert(REDUCTION_SIZE % 128 == 0);
@@ -2080,15 +2310,30 @@ __device__ __noinline__ void
   constexpr int NUM_WAVES = 4;
   constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
 
-  // ── Token activation in shared memory ────────────────────────────────────
-  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+  // ── Token activation in shared memory (N-axis packed) ────────────────────
+  // The MFMA is 16x16x128: 16 weight rows x 16 token columns. Staging token
+  // `col` at LDS row `col` gives lane (g, col) its own token's B operand, so
+  // one tile now covers up to 16 batch rows for the same MFMA count and the
+  // same weight traffic. See _gang_multirow_fp8_quant for the layout contract.
+  constexpr int MFMA_N = 16;
+  constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  constexpr int NUM_BBLK = (BATCH_SIZE + TOK_ROWS - 1) / TOK_ROWS;
+
+  // The +16 pad is load-bearing, not alignment slack. At ds_read_b128
+  // granularity lane `col` lands in bank group (col * TOK_ROW_STRIDE/16) % 8;
+  // with 2960 that is (col*185) % 8 and 185 % 8 == 1, so the 16 lanes spread
+  // over all 8 groups. Unpadded 2944 collapses them onto one group.
+  constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
 
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
 
   extern __shared__ char _rnlm_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
-  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -2107,51 +2352,55 @@ __device__ __noinline__ void
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
 
-  int tok_idx = tile_idx / n_wgs_per_xcd;
+  // Tile space is now (column block, weight group) instead of (token, weight
+  // group): the token axis moved into the MFMA's N dimension, so the host
+  // emits n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
+  int bblk = tile_idx / n_wgs_per_xcd;
   int wg_idx = tile_idx % n_wgs_per_xcd;
+  int tok_row_base = bblk * MFMA_N;
+  int tok_row = tok_row_base + col;
 
   uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
   // ── Phase A: Issue HBM→LDS weight prefetch BEFORE RMSNorm ─────────────
-  constexpr int QKV_TILE_ROWS = 16;
-  constexpr int QKV_TILE_DATA = QKV_TILE_ROWS * (REDUCTION_SIZE / 2);
-  constexpr int QKV_TILE_SCALE = QKV_TILE_ROWS * NUM_BLOCKS_32;
-  constexpr int qkv_n16_data = QKV_TILE_DATA / 16;
-  constexpr int QKV_LPT = (qkv_n16_data + 255) / 256;
-  constexpr int QKV_TILE_DATA_PADDED = QKV_LPT * 256 * 16;
-  constexpr int QKV_TILE_BYTES = QKV_TILE_DATA_PADDED + QKV_TILE_SCALE;
+  //
+  // The geometry lives in QkvWeightLds so the fused layer's Phase 9 prefetch
+  // (which stages the NEXT layer's weights into this same region during the
+  // barrier spin) cannot drift from what the MFMA below reads.
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  constexpr int QKV_TILE_SCALE = G::TILE_SCALE;
+  constexpr int QKV_TILE_DATA_PADDED = G::TILE_DATA_PADDED;
+  constexpr int QKV_TILE_BYTES = G::TILE_BYTES;
+  constexpr int QKV_LDS_OFF = G::W_OFF;
 
-  uint32_t qkv_buf_range = static_cast<uint32_t>(n_wgs_per_xcd) * WG_BYTES;
-  constexpr int QKV_LDS_OFF_A = ((FP8_TOK_DATA + MFMA_ITERS + 15) / 16) * 16;
-  static_assert(QKV_LDS_OFF_A + QKV_TILE_BYTES * NUM_WAVES <= 155 * 1024,
+  // The real budget is 155 KB minus AMD's 3 KB reserve minus the layer-index
+  // word the fused wrapper parks at the top; the old 155*1024 bound was
+  // permissive by 3 KB.
+  static_assert(G::W_END <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                 "QKV LDS weights exceed MI350X LDS budget");
-  uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF_A;
+  // The shared geometry must agree with this kernel's own token-region math,
+  // or the DMA writes where one says and the MFMA reads where the other says.
+  static_assert(G::TOK_REGION == TOK_REGION && G::SC_REGION == SC_REGION,
+                "QkvWeightLds token region disagrees with kvupd kernel");
+  // RoPE reuses the token region, which is dead once the MFMA has retired.
+  static_assert(TOK_ROWS * HEAD_DIM * 2 <= TOK_REGION,
+                "packed RoPE scratch must fit in the dead token region");
+  uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
 
-  {
-    i32x4_t qkv_rsrc = make_w_buffer_rsrc(W, qkv_buf_range);
-    uint32_t qkv_wg_voff = static_cast<uint32_t>(wg_idx) * WG_BYTES;
-    auto *qkv_lds_warp_base = (__attribute__((address_space(3)))
-                               uint32_t *)(qkv_lds_w + warp_id * 1024);
-#pragma unroll
-    for (int t = 0; t < NUM_WAVES; t++) {
-#pragma unroll
-      for (int j = 0; j < QKV_LPT; j++) {
-        int idx = tid + j * 256;
-        int clamped = idx < qkv_n16_data ? idx : qkv_n16_data - 1;
-        uint32_t voff =
-            qkv_wg_voff +
-            static_cast<uint32_t>(t * QKV_TILE_ROWS * (REDUCTION_SIZE / 2)) +
-            static_cast<uint32_t>(clamped * 16);
-        auto *lds_dst = (__attribute__((address_space(3)))
-                         uint32_t *)((uint8_t __attribute__((address_space(
-                                         3))) *)qkv_lds_warp_base +
-                                     t * QKV_TILE_BYTES + j * 4096);
-        __llvm_amdgcn_raw_buffer_load_lds(
-            qkv_rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
-      }
-    }
+  // MPK_ABLATE_QKV_DMA: timing-only upper bound on what any prefetch hoist
+  // could recover. Skipping the load leaves garbage weights in LDS, so the
+  // numerics are meaningless -- but it is safe to run (the garbage stays in
+  // the data path; every address comes from host-built index tables) and the
+  // wall clock is the honest ceiling for hiding this DMA perfectly.
+  // Measured 2.422 vs 2.486/2.491 ms at B=1 seq512: 64 us, 2.6%.
+#ifndef MPK_ABLATE_QKV_DMA
+  if (!weights_preloaded) {
+    qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+        weight_ptr, n_wgs_per_xcd, tile_idx);
   }
+#endif
 
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
@@ -2169,20 +2418,86 @@ __device__ __noinline__ void
       constexpr int _BLOCK_VEC = 256 * _VEC;
       constexpr int _MAX_ITERS = (REDUCTION_SIZE + _BLOCK_VEC - 1) / _BLOCK_VEC;
       float s_cache[_MAX_ITERS * _VEC];
+      // Pass 2's norm weights, hoisted ahead of the cross-wave reduction. See
+      // the issue loop below the pass-1 body for why.
+      uint64_t prefetched_norm_weights[_MAX_ITERS];
       int n_cached = 0;
       {
         constexpr int VEC = 4;
         constexpr int BLOCK_VEC = 256 * VEC;
-        float *ws_base = d_ws + b * REDUCTION_SIZE;
-        unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
+        // address_space(1) -- GLOBAL, not generic FLAT. Both buffers are
+        // device-global tensors on every path here (the workspace is
+        // host-allocated, the residual is a model activation), so the cast is
+        // sound; what it buys is that these loads increment vmcnt only. As
+        // generic FLAT they bumped lgkmcnt as well, and the compiler then has
+        // no way to express "wait for the first two slabs but not the rest" --
+        // it must emit a full `s_waitcnt vmcnt(0) lgkmcnt(0)`. The pass-1 body
+        // had four of those, one per slab, so the MOE_WS_SLOTS fold ran fully
+        // serialized: issue, drain, add, issue, drain, add. With GLOBAL the
+        // waits become counted vmcnt(N) and the four slabs overlap.
+        //
+        // Same reasoning applies to the norm-weight prefetch below, with
+        // more force here, because this loop reads MOE_WS_SLOTS slabs where
+        // the single-slab shape reads one.
+        auto const *ws_base = (__attribute__((address_space(1))) float const *)(
+            d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE));
+        auto const *res_base =
+            (__attribute__((address_space(1))) unsigned short const *)(
+                d_residual + b * REDUCTION_SIZE);
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
 
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+          // Sum the MoE expert contributions here, in fixed slot order, rather
+          // than letting the W2 epilogue atomicAdd them into one slab. The
+          // order is a compile-time constant, so this row's result does not
+          // depend on the order experts happened to retire, nor on what else
+          // is in the batch. That is what makes identical prompts in different
+          // slots produce identical output. See moe_ws_layout.cuh.
+          // Typed AS(1) vector loads rather than __builtin_memcpy: the builtin
+          // is declared __host__ and rejects an address-space qualified
+          // pointer, and dereferencing the AS(1) type is what makes the
+          // backend pick global_load_dwordx4 over flat_load_dwordx4.
+          _gl_f32x4 const ws_v =
+              *(__attribute__((address_space(1))) _gl_f32x4 const *)(ws_base +
+                                                                     off);
           float4 ws4;
-          __builtin_memcpy(&ws4, ws_base + off, 16);
+          ws4.x = ws_v[0];
+          ws4.y = ws_v[1];
+          ws4.z = ws_v[2];
+          ws4.w = ws_v[3];
+          // MPK_ABLATE_WS_FOLD: timing-only. Reads slot 0 and drops the other
+          // MOE_WS_SLOTS-1 slabs, so the numerics are wrong by three quarters
+          // of the MoE output -- never read tokens from a run with this set.
+          // It exists because this fold is the largest structural cost in the
+          // QKV prologue: the alternative shape is a W2 epilogue that
+          // atomicAdds into one slab so the consumer reads one, while the
+          // row-symmetry fix here (see moe_ws_layout.cuh) moved that sum into
+          // this loop, on every QKV worker, in QKV's serial window. The layout
+          // comment asks for exactly this measurement.
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+          for (int s = 1; s < MOE_WS_SLOTS; s++) {
+            _gl_f32x4 const sv =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + s * REDUCTION_SIZE + off);
+            float4 slot4;
+            slot4.x = sv[0];
+            slot4.y = sv[1];
+            slot4.z = sv[2];
+            slot4.w = sv[3];
+            ws4.x += slot4.x;
+            ws4.y += slot4.y;
+            ws4.z += slot4.z;
+            ws4.w += slot4.w;
+          }
+#endif
+          _gl_u32x2 const rv_v =
+              *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
+                                                                     off);
           uint2 res_packed;
-          __builtin_memcpy(&res_packed, res_base + off, 8);
+          res_packed.x = rv_v[0];
+          res_packed.y = rv_v[1];
 
           unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
           unsigned r1 = res_packed.x & 0xFFFF0000u;
@@ -2222,6 +2537,35 @@ __device__ __noinline__ void
         }
       }
 
+      // ── Pass 2's norm weights, issued here rather than at their use ──────
+      //
+      // The RMSNorm weights are immutable and pass 2 cannot consume them until
+      // after the cross-wave reduction and the two __syncthreads below. Issued
+      // here, that whole tree covers the HBM latency; left at the use site
+      // (where this used to be) every iteration of pass 2 pays an exposed
+      // round trip, and this kernel sits in QKV's serial window on the
+      // critical path.
+      //
+      // `global_load_dwordx2` in asm rather than a plain dereference is
+      // load-bearing, not a micro-optimisation. norm_weight_ptr is a
+      // device-global tensor on every path, but a generic-pointer FLAT load
+      // increments lgkmcnt as well as vmcnt -- so the very first
+      // `s_waitcnt lgkmcnt(0)` in the reduction (there is one, for the LDS
+      // s_red write) would drain these too and collapse the overlap this
+      // exists to create. GLOBAL touches vmcnt only.
+#pragma unroll
+      for (int iter = 0; iter < _MAX_ITERS; ++iter) {
+        int const off = tid * _VEC + iter * _BLOCK_VEC;
+        if (off < REDUCTION_SIZE) {
+          uint64_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(d_norm_w + off)
+                       : "memory");
+          prefetched_norm_weights[iter] = value;
+        }
+      }
+
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
@@ -2253,13 +2597,20 @@ __device__ __noinline__ void
       {
         using bf16 = __hip_bfloat16;
         constexpr int VEC = 4;
-        bf16 const *w_in = (bf16 const *)d_norm_w;
         bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
         int ci = 0;
+        int wi = 0;
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += _BLOCK_VEC) {
-          uint64_t wv;
-          __builtin_memcpy(&wv, &w_in[off], 8);
+          // The inline-asm load that produced this is opaque to the compiler,
+          // so nothing here makes it insert a vmcnt wait. What does is the
+          // second __syncthreads between the issue site and this use: its
+          // fence emits `s_waitcnt vmcnt(0)` ahead of the barrier. That is a
+          // property of the generated code rather than of the source, so it is
+          // verified in the disassembly -- look for a vmcnt(0) between the
+          // global_load_dwordx2 block and this loop before trusting a number
+          // from this path.
+          uint64_t wv = prefetched_norm_weights[wi++];
           bf16 const *wa = (bf16 const *)&wv;
           bf16 ov[VEC];
 #pragma unroll
@@ -2285,16 +2636,17 @@ __device__ __noinline__ void
 
   // ── Step 2: Prepare activation in LDS ──────────────────────────────────
 
-  unsigned short const *input_row =
-      (unsigned short const *)norm_scratch_ptr + tok_idx * REDUCTION_SIZE;
-  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-      input_row, s_tok_fp8, s_tok_scales);
+  _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE, TOK_ROW_STRIDE,
+                           SC_STRIDE>(
+      (unsigned short const *)norm_scratch_ptr, REDUCTION_SIZE, tok_row_base,
+      batch_count - tok_row_base, s_tok_fp8, s_tok_scales);
 
   // ── Phase B: Drain buffer_load_lds, scatter scales to LDS ──
   {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 
+#ifndef MPK_QKV_PREFETCH_SCALES
     constexpr int QKV_SC_DW4_PER_TILE = QKV_TILE_SCALE / 16;
     constexpr int QKV_TOTAL_SC_DW4 = (QKV_TILE_SCALE * NUM_WAVES) / 16;
     constexpr int QKV_SC_LPT = (QKV_TOTAL_SC_DW4 + 255) / 256;
@@ -2324,13 +2676,69 @@ __device__ __noinline__ void
         }
       }
     }
+#endif // MPK_QKV_PREFETCH_SCALES
 
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __syncthreads();
   }
 
-  if (tok_idx >= batch_count) {
+  // Whole-block early-out only: a column block with no real tokens at all.
+  // Individual inactive lanes within a live block must NOT return here -- they
+  // still have to issue their ds_reads and their share of the MFMA, and they
+  // participate in the __syncthreads inside the RoPE epilogue.
+  int const n_valid_tok = batch_count - tok_row_base;
+  if (n_valid_tok <= 0) {
     return;
+  }
+  bool const tok_active = col < n_valid_tok;
+
+  // ── Per-token position metadata ────────────────────────────────────────
+  // The single-token path derived request_id / global_pos / dst_idx from one
+  // tok_idx; every thread computed the same values in registers. With 16
+  // tokens in flight each column needs its own set, so 16 threads compute them
+  // into LDS and everyone reads them back.
+  //
+  // At TOK_ROWS == 1 that broadcast is pure overhead -- one barrier and 128 B
+  // of static LDS to publish a value every thread could recompute. So that
+  // case keeps the register form and the tables become thread-private arrays
+  // of length 1, which the consumers index identically.
+  int _priv_global_pos[TOK_ROWS];
+  int _priv_dst_idx[TOK_ROWS];
+  __shared__ int s_pos_tbl[TOK_ROWS > 1 ? 2 * MFMA_N : 1];
+  int const *s_global_pos;
+  int const *s_dst_idx;
+
+  auto compute_pos = [&](int t, int &gp_out, int &dst_out) {
+    int my_tok = tok_row_base + (t < n_valid_tok ? t : 0);
+    int request_id = 0;
+    while (qo_indptr[request_id + 1] <= my_tok) {
+      request_id++;
+    }
+    int token_in_request = my_tok - qo_indptr[request_id];
+    int first_page = kv_indptr[request_id];
+    int num_pages = kv_indptr[request_id + 1] - first_page;
+    int last_page_len_val = kv_last_page_len[request_id];
+    int global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len_val;
+    int num_new_tokens = qo_indptr[request_id + 1] - qo_indptr[request_id];
+    gp_out = global_seq_len - num_new_tokens + token_in_request;
+    dst_out = kv_indices[first_page + gp_out / PAGE_SIZE] * PAGE_SIZE +
+              gp_out % PAGE_SIZE;
+  };
+
+  if constexpr (TOK_ROWS == 1) {
+    compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+    s_global_pos = _priv_global_pos;
+    s_dst_idx = _priv_dst_idx;
+  } else {
+    if (tid < TOK_ROWS) {
+      int gp, dst;
+      compute_pos(tid, gp, dst);
+      s_pos_tbl[tid] = gp;
+      s_pos_tbl[MFMA_N + tid] = dst;
+    }
+    __syncthreads();
+    s_global_pos = s_pos_tbl;
+    s_dst_idx = s_pos_tbl + MFMA_N;
   }
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -2342,8 +2750,7 @@ __device__ __noinline__ void
   // ── MFMA + KV Update epilogue ─────────────────────────────────────────
   // ── QKV asm MFMA loop (weights already in LDS from Phase A/B) ──
   {
-    constexpr int QKV_LDS_OFF_M = ((FP8_TOK_DATA + MFMA_ITERS + 15) / 16) * 16;
-    uint8_t *lds_qkv_base = (uint8_t *)_rnlm_smem + QKV_LDS_OFF_M;
+    uint8_t *lds_qkv_base = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
 
     constexpr int ROW_DATA = REDUCTION_SIZE / 2;   // 1536
     constexpr int ROW_SCALE = REDUCTION_SIZE / 32; // 96
@@ -2364,8 +2771,14 @@ __device__ __noinline__ void
         unsigned w_addr =
             (unsigned)(uintptr_t)(lds_wd + col * ROW_DATA + g * 16);
         unsigned ws_addr = (unsigned)(uintptr_t)(lds_ws + col * ROW_SCALE + g);
-        unsigned t_addr = (unsigned)(uintptr_t)(s_tok_fp8 + g * 16);
-        unsigned ts_addr = (unsigned)(uintptr_t)(s_tok_scales);
+        // B operand: lane (g, col) reads token row `col`. Inactive lanes clamp
+        // to row 0 rather than skipping -- see the exec-mask note in
+        // _kvupd_rope_epilogue_packed.
+        int const b_row = tok_active ? col : 0;
+        unsigned t_addr =
+            (unsigned)(uintptr_t)(s_tok_fp8 + b_row * TOK_ROW_STRIDE + g * 16);
+        unsigned ts_addr =
+            (unsigned)(uintptr_t)(s_tok_scales + b_row * SC_STRIDE);
 
         asm volatile(
             // Zero accumulator
@@ -2527,47 +2940,65 @@ __device__ __noinline__ void
       acc[2] = qa2;
       acc[3] = qa3;
 
-      // ── Fused KV_UPD epilogue ──────────────────────────────────────────
+      // ── Fused KV_UPD epilogue (N-axis packed) ──────────────────────────
+      // Position metadata is per token and already in s_global_pos /
+      // s_dst_idx. RoPE scratch aliases the token region, which is dead now
+      // that the MFMA has retired.
+      //
+      // "Retired" is a per-WAVE property, and this is a 4-wave block. The asm
+      // above ends with s_waitcnt lgkmcnt(0), so when *this* wave falls out of
+      // it, *its* ds_reads have landed -- but nothing has ordered it against
+      // the other three waves, which may still be issuing the ds_read_b128
+      // pair that feeds their own MFMA. s_rope is _rnlm_smem, i.e. byte 0 of
+      // s_tok_fp8, so wave 0's step-1 stores land exactly on token row 0's
+      // activations: s_rope halfword (t*HEAD_DIM + ...) is byte 128*t + ...,
+      // and token row 0's MFMA iteration i reads bytes [128*i, 128*i+128).
+      // Wave 0 writing rope token t therefore destroys iteration t of token
+      // row 0 for whichever wave has not read it yet.
+      //
+      // That makes the corruption window exactly TOK_ROWS of the 23 MFMA
+      // iterations -- it scales with the batch width, is confined to token row
+      // 0 (col == 0), and vanishes at TOK_ROWS == 1 only because a single
+      // iteration is a narrow enough target to almost always lose the race.
+      // It is why row 0's Q/K diverged from rows 1..B-1 with identical
+      // prompts, and why B=8 was the reliable repro.
+      //
+      // One block-wide rendezvous closes it: every wave's ds_reads are
+      // complete when it arrives here, so the aliased region really is dead
+      // before the first store. The epilogue's own __syncthreads calls are all
+      // *after* its step-1 stores and cannot substitute.
+      __syncthreads();
       int kv_head = _kvupd_get_xcd_id();
-      int request_id = 0;
-      while (qo_indptr[request_id + 1] <= tok_idx) {
-        request_id++;
-      }
-      int token_in_request = tok_idx - qo_indptr[request_id];
-      int first_page = kv_indptr[request_id];
-      int num_pages = kv_indptr[request_id + 1] - first_page;
-      int last_page_len_val = kv_last_page_len[request_id];
-      int global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len_val;
-      int num_new_tokens = qo_indptr[request_id + 1] - qo_indptr[request_id];
-      int global_pos = global_seq_len - num_new_tokens + token_in_request;
-      unsigned short const *cos_row =
-          (unsigned short const *)cos_ptr + global_pos * HEAD_DIM;
-      unsigned short const *sin_row =
-          (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
+      unsigned short const *cos_base = (unsigned short const *)cos_ptr;
+      unsigned short const *sin_base = (unsigned short const *)sin_ptr;
       unsigned short *s_rope = (unsigned short *)_rnlm_smem;
       if (wg_idx < NUM_Q_PER_KV) {
         int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
-        _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
-                                       d_bias,
-                                       wg_idx,
-                                       wave_tile,
-                                       g,
-                                       col,
-                                       tid,
-                                       cos_row,
-                                       sin_row,
-                                       (unsigned short *)q_workspace_ptr,
-                                       q_ws_stride,
-                                       tok_idx,
-                                       q_head_global * HEAD_DIM,
-                                       OUTPUT_PER_WG,
-                                       s_rope);
+        _kvupd_rope_epilogue_packed<HEAD_DIM, TOK_ROWS>(
+            (float const *)&acc,
+            d_bias,
+            wg_idx,
+            wave_tile,
+            g,
+            col,
+            tid,
+            tok_active,
+            n_valid_tok < TOK_ROWS ? n_valid_tok : TOK_ROWS,
+            cos_base,
+            sin_base,
+            s_global_pos,
+            (unsigned short *)q_workspace_ptr,
+            q_ws_stride,
+            tok_row_base,
+            q_head_global * HEAD_DIM,
+            OUTPUT_PER_WG,
+            s_rope);
       } else if (wg_idx == NUM_Q_PER_KV) {
-        int page_num = global_pos / PAGE_SIZE;
-        int page_offset = global_pos % PAGE_SIZE;
-        int page_idx = kv_indices[first_page + page_num];
-        int dst_idx = page_idx * PAGE_SIZE + page_offset;
-        if (col == 0) {
+        // K: bias + RoPE, then scatter to the paged cache. Same three steps as
+        // the Q path but the destination row is a page slot, so it cannot go
+        // through the shared helper's contiguous store.
+        int const n_tok = n_valid_tok < TOK_ROWS ? n_valid_tok : TOK_ROWS;
+        if (tok_active) {
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
@@ -2577,75 +3008,79 @@ __device__ __noinline__ void
             unsigned bt = (unsigned)b4[i] << 16;
             float bv;
             __builtin_memcpy(&bv, &bt, 4);
-            s_rope[d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+            s_rope[col * HEAD_DIM + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
           }
         }
         __syncthreads();
         constexpr int HALF = HEAD_DIM / 2;
-        if (tid < HALF) {
-          unsigned v0b = (unsigned)s_rope[tid] << 16;
-          unsigned v1b = (unsigned)s_rope[tid + HALF] << 16;
+        for (int idx = tid; idx < TOK_ROWS * HALF; idx += 256) {
+          int t = idx / HALF;
+          if (t >= n_tok) {
+            continue;
+          }
+          int d = idx - t * HALF;
+          unsigned short *row = s_rope + t * HEAD_DIM;
+          int pos = s_global_pos[t];
+          unsigned short const *cos_row = cos_base + (long long)pos * HEAD_DIM;
+          unsigned short const *sin_row = sin_base + (long long)pos * HEAD_DIM;
+          unsigned v0b = (unsigned)row[d] << 16;
+          unsigned v1b = (unsigned)row[d + HALF] << 16;
           float v0, v1;
           __builtin_memcpy(&v0, &v0b, 4);
           __builtin_memcpy(&v1, &v1b, 4);
-          unsigned cb = (unsigned)cos_row[tid] << 16;
-          unsigned sb_r = (unsigned)sin_row[tid] << 16;
+          unsigned cb = (unsigned)cos_row[d] << 16;
+          unsigned sb_r = (unsigned)sin_row[d] << 16;
           float c, s;
           __builtin_memcpy(&c, &cb, 4);
           __builtin_memcpy(&s, &sb_r, 4);
-          s_rope[tid] = _gang_float_to_bf16(v0 * c - v1 * s);
-          s_rope[tid + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+          row[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+          row[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
         }
         __syncthreads();
         unsigned short *d_k = (unsigned short *)k_cache_ptr;
-        for (int d = tid; d < HEAD_DIM; d += 256) {
-          d_k[dst_idx * kv_stride + kv_head * HEAD_DIM + d] = s_rope[d];
+        for (int idx = tid; idx < TOK_ROWS * HEAD_DIM; idx += 256) {
+          int t = idx / HEAD_DIM;
+          if (t >= n_tok) {
+            continue;
+          }
+          int d = idx - t * HEAD_DIM;
+          d_k[(long long)s_dst_idx[t] * kv_stride + kv_head * HEAD_DIM + d] =
+              s_rope[idx];
         }
       } else {
-        int page_num = global_pos / PAGE_SIZE;
-        int page_offset = global_pos % PAGE_SIZE;
-        int page_idx = kv_indices[first_page + page_num];
-        int dst_idx = page_idx * PAGE_SIZE + page_offset;
+        // V: no RoPE, so lane (g, col) stores its own 4 values directly.
         unsigned short *d_v = (unsigned short *)v_cache_ptr;
-        if (col == 0) {
+        if (tok_active) {
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
           unsigned short const *b4 = (unsigned short const *)&bias4;
+          long long row_off =
+              (long long)s_dst_idx[col] * kv_stride + kv_head * HEAD_DIM;
 #pragma unroll
           for (int i = 0; i < 4; i++) {
             unsigned bt = (unsigned)b4[i] << 16;
             float bv;
             __builtin_memcpy(&bv, &bt, 4);
-            d_v[dst_idx * kv_stride + kv_head * HEAD_DIM + d0 + i] =
-                _gang_float_to_bf16(acc[i] + bv);
+            d_v[row_off + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
           }
         }
       }
     }
   }
 
-  // ── Zero workspace_f32 for next iteration ──────────────────────────────
-  // Done AFTER all MFMA computation so all gang workers have finished reading.
-  // Only one worker (tile_idx % n_wgs_per_xcd == 0) does this to avoid races.
-  // Uses write-through stores (sc0 sc1) so zeros are visible to MoE's
-  // cross-XCD coherent atomicAdd in fused kernels (task 216).
-  {
-    int wg_idx_z = tile_idx % n_wgs_per_xcd;
-    if (wg_idx_z == 0) {
-      float *d_ws = (float *)workspace_f32_ptr;
-      int batch_count_z =
-          (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
-      for (int b = 0; b < batch_count_z; b++) {
-        float *ws_row = d_ws + b * REDUCTION_SIZE;
-#pragma unroll
-        for (int off = tid * 4; off < REDUCTION_SIZE; off += 256 * 4) {
-          st_wt_zero128((void *)&ws_row[off]);
-        }
-      }
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    }
-  }
+  // ── No workspace zeroing ───────────────────────────────────────────────
+  // The old layout accumulated with atomicAdd, so it had to be cleared before
+  // the next layer could add into it. The per-slot layout is *assigned*, not
+  // accumulated: every (token, slot, hidden) element is written exactly once
+  // per layer by its one owning W2 tile, so there is nothing stale to clear.
+  // Dropping this also removes a full write-through pass over the workspace
+  // (st_wt bypasses L2 to HBM) from every layer. See moe_ws_layout.cuh.
+  //
+  // This holds only while coverage is total: a token routes to exactly
+  // MOE_WS_SLOTS experts and wg_idx partitions the hidden axis. Padding expert
+  // slots have no active token, write nothing, and own no (token, slot) pair,
+  // so they cannot leave a hole.
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {

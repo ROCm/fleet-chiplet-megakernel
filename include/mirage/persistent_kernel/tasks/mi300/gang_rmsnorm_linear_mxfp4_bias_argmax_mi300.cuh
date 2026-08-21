@@ -9,13 +9,30 @@
 
 // Fused RMSNorm + MXFP4 Gang Linear + Bias + Argmax for MI300/MI350.
 //
-// CROC-style: norm once, FP8 quant once, internal tile loop over all WGs
+// Norm once, FP8 quant once, internal tile loop over all WGs
 // assigned to this worker. Argmax accumulated in registers across all tiles.
-// Each worker writes one (bf16 max_val, int64 abs_idx) pair.
+// Each worker writes one (bf16 max_val, int64 abs_idx) pair per batch row.
 //
 // total_tiles_per_xcd = workers_per_xcd (30 on MI300X).
 // tile_idx = worker rank within XCD (0..29).
 // Internal loop: wg = tile_idx, tile_idx + workers_per_xcd, ...
+//
+// ── Batching (bs > 1) rides the MFMA's idle N dimension ──────────────────
+// The instruction is mfma_scale_f32_16x16x128_f8f6f4: M=16 weight rows,
+// N=16 token columns, K=128. Lane l supplies A[m = l&15][k-blk = l>>4] and
+// B[n = l&15][k-blk = l>>4], and receives D[m = (l>>4)*4 + i][n = l&15].
+// The single-token version broadcast the same token into all 16 N columns
+// and read back only n == 0, so 15/16 of every MFMA was thrown away. Here
+// token `col` occupies N column `col`, so up to TOK_ROWS = 16 batch rows
+// cost exactly what 1 row used to: same MFMA count, same weight traffic.
+//
+// Above 16 rows the batch is swept in column blocks (NUM_BBLK passes). That
+// pass loop has to sit OUTSIDE the weight-tile loop, because 64 fp8 rows of
+// K=2944 are 188 KB and the LDS budget is 152 KB — the token rows for the
+// whole batch cannot be resident at once no matter how the weights are
+// staged. So bs>16 re-reads the LM-head weights once per 16-row block; the
+// alternative (re-quantizing inside the tile loop) would pay the quant's
+// fixed ~15 us launch latency ~50x per worker and is far worse.
 //
 // Eliminates:
 //   - 393 redundant RMSNorm + FP8 quant (down to 30 — one per worker)
@@ -67,6 +84,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   constexpr int NUM_WAVES = 4;
   constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
 
+  // Batch tiling over the MFMA N dimension.
+  constexpr int MFMA_N = 16;
+  constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  constexpr int NUM_BBLK = (BATCH_SIZE + TOK_ROWS - 1) / TOK_ROWS;
+
   // LDS weight tile layout (padded for buffer_load_lds alignment)
   constexpr int QKV_TILE_ROWS = 16;
   constexpr int QKV_TILE_DATA = QKV_TILE_ROWS * (REDUCTION_SIZE / 2);
@@ -76,25 +98,40 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   constexpr int QKV_TILE_DATA_PADDED = QKV_LPT * 256 * 16;
   constexpr int QKV_TILE_BYTES = QKV_TILE_DATA_PADDED + QKV_TILE_SCALE;
 
-  // FP8 token data sits at start of LDS
-  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
-  constexpr int QKV_LDS_OFF = ((FP8_TOK_DATA + MFMA_ITERS + 15) / 16) * 16;
-  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES <= 155 * 1024,
-                "QKV LDS weights exceed MI350X LDS budget");
+  // FP8 token rows sit at the start of LDS, one row per MFMA N column.
+  // The +16 pad keeps consecutive rows off one bank group: the 16 lanes of a
+  // g-group each read 16 B at TOK_ROW_STRIDE spacing, and an unpadded 2944 B
+  // stride (736 dwords, 736 % 32 == 0) would serialize all 16 into one bank.
+  constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
+  // Cross-wave argmax scratch: NUM_WAVES x MFMA_N of (float val, int idx).
+  constexpr int RED_OFF = ((TOK_REGION + SC_REGION + 15) / 16) * 16;
+  constexpr int RED_REGION = NUM_WAVES * MFMA_N * 8;
+  constexpr int QKV_LDS_OFF = ((RED_OFF + RED_REGION + 15) / 16) * 16;
+  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                "LM-head LDS exceeds the MI350X dynamic LDS budget");
+  static_assert(TOK_ROW_STRIDE % 16 == 0,
+                "token row stride must keep the i32x4 B-operand loads aligned");
 
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
 
   extern __shared__ char _rnlm_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
-  uint8_t *s_tok_scales = s_tok_fp8 + REDUCTION_SIZE;
+  uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
+  float *s_red_val = (float *)((uint8_t *)_rnlm_smem + RED_OFF);
+  int *s_red_idx = (int *)(s_red_val + NUM_WAVES * MFMA_N);
   uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
   int const lane_id = tid & 63;
-  int const col = lane_id & 15;
-  int const g = lane_id >> 4;
+  int const col = lane_id & 15; // MFMA N index == token within block
+  int const g = lane_id >> 4;   // MFMA k-block / output-row group
 
   unsigned short *argmax_vals =
       reinterpret_cast<unsigned short *>(argmax_val_ptr);
@@ -105,33 +142,61 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   int partition_index = tile_idx / workers_per_xcd; // logical XCD (0..7)
   int worker_rank = tile_idx % workers_per_xcd;     // 0..workers_per_xcd-1
   int partition_start = partition_index * n_wgs_per_xcd * OUTPUT_PER_WG;
+  // argmax_part_* are [batch, num_workers], XCD-partitioned along dim 1, so
+  // the pointer already points at this XCD's worker slice while the row
+  // stride is still the full worker count.
+  int const argmax_row_stride = workers_per_xcd * 8;
 
-  // ── Step 1: RMSNorm (ONCE) ──────────────────────────────────────────
+  // ── Step 1: RMSNorm ─────────────────────────────────────────────────────
+  // DO NOT add a __syncthreads() to this loop body. Measured at bs=2: without
+  // it the run completes and both requests decode correct prose; with it the
+  // kernel deadlocks before a single task retires (tasks_done=0), and that
+  // holds for BOTH a runtime bound (batch_count) and a compile-time one
+  // (BATCH_SIZE), so it is the barrier and not the trip count.
+  // rmsnorm_inline_amd already ends with its own cross-wave barrier pair; an
+  // extra one here is what breaks it.
   for (int b = 0; b < batch_count; b++) {
     unsigned short const *row_in =
-        (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
+        (unsigned short const *)norm_input_ptr + (long long)b * REDUCTION_SIZE;
     unsigned short *row_out =
-        (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        (unsigned short *)norm_output_ptr + (long long)b * REDUCTION_SIZE;
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
         row_in, norm_weight_ptr, row_out);
   }
 
-  // ── Step 2: FP8 quant (ONCE) ────────────────────────────────────────
-  unsigned short const *input_row = (unsigned short const *)norm_output_ptr;
-  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-      input_row, s_tok_fp8, s_tok_scales);
-
-  // ── Step 3: Internal tile loop + argmax ──────────────────────────────
-  float thread_max = -1e30f;
-  long long thread_max_abs_idx = -1;
-
-  // SRD for weight buffer (hoisted outside loop)
+  // SRD for weight buffer (hoisted outside every loop)
   uint32_t qkv_buf_range = static_cast<uint32_t>(n_wgs_per_xcd) * WG_BYTES;
   i32x4_t qkv_rsrc = make_w_buffer_rsrc(W, qkv_buf_range);
 
-  for (int wg_idx = worker_rank; wg_idx < n_wgs_per_xcd;
-       wg_idx += workers_per_xcd) {
-    uint32_t qkv_wg_voff = static_cast<uint32_t>(wg_idx) * WG_BYTES;
+  // ── Batch column-block sweep ────────────────────────────────────────────
+  // NUM_BBLK == 1 for bs <= 16, so this collapses away entirely and the
+  // bs<=16 path costs exactly what the old single-token path did.
+#pragma unroll 1
+  for (int bblk = 0; bblk < NUM_BBLK; bblk++) {
+    int const tok_row = bblk * MFMA_N + col;
+    bool const tok_active = tok_row < batch_count;
+
+    // ── Step 2: FP8 quant of this block's token rows ──────────────────────
+    _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE,
+                             TOK_ROW_STRIDE, SC_STRIDE>(
+        (unsigned short const *)norm_output_ptr, REDUCTION_SIZE, bblk * MFMA_N,
+        TOK_ROWS, s_tok_fp8, s_tok_scales);
+
+    // Each lane owns exactly one token (N column `col`), so the running
+    // argmax stays a scalar per lane.
+    float thread_max = -1e30f;
+    int thread_max_idx = -1;
+
+    // B operand base for this lane's token. Inactive lanes clamp to row 0 to
+    // keep their LDS reads in range; their results are discarded below.
+    uint8_t const *b_data = s_tok_fp8 + (tok_active ? col : 0) * TOK_ROW_STRIDE;
+    uint8_t const *b_scale =
+        s_tok_scales + (tok_active ? col : 0) * SC_STRIDE;
+
+    // ── Step 3: Internal tile loop + argmax ────────────────────────────────
+    for (int wg_idx = worker_rank; wg_idx < n_wgs_per_xcd;
+         wg_idx += workers_per_xcd) {
+      uint32_t qkv_wg_voff = static_cast<uint32_t>(wg_idx) * WG_BYTES;
 
     // ── Phase A: Prefetch weight data into LDS via buffer_load_dwordx4 lds:1
     // ──
@@ -229,8 +294,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
 #pragma unroll 1
       for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
         {
-          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki];
+          i32x8_t b = _gang_load_fp8_mfma_b(b_data, ki * K_PER_MFMA, g);
+          int sb = (int)b_scale[ki];
           acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
         }
         if (ki + 4 < MFMA_ITERS) {
@@ -240,9 +305,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           sa0 = (int)tile_scale_lds[row_scale_base + kt4 / 32 + g];
         }
         {
-          i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 1];
+          i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 1) * K_PER_MFMA, g);
+          int sb = (int)b_scale[ki + 1];
           acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
         }
         if (ki + 5 < MFMA_ITERS) {
@@ -252,9 +316,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           sa1 = (int)tile_scale_lds[row_scale_base + kt5 / 32 + g];
         }
         {
-          i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 2];
+          i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 2) * K_PER_MFMA, g);
+          int sb = (int)b_scale[ki + 2];
           acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
         }
         if (ki + 6 < MFMA_ITERS) {
@@ -264,9 +327,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           sa2 = (int)tile_scale_lds[row_scale_base + kt6 / 32 + g];
         }
         if (ki + 3 < MFMA_ITERS) {
-          i32x8_t b =
-              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-          int sb = (int)s_tok_scales[ki + 3];
+          i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 3) * K_PER_MFMA, g);
+          int sb = (int)b_scale[ki + 3];
           acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
         }
         if (ki + 7 < MFMA_ITERS) {
@@ -277,8 +339,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         }
       }
 
-      // Argmax epilogue: accumulate across ALL tiles in registers
-      if (col == 0) {
+      // Argmax epilogue: accumulate across ALL tiles in registers.
+      // The guard is on `tok_active`, not `col == 0`: lane (g, col) now holds
+      // the 4 outputs for token `col`, so all 16 N columns are live. It sits
+      // strictly AFTER the MFMA -- narrowing exec around the ds_read_b128 /
+      // MFMA pair lets the compiler hoist the mask and feed stale B operands
+      // to the lanes that ARE active.
+      if (tok_active) {
         for (int i = 0; i < 4; i++) {
           int rel_idx = wave_tile * 16 + g * 4 + i;
           int abs_idx = partition_start + wg_idx * OUTPUT_PER_WG + rel_idx;
@@ -290,7 +357,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           float val = sum + bv;
           if (val > thread_max) {
             thread_max = val;
-            thread_max_abs_idx = (long long)abs_idx;
+            thread_max_idx = abs_idx;
           }
           // Perplexity mode: also spill the logit to HBM. abs_idx is the
           // vocab column this lane owns, so the writes across all workers
@@ -300,58 +367,71 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           // which is the same order as the GEMM error this buffer exists to
           // measure. Truncating here would fold a comparable one-sided error
           // into the very quantity under test.
+          //
+          // `step` is the position scored by token row 0 of this iteration;
+          // row `tok_row` scored the position `tok_row` later, so each token
+          // gets its own logits row and the rows still tile exactly once.
           if (logits_out_ptr != nullptr) {
             reinterpret_cast<float *>(
-                logits_out_ptr)[(long long)step * output_stride + abs_idx] =
-                val;
+                logits_out_ptr)[(long long)(step + tok_row) * output_stride +
+                                abs_idx] = val;
           }
         }
       }
     }
-  } // end tile loop
+    } // end tile loop
 
-// ── Warp reduce ─────────────────────────────────────────────────────
+    // ── Reduce within the wave, across g only ───────────────────────────
+    // NOT the full 64-lane butterfly: lanes differing in `col` hold different
+    // tokens, so mixing them would return one token's argmax for all 16.
+    // XOR on bits 4 and 5 walks the 4 g-groups and leaves `col` alone.
 #pragma unroll
-  for (int offset = 32; offset > 0; offset >>= 1) {
-    float other_val = __shfl_xor(thread_max, offset, 64);
-    unsigned int idx_lo =
-        static_cast<unsigned int>(thread_max_abs_idx & 0xFFFFFFFF);
-    unsigned int idx_hi =
-        static_cast<unsigned int>((thread_max_abs_idx >> 32) & 0xFFFFFFFF);
-    unsigned int other_lo = __shfl_xor(idx_lo, offset, 64);
-    unsigned int other_hi = __shfl_xor(idx_hi, offset, 64);
-    long long other_idx = (static_cast<long long>(other_hi) << 32) | other_lo;
-    if (other_val > thread_max) {
-      thread_max = other_val;
-      thread_max_abs_idx = other_idx;
-    }
-  }
-
-  // ── Cross-warp reduce via LDS ─────────────────────────────────────────
-  __shared__ float s_max_vals[4];
-  __shared__ long long s_max_idxs[4];
-  if (lane_id == 0) {
-    s_max_vals[warp_id] = thread_max;
-    s_max_idxs[warp_id] = thread_max_abs_idx;
-  }
-  __syncthreads();
-
-  // ── Write per-worker result ───────────────────────────────────────────
-  if (tid == 0) {
-    float best_val = -1e30f;
-    long long best_idx = -1;
-    for (int w = 0; w < 4; w++) {
-      if (s_max_vals[w] > best_val) {
-        best_val = s_max_vals[w];
-        best_idx = s_max_idxs[w];
+    for (int offset = 16; offset <= 32; offset <<= 1) {
+      float other_val = __shfl_xor(thread_max, offset, 64);
+      int other_idx = __shfl_xor(thread_max_idx, offset, 64);
+      if (other_val > thread_max) {
+        thread_max = other_val;
+        thread_max_idx = other_idx;
       }
     }
-    unsigned int vbits;
-    __builtin_memcpy(&vbits, &best_val, 4);
-    unsigned short bf16_val = (unsigned short)(vbits >> 16);
-    argmax_vals[worker_rank] = bf16_val;
-    argmax_idxs[worker_rank] = best_idx;
-  }
+
+    // ── Cross-wave reduce via LDS, one slot per (wave, token) ───────────
+    // No barrier before the write: s_red_* is disjoint from the token region
+    // the MFMA loop just read, and the previous block's readers were drained
+    // by the barrier at the bottom of this sweep.
+    if (g == 0) {
+      s_red_val[warp_id * MFMA_N + col] = thread_max;
+      s_red_idx[warp_id * MFMA_N + col] = thread_max_idx;
+    }
+    __syncthreads();
+
+    // ── Write per-(token, worker) result ────────────────────────────────
+    if (tid < MFMA_N) {
+      int out_row = bblk * MFMA_N + tid;
+      if (out_row < batch_count) {
+        float best_val = -1e30f;
+        int best_idx = -1;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          float v = s_red_val[w * MFMA_N + tid];
+          if (v > best_val) {
+            best_val = v;
+            best_idx = s_red_idx[w * MFMA_N + tid];
+          }
+        }
+        unsigned int vbits;
+        __builtin_memcpy(&vbits, &best_val, 4);
+        unsigned short bf16_val = (unsigned short)(vbits >> 16);
+        long long out_off = (long long)out_row * argmax_row_stride + worker_rank;
+        argmax_vals[out_off] = bf16_val;
+        argmax_idxs[out_off] = (long long)best_idx;
+      }
+    }
+    // The next block's quantizer overwrites s_tok_fp8, and s_red_* is reused.
+    // Compiled out at bs <= 16, where there is no next block.
+    if constexpr (NUM_BBLK > 1) {
+      __syncthreads();
+    }
+  } // end batch column-block sweep
 }
 
 } // namespace kernel

@@ -51,6 +51,40 @@
 
 namespace kernel {
 
+// ── O-proj LDS layout, shared with the Phase-6 weight DMA ─────────────────
+// gang_full_layer_fused_mi300.cuh issues the buffer_load_lds that fills the
+// weight region, and it derives the base independently -- different file,
+// different template parameters. If the two formulas drift, the DMA writes
+// where one says and the MFMA reads where the other says: wrong numerics, no
+// crash, nothing out of bounds. So both sites call these instead.
+constexpr int oproj_lds_tok_rows(int batch_size) {
+  return batch_size < 16 ? batch_size : 16;
+}
+
+// End of the token staging region (FP8 activations + E8M0 block scales), which
+// is also the base of the K-parallel cross-wave reduction buffer. That buffer
+// used to alias the staging region at offset 0, writing into it before the
+// __syncthreads while other waves could still be reading their B operands. At
+// one token row that survived only because wave 2's write window just missed
+// wave 3's read window; with 16 rows staged it is a clean overlap, so it gets
+// its own space.
+constexpr int oproj_lds_red_off(int batch_size, int reduction_size) {
+  int const rows = oproj_lds_tok_rows(batch_size);
+  // +16 pad per row: at ds_read_b128 granularity lane `col` lands in bank
+  // group (col * (stride/16)) % 8, and 2960/16 == 185 is odd, so the 16 lanes
+  // spread over all 8 groups instead of piling into one.
+  int const tok_region = rows * (reduction_size + 16);
+  int const sc_region = rows * (((reduction_size / 128 + 3) / 4) * 4);
+  return ((tok_region + sc_region + 15) / 16) * 16;
+}
+
+// Base of the MXFP4 weight region: past the reduction buffer, which is
+// NUM_WAVES(4) * 64 lanes * 4 floats = 4096 B.
+constexpr int oproj_lds_w_off(int batch_size, int reduction_size) {
+  return ((oproj_lds_red_off(batch_size, reduction_size) + 4096 + 15) / 16) *
+         16;
+}
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -88,6 +122,13 @@ __device__ __attribute__((noinline)) void
         // Optional: when non-null, the TopK-completing worker writes 1 here
         // via st_wt_u32 so the fused wrapper can poll before MoE.
         int *routing_ready_ptr = nullptr,
+        // Per-layer epoch for the Phase 2 barrier release target. Must be a
+        // value that is monotonic across the whole run, bumps exactly once per
+        // invocation of this barrier, and is computable by every worker without
+        // reading shared state -- the fused callers pass layer_counter + 1.
+        // 0 means "no layer loop", which selects the snapshot form; see the
+        // comment at oproj_release_expected for why that is only safe there.
+        int layer_epoch = 0,
         // Optional: per-worker timestamp ring buffer pointer (g_fused_ts).
         // When non-null, writes slots 9 (oproj_done), 10 (barrier_done),
         // 11 (rmsnorm_router_done) for sub-phase breakdown.
@@ -120,7 +161,15 @@ __device__ __attribute__((noinline)) void
 
   constexpr int NUM_WAVES = 4;
 
-  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+  // ── Token staging layout (N-axis MFMA packing) ──────────────────────────
+  // Token `col` lives at LDS row `col` and feeds N column `col` of the
+  // 16x16x128 MFMA, so up to 16 batch rows cost what 1 row used to.
+  constexpr int MFMA_N = 16;
+  constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
 
   unsigned short const *A = (unsigned short const *)input_ptr;
   uint8_t const *W = (uint8_t const *)weight_ptr;
@@ -134,10 +183,17 @@ __device__ __attribute__((noinline)) void
   constexpr int HIER_STRIDE = 16;
   int *hier_barrier = (int *)counters_ptr;
   int *topk_counter = hier_barrier + 9 * HIER_STRIDE;
+  // MPK_OPROJ_TREE_BARRIER: eight per-XCD arrival lines for the two-level
+  // form of the Phase 2 barrier. Slots 28..35 are dead space -- the chunk
+  // barrier used to live at 28*16 and moved to 48*16 (see
+  // FULL_LAYER_CHUNK_BARRIER_SLOT), and the tail counters this file's fused
+  // caller pins are at 44..47. The buffer is sized well past 36 lines by
+  // demo.py's counter_size, so this needs no allocation change.
+  int *hier_local = hier_barrier + 28 * HIER_STRIDE;
 
   extern __shared__ char _lm_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_lm_smem;
-  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+  uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -147,6 +203,21 @@ __device__ __attribute__((noinline)) void
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+
+#ifdef MPK_OPROJ_INNER_TIMING
+  // Self-contained inner split of Phase 7. The ts_base slots below are the
+  // older mechanism and every caller passes nullptr for that pointer, so they
+  // never fire; these four locals plus the printf at the end of the kernel are
+  // what actually produce a breakdown. Timestamps are s_memrealtime ticks
+  // (10 ns), taken on tid 0 only.
+  //
+  // Deliberately a *separate* flag from MPK_DEVICE_TIMING rather than nested
+  // inside it: this printf runs once per XCD per layer, which is frequent
+  // enough to inflate the [FUSED_PHASE] numbers measured by that flag (oproj
+  // read 17.2 us without it and 599 us with it). Enable one or the other.
+  unsigned long long _op_t0 = __builtin_amdgcn_s_memrealtime();
+  unsigned long long _op_t1 = _op_t0, _op_t2 = _op_t0, _op_t3 = _op_t0;
 #endif
 
   int batch_count =
@@ -162,10 +233,32 @@ __device__ __attribute__((noinline)) void
   // PHASE 1: O-PROJ (MXFP4 linear + bias + residual)
   // ════════════════════════════════════════════════════════════════════════
 
-  int tok_idx = local_tile / n_wgs_per_xcd;
+  // Tile space is (column block, weight group), not (token, weight group):
+  // the token axis moved into the MFMA's N dimension, so the host emits
+  // n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
+  int bblk = local_tile / n_wgs_per_xcd;
   int wg_idx = local_tile % n_wgs_per_xcd;
+  // At TOK_ROWS == 1 there is exactly one column block, so every tile that
+  // survives the guard below has bblk == 0 and the base is a literal zero.
+  // The compiler cannot derive that from `batch_count - bblk*16 > 0`, and
+  // leaving it as a runtime value makes every downstream address non-uniform
+  // -- worth 32 bytes of scratch in the epilogue.
+  int tok_row_base = TOK_ROWS == 1 ? 0 : bblk * MFMA_N;
+  // Whole-block early-out only. An individual inactive lane inside a live
+  // block must NOT leave -- it still owes its ds_reads and its share of the
+  // MFMA, which is a wave-level op reading B from all 64 lanes.
+  int n_valid_tok = batch_count - tok_row_base;
+  // The token this lane owns. At TOK_ROWS == 1 only col 0 is live, so adding
+  // col is a no-op -- but writing it costs the uniform token index its
+  // scalar-ness, and every address derived from it becomes per-lane. Fold.
+  int my_tok = TOK_ROWS == 1 ? 0 : tok_row_base + col;
+  // At TOK_ROWS == 1 the surviving block has n_valid_tok == 1, so the general
+  // form is exactly `col == 0` -- but only the constant form is compile-time
+  // known, and handing the allocator a runtime predicate here costs 16 bytes
+  // of scratch in the epilogue. Spell out the fold.
+  bool tok_active = TOK_ROWS == 1 ? (col == 0) : (col < n_valid_tok);
 
-  if (tok_idx >= batch_count) {
+  if (n_valid_tok <= 0) {
     goto oproj_barrier;
   }
 
@@ -173,87 +266,19 @@ __device__ __attribute__((noinline)) void
     uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
     uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
-    unsigned short const *input_row = A + tok_idx * REDUCTION_SIZE;
+    // Stage up to 16 token rows. The bespoke inline quantizer that used to
+    // live here was a second copy of the E8M0 logic that only ever handled
+    // row 0; the shared helper covers both OUTPUT_PER_WG shapes.
+    _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE,
+                             TOK_ROW_STRIDE, SC_STRIDE>(
+        A, REDUCTION_SIZE, tok_row_base, n_valid_tok, s_tok_fp8, s_tok_scales);
 
-    // FP8 quant only — weights already in LDS via Phase 6 buffer_load_lds
-    if constexpr (OUTPUT_PER_WG < 64) {
-      constexpr int SUB_BLOCK = 32;
-      constexpr int NSUBBLOCKS = REDUCTION_SIZE / SUB_BLOCK;
-      int const lane_id_q = tid & 63;
-
-      if (tid < NSUBBLOCKS) {
-        int const sb = tid;
-        int const base = sb * SUB_BLOCK;
-        int const super_blk = sb / 4;
-        int const sub_idx = sb & 3;
-        uint32_t const *base_ptr = (uint32_t const *)(input_row + base);
-
-        uint32_t dw[16];
-        asm volatile("global_load_dwordx4 %0, %4, off\n"
-                     "global_load_dwordx4 %1, %5, off\n"
-                     "global_load_dwordx4 %2, %6, off\n"
-                     "global_load_dwordx4 %3, %7, off"
-                     : "=&v"(*(i32x4_t *)&dw[0]),
-                       "=&v"(*(i32x4_t *)&dw[4]),
-                       "=&v"(*(i32x4_t *)&dw[8]),
-                       "=&v"(*(i32x4_t *)&dw[12])
-                     : "v"(base_ptr),
-                       "v"(base_ptr + 4),
-                       "v"(base_ptr + 8),
-                       "v"(base_ptr + 12)
-                     : "memory");
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-
-        float vals[32];
-        float amax = 0.0f;
-#pragma unroll
-        for (int j = 0; j < 16; j++) {
-          float lo = _gang_bf16_to_float((unsigned short)(dw[j] & 0xFFFF));
-          float hi = _gang_bf16_to_float((unsigned short)(dw[j] >> 16));
-          vals[j * 2] = lo;
-          vals[j * 2 + 1] = hi;
-          amax = fmaxf(amax, fmaxf(fabsf(lo), fabsf(hi)));
-        }
-
-        int base_lane = lane_id_q & ~3;
-        float a0 = __shfl(amax, base_lane);
-        float a1 = __shfl(amax, base_lane + 1);
-        float a2 = __shfl(amax, base_lane + 2);
-        float a3 = __shfl(amax, base_lane + 3);
-        float block_amax = fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
-
-        uint8_t se = _gang_compute_e8m0_fp8(block_amax);
-        float scale_f;
-        if (se == 0) {
-          scale_f = 1.0f;
-        } else {
-          union {
-            float f;
-            uint32_t u;
-          } sv;
-          sv.u = (uint32_t)se << 23;
-          scale_f = sv.f;
-        }
-
-#pragma unroll
-        for (int j = 0; j < 32; j += 4) {
-          fp8x4_t pk = {};
-          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
-              pk, vals[j], vals[j + 1], scale_f, false);
-          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
-              pk, vals[j + 2], vals[j + 3], scale_f, true);
-          *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
-        }
-
-        if (sub_idx == 0) {
-          s_tok_scales[super_blk] = se;
-        }
-      }
-      __syncthreads();
-    } else {
-      _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
-          input_row, s_tok_fp8, s_tok_scales);
-    }
+    // B operand base for this lane: token row `col`. Inactive lanes clamp to
+    // row 0 rather than skipping, so the exec mask cannot sink above the
+    // ds_read_b128 (see the CRITICAL note at the K-parallel reduce).
+    uint8_t const *b_tok = s_tok_fp8 + (tok_active ? col : 0) * TOK_ROW_STRIDE;
+    uint8_t const *b_scl =
+        s_tok_scales + (tok_active ? col : 0) * SC_STRIDE;
 
     if constexpr (OUTPUT_PER_WG >= 64) {
       // N-parallel: 4 waves handle different output rows
@@ -342,8 +367,8 @@ __device__ __attribute__((noinline)) void
 #pragma unroll 1
         for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
           {
-            i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki];
+            i32x8_t b = _gang_load_fp8_mfma_b(b_tok, ki * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki];
             acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
           }
           if (ki + 4 < MFMA_ITERS) {
@@ -369,8 +394,8 @@ __device__ __attribute__((noinline)) void
           }
           {
             i32x8_t b =
-                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki + 1];
+                _gang_load_fp8_mfma_b(b_tok, (ki + 1) * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki + 1];
             acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
           }
           if (ki + 5 < MFMA_ITERS) {
@@ -396,8 +421,8 @@ __device__ __attribute__((noinline)) void
           }
           {
             i32x8_t b =
-                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki + 2];
+                _gang_load_fp8_mfma_b(b_tok, (ki + 2) * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki + 2];
             acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
           }
           if (ki + 6 < MFMA_ITERS) {
@@ -423,8 +448,8 @@ __device__ __attribute__((noinline)) void
           }
           if (ki + 3 < MFMA_ITERS) {
             i32x8_t b =
-                _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
-            int sb = (int)s_tok_scales[ki + 3];
+                _gang_load_fp8_mfma_b(b_tok, (ki + 3) * K_PER_MFMA, g);
+            int sb = (int)b_scl[ki + 3];
             acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
           }
           if (ki + 7 < MFMA_ITERS) {
@@ -453,11 +478,18 @@ __device__ __attribute__((noinline)) void
         // Epilogue: acc + bias + residual -> bf16, write-through store
         // bias/residual are XCD-partitioned -> use local out_n_base
         // output is replicated -> add xcd_output_col_offset for writes
-        if (col == 0) {
+        //
+        // Lane (g, col) holds D[m = wave_tile*16 + g*4 + i][n = col], i.e. four
+        // output columns of token `col`. The guard is on the token, not on
+        // col == 0: every lane now has live results. Bias depends only on the
+        // output column, so the 16 lanes load the same 8 bytes and coalesce;
+        // residual becomes a 16-row gather -- exactly the loads the 16
+        // separate per-token tiles used to issue.
+        if (tok_active) {
           int out_n_local = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4;
           int out_n_global = xcd_output_col_offset + out_n_local;
-          int res_idx_base = tok_idx * output_stride + out_n_local;
-          int out_idx_base = tok_idx * output_stride + out_n_global;
+          int res_idx_base = my_tok * output_stride + out_n_local;
+          int out_idx_base = my_tok * output_stride + out_n_global;
 
           uint2 bias_packed;
           __builtin_memcpy(&bias_packed, &d_bias[out_n_local], 8);
@@ -517,9 +549,9 @@ __device__ __attribute__((noinline)) void
       // the MFMA loop + K-parallel reduction (~800 ns away).  Addresses
       // depend only on tile indices, not on MFMA results.
       uint2 pf_bias = {0, 0}, pf_res = {0, 0};
-      if (warp_id == 0 && col == 0) {
+      if (warp_id == 0 && tok_active) {
         int out_n_local_pf = wg_idx * OUTPUT_PER_WG + g * 4;
-        int res_idx_pf = tok_idx * output_stride + out_n_local_pf;
+        int res_idx_pf = my_tok * output_stride + out_n_local_pf;
         unsigned short const *bias_addr = &d_bias[out_n_local_pf];
         unsigned short const *res_addr = &d_residual[res_idx_pf];
         asm volatile("global_load_dwordx2 %0, %2, off\n"
@@ -532,9 +564,16 @@ __device__ __attribute__((noinline)) void
       // Read weights from LDS (populated by Phase 6 buffer_load_lds DMA).
       // LDS layout mirrors HBM tile layout: data at [0..WG_DATA_BYTES),
       // scales at [OPROJ_LDS_DATA_PAD..OPROJ_LDS_DATA_PAD + WG_SCALE_BYTES).
-      // Must match Phase 6 OPROJ_LDS_W_OFF (uses NUM_BLOCKS_32, not MFMA_ITERS)
-      constexpr int OPROJ_LDS_OFF =
-          ((FP8_TOK_DATA + NUM_BLOCKS_32 + 15) / 16) * 16;
+      // Must match the Phase 6 DMA base byte-for-byte -- both call
+      // oproj_lds_w_off() so there is only one formula to keep right.
+      constexpr int OPROJ_LDS_OFF = oproj_lds_w_off(BATCH_SIZE, REDUCTION_SIZE);
+      static_assert(OPROJ_LDS_OFF >= TOK_REGION + SC_REGION + 4096,
+                    "weight region must clear the token staging + reduce "
+                    "buffers");
+      static_assert(OPROJ_LDS_OFF + OPROJ_LDS_DATA_PAD + OPROJ_LDS_SCALE_PAD <=
+                        mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                            mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                    "O-proj LDS exceeds the MI350X budget");
       uint8_t const *lds_w_data = (uint8_t const *)_lm_smem + OPROJ_LDS_OFF;
       uint8_t const *lds_w_scales = lds_w_data + OPROJ_LDS_DATA_PAD;
 
@@ -559,8 +598,8 @@ __device__ __attribute__((noinline)) void
     a[5] = 0;                                                                  \
     a[6] = 0;                                                                  \
     a[7] = 0;                                                                  \
-    i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (KI)*K_PER_MFMA, g);          \
-    int sb = (int)s_tok_scales[KI];                                            \
+    i32x8_t b = _gang_load_fp8_mfma_b(b_tok, (KI)*K_PER_MFMA, g);          \
+    int sb = (int)b_scl[KI];                                            \
     acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
   } while (0)
 #define DO_MFMA_LDS_FP4(KI)                                                    \
@@ -613,18 +652,32 @@ __device__ __attribute__((noinline)) void
       // Fix: every lane writes to a unique LDS slot.
       // Layout: [warp_id][lane_id][4_accum_values]
       // Total: NUM_WAVES * 64 * 4 = 1024 floats = 4096 bytes
-      // The reduction reads only col==0 lanes' data (lane_id = g*16+0).
-      float *lds_reduce = (float *)_lm_smem;
+      //
+      // Since lane_id == g*16 + col, that layout already *is*
+      // [warp][g][col][4] == [warp][n-column][token][4]. Packing the token
+      // axis therefore costs zero extra LDS: every lane simply keeps its own
+      // slot instead of only the col==0 lanes' being read back.
+      //
+      // The buffer sits past the token staging region rather than aliasing it
+      // at offset 0. Aliasing was safe at one token row only by accident of
+      // timing; with 16 rows staged, these writes land on B operands other
+      // waves are still reading.
+      float *lds_reduce =
+          (float *)((uint8_t *)_lm_smem +
+                    oproj_lds_red_off(BATCH_SIZE, REDUCTION_SIZE));
       for (int i = 0; i < 4; i++) {
         lds_reduce[(warp_id * 64 + lane_id) * 4 + i] = acc[i];
       }
       __syncthreads();
 
-      if (warp_id == 0 && col == 0) {
+      if (warp_id == 0 && tok_active) {
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        // Each lane reduces its own (g, col) slot: output columns g*4..g*4+3
+        // of token col. At TOK_ROWS == 1 that slot is always g*16, and saying
+        // so keeps the address scalar in g -- reading lane_id here instead
+        // costs scratch even though the two are equal under tok_active.
+        int const src_lane = TOK_ROWS == 1 ? g * 16 : lane_id;
         for (int w = 0; w < NUM_WAVES; w++) {
-          // Read from col==0 lanes: lane_id = g*16 + 0 = g*16
-          int src_lane = g * 16; // col==0 lane for this g
           v0 += lds_reduce[(w * 64 + src_lane) * 4 + 0];
           v1 += lds_reduce[(w * 64 + src_lane) * 4 + 1];
           v2 += lds_reduce[(w * 64 + src_lane) * 4 + 2];
@@ -635,7 +688,7 @@ __device__ __attribute__((noinline)) void
         // output is replicated -> add xcd_output_col_offset
         int out_n_local = wg_idx * OUTPUT_PER_WG + g * 4;
         int out_n_global = xcd_output_col_offset + out_n_local;
-        int out_idx_base = tok_idx * output_stride + out_n_global;
+        int out_idx_base = my_tok * output_stride + out_n_global;
 
         // Wait for bias+residual prefetched before MFMA loop.
         // Early-clobber outputs prevent the compiler from aliasing
@@ -707,8 +760,16 @@ oproj_barrier :
     ts_base[9] = __builtin_amdgcn_s_memrealtime(); // slot 9: oproj_mfma_done
   }
 #endif
-  __syncthreads();
+#ifdef MPK_OPROJ_INNER_TIMING
+  _op_t1 = __builtin_amdgcn_s_memrealtime();
+#endif
+  // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
+  // guarantee: run after __syncthreads it only retires wave 0's stores, and
+  // tid 0 then publishes an arrival advertising output that waves 1..3 may
+  // still have in flight. Draining first makes every wave's stores retire,
+  // and the barrier then makes that true block-wide.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
 
   // ── Prefetch gamma + router weights during barrier wait ──────────
   // These are data-independent of O-proj output.
@@ -722,25 +783,189 @@ oproj_barrier :
   i32x2_pf_t w_pf_buf[MAX_ITERS_PF];
 
   {
-    // Mechanism C: single global arrive + per-XCD release flags
-    // Uses monotonically increasing expected values (no reset needed)
-    // All threads read release_expected independently (ld_nt is uniform),
-    // eliminating shared variables and both __syncthreads.
-    int oproj_release_expected =
-        ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
+    // Mechanism C: single global arrive + per-XCD release flags.
+    //
+    // The release target is derived from the layer counter, not snapshotted.
+    // It used to be `ld_nt_s32(&hier_barrier[xcd_id*16]) + 1` -- "whatever is
+    // there now, plus one" -- which is only correct if every one of the 184
+    // workers performs that read before *any* XCD's releaser overwrites the
+    // slot. Nothing orders those two events: the read sits after this block's
+    // own __syncthreads, but the releaser is a different workgroup on a
+    // different XCD, and it can fan out the eight release flags while a worker
+    // here has not yet taken its snapshot.
+    //
+    // A worker that reads *after* the update computes a target one lower than
+    // the value already published, so its poll is satisfied on entry: it falls
+    // straight through and reads attn_proj_out while the other XCDs' O-proj
+    // stores are still in flight. O-proj writes column-partitioned and the
+    // RMSNorm below reads the full row, so seven eighths of what it consumes
+    // may not be written yet. The observable signature is exact -- rmsnorm_out
+    // differing run to run while attn_proj_out, the settled HBM content, is
+    // bit-identical.
+    //
+    // This is the same defect the fused kernel already fixed for the other
+    // three counters (see the layer_counter block in
+    // gang_full_layer_fused_mi300.cuh: "These used to be snapshots of current
+    // value + 1"). This barrier was the one holdout.
+    //
+    // `layer_epoch` is that counter, passed in by the caller rather than read
+    // from a shared location: (iterations * num_layers + layer) + 1, monotonic,
+    // never reset, and identical for every worker with nothing to order. The
+    // two fused callers both have it in hand. The standalone task type
+    // (register_gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300_task) has no
+    // layer loop -- it is one task per dispatch -- so it passes 0 and keeps the
+    // snapshot, which is safe there precisely because there is no second layer
+    // to race with.
+    int const oproj_release_expected =
+        layer_epoch > 0 ? layer_epoch
+                        : ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) + 1;
 
+    // ── Release fan-out: one wave instruction, not eight serial stores ────
+    //
+    // The eight per-XCD release flags live on eight separate cache lines
+    // (HIER_STRIDE apart, deliberately -- see the MoE barrier's note on
+    // write-through vs L2 aliasing). Writing them from tid 0 is therefore
+    // eight independent `sc0 sc1` stores issued back to back by a single
+    // lane, and this lane is the single most critical thread on the GPU: 239
+    // workgroups are spinning on the flags it has not written yet, so the
+    // eighth XCD is released seven store-issues later than the first.
+    //
+    // Spreading them over lanes 0..7 of the same wave makes it one
+    // instruction -- the addresses differ only by lane, so it is a single
+    // `global_store_dword` with a per-lane offset -- and all eight XCDs are
+    // released together. Both hierarchical releases are published this way.
+    //
+    // The decision reaches the other seven lanes by readfirstlane, not LDS:
+    // tid 0..7 are the same wave, the arrival below runs with only lane 0
+    // active, and readfirstlane reads the first *active* lane -- so once the
+    // `if` closes and all lanes are live again, every lane holds lane 0's
+    // value. Zero means "not the releaser", which is unambiguous because a
+    // real epoch is >= 1.
+    int oproj_rel_epoch = 0;
     if (tid == 0) {
+      // GPU-scope release fence before the arrival.
+      //
+      // atom_add_release_gpu_s32 is not a release on AMD -- its own definition
+      // (mpk_atoms.cuh) emits only `flat_atomic_add ... sc0 sc1; s_waitcnt`,
+      // with the comment "Ordering provided by explicit threadfence_gpu()
+      // before this call." That call was never made here.
+      //
+      // The drain above (`s_waitcnt vmcnt(0)` + __syncthreads) retires this
+      // block's O-proj stores, which is what a *same-XCD* consumer needs. But
+      // this barrier is global: the workers released by it read
+      // attn_proj_out columns produced on all eight XCDs, and MI300/MI350 L2
+      // is not coherent across XCDs. Retiring a store means it reached this
+      // XCD's L2, not that a remote XCD can see it.
+      //
+      // threadfence_gpu lowers to `buffer_wbl2 sc1; s_waitcnt vmcnt(0)` on
+      // gfx950 -- the L2->HBM writeback that actually makes those columns
+      // visible to the other seven XCDs. Without it the release flag (st_wt,
+      // straight to HBM) can overtake the data it advertises.
+      //
+      // Contrast Phase 4's chunk barrier in gang_full_layer_fused_mi300.cuh,
+      // which deliberately does *not* do this: that barrier is per-XCD, so
+      // its producers and consumer share one L2 and the writeback would be
+      // pure cost. Here the consumer is remote and the writeback is the whole
+      // point. Only the arriving thread of each block pays it.
+      //
+      // MPK_OPROJ_NO_WB: the paragraph above is the argument for a *writeback*,
+      // and it does not survive contact with what this phase actually stores.
+      // The only global publication between the top of the kernel and this
+      // arrival is `st_wt_u64` into d_output, and that lowers to
+      // `global_store_dwordx2 ... sc0 sc1` -- write-through, straight past L2
+      // to HBM. The `s_waitcnt vmcnt(0)` two lines up retires those stores at
+      // HBM, not at a local L2, so by the time the arrival is issued the
+      // columns are already remotely visible. buffer_wbl2 then walks the whole
+      // L2 to write back lines that by construction do not hold any of the
+      // guarded data.
+      //
+      // What it costs: 184 workers each issue a whole-L2 writeback and then
+      // wait on it, and they all do so within ~0.14 us of each other (measured
+      // arrival spread), so the writebacks serialize against each other rather
+      // than overlapping with anything. That matches the measurement -- first
+      // and last arriver both wait ~5.6 us, i.e. the wait is protocol latency,
+      // not skew.
+      //
+      // This is the same argument, and the same fix, as commit 57422b1 on the
+      // EP fold. Kept behind a flag because the reasoning it overturns is
+      // load-bearing if any store on this path is ever changed away from
+      // write-through: the failure signature to watch for is rows of
+      // rmsnorm_out differing run to run while attn_proj_out is bit-identical.
+#ifndef MPK_OPROJ_NO_WB
+      threadfence_gpu();
+#else
+      // Still order the arrival after this block's own stores; drop only the
+      // L2 writeback. The stores are write-through, so retiring them is the
+      // whole of what the release needs.
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+#ifdef MPK_OPROJ_TREE_BARRIER
+      // ── Two-level arrival ────────────────────────────────────────────────
+      //
+      // The flat form below puts all `total_oproj_tiles` (184 at bs=1)
+      // arrivals on one cache line at [8*16]. Every one of those is a
+      // cross-die read-modify-write -- `sc0 sc1` carries the atomic past this
+      // XCD's private L2 to the device coherency point -- and they serialize
+      // there, because a line can only be owned in one place at a time. That
+      // is the same cost Phase 9's comment already prices for its own flat
+      // predecessor ("~1.0 ms/iter ... every one of those 240 atomics is a
+      // cross-die read-modify-write serialising on a single cache line") and
+      // the same fix: aggregate per-XCD first so the shared line sees 8
+      // arrivals instead of 184.
+      //
+      // Level 1 is XCD-private -- written and read only at [xcd_id] -- so it
+      // takes the `sc0`-only atomic that resolves in the local L2 and never
+      // leaves the die. Level 2 keeps `sc0 sc1`: it is the level that is
+      // genuinely cross-XCD.
+      //
+      // The release value and its fan-out are untouched, so a worker's poll
+      // below is unchanged and sees exactly the same value at the same point
+      // in the layer.
+      //
+      // Expected counts. tiles_per_xcd is `oproj_topk_tiles_per_xcd` from the
+      // fused caller = max(oproj_tiles_per_xcd, router_tile_n), which is what
+      // gates `xcd_rank < oproj_topk_tiles_per_xcd` there -- so exactly
+      // tiles_per_xcd workers per XCD reach this arrival. total_oproj_tiles is
+      // 8 * that, which is what the flat form counts. The two agree by
+      // construction; the static relation is asserted at the caller rather
+      // than here because tiles_per_xcd is a runtime argument.
+      //
+      // The `%` form is a monotonic-counter release, identical in shape to
+      // the flat one: counters are never reset, so "this layer's last
+      // arrival" is `prev % N == N - 1` rather than a compare against N.
+      int const local_prev =
+          atom_add_xcd_local_s32(&hier_local[xcd_id * HIER_STRIDE], 1);
+      if ((local_prev % tiles_per_xcd) == tiles_per_xcd - 1) {
+        // Last worker on this XCD. Its own stores are drained (above) and so
+        // are every other arriving worker's on this XCD -- each drained
+        // before its own arrival, and all of those arrivals precede this one
+        // on the same line. Publish one arrival for the whole die.
+        int const prev_global =
+            atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+        if ((prev_global % 8) == 7) {
+          oproj_rel_epoch = oproj_release_expected;
+        }
+      }
+#else
       // Single global arrival (all workers increment one counter)
       int prev_global =
           atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
       if ((prev_global % total_oproj_tiles) == total_oproj_tiles - 1) {
-        // Last arrival: write 8 per-XCD release flags (write-through)
-        for (int x = 0; x < 8; x++) {
-          st_wt_u32((void *)&hier_barrier[x * HIER_STRIDE],
-                    (unsigned)oproj_release_expected);
-        }
-        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        oproj_rel_epoch = oproj_release_expected;
       }
+#endif
+    }
+
+    // Lanes 0..7 of wave 0 publish the eight flags in one instruction. See
+    // the note above the arrival for why readfirstlane carries the epoch and
+    // why 0 is a safe "not the releaser" sentinel.
+    oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
+    if (oproj_rel_epoch != 0) {
+      if (tid < 8) {
+        st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
+                  (unsigned)oproj_rel_epoch);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
 
     // Issue prefetch loads AFTER barrier atomics but BEFORE poll loop.
@@ -768,19 +993,143 @@ oproj_barrier :
     }
 
     // All threads poll per-XCD release flag independently.
-    // Eliminates __syncthreads — each thread confirms the barrier itself.
     // ld_nt coalesces across waves, so no extra HBM traffic.
-    while (ld_nt_s32(&hier_barrier[xcd_id * HIER_STRIDE]) <
-           oproj_release_expected) {
-      __builtin_amdgcn_s_sleep(1);
-    }
+#ifdef MPK_OPROJ_ARRIVE_ONLY
+    // ── TESTED AND REJECTED: incorrect. Kept for the reasoning. ──────────
+    //
+    // Measured 2.015 mean over 6 reps against 2.019 for the control -- and
+    // rep 3 generated *different text* (hash 1304e716e7db against
+    // 88861a4763c0 on the other five). It is a race, not a numerics change.
+    //
+    // The read-side argument below is right as far as it goes: the release
+    // says "every XCD's O-proj columns are in HBM", and a worker that skips
+    // the RMSNorm never reads them. What it misses is the *write* side. This
+    // poll is also the only thing standing between such a worker and the
+    // next layer's O-proj store into the same buffer, and it is load-bearing
+    // precisely because of which workers skip it. `local_tile >=
+    // router_tile_n` means `xcd_rank >= 16`, and MPK_W2_CONSUMER_GATE's
+    // Phase 9 joiner test is `xcd_rank < total_qkv_tiles_per_xcd` (10) -- so
+    // every worker this flag releases early is also a worker that does not
+    // join the layer barrier. It therefore has no gate at all until Phase 6
+    // of layer N+1, and can reach layer N+1's Phase 7 and store its
+    // attn_proj_out columns while a straggling XCD's layer-N router worker
+    // is still reading that row. WAR, cross-XCD, silent.
+    //
+    // That also explains the shape of the failure: one run in six, and one
+    // that produces coherent-but-different text rather than garbage, because
+    // the overwritten columns are a valid activation from the wrong layer.
+    //
+    // Fixing it means giving these workers some later gate, and the only one
+    // available is Phase 9's -- which is the wait this flag was removing. So
+    // the 2.5 us is not recoverable at this barrier; it would have to come
+    // from making the barrier itself cheaper.
+    //
+    // ── Original rationale, retained ─────────────────────────────────────
+    //
+    // This barrier is a *producer* barrier: what it guarantees to the worker
+    // that clears it is that every XCD's O-proj columns are in HBM, so the
+    // RMSNorm below can read the whole row. A worker with
+    // `local_tile >= router_tile_n` does not run that RMSNorm -- it falls
+    // straight to `goto done` a few lines below -- so the release tells it
+    // nothing it uses. It still has to *arrive*, because its own O-proj
+    // columns are part of what the barrier publishes, and the arrival above
+    // is already drained and issued before this poll.
+    //
+    // At the shipped geometry that is 7 of the 23 O-proj workers per XCD
+    // released ~2.5 us early, and they are the ones that go on to draw MoE
+    // tiles in Phase 8 -- so the time comes off the front of the phase that
+    // is the critical path, not off an idle worker.
+    //
+    // Only the poll is skipped. `local_tile` is workgroup-uniform, so this
+    // branch is uniform and the __syncthreads below is still executed by all
+    // 256 threads of every block -- no divergent barrier. The skippers do run
+    // that rendezvous and the `buffer_inv` after it before reaching `goto
+    // done`; both are a few cycles against the ~2.5 us poll, and leaving them
+    // in keeps the acquire argument below untouched.
+    if (local_tile < router_tile_n)
+#endif
+      while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+             oproj_release_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
   }
 
-  // Invalidate L2 so we read fresh O-PROJ output from HBM
+  // Rendezvous before the acquire. The per-thread poll above establishes, for
+  // each wave independently, that the barrier has been released -- and that
+  // used to be the whole argument for dropping this __syncthreads ("each
+  // thread confirms the barrier itself"). It is not sufficient, because the
+  // acquire that follows is `buffer_inv`, which is a *per-wave* instruction
+  // acting on caches the whole CU shares.
+  //
+  // Without the rendezvous: wave 0 clears its poll, invalidates, and begins
+  // reading attn_proj_out through vL1/L2 -- repopulating those lines. Wave 3
+  // has not cleared its poll yet, so some of the lines wave 0 just pulled in
+  // are pre-barrier values from XCDs that had not finished storing. Wave 3
+  // then runs its own buffer_inv, but that invalidate happens *before* it
+  // reads, and the stale lines were already re-cached by wave 0 after it. The
+  // sc1 invalidate cannot undo a fill that a sibling wave performs behind it.
+  //
+  // Draining, rendezvousing, then invalidating makes the invalidate the first
+  // memory event any wave performs after the barrier is known released
+  // block-wide, which is what the acquire has to mean. This is the read side of
+  // the same drain-then-rendezvous discipline the release sides in this file
+  // already follow.
+#ifdef MPK_OPROJ_LEAN_ACQUIRE
+  // ── The rendezvous and the invalidate go together, or not at all ─────────
+  //
+  // The argument above is sound *given* that a `buffer_inv` follows: it is
+  // entirely about one wave refilling vL1 behind another wave's invalidate.
+  // Remove the invalidate and there is nothing for the rendezvous to order, so
+  // this arm removes both. What has to hold instead is that no wave can be
+  // holding a stale line for this data in the first place.
+  //
+  // It does hold, for the same reason MPK_OPROJ_NO_WB holds on the write side.
+  // The producer is `st_wt_u64` -> `global_store_dwordx2 ... sc0 sc1`:
+  // write-through past vL1 and L2 to HBM, and `sc0` on a store also
+  // *invalidates* the writing CU's vL1 line rather than leaving a stale copy.
+  // The only other reader of attn_proj_out in the layer is this same phase one
+  // layer earlier, and between the two sits Phase 9's layer barrier, whose
+  // consumer gate already issues `buffer_inv sc1` under MPK_W2_CONSUMER_GATE.
+  //
+  // The remaining hole the default build closes is a reader that pulled a line
+  // into vL1 *this* layer, before the release -- but nothing in this phase
+  // reads attn_proj_out before the poll, and the poll itself is a device-scope
+  // load of a different line.
+  //
+  // Failure signature if this is wrong, and it is worth restating because it is
+  // silent: rows of rmsnorm_out differing between two runs whose
+  // attn_proj_out is bit-identical. That is why this arm is verified over 8+
+  // reps of generated-text hash, not over timing.
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
+
+  // Cross-XCD ACQUIRE for the O-proj output. Must be `sc1` (vL1 + L2).
+  //
+  // The barrier above is global, not per-XCD: every O-proj worker on all eight
+  // XCDs increments hier_barrier[8*16], and the last arrival releases all of
+  // them. It has to be, because O-proj *writes* column-partitioned -- worker
+  // (xcd, wg) owns columns xcd*368 + wg*16 .. +16 -- while the RMSNorm below
+  // reads all ACTUAL_HIDDEN_DIM columns of its token row. Seven eighths of
+  // what each worker reads here was produced on a different XCD, and
+  // MI300/MI350 L2 is not coherent across XCDs.
+  //
+  // The producer is `st_wt_u64` (sc0 sc1), so the data bypasses L2 and lands
+  // in HBM. This was `buffer_inv sc1` to invalidate L2 as well as vL1; it is
+  // now plain `buffer_inv` (vL1 only). See the layer-boundary acquire at the
+  // top of gang_full_layer_fused_mi300.cuh for why that is sufficient given
+  // the Phase 9 layer barrier, and for the ablation that established it.
+  //
+  // The signature to watch for if this ever regresses is exact: rows of
+  // `rmsnorm_out` differing between two runs whose `attn_proj_out` (the
+  // settled HBM content) is bit-identical -- the norm read something that is
+  // not what is in memory.
   asm volatile("buffer_inv" ::: "memory");
   // Drain prefetched gamma + router weight loads (issued before barrier).
   // NT loads bypass L2, unaffected by buffer_inv.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
 
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   {
@@ -796,6 +1145,9 @@ oproj_barrier :
     ts_base[10] =
         __builtin_amdgcn_s_memrealtime(); // slot 10: oproj_barrier_done
   }
+#endif
+#ifdef MPK_OPROJ_INNER_TIMING
+  _op_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
 
   // ════════════════════════════════════════════════════════════════════════
@@ -836,14 +1188,10 @@ oproj_barrier :
     // Max iterations per thread: ceil(H4 / 256)
     constexpr int MAX_ITERS = (H4 + 255) / 256;
 
-    float ssq = 0.0f;
-    float dp = 0.0f;
     bf16 const *my_gate = d_gate_w + local_tile * output_stride;
 
-    char const *h_base = (char const *)d_hidden;
     char const *g_base = (char const *)d_gamma;
     char const *w_base = (char const *)my_gate;
-    char *n_base = (char *)d_normed;
 
     // Register cache for hidden, gamma, and gate_weight raw bf16 values.
     // 3 arrays × MAX_ITERS entries × 2 VGPRs = 18 VGPRs (MAX_ITERS=3).
@@ -852,164 +1200,587 @@ oproj_barrier :
     i32x2_t w_cache[MAX_ITERS];
     int n_cached = 0;
 
-    // ── Pass 1: Pipelined hidden load + ssq accumulation ────────────
-    // Gamma and router weights already prefetched before O-proj barrier
-    // (g_pf_buf / w_pf_buf). Only hidden state needs fresh loads here.
+    // Two independent cross-wave reductions run in this phase, and they must
+    // not share storage. `red` carries the ssq reduction and then, at red[0],
+    // the *broadcast* of irms, which every one of the 256 threads reads. The
+    // dp reduction that follows used to write red[wave] -- so wave 0's
+    // `red[0] = dp` lands on the very slot waves 1..3 are still reading irms
+    // from.
+    //
+    // Nothing separates the two: the `__syncthreads()` after the irms store is
+    // the *last* barrier before pass 2, and pass 2 both reads irms and writes
+    // dp. Worse, irms is consumed inside pass 2's unrolled loop (n = h*irms*g),
+    // so the compiler is free to keep re-reading the LDS slot rather than
+    // hoisting it into a VGPR -- which widens the window from a few
+    // instructions to the whole loop.
+    //
+    // A wave that reads a clobbered irms computes a wrong norm for its quarter
+    // of the row. That value is *stored* to norm_output (the MoE's input) and
+    // folded into the router dot product, so the damage lands in
+    // rmsnorm_out_moe and in the routing decision at once -- and it is timing
+    // dependent, hence different every run. Which quarter of the row is hit
+    // depends on which wave loses the race, so the corruption is spread evenly
+    // across the row rather than confined to one workgroup's columns.
+    //
+    // Giving dp its own slots removes the aliasing outright; 64 bytes of LDS
+    // is cheaper than a third barrier on the critical path.
+    __shared__ float red[16];
+    __shared__ float red_dp[16];
 
-    // Prefetch first hidden iteration
-    i32x2_t h_pf;
-    if (tid < H4) {
-      int byte_off = tid * 8;
-      asm volatile("global_load_dwordx2 %0, %1, off"
-                   : "=v"(h_pf)
-                   : "v"(h_base + byte_off)
-                   : "memory");
-    }
+    // This worker owns router expert `local_tile` for *every* token. The
+    // pipeline below used to run once with no token offset anywhere, so at
+    // batch > 1 all rows were routed by token 0's logits and the normed
+    // buffer the MoE reads held token 0 in every row. It is a GEMV, not a
+    // GEMM: ~184 extra FMA per thread per token, so a plain loop is the right
+    // shape -- restructuring it into MFMA would cost more than it saves.
+    //
+    // At BATCH_SIZE == 1 the bound is a compile-time 1 and the loop vanishes.
+    int const n_tok_router = BATCH_SIZE == 1 ? 1 : batch_count;
+
+    for (int b = 0; b < n_tok_router; b++) {
+      char const *h_base =
+          (char const *)(d_hidden + (int64_t)b * output_stride);
+      char *n_base = (char *)(d_normed + (int64_t)b * output_stride);
+
+      float ssq = 0.0f;
+      float dp = 0.0f;
+
+      // ── Pass 1: Pipelined hidden load + ssq accumulation ────────────
+      // Gamma and router weights already prefetched before O-proj barrier
+      // (g_pf_buf / w_pf_buf). Only hidden state needs fresh loads here.
+      //
+      // All MAX_ITERS loads are issued up front rather than one iteration
+      // ahead. The depth-1 version that used to be here drained with
+      // `s_waitcnt vmcnt(0)` at the top of every trip, and vmcnt(0) is *all*
+      // outstanding loads, not just the one being consumed -- so the load
+      // issued for iteration i+1 was waited on at iteration i, and the three
+      // round trips serialized end to end instead of overlapping. Issuing the
+      // whole set first lets each trip wait on `vmcnt(MAX_ITERS-1-iter)`,
+      // which retires exactly the one load it needs and leaves the rest in
+      // flight.
+      //
+      // Costs nothing in registers: every value already had to be live in
+      // h_cache[] for pass 2, so this only moves where the load is issued,
+      // not how long the result lives. MAX_ITERS is 3 at hidden 2880.
+      //
+      // This sits on the strictly serial part of the layer -- TopK cannot
+      // start until the router logits are written, and no MoE worker can
+      // start until TopK publishes -- so latency here is layer latency.
+      // The counted waits below name a nonzero vmcnt, which is only sound if
+      // nothing this thread issued *earlier* is still outstanding. At b == 0
+      // the O-proj barrier's drain already guarantees that, but at b > 0 the
+      // previous token's pass-2 normed-row stores are vector memory ops too
+      // and sit in the same counter -- an undrained store would make
+      // vmcnt(2) retire the store instead of the load, and this loop would
+      // consume an unwritten register. One drain per token closes that; it is
+      // dead code at BATCH_SIZE == 1, where n_tok_router is a compile-time 1.
+      if (BATCH_SIZE != 1) {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+
+      // The wait-count switch below enumerates 0, 1 and 2 outstanding loads.
+      // vmcnt takes an immediate, so the arms cannot be generated from a
+      // runtime expression -- a deeper pipeline needs more arms, and getting
+      // that wrong reads a register the load has not written yet, which is
+      // silent wrong numerics in the routing logits rather than a fault.
+      static_assert(MAX_ITERS <= 3,
+                    "pass-1 hidden prefetch: the s_waitcnt vmcnt switch below "
+                    "only covers up to 3 in-flight loads; add arms before "
+                    "raising ACTUAL_HIDDEN_DIM past 3*256*4");
+      i32x2_t h_pf[MAX_ITERS];
+      int n_issued = 0;
+#pragma unroll
+      for (int iter = 0; iter < MAX_ITERS; iter++) {
+        int i_cur = tid + iter * 256;
+        if (i_cur >= H4) {
+          break;
+        }
+        asm volatile("global_load_dwordx2 %0, %1, off"
+                     : "=v"(h_pf[iter])
+                     : "v"(h_base + i_cur * 8)
+                     : "memory");
+        n_issued = iter + 1;
+      }
 
 #pragma unroll
-    for (int iter = 0; iter < MAX_ITERS; iter++) {
-      int i_cur = tid + iter * 256;
-      if (i_cur >= H4) {
-        break;
+      for (int iter = 0; iter < MAX_ITERS; iter++) {
+        int i_cur = tid + iter * 256;
+        if (i_cur >= H4) {
+          break;
+        }
+
+        // Retire this iteration's load and leave the later ones outstanding.
+        // The count is `n_issued - 1 - iter` -- how many of *these* loads are
+        // still in flight behind the one being consumed. It is safe to name a
+        // nonzero count only because nothing else this thread issued can be
+        // outstanding here: gamma and the router weights were drained by the
+        // `s_waitcnt vmcnt(0)` that follows the O-proj barrier's buffer_inv,
+        // which every path into this block has already executed.
+        //
+        // vmcnt is an immediate, so the count has to be a compile-time
+        // constant -- hence the switch rather than an expression. Both bounds
+        // are constexpr, so exactly one arm survives per unrolled trip.
+        if (n_issued - 1 - iter == 0) {
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        } else if (n_issued - 1 - iter == 1) {
+          asm volatile("s_waitcnt vmcnt(1)" ::: "memory");
+        } else {
+          asm volatile("s_waitcnt vmcnt(2)" ::: "memory");
+        }
+        i32x2_t h_v = h_pf[iter];
+
+        // Cache: hidden from the fresh load, gamma+router from the
+        // pre-barrier prefetch. Both of the latter are token-invariant, but
+        // the copy stays inside the loop rather than being hoisted: hoisting
+        // extends g_pf_buf/w_pf_buf's live range across the whole token
+        // sweep and the allocator answers with 16 more bytes of scratch even
+        // at BATCH_SIZE == 1. Re-copying the same VGPRs is free.
+        h_cache[iter] = h_v;
+        __builtin_memcpy(&g_cache[iter], &g_pf_buf[iter], 8);
+#ifndef MPK_ROUTER_FUSED_DP
+        __builtin_memcpy(&w_cache[iter], &w_pf_buf[iter], 8);
+#endif
+        n_cached = iter + 1;
+
+        // Compute ssq from hidden values
+        float v0, v1, v2, v3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(v0), "=&v"(v1), "=&v"(v2), "=&v"(v3)
+                     : "v"(h_v[0]), "v"(h_v[1]));
+        ssq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+
+#ifdef MPK_ROUTER_FUSED_DP
+        // ── The router dot product, folded into this pass ────────────────
+        // irms is a single scalar, uniform over the whole row, so
+        //   sum_i w_i * (h_i * irms * g_i)  ==  irms * sum_i w_i * h_i * g_i
+        // and the scale can be applied once after the reduction instead of
+        // once per element. That is the whole trick: the dp no longer needs
+        // the normalized values, so it no longer needs to wait for the ssq
+        // reduction, so it can consume the hidden payload while it is still
+        // in registers from the load above.
+        //
+        // What that buys is not the arithmetic -- it is pass 2. Pass 2 exists
+        // only because dp needed post-irms values; with dp gone from it, the
+        // only thing left in it is the normed-row store, which
+        // MPK_ONE_NORM_WRITER already restricts to one workgroup per XCD. So
+        // 15 of every 16 router workgroups now skip the second unpack of
+        // hidden+gamma+weight, its stores, its shuffle reduction and one of
+        // its two __syncthreads outright.
+        //
+        // Not bit-identical to the unfused order: (h*irms)*g*w rounds
+        // differently from (h*g*w)*irms. The logit feeds a top-8 argmax over
+        // 128 experts whose gaps are far wider than a single ulp, so the
+        // routing decision is unchanged -- but this is exactly why the flag
+        // is verified by hashing the generated text and not by timing alone.
+        float gg0, gg1, gg2, gg3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(gg0), "=&v"(gg1), "=&v"(gg2), "=&v"(gg3)
+                     : "v"(g_pf_buf[iter][0]), "v"(g_pf_buf[iter][1]));
+        float ww0, ww1, ww2, ww3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(ww0), "=&v"(ww1), "=&v"(ww2), "=&v"(ww3)
+                     : "v"(w_pf_buf[iter][0]), "v"(w_pf_buf[iter][1]));
+        dp += ww0 * (v0 * gg0) + ww1 * (v1 * gg1) + ww2 * (v2 * gg2) +
+              ww3 * (v3 * gg3);
+#endif
       }
-
-      // Wait for hidden load (gamma+router already in VGPRs from pre-barrier)
-      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-      i32x2_t h_v = h_pf;
-
-      // Prefetch next hidden iteration
-      int i_next = i_cur + 256;
-      if (i_next < H4) {
-        int byte_off_next = i_next * 8;
-        asm volatile("global_load_dwordx2 %0, %1, off"
-                     : "=v"(h_pf)
-                     : "v"(h_base + byte_off_next)
-                     : "memory");
-      }
-
-      // Cache: hidden from fresh load, gamma+router from pre-barrier prefetch
-      h_cache[iter] = h_v;
-      __builtin_memcpy(&g_cache[iter], &g_pf_buf[iter], 8);
-      __builtin_memcpy(&w_cache[iter], &w_pf_buf[iter], 8);
-      n_cached = iter + 1;
-
-      // Compute ssq from hidden values
-      float v0, v1, v2, v3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(v0), "=&v"(v1), "=&v"(v2), "=&v"(v3)
-                   : "v"(h_v[0]), "v"(h_v[1]));
-      ssq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
-    }
 
 // Wave-level reduction for ssq
 #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      ssq += __shfl_xor(ssq, off);
-    }
-
-    // Cross-wave reduction via LDS
-    __shared__ float red[16];
-    if (lane == 0) {
-      red[wave] = ssq;
-    }
-    __syncthreads();
-
-    float irms;
-    if (tid == 0) {
-      float tot = 0.0f;
-      for (int w = 0; w < NUM_WAVES; w++) {
-        tot += red[w];
+      for (int off = 32; off > 0; off >>= 1) {
+        ssq += __shfl_xor(ssq, off);
       }
-      red[0] = rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
-    }
-    __syncthreads();
-    irms = red[0];
 
-// ── Pass 2: Register-only norm + GEMV (no HBM re-reads) ─────────
+#ifdef MPK_ROUTER_FUSED_DP
+      // dp is already complete (unscaled) at this point, so it rides the same
+      // cross-wave reduction as ssq instead of paying for its own barrier
+      // after pass 2. Two shuffle chains, one LDS round trip, one
+      // __syncthreads -- and the pair of slots stays split (red / red_dp)
+      // because red[0] is still overwritten with the irms broadcast below.
 #pragma unroll
-    for (int iter = 0; iter < MAX_ITERS; iter++) {
-      if (iter >= n_cached) {
-        break;
+      for (int off = 32; off > 0; off >>= 1) {
+        dp += __shfl_xor(dp, off);
       }
-      int byte_off = (tid + iter * 256) * 8;
+#endif
 
-      // Unpack cached hidden
-      float h0, h1, h2, h3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(h0), "=&v"(h1), "=&v"(h2), "=&v"(h3)
-                   : "v"(h_cache[iter][0]), "v"(h_cache[iter][1]));
+      // Cross-wave reduction via LDS
+      if (lane == 0) {
+        red[wave] = ssq;
+#ifdef MPK_ROUTER_FUSED_DP
+        red_dp[wave] = dp;
+#endif
+      }
+      __syncthreads();
 
-      // Unpack cached gamma
-      float g0, g1, g2, g3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(g0), "=&v"(g1), "=&v"(g2), "=&v"(g3)
-                   : "v"(g_cache[iter][0]), "v"(g_cache[iter][1]));
+      float irms;
+      if (tid == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          tot += red[w];
+        }
+        float const irms_t0 =
+            rsqrtf(tot / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+#ifdef MPK_ROUTER_FUSED_DP
+        // The logit is finished here rather than after pass 2: irms is the
+        // uniform scale factored out of every term, so applying it once to the
+        // reduced dot product is the same quantity the per-element version
+        // computed. See the fold in pass 1 for why that is legal.
+        float s = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          s += red_dp[w];
+        }
+        s *= irms_t0;
+        if (d_rbias) {
+          s += __bfloat162float(d_rbias[local_tile]);
+        }
+        bf16 bval = __float2bfloat16(s);
+        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
+                  *reinterpret_cast<unsigned short *>(&bval));
+#endif
+        red[0] = irms_t0;
+      }
+#ifndef MPK_ROUTER_FUSED_DP
+      __syncthreads();
+      irms = red[0];
+#endif
 
-      // Compute norm = hidden * irms * gamma
-      float n0 = h0 * irms * g0;
-      float n1 = h1 * irms * g1;
-      float n2 = h2 * irms * g2;
-      float n3 = h3 * irms * g3;
+      // ── Pass 2: Register-only norm + GEMV (no HBM re-reads) ─────────
+#ifdef MPK_ROUTER_FUSED_DP
+      // With dp already reduced above, the only thing pass 2 still produces is
+      // the normed row -- and only one workgroup per XCD stores it (see the
+      // MPK_ONE_NORM_WRITER note below for why the election is per XCD and not
+      // device-wide). So the other 15 skip the pass entirely rather than
+      // computing a row they will throw away.
+      //
+      // Per XCD and not device-wide *also* makes this safe to gate: eliding
+      // the pass elides no store that any other worker was relying on this
+      // workgroup to make.
+      //
+      // Without MPK_ONE_NORM_WRITER every worker is a writer, so there is
+      // nothing to skip and the pass runs for all of them -- the fold still
+      // pays for itself there by dropping the weight unpack, the second
+      // shuffle chain and one barrier. Keeping the two flags independent is
+      // what lets the batch below attribute the delta to one of them.
+#if defined(MPK_W13_PREQUANT) && defined(MPK_ONE_NORM_WRITER)
+      // ── Split the publication across MAX_ITERS workgroups ────────────────
+      //
+      // Under MPK_W13_PREQUANT the elected writer no longer just stores a row;
+      // it also quantizes it, and that landed on the critical path
+      // (rmsnorm_router 1.88 -> 2.78 us) because one workgroup was doing all
+      // 23 scale blocks while fifteen idled at the barrier below.
+      //
+      // The split is free of data movement. Every router workgroup ran the
+      // whole of pass 1, so every one of them holds the entire row in
+      // h_cache/g_cache -- the election was never about who *has* the data.
+      // And a scale domain is 32 lanes of one iteration (scale_block =
+      // i_cur/32 with i_cur = tid + iter*256), so iteration `k` owns blocks
+      // [8k, 8k+8) exactly: no domain straddles the cut, and no cross-
+      // workgroup reduction is needed.
+      //
+      // Workgroup `k` publishes iteration `k`. The row is 2944 elements =
+      // MAX_ITERS(3) iterations, so three workgroups share it and the other
+      // thirteen still skip pass 2 entirely. `router_tile_n` is 16 here; the
+      // fallback keeps the single-writer form if a configuration ever has
+      // fewer router tiles than iterations.
+      bool const pq_split = (router_tile_n >= MAX_ITERS);
+      bool const router_norm_writer =
+          pq_split ? (local_tile < MAX_ITERS) : (local_tile == 0);
+      int const pq_my_iter = pq_split ? local_tile : -1;
+#elif defined(MPK_ONE_NORM_WRITER)
+      bool const router_norm_writer = (local_tile == 0);
+#ifdef MPK_W13_PREQUANT
+      int const pq_my_iter = -1;
+#endif
+#else
+      bool const router_norm_writer = true;
+#ifdef MPK_W13_PREQUANT
+      int const pq_my_iter = -1;
+#endif
+#endif
+      // The irms broadcast barrier moves in here with its only consumer. Under
+      // this flag the logit no longer needs irms per element -- tid 0 applied
+      // it to the reduced dp above -- so the 15 non-writer workgroups have no
+      // reason to read red[0] at all, and making them rendezvous for it is a
+      // block-wide barrier bought for one workgroup in sixteen, so the
+      // __syncthreads belongs inside the producer branch.
+      if (router_norm_writer) {
+        __syncthreads();
+        irms = red[0];
+      }
+      if (router_norm_writer)
+#endif
+#pragma unroll
+      for (int iter = 0; iter < MAX_ITERS; iter++) {
+        if (iter >= n_cached) {
+          break;
+        }
+#ifdef MPK_W13_PREQUANT
+        // The split elects MAX_ITERS writers, one per iteration, but each of
+        // them was still running the *whole* loop and throwing away every
+        // iteration but its own -- the store was predicated, the unpack /
+        // norm / quant above it were not. pq_my_iter is workgroup-uniform, so
+        // this branch is uniform and skips the two dead iterations entirely.
+        // Under the BF16 path the wasted work was a few v_cvt; under prequant
+        // it is the whole ~10-op-per-element quant plus a 5-step shfl_xor
+        // tree, which is why it showed up as rmsnorm_router 1.88 -> 2.78 us.
+        if (pq_my_iter >= 0 && iter != pq_my_iter) {
+          continue;
+        }
+#endif
+        int byte_off = (tid + iter * 256) * 8;
 
-      // Pack and store normed output
-      uint32_t pk_lo, pk_hi;
-      asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                   : "=v"(pk_lo)
-                   : "v"(n0), "v"(n1));
-      asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                   : "=v"(pk_hi)
-                   : "v"(n2), "v"(n3));
-      i32x2_t n_packed;
-      n_packed[0] = (int)pk_lo;
-      n_packed[1] = (int)pk_hi;
-      asm volatile("global_store_dwordx2 %0, %1, off" ::"v"(n_base + byte_off),
-                   "v"(n_packed)
-                   : "memory");
+        // Unpack cached hidden
+        float h0, h1, h2, h3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(h0), "=&v"(h1), "=&v"(h2), "=&v"(h3)
+                     : "v"(h_cache[iter][0]), "v"(h_cache[iter][1]));
 
-      // Unpack cached gate_weight and accumulate dot product
-      float w0, w1, w2, w3;
-      asm volatile("v_cvt_f32_bf16 %0, %4\n"
-                   "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
-                   "v_cvt_f32_bf16 %2, %5\n"
-                   "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
-                   : "=&v"(w0), "=&v"(w1), "=&v"(w2), "=&v"(w3)
-                   : "v"(w_cache[iter][0]), "v"(w_cache[iter][1]));
-      dp += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
-    }
+        // Unpack cached gamma
+        float g0, g1, g2, g3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(g0), "=&v"(g1), "=&v"(g2), "=&v"(g3)
+                     : "v"(g_cache[iter][0]), "v"(g_cache[iter][1]));
 
+        // Compute norm = hidden * irms * gamma
+        float n0 = h0 * irms * g0;
+        float n1 = h1 * irms * g1;
+        float n2 = h2 * irms * g2;
+        float n3 = h3 * irms * g3;
+
+        // Pack and store normed output
+        uint32_t pk_lo, pk_hi;
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
+                     : "=v"(pk_lo)
+                     : "v"(n0), "v"(n1));
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
+                     : "=v"(pk_hi)
+                     : "v"(n2), "v"(n3));
+#ifndef MPK_W13_PREQUANT
+        i32x2_t n_packed;
+        n_packed[0] = (int)pk_lo;
+        n_packed[1] = (int)pk_hi;
+#endif
+#ifdef MPK_W13_PREQUANT
+#ifndef MPK_ROUTER_FUSED_DP
+#error "MPK_W13_PREQUANT requires MPK_ROUTER_FUSED_DP (it publishes from the elected norm writer, which that flag defines)"
+#endif
+        // ── Publish FP8 + E8M0 instead of BF16 ──────────────────────────────
+        //
+        // Every W13 tile re-derives the same thing from this row: an FP8 E4M3
+        // payload with one E8M0 exponent per 128 elements. At bs=1 that is 184
+        // workgroups each quantizing an identical 2944-element row, and the
+        // ablation prices the whole of it at 0.047 ms. The row is already in
+        // registers here, one workgroup per XCD already stores it, and the
+        // quant is ~10 ALU ops per element -- so the work moves here and the
+        // consumer becomes an LDS fill.
+        //
+        // It also halves the bytes: FP8 + scales is 2967 bytes against 5888
+        // for BF16, read 184 times per layer per XCD.
+        //
+        // Bit-identity with the BF16 path is the design constraint, not a hope,
+        // and it is what lets the generated-text hash verify this flag:
+        //
+        //   values  -- the consumer today reads back exactly the BF16 this
+        //              loop packs, so the quant input must be the *round-
+        //              tripped* value, not n0..n3. Hence the unpack of
+        //              pk_lo/pk_hi below rather than using n0..n3 directly.
+        //   blocks  -- a 128-element scale domain is i_cur/32, and i_cur is
+        //              tid + iter*256, so a domain is 32 consecutive lanes of
+        //              one iteration: lanes 0-31 or 32-63 of a wave. The
+        //              consumer's domains are lanes 8b..8b+7 of a 16-per-lane
+        //              mapping, i.e. the same 128 elements. fmax is exact and
+        //              commutative, so a different reduction tree gives the
+        //              same bits.
+        //   scale   -- _gang_compute_e8m0_fp8, the consumer's own function.
+        //   packing -- cvt_scalef32_pk_fp8_f32 over (q0,q1) then (q2,q3) with
+        //              opsel, one dword per lane at byte offset 4*i_cur. The
+        //              consumer writes the identical dword at the identical
+        //              LDS offset.
+        //
+        // The last domain is short. ACTUAL_HIDDEN_DIM is 2880 and the row is
+        // padded to output_stride (2944), so domain 22 holds 64 real elements
+        // in 16 lanes plus 64 padding elements. Lanes 16..31 of that group
+        // already broke out of this loop, so the cross-row shuffle is skipped
+        // for it -- __shfl from an inactive lane returns nothing meaningful.
+        // The padding itself is zeroed below, which is what the BF16 path got
+        // for free from the buffer's zero-init.
+        {
+          float q0 = _gang_bf16_to_float((unsigned short)(pk_lo & 0xFFFF));
+          float q1 = _gang_bf16_to_float((unsigned short)(pk_lo >> 16));
+          float q2 = _gang_bf16_to_float((unsigned short)(pk_hi & 0xFFFF));
+          float q3 = _gang_bf16_to_float((unsigned short)(pk_hi >> 16));
+
+          // Four elements per lane, so the 128-element scale domain is 32
+          // consecutive lanes: (i_cur_q * 4) / 128.
+          int const i_cur_q = tid + iter * 256;
+          int const scale_block = i_cur_q >> 5;
+          int const last_block = (output_stride / 128) - 1;
+
+          float amax = fmaxf(fmaxf(fabsf(q0), fabsf(q1)),
+                             fmaxf(fabsf(q2), fabsf(q3)));
+          // Butterfly over the 16-lane DPP row, then across the two rows of
+          // the half-wave. Every lane in the domain ends up holding the full
+          // amax, so no separate broadcast pass is needed.
+          amax = fmaxf(amax, __shfl_xor(amax, 8));
+          amax = fmaxf(amax, __shfl_xor(amax, 4));
+          amax = fmaxf(amax, __shfl_xor(amax, 2));
+          amax = fmaxf(amax, __shfl_xor(amax, 1));
+          if (scale_block != last_block) {
+            amax = fmaxf(amax, __shfl_xor(amax, 16));
+          }
+
+          uint8_t const se = _gang_compute_e8m0_fp8(amax);
+          float scale_f = 1.0f;
+          if (se != 0) {
+            uint32_t const sbits = (uint32_t)se << 23;
+            __builtin_memcpy(&scale_f, &sbits, sizeof(scale_f));
+          }
+          fp8x4_t pk = {};
+          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, q0, q1, scale_f,
+                                                        false);
+          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, q2, q3, scale_f,
+                                                        true);
+          uint32_t pk_bits;
+          __builtin_memcpy(&pk_bits, &pk, sizeof(pk_bits));
+
+          // Same store flavour and the same per-XCD writer election as the
+          // BF16 path below: a plain global_store into this XCD's L2, read
+          // back by MoE workers on this XCD. See the MPK_ONE_NORM_WRITER note
+          // for why the election is per XCD and not device-wide.
+          bool const pq_store =
+#if defined(MPK_ONE_NORM_WRITER)
+              (pq_my_iter < 0) ? router_norm_writer : (iter == pq_my_iter);
+#else
+              router_norm_writer;
+#endif
+          if (pq_store) {
+            asm volatile("global_store_dword %0, %1, off" ::"v"(n_base +
+                                                                i_cur_q * 4),
+                         "v"(pk_bits)
+                         : "memory");
+            if ((lane & 31) == 0) {
+              asm volatile("global_store_byte %0, %1, off" ::"v"(
+                               n_base + output_stride + scale_block),
+                           "v"((unsigned)se)
+                           : "memory");
+            }
+          }
+        }
+#elif defined(MPK_ONE_NORM_WRITER)
+        // All `router_tile_n` router workers on this XCD compute the identical
+        // normed row and store it to the identical global address, so 15 of
+        // every 16 stores per XCD are pure redundant HBM traffic.
+        //
+        // Gated per XCD, not globally. This is a plain `global_store` into a
+        // per-XCD L2 that is not coherent with the other seven, so the reason
+        // a MoE worker on XCD k sees this row today is that XCD k's own router
+        // workers dirtied k's L2 with it. Electing a single *device-wide*
+        // producer would leave the other seven XCDs reading a line no one on
+        // their die ever wrote. One writer per XCD keeps that locality intact
+        // and still drops 128 writers to 8.
+        if (local_tile == 0) {
+          asm volatile("global_store_dwordx2 %0, %1, off" ::"v"(n_base +
+                                                                byte_off),
+                       "v"(n_packed)
+                       : "memory");
+        }
+#else
+        asm volatile("global_store_dwordx2 %0, %1, off" ::"v"(n_base +
+                                                              byte_off),
+                     "v"(n_packed)
+                     : "memory");
+#endif
+
+#ifndef MPK_ROUTER_FUSED_DP
+        // Unpack cached gate_weight and accumulate dot product
+        float w0, w1, w2, w3;
+        asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                     "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                     "v_cvt_f32_bf16 %2, %5\n"
+                     "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                     : "=&v"(w0), "=&v"(w1), "=&v"(w2), "=&v"(w3)
+                     : "v"(w_cache[iter][0]), "v"(w_cache[iter][1]));
+        dp += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3;
+#endif
+      }
+
+#ifdef MPK_W13_PREQUANT
+      // Zero the padded tail, elements ACTUAL_HIDDEN_DIM..output_stride.
+      //
+      // The BF16 path got this for free: it never wrote the tail, and the
+      // buffer is zero-initialised, so the consumer's quant read zeros there.
+      // FP8 halves the addresses, so the tail now lands where BF16 kept *real*
+      // data -- byte 2880 is element 1440's low half under BF16 -- and leaving
+      // it unwritten would feed the MFMA whatever was there.
+      //
+      // The scale byte for the last block needs no adjustment: its amax was
+      // taken over the real elements only, and fmax against the 64 zeros the
+      // consumer used to see cannot change a non-negative maximum. Same byte,
+      // same payload for the real half, zeros for the pad.
+      if (router_norm_writer && (pq_my_iter <= 0)) {
+        int const pad_dw = (output_stride - ACTUAL_HIDDEN_DIM) / 4;
+        if ((int)tid < pad_dw) {
+          asm volatile("global_store_dword %0, %1, off" ::"v"(
+                           n_base + ACTUAL_HIDDEN_DIM + (int)tid * 4),
+                       "v"(0u)
+                       : "memory");
+        }
+      }
+#endif
+
+#ifndef MPK_ROUTER_FUSED_DP
 // Wave-level reduction for dp
 #pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      dp += __shfl_xor(dp, off);
-    }
-
-    // Cross-wave LDS reduce
-    if (lane == 0) {
-      red[wave] = dp;
-    }
-    __syncthreads();
-
-    // tid==0 writes logit + bias via write-through store
-    if (tid == 0) {
-      float s = 0.0f;
-      for (int w = 0; w < NUM_WAVES; w++) {
-        s += red[w];
+      for (int off = 32; off > 0; off >>= 1) {
+        dp += __shfl_xor(dp, off);
       }
-      if (d_rbias) {
-        s += __bfloat162float(d_rbias[local_tile]);
+
+      // Cross-wave LDS reduce. Into red_dp, not red: red[0] is still serving
+      // as the irms broadcast that pass 2 above reads.
+      if (lane == 0) {
+        red_dp[wave] = dp;
       }
-      bf16 bval = __float2bfloat16(s);
-      st_wt_u16(&d_logits[local_tile],
-                *reinterpret_cast<unsigned short *>(&bval));
+      __syncthreads();
+
+      // tid==0 writes logit + bias via write-through store.
+      // logits_scratch is [batch, NUM_EXPERTS], XCD-partitioned along the
+      // expert axis: the pointer is pre-offset by xcd_id*CHUNK_N (which
+      // topk_noinline undoes) while the row stride stays NUM_EXPERTS.
+      if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          s += red_dp[w];
+        }
+        if (d_rbias) {
+          s += __bfloat162float(d_rbias[local_tile]);
+        }
+        bf16 bval = __float2bfloat16(s);
+        st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
+                  *reinterpret_cast<unsigned short *>(&bval));
+      }
+#endif // !MPK_ROUTER_FUSED_DP
+
+      // Keep the next token's `red[wave] = ssq` from racing tid 0's read of
+      // this token's dp slots. Compiled out at BATCH_SIZE == 1, where the
+      // loop body runs once.
+      if constexpr (BATCH_SIZE > 1) {
+        __syncthreads();
+      }
     }
   }
 
@@ -1032,8 +1803,16 @@ topk_barrier :
         __builtin_amdgcn_s_memrealtime(); // slot 11: rmsnorm_router_done
   }
 #endif
-  __syncthreads();
+#ifdef MPK_OPROJ_INNER_TIMING
+  _op_t3 = __builtin_amdgcn_s_memrealtime();
+#endif
+  // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
+  // guarantee: run after __syncthreads it only retires wave 0's stores, and
+  // tid 0 then publishes an arrival advertising output that waves 1..3 may
+  // still have in flight. Draining first makes every wave's stores retire,
+  // and the barrier then makes that true block-wide.
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  __syncthreads();
 
   __shared__ int s_topk_done;
   if (tid == 0) {
@@ -1042,23 +1821,36 @@ topk_barrier :
   __syncthreads();
 
   if (s_topk_done == total_topk_tiles) {
+#ifdef MPK_ROUTING_LANE_RELEASE
+    // Carries the release epoch from tid 0 to lanes 1..7 of wave 0 by
+    // readfirstlane; see the fan-out at the end of this block. Declared here
+    // rather than at the top of the phase because `goto done` above jumps past
+    // that point and may not cross an initialization. Zero means "not the
+    // releaser".
+    int rr_epoch = 0;
+#endif
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     if (tid == 0 && ts_base) {
       ts_base[14] =
           __builtin_amdgcn_s_memrealtime(); // slot 14: topk_compute_start
     }
 #endif
-    gang_rmsnorm_topk_detail::topk_noinline<__hip_bfloat16, NUM_EXPERTS, K>(
+    gang_rmsnorm_topk_detail::topk_noinline<__hip_bfloat16, NUM_EXPERTS, K, BATCH_SIZE>(
         logits_scratch_ptr,
         topk_weight_ptr,
         routing_indices_ptr,
         active_expert_ids_ptr,
         topk_counter,
         num_active_tokens);
-    // topk_noinline resets topk_counter internally
-    // topk_noinline's return has per-thread s_waitcnt, but thread 0 could reach
-    // threadfence_gpu before other threads finish their stores. syncthreads
-    // ensures all threads complete TopK stores before thread 0 flushes L2→HBM.
+    // topk_noinline resets topk_counter internally.
+    //
+    // Drain then rendezvous. __syncthreads alone is NOT enough here: it makes
+    // every wave *reach* this point, but `s_waitcnt` is per-wave, so a wave
+    // can arrive at the barrier with its routing_indices / active_expert_ids
+    // stores still in flight. tid 0 then fences and publishes the release,
+    // advertising data that has not landed. Each wave must retire its own
+    // stores first; the barrier then makes that true block-wide.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     __syncthreads();
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
     if (tid == 0 && ts_base) {
@@ -1092,16 +1884,118 @@ topk_barrier :
       // gang_oproj_topk_moe_fused_mi300.cuh, "TopK worker wrote per-XCD flags
       // via st_wt after threadfence_gpu". The comment above was written for a
       // fence that was never actually here.
+      //
+      // MPK_OPROJ_NO_WB: the argument above says "ordinary st_wt stores" and
+      // then concludes a GPU-scope fence is needed. Those two halves don't fit
+      // together. st_wt IS the write-through store -- st_wt_u32/st_wt_u16 emit
+      // `global_store_dword{,x2} ... sc0 sc1`, bypassing L2 for HBM (see every
+      // publication in moe_topk_softmax_mi300.cuh: routing_indices,
+      // active_expert_ids, topk output, the count at [NUM_EXPERTS]). The
+      // `s_waitcnt vmcnt(0)` immediately above, run per-wave before the
+      // __syncthreads, already retires all of them at HBM. There is no L2
+      // residency for buffer_wbl2 to write back.
+      //
+      // What remains true is the *ordering* requirement -- the release flags
+      // must not land before the routing data -- and the drain provides it.
+      // The whole-L2 writeback does not add ordering the drain lacks.
+      //
+      // Only one worker per layer runs this, but it is the worker every other
+      // XCD's Phase 7b poll is waiting on, so its latency is on the critical
+      // path rather than amortized. Same reasoning as the Phase 2 arrival
+      // fence above; both are under the one flag because they stand or fall on
+      // the same fact about st_wt.
+#ifndef MPK_OPROJ_NO_WB
       threadfence_gpu();
+#endif
       if (routing_ready_ptr) {
+        // ── The epoch is derived, not read back ───────────────────────────
+        //
+        // `ld_nt_s32(routing_ready_ptr) + 1` is a dependent, cache-bypassing
+        // HBM load sitting in front of the nine stores that release all 240
+        // workgroups -- the single most-awaited publication in the layer, and
+        // the one thread on the GPU whose latency nothing hides. The consumer
+        // side never pays it: the Phase 7b poll in
+        // gang_full_layer_fused_mi300.cuh compares against `layer_counter + 1`
+        // computed locally.
+        //
+        // `layer_epoch` is that same counter -- (iterations * num_layers +
+        // layer) + 1, monotonic, never reset, identical for every worker --
+        // already passed in for the O-proj hierarchical barrier a few hundred
+        // lines up, which stopped snapshotting for exactly this reason (see
+        // `oproj_release_expected`). Using it here makes producer and consumer
+        // derive the release value the same way instead of one of them reading
+        // what the other wrote.
+        //
+        // The standalone task type passes layer_epoch == 0 (it has no layer
+        // loop), so that path keeps the read-back, which is safe there because
+        // there is no second layer to race with.
+#ifdef MPK_ROUTING_DERIVED_EPOCH
+        int epoch = layer_epoch > 0 ? layer_epoch
+                                    : ld_nt_s32(routing_ready_ptr) + 1;
+#else
         int epoch = ld_nt_s32(routing_ready_ptr) + 1;
+#endif
         st_wt_u32((void *)routing_ready_ptr, (unsigned)epoch);
+#ifdef MPK_ROUTING_LANE_RELEASE
+        rr_epoch = epoch;
+#else
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&routing_ready_ptr[(1 + x) * 16], (unsigned)epoch);
         }
+#endif
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
     }
+#ifdef MPK_ROUTING_LANE_RELEASE
+    // ── Fan the eight per-XCD flags out over lanes, not over time ─────────
+    //
+    // TESTED AND NOT ADOPTED, twice. Interleaved A/B, 5 rounds each: this
+    // readfirstlane form measures 2.022 against 2.025 for the serial loop --
+    // inside the noise. An earlier version that carried the epoch through LDS
+    // measured 2.042 against 2.017, i.e. clearly worse, because its
+    // __syncthreads lands at the exact point 240 workgroups are waiting on
+    // this block. Correct on both arms (hash 88861a4763c0 throughout).
+    //
+    // Why the transform pays elsewhere and not here: the seven store-issues it
+    // removes are ~100 ns against the ~5.8 us this phase's poll actually
+    // costs, and that 5.8 us is the TopK compute the release is waiting for,
+    // not the release's own latency. Kept behind the flag rather than deleted
+    // because the reasoning below is the same one that did pay at the two
+    // other barriers, and this is the measurement that bounds it.
+    //
+    // This is the single most-awaited store in the layer: every worker on all
+    // eight XCDs is parked in the Phase 7b poll on one of these lines, and
+    // until now one lane issued all eight back to back, so XCD 7 was released
+    // seven `sc0 sc1` store-issues after XCD 0. The lines are 16 ints apart
+    // by design, so lanes 0..7 differ only in address and the eight stores
+    // collapse into one `global_store_dword`.
+    //
+    // Same transform, same argument, as the O-proj hierarchical release a few
+    // hundred lines up and Phase 9's layer release -- both already do this and
+    // both measured for it. It does *not* apply at Phase 5's attention release
+    // (measured 2.047 vs 2.038 there), because those consumers arrive spread
+    // out rather than pre-parked; here all 240 are already spinning.
+    //
+    // The epoch reaches lanes 1..7 by readfirstlane, NOT through LDS. An
+    // earlier version put it in a __shared__ int and rendezvoused; that
+    // measured 2.042 against 2.017 for the serial loop, because the
+    // __syncthreads lands at the one point in the layer where 240 workgroups
+    // are waiting on this block and it costs more than the seven store-issues
+    // it removes. readfirstlane needs no barrier: tid 0..7 are the same wave,
+    // the `if (tid == 0)` above has closed so all lanes are live, and
+    // readfirstlane reads the first active lane. Zero is a safe "no release"
+    // sentinel -- a real epoch is >= 1 -- so the `routing_ready_ptr ==
+    // nullptr` path needs no separate test.
+    //
+    // Ordering is unchanged from the serial form: the `s_waitcnt vmcnt(0)`
+    // inside tid 0's block retires both the routing data and its aggregate
+    // store to routing_ready_ptr[0] before any of these eight flags issue.
+    rr_epoch = __builtin_amdgcn_readfirstlane(rr_epoch);
+    if (rr_epoch != 0 && tid < 8) {
+      st_wt_u32((void *)&routing_ready_ptr[(1 + tid) * 16], (unsigned)rr_epoch);
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    }
+#endif
   }
 
 done :
@@ -1113,6 +2007,30 @@ done :
     atomicAdd(&g_subphase_cnt[3], 1ULL);
   }
 }
+#endif
+#ifdef MPK_OPROJ_INNER_TIMING
+  // Inner split of Phase 7, printed by one worker per XCD so the four numbers
+  // come from a single consistent timeline. `_op_t3` is taken before the TopK
+  // barrier, so `topk` here folds in that wait -- the interesting comparison is
+  // mfma vs the rest, since mfma is the only part that is bandwidth-bound.
+  // Every tile prints, not just one per XCD: the question this is here to
+  // answer is whether `bar` is release latency or arrival skew, and skew is
+  // only visible as a spread across tiles. `t1` is the raw arrival tick, kept
+  // so the spread of arrivals within one layer can be measured directly.
+  // One tile per XCD. Printing all 184 floods the printf buffer badly enough
+  // to stall the run; it was done once, off this flag, to establish that the
+  // barrier wait is protocol latency and not arrival skew (spread 0.14 us,
+  // first and last arriver both waiting ~5.6 us).
+  if (tid == 0 && (tile_idx % tiles_per_xcd) == 0) {
+    unsigned long long _op_t4 = __builtin_amdgcn_s_memrealtime();
+    printf("[OPROJ_INNER] mfma=%.2f bar=%.2f "
+           "rmsnorm_router=%.2f topk=%.2f total=%.2f\n",
+           (double)(_op_t1 - _op_t0) * 10.0 / 1000.0,
+           (double)(_op_t2 - _op_t1) * 10.0 / 1000.0,
+           (double)(_op_t3 - _op_t2) * 10.0 / 1000.0,
+           (double)(_op_t4 - _op_t3) * 10.0 / 1000.0,
+           (double)(_op_t4 - _op_t0) * 10.0 / 1000.0);
+  }
 #endif
   (void)0;
 }

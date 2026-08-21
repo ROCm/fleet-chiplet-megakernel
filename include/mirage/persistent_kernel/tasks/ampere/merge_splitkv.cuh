@@ -21,6 +21,14 @@
 // the log exp sum as input,
 namespace kernel {
 
+// Native vector types for address-space-qualified loads in the two-pass merge.
+// HIP's float2/float4 are HIP_vector_type class templates and cannot be
+// copy-constructed through an AS(1) pointer; these can. See the comment at
+// their use in merge_splitkv_ck_fmha for why GLOBAL rather than generic FLAT
+// is load-bearing here.
+typedef float _mg_f32x2 __attribute__((ext_vector_type(2)));
+typedef float _mg_f32x4 __attribute__((ext_vector_type(4)));
+
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_KV_HEADS,
@@ -189,6 +197,10 @@ __device__ __forceinline__ void
   constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
   constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
+  static_assert(VAL_PER_THREAD == 1 || VAL_PER_THREAD % 2 == 0,
+                "merge: VAL_PER_THREAD must be 1 or even; the AS(1) vector "
+                "loads in the two-pass arm assume natural alignment at the "
+                "vector width and fall back to scalars otherwise");
 
   int thread_in_group = threadIdx.x % THREADS_PER_TOKEN;
   int group_id = threadIdx.x / THREADS_PER_TOKEN;
@@ -222,6 +234,191 @@ __device__ __forceinline__ void
 
     // Compute all VAL_PER_THREAD dimensions
     float out_vals[VAL_PER_THREAD];
+#ifdef MPK_MERGE_KV_OUTER
+    // KV outer, dim inner. The running softmax state (m_global, d_global, and
+    // both rescale weights) depends only on kv_idx, but the dim-outer nest
+    // below recomputes all of it -- and reloads the same lse element -- once
+    // per dim. Interchanging hoists it: per kv step this does one lse load and
+    // two exp2 instead of VAL_PER_THREAD of each.
+    //
+    // No float reassociation: each accumulator sees the same operations in the
+    // same order over kv. It is NOT bit-identical in practice, though -- the
+    // generated text hash changes (88861a4763c0 -> 2051938f7067, stable across
+    // runs). Naming `w_prev`/`w_other` once instead of recomputing ptx_exp2 per
+    // dim changes which multiply-adds the backend contracts into v_fma, and a
+    // contracted FMA keeps a wider intermediate than mul-then-add.
+    //
+    // Sized, not assumed: on wikitext-2 (4 x 1024-token slices) the two flags
+    // together move mean NLL by +0.033 +/- 0.008, sign-flipping across slices.
+    // The yardstick is CK_FMHA_NUM_KV_CHUNKS 8->16, which is *exact* in real
+    // arithmetic (same keys, merge is an identity) and so measures pure FP
+    // reordering: it moves NLL by -0.107 +/- 0.012, 2.6x further. This is
+    // inside the decode path's own FP-sensitivity band.
+    //
+    // The redundancy this removes is CSE the compiler cannot do itself,
+    // because the loads sit between the repeated computations and it cannot
+    // prove lse_ptr is unaliased by the stores.
+    //
+    // The o loads also become adjacent within a kv step (o_base + 0..
+    // VAL_PER_THREAD-1) so they merge into one wide load. In the dim-outer
+    // form each lane's o access was 4 B at an 8 B stride -- half of every
+    // cache line fetched and discarded, twice.
+    {
+      float m_global = -inf;
+      float d_global = 1.f;
+      float o_global[VAL_PER_THREAD];
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        o_global[i] = 0.f;
+      }
+#ifdef MPK_MERGE_TWO_PASS
+      // Two-pass form. The running-max version below is a serial chain: step
+      // k's `o` accumulate needs w_prev, which needs m_global from step k-1,
+      // so the 31 chunk loads cannot overlap -- the loop runs at one
+      // load->exp2->fma latency per chunk with the memory system idle.
+      //
+      // Pass 1 reads only the 31 lse values (one dword each, and this thread's
+      // whole set is contiguous in kv) and reduces them to m_max. Pass 2 then
+      // has every weight known up front, so all 31 `o` loads are independent
+      // and issue back-to-back into one long vmcnt queue, and every accumulate
+      // is a plain FMA against a constant weight -- no rescale, no chain.
+      //
+      // Mathematically the standard flash-attention final-merge form: with
+      // m_max fixed, sum_k exp2(m_k - m_max) * o_k over a common base rather
+      // than rescaling a running base. Same result in exact arithmetic and
+      // strictly better conditioned (every weight is <= 1); it differs from
+      // the running form in the low bits for the same FMA-contraction reason
+      // noted above.
+      float lse_log2[NUM_KV_CHUNKS];
+      int const lse_base0 = head_idx +
+                            (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                            lse_kv_offset;
+      // AS(1) for the same reason as the `o` loads below: as generic FLAT
+      // these bump lgkmcnt too, and pass 1 is precisely the part that must
+      // become one deep independent queue -- every value is needed before the
+      // max reduction can finish, and none depends on any other.
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        lse_log2[kv_idx] =
+            *(__attribute__((address_space(1))) float const *)(
+                lse_ptr + lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) *
+            1.44269504088896340736f;
+      }
+      float m_max = -inf;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        m_max = max(m_max, lse_log2[kv_idx]);
+      }
+      float d_sum = 0.f;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w;
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+        // Load this chunk's slice as ONE address-space(1) vector, not
+        // VAL_PER_THREAD scalar dereferences.
+        //
+        // Both halves of this matter, and the second half is the whole point
+        // of the two-pass form.
+        //
+        // A plain `o_ptr[...]` is a *generic* pointer, so clang emits
+        // `flat_load_dwordx2`, and a FLAT load bumps lgkmcnt as well as vmcnt.
+        // The compiler therefore cannot express "wait for chunk k's load but
+        // not chunk k+4's" -- there is no counted wait that covers one counter
+        // and not the other -- so it falls back to full
+        // `s_waitcnt vmcnt(0) lgkmcnt(0)` drains. Verified in the gfx950
+        // disassembly of the shipping build: pass 2 issued its loads in
+        // batches of four separated by full drains, i.e. issue-4, stall,
+        // accumulate, issue-4, ... The 31 loads never formed the single deep
+        // queue this loop was restructured to create, so the two-pass rewrite
+        // was buying nothing over the running-max chain it replaced.
+        //
+        // Through an AS(1) pointer the same access becomes
+        // `global_load_dwordx2`, which touches vmcnt only, and the scheduler
+        // is free to hoist loads and retire them with counted `vmcnt(N)`.
+        //
+        // Bit-identical, deliberately: this changes only how the bytes are
+        // fetched. The floats are the same floats, the FMA order is unchanged,
+        // and no reassociation is introduced -- so it is testable against an
+        // exact hash rather than a perplexity band. (Contrast MERGE_KV_OUTER
+        // and the two-pass form itself, both of which do move the low bits.)
+        //
+        // Alignment is structural, not assumed: o_base's chunk term is a
+        // multiple of HEAD_DIM (64) and its lane term is
+        // thread_in_group * VAL_PER_THREAD, so the offset is a multiple of
+        // VAL_PER_THREAD and the address is naturally aligned for the vector
+        // width. The static_assert below pins the only two widths this
+        // produces (HEAD_DIM/THREADS_PER_TOKEN is 2 or 4 for every shape here);
+        // anything else takes the scalar path rather than misaligning.
+        float o_v[VAL_PER_THREAD];
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr +
+                                                                     o_base);
+          o_v[0] = t.x;
+          o_v[1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr +
+                                                                     o_base);
+          o_v[0] = t.x;
+          o_v[1] = t.y;
+          o_v[2] = t.z;
+          o_v[3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_v[i] = o_ptr[o_base + i];
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_v[i] * w;
+        }
+      }
+      m_global = m_max;
+      d_global = d_sum;
+#else
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float m_prev = m_global, d_prev = d_global;
+
+        int lse_linear = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
+                         (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                         lse_kv_offset;
+        int o_base = lse_linear * HEAD_DIM + thread_in_group * VAL_PER_THREAD;
+
+        // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
+        float other_m = lse_ptr[lse_linear] * 1.44269504088896340736f,
+              other_d = 1;
+        m_global = max(m_prev, other_m);
+        float const w_prev = ptx_exp2(m_prev - m_global);
+        float const w_other = ptx_exp2(other_m - m_global);
+        d_global = d_prev * w_prev + other_d * w_other;
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] = o_global[i] * w_prev + o_ptr[o_base + i] * w_other;
+        }
+      }
+#endif
+      float corr = 1.0f;
+      if (sinks_ptr != nullptr) {
+        float lse_log2 = m_global + ptx_log2(d_global);
+        float diff = sink_val_log2 - lse_log2;
+        corr = __fdividef(1.0f, 1.0f + ptx_exp2(diff));
+      }
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        float out_f = __fdividef(o_global[i], d_global);
+        if (sinks_ptr != nullptr) {
+          out_f *= corr;
+        }
+        out_vals[i] = out_f;
+      }
+    }
+#else
 #pragma unroll
     for (int i = 0; i < VAL_PER_THREAD; ++i) {
       float m_global = -inf;
@@ -257,6 +454,7 @@ __device__ __forceinline__ void
       }
       out_vals[i] = out_f;
     }
+#endif
 
     // Write output: either write-through (st_wt) or regular global store
     if constexpr (WRITE_THROUGH) {

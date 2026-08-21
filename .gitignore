@@ -83,6 +83,7 @@ tests/standalone/test_mfma_pipeline_hazards
 
 # hipcc -save-temps intermediates
 *-hip-amdgcn-amd-amdhsa-*.bc
+*-hip-amdgcn-amd-amdhsa-*.bc.tmp
 *-hip-amdgcn-amd-amdhsa-*.hipi
 *-hip-amdgcn-amd-amdhsa-*.s
 *-hip-amdgcn-amd-amdhsa-*.out
