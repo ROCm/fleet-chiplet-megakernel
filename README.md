@@ -78,11 +78,21 @@ GPT-OSS 120B supports **up to 16 tokens per iteration** (`--max-num-batched-toke
 1..16`) across **up to 8 concurrent requests** (`--max-num-batched-requests 1..8`).
 
 Tokens ride the N axis of the `16x16x128` scaled-MFMA instruction, which was
-already computing 16 columns for one token, so the dense GEMMs cost the same for
-16 tokens as for 1 and only the MoE grows — with the number of *distinct* experts
-the batch activates, not with the token count. Measured prefill: 2.09 / 4.06 /
-5.11 / 6.55 / 8.51 ms at 1 / 2 / 4 / 8 / 16 tokens, i.e. 16 tokens for 4.1x the
-cost of one.
+already computing 16 columns for one token, so the dense GEMMs issue the same
+instructions for 16 tokens as for 1 and the growth is in the MoE — with the
+number of *distinct* experts the batch activates, not with the token count.
+Prefilling a 512-token prompt at `--max-num-batched-tokens T`:
+
+| T (tokens/iteration) | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| ms/iteration | 1.92 | 4.72 | 5.83 | 8.00 | 12.00 |
+| ms/prompt token | 1.92 | 2.36 | 1.46 | 0.97 | 0.70 |
+
+16 tokens cost 6.3x one token, so packing them is 2.7x cheaper per token and
+prefill of that prompt drops from 980 ms to 360 ms. **T=2 is a pessimal point**
+— it costs 2.5x T=1 to do 2 tokens, worse than not packing at all; the curve
+only pays from T=4 up. T=1/2/4 were run twice and agree to within 1.5%; all five
+runs produced identical generated text.
 
 Concurrent requests reuse that same flat token axis — there is no batch
 dimension anywhere, exactly as in vLLM — so the only per-request structure is in
@@ -90,26 +100,48 @@ attention. The 30 workers on each XCD are split as
 `(request, chunk) = (xcd_rank / chunks, xcd_rank % chunks)` with
 `chunks = 30 / B`, trading split-KV depth for batch width the same way vLLM
 picks partitioned vs non-partitioned attention on occupancy rather than on
-sequence length. Measured decode:
+sequence length.
+
+![decode vs concurrent requests](docs/img/bs_sweep.svg)
 
 | B | 1 | 2 | 4 | 8 |
 |---|---|---|---|---|
-| ms/iter | 2.13 | 2.50 | 5.36 | 8.19 |
-| tokens/s | 470 | 800 | 747 | 977 |
+| ms/iteration | 1.906 | 3.050 | 4.175 | 6.767 |
+| ms/token (per request) | 1.906 | 1.525 | 1.044 | 0.846 |
+| tokens/s (aggregate) | 524 | 656 | 958 | 1182 |
 
-Per-layer attribution (`MPK_DEVICE_TIMING=1`, µs, B=1 → B=8) shows where the
-growth actually goes:
+Eight concurrent requests cost 3.55x one request's iteration while serving 8x
+the tokens, so per-token latency *falls* 2.3x as B rises. The sublinear part is
+the MoE: the dense GEMMs are already paid for by the N-axis token packing, but
+expert weight traffic grows with the number of *distinct* experts the batch
+activates (`min(topk*B, 128)`, so roughly 4 -> 32 experts from B=1 to B=8).
+Attention grows for a second reason — the per-request chunk budget falls from 30
+to 3, which is less split-KV parallelism per request rather than more work.
 
-| | qkv gemm | attn | merge | oproj+topk | moe |
-|---|---|---|---|---|---|
-| B=1 | 9.0 | 4.8 | — | 14.8 | 22.0 |
-| B=8 | 10.7 | 11.2 | 2.6 | 16.3 | 34.0 |
+Every point above runs **distinct** prompts, one per request, and the generated
+text was checked per row: with identical prompts a request that reads another
+request's KV cache still produces the right answer, so identical prompts cannot
+gate the batched path.
 
-The MoE is the largest term (`min(topk*B, 128)` distinct experts, so expert
-weight traffic roughly 4 → 32 experts), and the dense GEMMs barely move — that
-is the batching win, already paid for by the N-axis token packing. Attention
-grows too, mostly because the per-request chunk budget falls from 8 to 3: less
-split-KV parallelism per request, not more work.
+Reproduce:
+
+```bash
+export MODEL_PATH=/path/to/gpt-oss-120b
+bash tests/ci-tests/run_gpt_oss_bs_sweep.sh    # prints the table, writes summary.json
+python3 tests/ci-tests/plot_bs_sweep.py \
+  --bs outputs/gpt_oss/bs_sweep/summary.json --out docs/img/bs_sweep.svg
+
+# the token-packing table above: one request, T tokens per iteration
+TOKENS_PER_ITER="1 2 4 8 16" bash tests/ci-tests/run_gpt_oss_bs_sweep.sh
+```
+
+The measured numbers are checked in under
+[`docs/data/bs_sweep/`](docs/data/bs_sweep/).
+
+TPOT here is a two-point difference of the device clock across two decode
+lengths, which cancels prefill exactly. Do **not** read `Decode avg` at B>1: it
+assumes `ceil(prompt_len / max_num_batched_tokens)` prefill iterations, which
+only holds at B=1, so it misclassifies prefill iterations as decode.
 
 ```bash
 python3 demo/gpt_oss/demo.py --use-mirage --model-path "$MODEL_PATH" \

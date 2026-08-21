@@ -1,0 +1,44 @@
+{
+  "rows": [
+    {
+      "tokens_per_iter": 1,
+      "prefill_ms": 978.6,
+      "prefill_iters": 510,
+      "ms_per_iter": 1.919,
+      "ms_per_prompt_token": 1.911,
+      "decode_ms": 1.962
+    },
+    {
+      "tokens_per_iter": 2,
+      "prefill_ms": 1199.8,
+      "prefill_iters": 254,
+      "ms_per_iter": 4.724,
+      "ms_per_prompt_token": 2.343,
+      "decode_ms": 2.253
+    },
+    {
+      "tokens_per_iter": 4,
+      "prefill_ms": 734.8,
+      "prefill_iters": 126,
+      "ms_per_iter": 5.832,
+      "ms_per_prompt_token": 1.435,
+      "decode_ms": 2.45
+    },
+    {
+      "tokens_per_iter": 8,
+      "prefill_ms": 496.1,
+      "prefill_iters": 62,
+      "ms_per_iter": 8.002,
+      "ms_per_prompt_token": 0.969,
+      "decode_ms": 2.829
+    },
+    {
+      "tokens_per_iter": 16,
+      "prefill_ms": 360.0,
+      "prefill_iters": 30,
+      "ms_per_iter": 12.0,
+      "ms_per_prompt_token": 0.703,
+      "decode_ms": 3.552
+    }
+  ]
+}
