@@ -25,6 +25,7 @@ them. Details below.
 | `aid_home_map.hip` | classifies the home side of each address granule; finds the granularity |
 | `hipmalloc_pages.hip` | how hipMalloc lays out pages, and the AID granularity/periodicity |
 | `aid_alloc.hip` | AID-pinned allocator built on 4 KiB VMM handles, plus the bandwidth payoff |
+| `aid_gemv.hip` | batch-1 GEMV on AID-pinned weights — the end-to-end latency result |
 | `aid_page_map.hip` | single-chiplet atomic latency probe — **negative result, see caveat** |
 
 All of them read `HW_REG_XCC_ID` so each phase runs only on the chiplet it
@@ -130,6 +131,49 @@ Two caveats worth keeping:
 - **The map follows physical addresses**, so it must be re-probed per
   allocation and cannot be cached across runs.
 
+## Latency on a real kernel (`aid_gemv.hip`)
+
+STREAM is the friendliest possible case, so the same question on a GEMV.
+Batch-1 decode is the shape that matters here: `y[n] = dot(W[n][:], x[:])`
+touches every weight exactly once and reuses nothing, so it is pure weight
+streaming and it is what the megakernel spends its time on. `N=16384, K=8192`
+fp32 puts W at 512 MiB, comfortably past the 224 MiB L3.
+
+Phase 1, only XCD0-3 working, over 256 MiB of W:
+
+| W homed | latency | GB/s |
+|---|---|---|
+| on its own side | **1.62 ms** | 165.3 |
+| on the far side | 2.00 ms | 134.4 |
+
+23% more latency for the same arithmetic, purely from where the pages live.
+
+Phase 2 is the version you would actually ship: all 8 chiplets working, each
+group taking half the rows, with that half homed on its own side.
+
+| W allocation | latency | GB/s |
+|---|---|---|
+| plain `hipMalloc` | 1.81 ms | 296.9 |
+| AID-pinned | **1.64 ms** | 327.2 |
+| inverted (control) | 2.02 ms | 266.3 |
+
+**1.10x end-to-end** against stock `hipMalloc`, and 1.23x against the inverted
+control. The control is the load-bearing part: it reuses the exact same VMM
+pages and only swaps which group reads which half, so the gain cannot be an
+artifact of 4 KiB VMM pages differing from `hipMalloc` pages. `hipMalloc`
+landing between the two is what its ~50/50 split predicts.
+
+Checksums are identical across all five configurations. Reproduced across three
+runs, spread under 1%.
+
+The honest framing of the 1.10x: half the win is already there by accident,
+because `hipMalloc`'s even spread means half of each group's reads are local
+anyway. Pinning converts the remaining half. The 1.23x pinned-vs-inverted gap is
+the full size of the effect.
+
+Probe cost is 8.8 s for the 768 MiB candidate pool, which only makes sense for
+allocations that live for the whole process — model weights, not activations.
+
 ## How hipMalloc lays out pages (`hipmalloc_pages.hip`)
 
 Observed mechanics:
@@ -201,11 +245,12 @@ are the usable signal.
 ## Build
 
 ```bash
-for f in aid_remote_hbm xcd_pair_matrix aid_home_map aid_alloc aid_page_map; do
+for f in aid_remote_hbm xcd_pair_matrix aid_home_map aid_alloc aid_gemv aid_page_map; do
   hipcc -O3 -std=c++17 --offload-arch=gfx950 \
     benchmark/aid_remote_hbm/$f.hip -o /tmp/$f
 done
 HIP_VISIBLE_DEVICES=1 /tmp/aid_alloc 256   # argument is the buffer size in MiB
+HIP_VISIBLE_DEVICES=1 /tmp/aid_gemv        # ~90 s, most of it page probing
 ```
 
 Run on an idle GPU; a neighbouring process on the same package perturbs the
