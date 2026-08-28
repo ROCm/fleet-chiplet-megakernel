@@ -26,6 +26,7 @@ them. Details below.
 | `hipmalloc_pages.hip` | how hipMalloc lays out pages, and the AID granularity/periodicity |
 | `aid_alloc.hip` | AID-pinned allocator built on 4 KiB VMM handles, plus the bandwidth payoff |
 | `aid_gemv.hip` | batch-1 GEMV on AID-pinned weights — the end-to-end latency result |
+| `analyze_locality.py` | census of fleet's per-token reads: how much is local, remote, pinnable |
 | `aid_page_map.hip` | single-chiplet atomic latency probe — **negative result, see caveat** |
 
 All of them read `HW_REG_XCC_ID` so each phase runs only on the chiplet it
@@ -173,6 +174,64 @@ the full size of the effect.
 
 Probe cost is 8.8 s for the 768 MiB candidate pool, which only makes sense for
 allocations that live for the whole process — model weights, not activations.
+
+## How much of fleet's traffic is remote (`analyze_locality.py`)
+
+The benchmarks above say a remote read costs ~23% more. This says how much of
+fleet's traffic is exposed to that. The script walks `demo/gpt_oss` task graph
+0 (gpt-oss-120b, batch 1 decode) and, for every tensor a task reads, checks
+whether the 8 sibling tasks of a layer touch disjoint byte ranges. Task index
+within a layer group is the XCD, since `global_tile = tile_idx * 8 + xcd_id`.
+
+Per token, across all 36 layers:
+
+| class | GiB/token | share | meaning |
+|---|---|---|---|
+| private | 0.509 | 20.8% | QKV, o_proj, gate — each XCD reads a disjoint, build-time-fixed range |
+| routed | 1.855 | 75.8% | MoE experts — disjoint per XCD, but which range depends on runtime routing |
+| shared | 0.083 | 3.4% | norms, barriers, accumulators — every XCD reads the same bytes |
+| total | 2.447 | | |
+
+The 2.447 GiB/token checks out against the model: 128 experts x 138 wgs x
+100096 B x 36 layers is 63.6 GB of MXFP4 weights, and top-4-of-128 routing
+touches ~2.4 GiB of it per token.
+
+Today `hipMalloc`'s ~50/50 spread means **half of all 2.447 GiB is read from the
+far AID**, private and routed alike. Where that can go:
+
+| scenario | local | remote | remote % |
+|---|---|---|---|
+| today (hipMalloc) | 1.223 | 1.223 | 50.0% |
+| pin private tensors only | 1.478 | 0.969 | 39.6% |
+| + expert-invariant MoE tile map | 2.405 | 0.041 | **1.7%** |
+
+Pinning alone only gets 50% down to 39.6%, because the 76% of traffic that is
+MoE weights cannot be pinned as the kernel is written today. The tile decode is
+
+    global_tile = tile_idx * 8 + xcd_id
+    expert_idx  = global_tile / TILES ;  wg_idx = global_tile % TILES
+
+so workgroup `w` of an expert is read by XCD `(p * TILES + w) % 8`, where `p` is
+that expert's **position in the activated list** — which changes every token.
+With `W13_TILES = 92` (`92 % 8 = 4`) and `W2_TILES = 46` (`46 % 8 = 6`), the
+script finds **0 of 92** and **0 of 46** workgroups keep a single AID across the
+4 possible positions. Not one weight page has a stable home, so no static
+placement can help.
+
+Making the map expert-invariant (`xcd = wg_idx % 8`) fixes that and is what
+takes remote traffic to 1.7%. It costs some balance: 92 workgroups over 8 XCDs
+is 11 or 12 each rather than an even split.
+
+The residual 1.7% is the 85 MiB/token of genuinely shared tensors. Removing it
+would mean replicating them per AID, which is cheap in bytes but only worth it
+after the first two steps land.
+
+Two things this analysis does *not* establish. It counts bytes demanded, not
+bytes that miss the 224 MiB L3, so the shared tensors in particular are likely
+already cached and cheaper than their row suggests. And fleet's MoE GEMMs
+overlap MFMA with the weight stream, so the end-to-end gain is bounded by the
+1.10x measured on a pure-streaming GEMV rather than equal to it. No end-to-end
+number is claimed here because none has been measured.
 
 ## How hipMalloc lays out pages (`hipmalloc_pages.hip`)
 
