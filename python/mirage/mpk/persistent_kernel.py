@@ -359,6 +359,22 @@ def get_compile_command(
             "-o",
             py_so_path,
         ]
+        # Profiling aid, off by default: emit DWARF line tables so a thread
+        # trace can name the source line behind a hot instruction.
+        #
+        # The thread tracer resolves each program counter through the code
+        # object's debug info; with no line tables its per-instruction report
+        # comes back with an empty source column, which leaves raw addresses
+        # in a single inlined megakernel and no way to tell one phase's spin
+        # loop from another's.
+        #
+        # `-gline-tables-only` rather than `-g`: line tables are the whole of
+        # what the decoder reads, so the variable DWARF that full `-g` adds is
+        # paid for and never used. Line tables do not change codegen, but this
+        # is still a build change, so it stays opt-in -- measure on a stock
+        # build, then turn this on to find out where the time went.
+        if os.environ.get("MPK_ATT_LINEINFO", "0") == "1":
+            common_cmd = common_cmd + ["-gline-tables-only"]
         if mpk.mode == "offline":
             flags = flags + ["-DMODE_OFFLINE"]
         elif mpk.mode == "online":
