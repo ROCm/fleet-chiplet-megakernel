@@ -662,10 +662,17 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
       }
 
 // Wavefront reduction (AMD wavefront = 64 lanes)
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       // Cross-wave reduction via shared memory (reuse FP8 area, dead here)
       float *s_red = (float *)_rnlm_smem;
@@ -1537,10 +1544,17 @@ __device__ __noinline__ void
       }
 
 // Wavefront reduction (AMD wavefront = 64 lanes)
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       // Cross-wave reduction via shared memory (reuse FP8 area, dead here)
       float *s_red = (float *)_rnlm_smem;
@@ -1991,10 +2005,17 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
       }
 
 // Wavefront reduction
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       // Cross-wave reduction via shared memory
       float *s_red = (float *)_rnlm_smem;
@@ -2627,10 +2648,17 @@ __device__ __noinline__ void
         }
       }
 
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;

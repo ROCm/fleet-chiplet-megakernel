@@ -912,6 +912,25 @@ def get_compile_command(
         # and tested, not because it is faster.
         if os.environ.get("MPK_ARGMAX_DUAL_REDUCE", "0") == "1":
             flags = flags + ["-DMPK_ARGMAX_DUAL_REDUCE"]
+        # The same transform on the RMSNorm prologues' sum-of-squares. Seven
+        # live sites run the identical six-step `__shfl_xor` butterfly and then
+        # read lane 0 only, so each pays six ds_bpermute round trips and six
+        # lgkmcnt waits for data that never left the register file. Two
+        # permlane swaps and four DPP row_shl adds replace the whole chain.
+        #
+        # Wider reach than the router or the argmax: this one runs in the QKV
+        # and MoE prologues, not once per token in the tail.
+        #
+        # Bit-identical at lane 0 -- same 32/16/8/4/2/1 association tree, so
+        # the float sum is not reassociated. Verified over 8192 cases in
+        # tests/standalone/test_rmsnorm_dpp_reduce.hip.
+        #
+        # 1.8510 -> 1.8353 ms, all three alternating pairs (-0.019 / -0.021 /
+        # -0.007) with the generated text unchanged. The reach is what makes
+        # the difference against the router's 1 us: same idiom, but on the
+        # prologues rather than once per token.
+        if _opt("MPK_RMSNORM_DPP_REDUCE"):
+            flags = flags + ["-DMPK_RMSNORM_DPP_REDUCE"]
         if _opt("MPK_ML_TABLE_PREFETCH"):
             # Read layer N+1's pointer-table row during layer N's body instead
             # of after layer N's Phase 9 gate. The tables are host-built and
