@@ -85,6 +85,93 @@ constexpr int oproj_lds_w_off(int batch_size, int reduction_size) {
          16;
 }
 
+#ifdef MPK_ROUTER_DUAL_REDUCE
+#ifndef MPK_ROUTER_FUSED_DP
+#error                                                                         \
+    "MPK_ROUTER_DUAL_REDUCE interleaves the ssq and router-dp wave reductions, but without MPK_ROUTER_FUSED_DP the dot product is not finished until pass 2 and there is no second reduction here to interleave with. Enable MPK_ROUTER_FUSED_DP or drop this flag."
+#endif
+// ── Router's two wave reductions, interleaved into one lane-crossing chain ──
+//
+// Under MPK_ROUTER_FUSED_DP the router finishes pass 1 holding two independent
+// per-lane partials -- the RMSNorm sum of squares and the (unscaled) router dot
+// product -- and reduces each with its own six-step `__shfl_xor` butterfly.
+// That is twelve lane-crossing ops on the LDS data path: `__shfl_xor` lowers to
+// ds_bpermute/ds_swizzle, which costs an LDS round trip and an lgkmcnt wait per
+// step even though nothing here is in LDS.
+//
+// Every step of that butterfly has a VALU-native equivalent on gfx950:
+// permlane32_swap for the xor-32 stage, permlane16_swap for xor-16, and DPP
+// row_shl for the four intra-row stages. None of them touch LDS.
+//
+// The swaps and the DPP moves both have a hazard requiring a gap before the
+// value is consumed -- alone, that gap is an `s_nop`. Running the two
+// reductions together fills it with real work instead: ssq's swap issues, dp's
+// swap issues, then ssq's add. So the pair costs barely more than one would.
+//
+// Result semantics differ from the butterfly: `__shfl_xor` leaves the total in
+// every lane, whereas row_shl accumulates toward lane 0 of each row of 16 and
+// leaves the other lanes holding partial sums. Lane 0 is correct, which is all
+// the caller reads (`if (lane == 0) red[wave] = ssq`). Hence the name.
+//
+// The summation order is the same xor-32, xor-16, 8/4/2/1 tree the shuffles
+// walked, so this is bit-identical to the reduction it replaces -- unlike
+// MPK_ROUTER_FUSED_DP itself, which does reassociate.
+__device__ __forceinline__ void router_dual_wave_sum_to_lane_zero(float &ssq,
+                                                                  float &dp) {
+  // The swap instructions exchange one operand's low half with the other's
+  // high half, so seeding each peer with a copy of its own value turns the
+  // swap plus one add into a lane-uniform butterfly. The DPP stages are
+  // destructive in the other direction, so the peer is re-derived each time
+  // rather than carried.
+  float ssq_peer = ssq;
+  float dp_peer = dp;
+  asm volatile("s_nop 1\n"
+               "v_permlane32_swap_b32 %[ssq], %[ssq_peer]\n"
+               "v_permlane32_swap_b32 %[dp], %[dp_peer]\n"
+               "v_add_f32 %[ssq], %[ssq], %[ssq_peer]\n"
+               "v_add_f32 %[dp], %[dp], %[dp_peer]\n"
+               "v_mov_b32_e32 %[ssq_peer], %[ssq]\n"
+               "v_mov_b32_e32 %[dp_peer], %[dp]\n"
+               "s_nop 1\n"
+               "v_permlane16_swap_b32 %[ssq], %[ssq_peer]\n"
+               "v_permlane16_swap_b32 %[dp], %[dp_peer]\n"
+               "v_add_f32 %[ssq], %[ssq], %[ssq_peer]\n"
+               "v_add_f32 %[dp], %[dp], %[dp_peer]\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %[ssq_peer], %[ssq] row_shl:8 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_mov_b32_dpp %[dp_peer], %[dp] row_shl:8 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_add_f32 %[ssq], %[ssq], %[ssq_peer]\n"
+               "v_add_f32 %[dp], %[dp], %[dp_peer]\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %[ssq_peer], %[ssq] row_shl:4 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_mov_b32_dpp %[dp_peer], %[dp] row_shl:4 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_add_f32 %[ssq], %[ssq], %[ssq_peer]\n"
+               "v_add_f32 %[dp], %[dp], %[dp_peer]\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %[ssq_peer], %[ssq] row_shl:2 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_mov_b32_dpp %[dp_peer], %[dp] row_shl:2 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_add_f32 %[ssq], %[ssq], %[ssq_peer]\n"
+               "v_add_f32 %[dp], %[dp], %[dp_peer]\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %[ssq_peer], %[ssq] row_shl:1 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_mov_b32_dpp %[dp_peer], %[dp] row_shl:1 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "v_add_f32 %[ssq], %[ssq], %[ssq_peer]\n"
+               "v_add_f32 %[dp], %[dp], %[dp_peer]"
+               : [ssq] "+v"(ssq),
+                 [dp] "+v"(dp),
+                 [ssq_peer] "+v"(ssq_peer),
+                 [dp_peer] "+v"(dp_peer));
+}
+#endif
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -132,7 +219,15 @@ __device__ __attribute__((noinline)) void
         // Optional: per-worker timestamp ring buffer pointer (g_fused_ts).
         // When non-null, writes slots 9 (oproj_done), 10 (barrier_done),
         // 11 (rmsnorm_router_done) for sub-phase breakdown.
-        unsigned long long *ts_base = nullptr) {
+        unsigned long long *ts_base = nullptr,
+        // Optional: base of the eight per-XCD attention release flags, strided
+        // by 16 ints, that the Phase 5 merge publishes under
+        // MPK_ATTN_SLICE_RELEASE. When supplied, this kernel does its own
+        // per-wave wait on the two slices each wave reads and the caller does
+        // not wait for attention at all. Passed rather than derived from
+        // `counters_ptr` so the slot number stays owned by the one file that
+        // lays that buffer out.
+        int const *attn_slice_release = nullptr) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0,
                 "OUTPUT_PER_WG must be multiple of 16");
@@ -160,6 +255,22 @@ __device__ __attribute__((noinline)) void
   constexpr int BF16_MFMA_ITERS = REDUCTION_SIZE / 32;
 
   constexpr int NUM_WAVES = 4;
+
+  // ── Attention slice release ─────────────────────────────────────────────
+  // See the SLICE_RELEASE arm below. The flag only selects the arm when the
+  // caller actually supplies the release line and the shape is the one the
+  // arm is derived for; every other instantiation of this kernel (the
+  // standalone O-proj wrapper, the N-parallel shape) keeps the shared
+  // block-wide quantizer, so this needs no second implementation.
+  constexpr int ATTN_SLICE = REDUCTION_SIZE / 8;
+  constexpr int ELEMENTS_PER_THREAD = REDUCTION_SIZE / 256;
+  constexpr int ELEMENTS_PER_SCALE = 128;
+#if defined(MPK_ATTN_SLICE_RELEASE)
+  constexpr bool SLICE_RELEASE =
+      OUTPUT_PER_WG < 64 && BATCH_SIZE == 1 && ELEMENTS_PER_THREAD == 16;
+#else
+  constexpr bool SLICE_RELEASE = false;
+#endif
 
   // ── Token staging layout (N-axis MFMA packing) ──────────────────────────
   // Token `col` lives at LDS row `col` and feeds N column `col` of the
@@ -266,12 +377,146 @@ __device__ __attribute__((noinline)) void
     uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
     uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
-    // Stage up to 16 token rows. The bespoke inline quantizer that used to
-    // live here was a second copy of the E8M0 logic that only ever handled
-    // row 0; the shared helper covers both OUTPUT_PER_WG shapes.
-    _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE,
-                             TOK_ROW_STRIDE, SC_STRIDE>(
-        A, REDUCTION_SIZE, tok_row_base, n_valid_tok, s_tok_fp8, s_tok_scales);
+    if constexpr (SLICE_RELEASE) {
+      // ── Per-wave attention slice wait + quantize ──────────────────────
+      //
+      // Replaces the block-wide staging below for the one shape that can use
+      // it. The caller (MPK_ATTN_SLICE_RELEASE in the fused full-layer
+      // kernel) no longer waits for attention at all before entering here;
+      // instead each XCD publishes attn_release[x] as soon as its own merge
+      // finishes, and each wave here waits for only the two slices it reads.
+      //
+      // The mapping is forced, not chosen. This is the K-parallel arm, so
+      // wave w owns MFMA iterations [8w, 8w+8) -- K elements
+      // [1024w, 1024w+1024). The merge gives XCD x elements
+      // [512x, 512x+512). So wave w reads exactly slices 2w and 2w+1 and is
+      // independent of the other six. The static_asserts below pin every
+      // number that argument uses.
+      //
+      // The payoff is the tail: under the default rendezvous *every* wave on
+      // *every* XCD starts when the slowest of eight merges lands. Here wave
+      // 0 starts when XCDs 0 and 1 land.
+      static_assert(TOK_ROWS == 1 && BATCH_SIZE == 1,
+                    "the slice arm stages one token row and drops the "
+                    "block-wide barrier that multi-row staging needs");
+      static_assert(REDUCTION_SIZE == 256 * ELEMENTS_PER_THREAD,
+                    "one contiguous 16-element run per thread is what makes "
+                    "wave w's staged range equal to its K range");
+      static_assert(K_PER_MFMA == ELEMENTS_PER_SCALE,
+                    "one E8M0 block per MFMA iteration, so b_scl[ki] indexes "
+                    "the same blocks this wave wrote");
+      // MFMA_ITERS % NUM_WAVES == 0 is doing double duty: it is what makes
+      // wave w's K range [8w, 8w+8), and it is also what makes the
+      // load-balanced split further down (KP_EXTRA waves get one extra iter)
+      // degenerate to the same even split. If it ever fails, the staging
+      // range and the MFMA range stop agreeing and the arm is wrong.
+      static_assert(MFMA_ITERS % NUM_WAVES == 0 &&
+                        (MFMA_ITERS / NUM_WAVES) * K_PER_MFMA == 2 * ATTN_SLICE,
+                    "wave w must cover exactly slices 2w and 2w+1");
+
+      // The weight DMA is the one thing here that still needs the whole
+      // block: the caller's buffer_load_lds slices are issued per wave and
+      // interleave across the region every wave then reads. Drain and
+      // rendezvous once, before any wave goes off on its own.
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      __syncthreads();
+
+      int const first_xcd = warp_id * 2;
+      // ld_sys_s32 takes a mutable pointer only because every other caller
+      // hands it one; the load itself is read-only.
+      int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
+      int *rel1 = const_cast<int *>(attn_slice_release) + (first_xcd + 1) * 16;
+      while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      // Cross-XCD acquire, per wave, placed at this wave's observation. The
+      // caller's Phase 6 `buffer_inv` runs before any flag has been seen on
+      // this path, so it cannot be the acquire for attn_out: a line cached
+      // here while reading the *previous* layer's attn_out would outlive it.
+      // buffer_inv is a per-wave instruction, so four of them is the correct
+      // shape, not a redundancy -- each wave invalidates for itself.
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      asm volatile("buffer_inv" ::: "memory");
+
+      constexpr int THREADS_PER_SCALE =
+          ELEMENTS_PER_SCALE / ELEMENTS_PER_THREAD;
+      int const scale_block = tid / THREADS_PER_SCALE;
+      int const lane_in_scale = tid & (THREADS_PER_SCALE - 1);
+      int const base = scale_block * ELEMENTS_PER_SCALE +
+                       lane_in_scale * ELEMENTS_PER_THREAD;
+
+      i32x4_t const *src = (i32x4_t const *)(A + base);
+      i32x4_t v0 = src[0];
+      i32x4_t v1 = src[1];
+
+      float vals[ELEMENTS_PER_THREAD];
+      float amax = 0.0f;
+      unsigned short const *vs0 = (unsigned short const *)&v0;
+      unsigned short const *vs1 = (unsigned short const *)&v1;
+#pragma unroll
+      for (int j = 0; j < ELEMENTS_PER_THREAD / 2; j++) {
+        vals[j] = _gang_bf16_to_float(vs0[j]);
+        vals[j + ELEMENTS_PER_THREAD / 2] = _gang_bf16_to_float(vs1[j]);
+        amax = fmaxf(
+            amax,
+            fmaxf(fabsf(vals[j]), fabsf(vals[j + ELEMENTS_PER_THREAD / 2])));
+      }
+
+      // All eight threads of a scale block sit in consecutive lanes of one
+      // wave (lane_in_scale is the low 3 bits of tid), so an xor butterfly
+      // over 1/2/4 stays inside the wave and leaves every lane holding the
+      // block max -- no leader broadcast needed.
+      amax = fmaxf(amax, __shfl_xor(amax, 1));
+      amax = fmaxf(amax, __shfl_xor(amax, 2));
+      amax = fmaxf(amax, __shfl_xor(amax, 4));
+
+      uint8_t const se = _gang_compute_e8m0_fp8(amax);
+      float scale_f;
+      if (se == 0) {
+        scale_f = 1.0f;
+      } else {
+        union {
+          float f;
+          uint32_t u;
+        } sv;
+        sv.u = (uint32_t)se << 23;
+        scale_f = sv.f;
+      }
+
+#pragma unroll
+      for (int j = 0; j < ELEMENTS_PER_THREAD; j += 4) {
+        fp8x4_t pk = {};
+        pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+            pk, vals[j], vals[j + 1], scale_f, false);
+        pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+            pk, vals[j + 2], vals[j + 3], scale_f, true);
+        *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
+      }
+      if (lane_in_scale == 0) {
+        s_tok_scales[scale_block] = se;
+      }
+      // Deliberately NOT __syncthreads. Every byte this wave just wrote is
+      // read back by this same wave and by no other, so a wave-scope drain is
+      // the whole requirement -- and keeping it wave-scope is the point of
+      // the arm: wave 0 enters its MFMA while wave 3 is still spinning on
+      // XCDs 6 and 7.
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      __builtin_amdgcn_wave_barrier();
+    } else {
+      // Stage up to 16 token rows. The bespoke inline quantizer that used to
+      // live here was a second copy of the E8M0 logic that only ever handled
+      // row 0; the shared helper covers both OUTPUT_PER_WG shapes.
+      _gang_multirow_fp8_quant<REDUCTION_SIZE,
+                               TOK_ROWS,
+                               BATCH_SIZE,
+                               TOK_ROW_STRIDE,
+                               SC_STRIDE>(A,
+                                          REDUCTION_SIZE,
+                                          tok_row_base,
+                                          n_valid_tok,
+                                          s_tok_fp8,
+                                          s_tok_scales);
+    }
 
     // B operand base for this lane: token row `col`. Inactive lanes clamp to
     // row 0 rather than skipping, so the exec mask cannot sink above the
@@ -578,16 +823,49 @@ __device__ __attribute__((noinline)) void
       uint8_t const *lds_w_scales = lds_w_data + OPROJ_LDS_DATA_PAD;
 
       int w_row_lds = col;
-      int const lds_row_data_base = w_row_lds * (REDUCTION_SIZE / 2);
       int const lds_row_scale_base = w_row_lds * NUM_BLOCKS_32;
+
+      // ── Weight fragment addressing ────────────────────────────────────────
+      //
+      // Row-major (default): lane (g, col) reads
+      //   col * (REDUCTION_SIZE / 2) + KI * 64 + g * 16.
+      // At REDUCTION_SIZE 4096 the row stride is 2048 B = 512 dwords, and
+      // 512 % 32 == 0, so all 16 values of `col` land on the same LDS bank.
+      // The 64 lanes of the wave therefore start at only four distinct banks
+      // (g * 16 B = g * 4 dwords), sixteen lanes deep on each -- a 16-way
+      // conflict on every ds_read_b128 in the K loop.
+      //
+      // K-major (MPK_OPROJ_KMAJOR): the tile is repacked offline from
+      // [row][k128][quarter][16B] to [k128][quarter][row][16B], so the lane's
+      // fragment sits at lane_id * 16 within its K block. Since
+      // lane_id == g * 16 + col, that is exactly quarter-major-then-row, and
+      // the wave reads 64 consecutive 16-byte fragments -- the conflict-free
+      // pattern ds_read_b128 is built for. Only the address changes; the same
+      // bytes reach the same lane, so this is bit-exact.
+      //
+      // The scale suffix stays row-major in both layouts (one byte per
+      // 32-element block, read as a scalar, not a b128), so
+      // lds_row_scale_base is shared.
+#ifdef MPK_OPROJ_KMAJOR
+      static_assert(OUTPUT_PER_WG == 16,
+                    "MPK_OPROJ_KMAJOR assumes a 16-row tile: lane_id spans "
+                    "exactly 16 rows x 4 K-quarters, which is what makes "
+                    "lane_id * 16 the fragment address.");
+      // One K128 block holds all 16 rows x 4 quarters x 16 B.
+      constexpr int LDS_DATA_K_STRIDE = 16 * (K_PER_MFMA / 2);
+      int const lds_data_lane_offset = lane_id * 16;
+#define MPK_OPROJ_W_ADDR(KI)                                                   \
+  (lds_w_data + lds_data_lane_offset + (KI)*LDS_DATA_K_STRIDE)
+#else
+      int const lds_row_data_base = w_row_lds * (REDUCTION_SIZE / 2);
+#define MPK_OPROJ_W_ADDR(KI)                                                   \
+  (lds_w_data + lds_row_data_base + (KI) * (K_PER_MFMA / 2) + g * 16)
+#endif
 
 #define DO_MFMA_LDS_FP8(KI)                                                    \
   do {                                                                         \
     i32x4_t _wt;                                                               \
-    __builtin_memcpy(&_wt,                                                     \
-                     lds_w_data + lds_row_data_base +                          \
-                         (KI) * (K_PER_MFMA / 2) + g * 16,                     \
-                     16);                                                      \
+    __builtin_memcpy(&_wt, MPK_OPROJ_W_ADDR(KI), 16);                          \
     int sa = (int)lds_w_scales[lds_row_scale_base + (KI)*4 + g];               \
     i32x8_t a;                                                                 \
     a[0] = _wt[0];                                                             \
@@ -598,17 +876,14 @@ __device__ __attribute__((noinline)) void
     a[5] = 0;                                                                  \
     a[6] = 0;                                                                  \
     a[7] = 0;                                                                  \
-    i32x8_t b = _gang_load_fp8_mfma_b(b_tok, (KI)*K_PER_MFMA, g);          \
-    int sb = (int)b_scl[KI];                                            \
+    i32x8_t b = _gang_load_fp8_mfma_b(b_tok, (KI)*K_PER_MFMA, g);              \
+    int sb = (int)b_scl[KI];                                                   \
     acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
   } while (0)
 #define DO_MFMA_LDS_FP4(KI)                                                    \
   do {                                                                         \
     i32x4_t _wt;                                                               \
-    __builtin_memcpy(&_wt,                                                     \
-                     lds_w_data + lds_row_data_base +                          \
-                         (KI) * (K_PER_MFMA / 2) + g * 16,                     \
-                     16);                                                      \
+    __builtin_memcpy(&_wt, MPK_OPROJ_W_ADDR(KI), 16);                          \
     int sa = (int)lds_w_scales[lds_row_scale_base + (KI)*4 + g];               \
     i32x8_t a;                                                                 \
     a[0] = _wt[0];                                                             \
@@ -640,6 +915,7 @@ __device__ __attribute__((noinline)) void
       }
 #undef DO_MFMA_LDS_FP8
 #undef DO_MFMA_LDS_FP4
+#undef MPK_OPROJ_W_ADDR
 
       // K-parallel reduce via LDS
       // CRITICAL: All lanes must write acc to LDS unconditionally.
@@ -1394,6 +1670,13 @@ oproj_barrier :
 #endif
       }
 
+#if defined(MPK_ROUTER_FUSED_DP) && defined(MPK_ROUTER_DUAL_REDUCE)
+      // Both partials are complete here, so they reduce together through one
+      // interleaved permlane/DPP chain rather than two shuffle butterflies.
+      // Only lane 0 is left holding the totals, which is what the cross-wave
+      // publish below reads. See router_dual_wave_sum_to_lane_zero.
+      router_dual_wave_sum_to_lane_zero(ssq, dp);
+#else
 // Wave-level reduction for ssq
 #pragma unroll
       for (int off = 32; off > 0; off >>= 1) {
@@ -1410,6 +1693,7 @@ oproj_barrier :
       for (int off = 32; off > 0; off >>= 1) {
         dp += __shfl_xor(dp, off);
       }
+#endif
 #endif
 
       // Cross-wave reduction via LDS

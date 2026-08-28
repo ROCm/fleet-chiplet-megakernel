@@ -175,6 +175,75 @@ __device__ __noinline__ void
   int xcd_rank = tile_idx % workers_per_xcd;
   int tid = threadIdx.x;
 
+  // ── Optional: rotate QKV/attention ownership off the O-proj ranks ─────────
+  //
+  // Phase 7 (O-proj + router + TopK) is owned by ranks
+  // [0, oproj_topk_tiles_per_xcd); the ranks above it have no Phase 7 work and
+  // therefore reach the MoE phase -- and finish its W2 tail -- ahead of
+  // everyone else. Those are precisely the workers that have slack to spend on
+  // the *next* layer's QKV weight prefetch and its GEMM, and today they are
+  // the ones that never get either: Phase 1 and Phase 3 are both keyed on
+  // `xcd_rank < K` with small K, so QKV and attention land on ranks 0..K-1 --
+  // the same ranks that are still busy in Phase 7.
+  //
+  // Rotating by exactly the size of the no-Phase-7 block hands QKV and
+  // attention to that block. It is a rotation, not a reassignment: `(r + d) %
+  // workers_per_xcd` is a bijection on [0, workers_per_xcd), so every guard of
+  // the form `rank < K` still selects exactly K workers and every tile index
+  // derived from it is still covered exactly once. Only *which* physical
+  // worker runs a given QKV tile or attention chunk changes.
+  //
+  // O-proj, TopK, MoE and every barrier arrival keep the physical rank. That
+  // asymmetry is the point -- rotating those too would just relabel the same
+  // overlap. It also keeps the Phase 9 barrier accounting untouched, which
+  // counts arrivals per XCD and does not care who did what.
+  //
+  // The rotation distance is computed from the topology rather than hardcoded
+  // for a 32-worker/23-tile layout, so it tracks fleet's 31 workers.
+  //
+  // ── DEFAULT OFF: it measures slower here, and the reason is structural ────
+  //
+  // 1.892 ms/token against 1.877 for the same build with the flag off (three
+  // runs each, per-run medians, alternating, generated text bit-identical to
+  // the reference on all six). The first numbers this produced were faster --
+  // 1.854 to 1.871 -- but those runs were wrong: the rotation moved the layer
+  // gate's waiter set off its arriver set, and the eight workers per XCD that
+  // stopped waiting are the whole apparent gain. See the union computation at
+  // MPK_LAYER_GATE_ARRIVES.
+  //
+  // Once the gate is honest the rotation cannot pay, because fleet already
+  // spends the same slack twice over. Redline's ranks 23..31 are idle in the
+  // W2 tail, so handing them QKV is free; fleet's are not idle, they are
+  // *excused* -- MPK_W2_ONLY_ARRIVE keeps them out of the layer-gate arrival
+  // and MPK_W2_CONSUMER_GATE keeps them out of its wait, precisely because
+  // they have no second MoE tile. Rotating QKV onto them makes them waiters
+  // again, which puts the arrival count back from 22 to 30 of 31 and costs
+  // more than the prefetch overlap returns. The two optimizations are
+  // competing for one resource; fleet's existing pair wins.
+  //
+  // Kept, behind the flag, because it is correct and because that trade could
+  // invert at a geometry where the no-Phase-7 block and the no-second-tile
+  // block stop coinciding.
+  int const oproj_topk_ranks =
+      oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
+#ifdef MPK_ROTATE_QKV_ATTN_RANKS
+#ifdef MPK_QKV_ROT_OVERRIDE
+  // Diagnostic only: pick the rotation distance by hand. Used to separate
+  // "the rotation itself is unsound" from "the destination block of ranks is
+  // special" -- a distance that lands QKV/attention on ranks that already run
+  // Phase 7 exercises the same relabelling without moving the work off the
+  // O-proj workers.
+  int const qkv_rot = MPK_QKV_ROT_OVERRIDE % workers_per_xcd;
+#else
+  int const qkv_rot = workers_per_xcd > oproj_topk_ranks
+                          ? workers_per_xcd - oproj_topk_ranks
+                          : 0;
+#endif
+  int const qkv_attn_rank = (xcd_rank + qkv_rot) % workers_per_xcd;
+#else
+  int const qkv_attn_rank = xcd_rank;
+#endif
+
   // Attention work is (request, kv_head, kv_chunk). kv_head is bound to the
   // XCD (kv_head_idx = xcd_id below), so the request and chunk axes both have
   // to fit in xcd_rank -- the 30 workers on this XCD. The host keeps
@@ -187,8 +256,8 @@ __device__ __noinline__ void
   // the chunk barrier below. Keeping the participant set fixed is what makes
   // every modulus here independent of how many requests happen to be live.
   constexpr int ATTN_PARTICIPANTS = NUM_REQS * NUM_KV_CHUNKS;
-  int const attn_req = xcd_rank / NUM_KV_CHUNKS;
-  int const attn_chunk = xcd_rank % NUM_KV_CHUNKS;
+  int const attn_req = qkv_attn_rank / NUM_KV_CHUNKS;
+  int const attn_chunk = qkv_attn_rank % NUM_KV_CHUNKS;
 
   // Layer-boundary ACQUIRE for moe_workspace_f32. Plain `buffer_inv` (vL1
   // only) -- NOT `buffer_inv sc1`.
@@ -417,7 +486,7 @@ __device__ __noinline__ void
   // Phase 1: QKV GEMM
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(10, xcd_rank);
-  if (xcd_rank < total_qkv_tiles_per_xcd) {
+  if (qkv_attn_rank < total_qkv_tiles_per_xcd) {
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -445,7 +514,7 @@ __device__ __noinline__ void
         qkv_n_wgs_per_xcd,
         kv_stride,
         q_ws_stride,
-        xcd_rank,
+        qkv_attn_rank,
 #ifdef MPK_PREFETCH_NEXT_QKV
         // Skip the DMA: the previous layer's Phase 9 already staged these
         // exact bytes into this exact LDS region during its barrier spin.
@@ -488,7 +557,7 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(20, qkv_epoch_expected);
   MPK_WS_PHASE(20, qkv_epoch_expected, xcd_id);
-  if (xcd_rank < qkv_epoch_participants) {
+  if (qkv_attn_rank < qkv_epoch_participants) {
     __shared__ int s_prev;
     if (tid == 0) {
       // Both counters on this barrier are XCD-private: the arrival line is
@@ -573,7 +642,7 @@ __device__ __noinline__ void
   MPK_TW_SUB(30, xcd_rank);
   MPK_WS_PHASE(30, qkv_epoch_expected, xcd_id);
   {
-    if (xcd_rank < ATTN_PARTICIPANTS) {
+    if (qkv_attn_rank < ATTN_PARTICIPANTS) {
       int kv_chunk_idx = attn_chunk;
       using bf16_t = __hip_bfloat16;
       void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
@@ -762,6 +831,40 @@ __device__ __noinline__ void
         // Phase 1 or attention role join Phase 6, they arrive spread out rather
         // than pre-parked, and this releaser is not on anyone's critical path
         // for the seven store-issues it saves. Left serial.
+#ifdef MPK_ATTN_SLICE_RELEASE
+        // ── Per-XCD slice release ────────────────────────────────────────
+        //
+        // This XCD's merge just finished, and what it finished is exactly the
+        // 512-element K slice [xcd_id*512, xcd_id*512+512) of attn_out: the
+        // merge is called with kv_head_idx == xcd_id, so XCD x owns q heads
+        // [8x, 8x+8) and NUM_Q_PER_KV * HEAD_DIM == 8 * 64 == 512 of the
+        // O-proj's 4096-wide reduction. Eight XCDs tile it exactly.
+        //
+        // So there is nothing for this XCD to learn from the other seven. The
+        // default path below still routes every arrival through attn_global
+        // and has the *last* XCD fan out all eight flags, which makes the
+        // slowest merge on the machine the release time for all eight slices.
+        // Here each XCD publishes its own slice the moment it is ready and the
+        // consumer waits per slice (see the ATTENTION_SLICE_RELEASE arm in
+        // gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh, where wave w
+        // polls only XCDs 2w and 2w+1 -- the two slices its K interval reads).
+        //
+        // The `s_waitcnt vmcnt(0)` + `__syncthreads()` above is what makes
+        // this sound: all four merge waves have drained their st_wt stores
+        // before any of them reaches here, so tid 0's flag cannot outrun a
+        // sibling wave's attn_out writes.
+        //
+        // NUM_REQS == 1 only. With more requests attn_global is bumped once
+        // per (XCD, request) and an XCD's slice is not complete until all of
+        // its requests have merged, so a single unconditioned store here would
+        // release after the first. The static_assert is at the top of the
+        // MPK_ATTN_SLICE_RELEASE block in Phase 6.
+        if (tid == 0) {
+          st_wt_u32((void *)&attn_release[xcd_id * 16],
+                    (unsigned)attn_release_expected);
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        }
+#else
         if (tid == 0) {
           // attn_global is bumped exactly ATTN_ARRIVALS times per layer: the
           // modulus above fires once per (XCD, request), and every empty-work
@@ -817,6 +920,7 @@ __device__ __noinline__ void
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
           }
         }
+#endif
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
         _fused_t0d = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -841,8 +945,9 @@ __device__ __noinline__ void
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(60, attn_release_expected);
   MPK_WS_PHASE(60, qkv_epoch_expected, xcd_id);
-  int oproj_topk_tiles_per_xcd =
-      oproj_tiles_per_xcd > router_tile_n ? oproj_tiles_per_xcd : router_tile_n;
+  // Same quantity the QKV/attention rotation is sized from; computed once at
+  // the top of the kernel so the two cannot drift.
+  int oproj_topk_tiles_per_xcd = oproj_topk_ranks;
 
   {
     constexpr int OPROJ_WG_DATA =
@@ -921,6 +1026,28 @@ __device__ __noinline__ void
   }
 
   MPK_WS_WAIT_BEGIN(60, attn_release_expected);
+#ifdef MPK_ATTN_SLICE_RELEASE
+  static_assert(NUM_REQS == 1,
+                "MPK_ATTN_SLICE_RELEASE publishes one flag per XCD from the "
+                "merge, but with NUM_REQS > 1 an XCD's attn_out slice is only "
+                "complete after all of its requests have merged. Use the "
+                "attn_global rendezvous at more than one request.");
+  static_assert(OPROJ_REDUCTION_SIZE == 8 * NUM_Q_PER_KV * HEAD_DIM,
+                "the eight per-XCD merge slices must tile the O-proj "
+                "reduction exactly -- the consumer maps wave w to XCDs 2w and "
+                "2w+1 on that assumption");
+  // The O-proj/TopK workers do not wait here at all. They are the only
+  // consumers of attn_out, and each of their waves waits for just the two
+  // slices its own K interval reads, inside the Phase 7 kernel. Waiting for
+  // this XCD's flag first would be strictly worse than useless: it is one
+  // more slice than wave 0 needs and one fewer than wave 3 needs, so it
+  // would delay the early waves without protecting the late ones.
+  //
+  // Everyone else still waits, unchanged. They read nothing from attn_out --
+  // this is the ordering that keeps them from running ahead into Phase 8 --
+  // and their own XCD's flag is the cheapest sufficient one to wait on.
+  if (xcd_rank >= oproj_topk_tiles_per_xcd)
+#endif
   {
     int _obs;
     int _spins = 0;
@@ -955,6 +1082,15 @@ __device__ __noinline__ void
 #endif
   }
   // Cross-XCD ACQUIRE for attn_out. Plain `buffer_inv` (vL1 only), not `sc1`.
+  //
+  // Under MPK_ATTN_SLICE_RELEASE this one no longer acquires attn_out for the
+  // O-proj workers -- they reach it without having observed any release flag,
+  // so an attn_out line left in vL1 by the *previous* layer would survive the
+  // invalidate and then be hit by this layer's read. Their acquire moved to
+  // where their observation is, per wave, right after the slice poll in the
+  // Phase 7 kernel. This site is kept for the workers that still wait above,
+  // and because it is the acquire for the whole Phase 6 hand-off, not just
+  // for attn_out.
   //
   // The producer is the Phase 5 merge, which writes attn_out with st_wt
   // (WRITE_THROUGH=true) -- sc0 sc1, bypassing L2 and landing in HBM. The
@@ -1062,7 +1198,15 @@ __device__ __noinline__ void
           // below derives every number from _fused_t0.._fused_t4, which are
           // taken in this function. This used to name a _ts_base that was
           // never declared, so MPK_DEVICE_TIMING=1 did not compile.
-          nullptr);
+          nullptr,
+#ifdef MPK_ATTN_SLICE_RELEASE
+          // The kernel does its own per-wave slice wait; the Phase 6 gate
+          // above skipped this worker entirely.
+          attn_release
+#else
+          nullptr
+#endif
+      );
     }
   }
   MPK_PHASE_MARK(_pslot_w, 6);
@@ -1320,13 +1464,13 @@ __device__ __noinline__ void
     // Who joins the release wait. Default: everyone, a full gang rendezvous.
     // Under MPK_W2_CONSUMER_GATE: only the workers that read
     // moe_workspace_f32 in the next layer's Phase 1, which is the same
-    // `xcd_rank < total_qkv_tiles_per_xcd` set that guards the reader itself
-    // (xcd_rank is fixed for the life of the task, so this worker is the one
-    // that will do that read). Everyone still *arrives* either way -- the
-    // arrival tree is what publishes the release, so narrowing it would
+    // `qkv_attn_rank < total_qkv_tiles_per_xcd` set that guards the reader
+    // itself (qkv_attn_rank is fixed for the life of the task, so this worker
+    // is the one that will do that read). Everyone still *arrives* either way
+    // -- the arrival tree is what publishes the release, so narrowing it would
     // deadlock; this narrows only the wait.
 #ifdef MPK_W2_CONSUMER_GATE
-    bool const MPK_LAYER_GATE_JOINS = (xcd_rank < total_qkv_tiles_per_xcd);
+    bool const MPK_LAYER_GATE_JOINS = (qkv_attn_rank < total_qkv_tiles_per_xcd);
 #else
     bool const MPK_LAYER_GATE_JOINS = true;
 #endif
@@ -1389,10 +1533,69 @@ __device__ __noinline__ void
             ? moe_total_tiles_per_xcd - workers_per_xcd
             : moe_total_tiles_per_xcd;
 #ifdef MPK_W2_ONLY_ARRIVE
-    int const arrivers_per_xcd = n_w2_workers_per_xcd < workers_per_xcd
-                                     ? n_w2_workers_per_xcd
-                                     : workers_per_xcd;
+    // ── Every waiter must also arrive ────────────────────────────────────
+    //
+    // `s_layer_rel_prev` is written only on the arrival path, so a worker
+    // that *waits* below without *arriving* still holds the -1 seed. -1 is
+    // beaten by the release already sitting in the line -- last layer's --
+    // so its gate clears immediately and it runs the next layer's Phase 1
+    // against a moe_workspace_f32 this layer's W2 has not published yet.
+    // Silent, run-to-run varying wrong numerics, not a hang.
+    //
+    // The seed comment above names one configuration that trips this
+    // (MPK_W2_CONSUMER_GATE=0, where JOINS is unconditionally true while
+    // only the W2 producers arrive) and calls it a hang; the -1 seed
+    // converted it into this race. MPK_ROTATE_QKV_ATTN_RANKS trips it too,
+    // and worse: it moves the waiter set to a cyclic block of ranks chosen
+    // *because* they have no Phase 7 work, and those are very nearly the
+    // same ranks that get no second MoE tile and therefore do not arrive.
+    // Measured at the shipped geometry, rotation on: three runs, three
+    // different completions, against a control that is bit-identical over
+    // eight.
+    //
+    // So arrive on the union of "W2 producer" and "gate waiter" rather than
+    // on the producers alone, and move the modulus with it. The waiter set
+    // is a cyclic block, so the union is a prefix plus at most two pieces
+    // and its size is closed-form -- it has to be exact, or the local
+    // counter's modulus stops firing and the release never comes.
+    int const n_w2_arrivers = n_w2_workers_per_xcd < workers_per_xcd
+                                  ? n_w2_workers_per_xcd
+                                  : workers_per_xcd;
+#if !defined(MPK_W2_CONSUMER_GATE)
+    // JOINS is `true` here, so the union is everybody.
+    int const arrivers_per_xcd = workers_per_xcd;
+    bool const MPK_LAYER_GATE_ARRIVES = true;
+#elif defined(MPK_ROTATE_QKV_ATTN_RANKS)
+    // qkv_attn_rank = (r + qkv_rot) % W, so the waiters
+    // `qkv_attn_rank < total_qkv_tiles_per_xcd` are exactly
+    // r in [W - qkv_rot, W - qkv_rot + T) taken mod W.
+    int const wait_b = (workers_per_xcd - qkv_rot) % workers_per_xcd;
+    int const wait_n = total_qkv_tiles_per_xcd < workers_per_xcd
+                           ? total_qkv_tiles_per_xcd
+                           : workers_per_xcd;
+    int const wait_hi = wait_b + wait_n; // may run past workers_per_xcd
+    // Part of the block at or above the producer prefix, before the wrap...
+    int const seg_lo = wait_b > n_w2_arrivers ? wait_b : n_w2_arrivers;
+    int const seg_hi = wait_hi < workers_per_xcd ? wait_hi : workers_per_xcd;
+    int const seg_head = seg_hi > seg_lo ? seg_hi - seg_lo : 0;
+    // ...and the wrapped tail [0, wrap), likewise only where it is not
+    // already counted by the prefix.
+    int const wrap = wait_hi > workers_per_xcd ? wait_hi - workers_per_xcd : 0;
+    int const seg_tail = wrap > n_w2_arrivers ? wrap - n_w2_arrivers : 0;
+    int const arrivers_per_xcd = n_w2_arrivers + seg_head + seg_tail;
+    bool const MPK_LAYER_GATE_ARRIVES =
+        (xcd_rank < n_w2_arrivers) || MPK_LAYER_GATE_JOINS;
+#else
+    // Unrotated: the waiters are the prefix [0, total_qkv_tiles_per_xcd),
+    // which the producer prefix already covers at every shipped geometry.
+    // Take the wider of the two rather than assume it.
+    int const n_waiters_unrot = total_qkv_tiles_per_xcd < workers_per_xcd
+                                    ? total_qkv_tiles_per_xcd
+                                    : workers_per_xcd;
+    int const arrivers_per_xcd =
+        n_w2_arrivers > n_waiters_unrot ? n_w2_arrivers : n_waiters_unrot;
     bool const MPK_LAYER_GATE_ARRIVES = (xcd_rank < arrivers_per_xcd);
+#endif
 #else
     int const arrivers_per_xcd = workers_per_xcd;
     bool const MPK_LAYER_GATE_ARRIVES = true;
@@ -1480,9 +1683,21 @@ __device__ __noinline__ void
     // increases by 8 per layer, so a large positive leaves the gate closed
     // forever: all 248 workers hang with tasks_done=0 and no error.
     //
-    // -1 is below every real release value (they are 8*L, L >= 1), so a
-    // non-arriving worker's wait is satisfied by the first release it sees --
-    // which is the correct semantics for a worker that published nothing.
+    // -1 is below every real release value (they are 8*L, L >= 1), so under
+    // MPK_GATE_PREV_LDS a non-arriving worker reads a defined value instead of
+    // whatever the slot held.
+    //
+    // It is NOT, as this comment used to claim, "the correct semantics for a
+    // worker that published nothing". A non-arriving *waiter* is beaten by the
+    // release already in the line -- last layer's -- so its gate clears
+    // without waiting for this layer's release at all, and it reads
+    // moe_workspace_f32 in the next layer's Phase 1 before this layer's W2
+    // published it. The seed turned a hang into a silent race. What makes
+    // the seed harmless is the arriver set above now covering the waiter set
+    // by construction, so no waiter reaches this line unseeded; see the
+    // union computation at MPK_LAYER_GATE_ARRIVES for the two configurations
+    // that used to break it. The seed stays as the belt to that suspenders.
+    //
     // Cost is one LDS store per workgroup per layer on a path that already
     // does several.
     __syncthreads();
@@ -1684,13 +1899,16 @@ __device__ __noinline__ void
     //
     // Only Phase-1 workers stage anything: the rest have no QKV tile next
     // layer and their LDS would just be dirtied for nothing. tile_idx there
-    // is xcd_rank, and xcd_rank is fixed for the life of the task, so this
-    // worker prefetches exactly the tile it will itself execute.
+    // is qkv_attn_rank, and qkv_attn_rank is fixed for the life of the task,
+    // so this worker prefetches exactly the tile it will itself execute --
+    // which is why the rotation has to be applied here too, not just at the
+    // Phase 1 guard.
     //
     // input_ptrs[24] is null on the last layer of the iteration -- see the
     // publish site in persistent_kernel.cuh for why nothing may be staged
     // across the iteration boundary.
-    if (input_ptrs[24] != nullptr && xcd_rank < total_qkv_tiles_per_xcd
+    if (input_ptrs[24] != nullptr &&
+        qkv_attn_rank < total_qkv_tiles_per_xcd
 #ifdef MPK_QKV_PF_WAVE_SPLIT
         // ── Keep the poller's wave out of the pre-gate DMA ─────────────────
         //
@@ -1716,7 +1934,7 @@ __device__ __noinline__ void
       qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
                                QKV_OUTPUT_PER_WG,
                                QKV_REDUCTION_SIZE>(
-          input_ptrs[24], qkv_n_wgs_per_xcd, xcd_rank);
+          input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
     }
 #endif
 
@@ -1731,7 +1949,7 @@ __device__ __noinline__ void
     // to close is exactly one edge: the next layer's QKV prologue
     // (gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel) reads
     // moe_workspace_f32, which this layer's W2 epilogue writes. That reader is
-    // already guarded by `xcd_rank < total_qkv_tiles_per_xcd`, so only
+    // already guarded by `qkv_attn_rank < total_qkv_tiles_per_xcd`, so only
     // total_qkv_tiles_per_xcd of the workers_per_xcd workers on each XCD ever
     // touch the buffer. Ordering the other ~20 against a buffer they never
     // load is synchronization the dependency does not ask for, and the
@@ -1909,12 +2127,12 @@ __device__ __noinline__ void
     // It is still a prefetch: the consumer in the next layer drains with
     // `s_waitcnt vmcnt(0)` before its first ds_read, so the DMA has the whole
     // rest of this layer's epilogue plus the next layer's prologue to land.
-    if (input_ptrs[24] != nullptr && xcd_rank < total_qkv_tiles_per_xcd &&
+    if (input_ptrs[24] != nullptr && qkv_attn_rank < total_qkv_tiles_per_xcd &&
         tid < 64) {
       qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
                                QKV_OUTPUT_PER_WG,
                                QKV_REDUCTION_SIZE>(
-          input_ptrs[24], qkv_n_wgs_per_xcd, xcd_rank);
+          input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
     }
 #endif
     // No invalidate here: in the default build the task body re-entered for

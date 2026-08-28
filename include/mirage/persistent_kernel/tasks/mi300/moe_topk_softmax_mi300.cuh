@@ -221,6 +221,69 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       // ── Step 1: Branchless local argmax over VPT=8 elements ──
       float max_val;
       int expert;
+#ifdef MPK_TOPK_LOCAL_MAX3
+      // The serial scan below is 23 VALU ops on a ~21-deep dependency chain:
+      // each of the seven steps must know the running max before it can
+      // compare, and the running index rides the same chain. Both are
+      // avoidable.
+      //
+      // v_max3_f32 takes three sources, so the value reduces as a tree --
+      // max3(r0,r1,r2) and max3(r3,r4,r5) issue back to back, then one more
+      // max3 folds in r6 and a v_max_f32 folds in r7. Three levels, not seven.
+      //
+      // Recovering the index then costs seven independent v_cmp_eq against
+      // that one max, and a v_cndmask chain to pick the winner. Only the
+      // cndmask chain is serial, and it no longer gates the compares.
+      //
+      // Tie-break: the serial version uses strict `>`, so on equal values the
+      // LOWEST column wins. Visiting the equality matches in REVERSE order
+      // (c7 first, c0 last) reproduces that exactly -- the last cndmask to
+      // fire is the lowest matching column. This matters: BF16 logits collide
+      // often enough that a different tie-break reroutes tokens.
+      static_assert(VPT == 8,
+                    "MPK_TOPK_LOCAL_MAX3 hard-codes an 8-wide reduction tree");
+      float _lmax0, _lmax1;
+      asm volatile("v_max3_f32 %[m0], %[r0], %[r1], %[r2]\n"
+                   "v_max3_f32 %[m1], %[r3], %[r4], %[r5]\n"
+                   "v_max3_f32 %[mv], %[m0], %[m1], %[r6]\n"
+                   "v_max_f32 %[mv], %[mv], %[r7]\n"
+                   "v_mov_b32 %[ex], %[c7]\n"
+                   "v_cmp_eq_f32 vcc, %[r6], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c6], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r5], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c5], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r4], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c4], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r3], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c3], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r2], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c2], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r1], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c1], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r0], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c0], vcc\n"
+                   : [mv] "=&v"(max_val),
+                     [ex] "=&v"(expert),
+                     [m0] "=&v"(_lmax0),
+                     [m1] "=&v"(_lmax1)
+                   : [r0] "v"(row_chunk[0]),
+                     [r1] "v"(row_chunk[1]),
+                     [r2] "v"(row_chunk[2]),
+                     [r3] "v"(row_chunk[3]),
+                     [r4] "v"(row_chunk[4]),
+                     [r5] "v"(row_chunk[5]),
+                     [r6] "v"(row_chunk[6]),
+                     [r7] "v"(row_chunk[7]),
+                     [c0] "v"(col[0]),
+                     [c1] "v"(col[1]),
+                     [c2] "v"(col[2]),
+                     [c3] "v"(col[3]),
+                     [c4] "v"(col[4]),
+                     [c5] "v"(col[5]),
+                     [c6] "v"(col[6]),
+                     [c7] "v"(col[7])
+                   : "vcc");
+#else
       asm volatile("v_mov_b32 %[mv], %[r0]\n"
                    "v_mov_b32 %[ex], %[c0]\n"
                    "v_cmp_gt_f32 vcc, %[r1], %[mv]\n"
@@ -262,6 +325,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
                      [c6] "v"(col[6]),
                      [c7] "v"(col[7])
                    : "vcc");
+#endif
 
       // ── Step 2: Branchless argmax reduce across subgroup ──
       // Uses __shfl_xor for cross-lane communication, inline asm for

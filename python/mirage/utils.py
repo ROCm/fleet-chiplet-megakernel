@@ -51,7 +51,13 @@ MAX_NUM_WORKERS = 304
 # Only the DEFAULT is narrowed. Setting one explicitly at bs>1 still reaches
 # the static_assert, which is the intended loud failure rather than a knob
 # that silently does nothing.
-_BS1_ONLY_OPTS = ("MPK_W13_PREQUANT", "MPK_W13_T1_SPLIT_LDS_STAGE")
+_BS1_ONLY_OPTS = (
+    "MPK_W13_PREQUANT",
+    "MPK_W13_T1_SPLIT_LDS_STAGE",
+    # Rides on MPK_W13_PREQUANT (it reorders that flag's handoff), so it has
+    # to go off wherever that one does.
+    "MPK_W13_T0_COUNTED_HANDOFF",
+)
 
 
 def mpk_opt(name, batch_size=1):

@@ -428,6 +428,115 @@ def pack_mxfp4_workgroup(blocks: torch.Tensor, scales: torch.Tensor,
     return packed.contiguous()
 
 
+# MPK_OPROJ_KMAJOR: repack the O-proj tiles so the MFMA weight fragments are
+# lane-consecutive in LDS. Ships on; the kernel must be built with the
+# matching -DMPK_OPROJ_KMAJOR or the numerics are silently wrong, which is why
+# both sides read this one variable -- through the same mpk_opt(), so the two
+# halves cannot disagree about what a value other than "0"/"1" means.
+#
+# Only the fused O-proj paths have a K-major arm; the standalone
+# gang_linear_mxfp4_res_bias fallback raises rather than read the permuted
+# tiles row-major. Set MPK_OPROJ_KMAJOR=0 to run that path.
+from mirage.utils import mpk_opt as _mpk_opt  # noqa: E402
+
+OPROJ_KMAJOR = _mpk_opt("MPK_OPROJ_KMAJOR")
+
+
+def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
+                                    output_per_wg: int = 16) -> torch.Tensor:
+    """Repack packed O-proj workgroups into lane-native K128 fragments.
+
+    The data prefix goes from ``[row, k128, quarter, 16B]`` to
+    ``[k128, quarter, row, 16B]``; the scale suffix stays row-major. Since
+    ``lane_id == quarter * 16 + row`` for the 16x16x128 MFMA A operand, the
+    new order puts lane L's fragment at byte ``L * 16`` of its K128 block, so
+    a wave reads 64 consecutive 16-byte chunks instead of 16-way-conflicting
+    on a 2048-byte row stride. See the MPK_OPROJ_KMAJOR block in
+    gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh.
+
+    This is a permutation, not a requantization -- every lane still receives
+    exactly the bytes it received before, so results are bit-exact.
+    """
+    if packed.ndim != 2:
+        raise ValueError(
+            f"expected a rank-2 [n_wgs, wg_bytes] O-proj tile, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg != 16:
+        raise ValueError(
+            "the K-major O-proj layout is defined for 16-row tiles only "
+            f"(got output_per_wg={output_per_wg}); the kernel-side "
+            "static_assert enforces the same thing")
+
+    n_wgs, wg_bytes = packed.shape
+    # Solve for the reduction size: each row costs K/2 data bytes + K/32
+    # scale bytes, so wg_bytes = OPW * K * (1/2 + 1/32).
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(
+            f"wg_bytes={wg_bytes} is not a valid MXFP4 record for "
+            f"output_per_wg={output_per_wg}")
+    k128_blocks = reduction // 128
+
+    data = packed[:, :data_bytes].reshape(
+        n_wgs, output_per_wg, k128_blocks, 4, 16)
+    # [wg, row, k128, quarter, byte] -> [wg, k128, quarter, row, byte]
+    data = data.permute(0, 2, 3, 1, 4).reshape(n_wgs, data_bytes)
+    return torch.cat([data, packed[:, data_bytes:]], dim=1).contiguous()
+
+
+# MPK_LM_HEAD_KMAJOR: the same permutation applied to the LM-head record.
+# Same one-variable contract as MPK_OPROJ_KMAJOR -- a host/kernel disagreement
+# here is silently wrong numerics rather than a build error -- but this one is
+# opt-in rather than default-on, because it measured slower (1.837 -> 1.844 ms,
+# losing all three pairs). Read the raw variable, not mpk_opt(), so both sides
+# agree on the same default of off; persistent_kernel.py does the same.
+LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
+
+
+def shuffle_lm_head_record_kmajor(packed: torch.Tensor,
+                                  output_per_wg: int = 64) -> torch.Tensor:
+    """Repack packed LM-head workgroups into lane-native K128 fragments.
+
+    The LM-head record is wider than the O-proj tile: ``output_per_wg`` is 64
+    rows, consumed as four independent 16-row MFMA tiles, one per resident
+    wave. So the permutation is the O-proj one applied *within* each 16-row
+    tile -- ``[tile][row][k128][quarter][16B]`` becomes
+    ``[tile][k128][quarter][row][16B]`` -- which keeps each wave's tile a
+    self-contained contiguous region and leaves the per-tile LDS staging in
+    gang_rmsnorm_linear_mxfp4_bias_argmax_mi300.cuh a byte-for-byte image of
+    HBM, exactly as before. The scale suffix stays row-major.
+
+    A permutation, not a requantization: every lane still receives exactly the
+    bytes it received before, so results are bit-exact.
+    """
+    if packed.ndim != 2:
+        raise ValueError(
+            f"expected a rank-2 [n_wgs, wg_bytes] LM-head record, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg % 16 != 0:
+        raise ValueError(
+            "the K-major LM-head layout is built out of 16-row MFMA tiles "
+            f"(got output_per_wg={output_per_wg})")
+
+    n_wgs, wg_bytes = packed.shape
+    tiles = output_per_wg // 16
+    # Each row costs K/2 data bytes + K/32 scale bytes.
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(
+            f"wg_bytes={wg_bytes} is not a valid MXFP4 record for "
+            f"output_per_wg={output_per_wg}")
+    k128_blocks = reduction // 128
+
+    data = packed[:, :data_bytes].reshape(
+        n_wgs, tiles, 16, k128_blocks, 4, 16)
+    # [wg, tile, row, k128, quarter, byte] -> [wg, tile, k128, quarter, row, byte]
+    data = data.permute(0, 1, 3, 4, 2, 5).reshape(n_wgs, data_bytes)
+    return torch.cat([data, packed[:, data_bytes:]], dim=1).contiguous()
+
+
 def dequant_mxfp4_to_bf16(blocks: torch.Tensor, scales: torch.Tensor,
                            target_out_dim: int = None,
                            target_reduction: int = None) -> torch.Tensor:
@@ -1803,6 +1912,9 @@ if __name__ == "__main__":
         lm_head_packed = pack_mxfp4_workgroup(
             lm_blocks, lm_scales, output_per_wg=lm_head_output_per_wg,
         ).squeeze(0)  # [n_wgs, wg_bytes]
+        if LM_HEAD_KMAJOR:
+            lm_head_packed = shuffle_lm_head_record_kmajor(
+                lm_head_packed, output_per_wg=lm_head_output_per_wg)
         print(f"LM head MXFP4: {lm_head_weight.shape} BF16 ({lm_head_weight.numel()*2/1e6:.0f} MB) "
               f"-> {lm_head_packed.shape} packed ({lm_head_packed.numel()/1e6:.0f} MB)")
 
@@ -2217,11 +2329,29 @@ if __name__ == "__main__":
             target_cols=PADDED_HIDDEN_SIZE,
         )
         w = mpk.attach_input(torch_tensor=embed_weight, name="embed_tokens")
+        # One workgroup gathers the whole 2944-wide row by default. grid.x is
+        # already mapped onto the hidden dimension for both the table and the
+        # output (see embed_layer), so raising it splits the row into that many
+        # contiguous chunks handled by that many workers -- the task's
+        # CHUNK_SIZE shrinks while its OUTPUT_DIM_SIZE row stride does not.
+        # Nothing overlaps the embedding (it is the head of the token's
+        # dependency chain), so its latency lands on TPOT directly.
+        #
+        # Stays at 1: 4 producers measured 1.843 -> 1.852 ms, losing all four
+        # pairs, text bit-identical. The split is real (the graph goes from 301
+        # to 304 tasks) and each worker's share drops to 1,472 bytes, but three
+        # extra task descriptors have to be dispatched, claimed and waited on
+        # around a copy that was already only a few microseconds, and at the
+        # head of the chain there is nothing else in flight to absorb that.
+        embed_producers = int(os.environ.get("MPK_EMBED_PRODUCERS", "1"))
+        assert PADDED_HIDDEN_SIZE % embed_producers == 0, (
+            f"MPK_EMBED_PRODUCERS={embed_producers} must divide "
+            f"PADDED_HIDDEN_SIZE={PADDED_HIDDEN_SIZE}")
         mpk.embed_layer(
             input=x,
             weight=w,
             output=y,
-            grid_dim=(1, 1, 1),
+            grid_dim=(embed_producers, 1, 1),
             block_dim=(128, 1, 1),
             input_source=1,
         )
@@ -2356,6 +2486,9 @@ if __name__ == "__main__":
                     w_o_packed = pack_mxfp4_workgroup(
                         o_blocks, o_scales, output_per_wg=o_output_per_wg,
                     ).squeeze(0)
+                    if OPROJ_KMAJOR:
+                        w_o_packed = shuffle_oproj_workgroups_kmajor(
+                            w_o_packed, o_output_per_wg)
                     w_o_mxfp4 = _attach_input_keep(
                         w_o_packed, f"layer_{i}_o_proj_mxfp4")
                     # MoE weight prep
@@ -2703,6 +2836,16 @@ if __name__ == "__main__":
                 w_o_packed = pack_mxfp4_workgroup(
                     o_blocks, o_scales, output_per_wg=o_output_per_wg,
                 ).squeeze(0)  # [n_wgs, wg_bytes]
+                if OPROJ_KMAJOR:
+                    # Both consumers reachable from here that read this tile
+                    # -- gang_oproj_topk_moe_fused and
+                    # gang_linear_mxfp4_res_bias_rmsnorm_topk -- share the
+                    # K-parallel LDS arm that MPK_OPROJ_KMAJOR rewrites. The
+                    # third, gang_linear_mxfp4_res_bias, is a different kernel
+                    # that still indexes row-major; it is rejected below
+                    # rather than fed a layout it cannot read.
+                    w_o_packed = shuffle_oproj_workgroups_kmajor(
+                        w_o_packed, o_output_per_wg)
                 w_o_mxfp4 = _attach_input_keep(
                     w_o_packed, f"layer_{i}_o_proj_mxfp4")
 
@@ -2800,6 +2943,15 @@ if __name__ == "__main__":
                 x = attn_proj_out
             else:
                 if is_rocm:
+                    if OPROJ_KMAJOR:
+                        raise RuntimeError(
+                            "MPK_OPROJ_KMAJOR is on (it ships on) but the "
+                            "O-proj is running through "
+                            "gang_linear_mxfp4_res_bias, which reads the "
+                            "weight tile row-major and has no K-major arm. "
+                            "Enable one of the fused O-proj paths "
+                            "(FUSE_FULL_LAYER / FUSE_OPROJ_TOPK / "
+                            "FUSE_OPROJ_MOE) or set MPK_OPROJ_KMAJOR=0.")
                     mpk.gang_linear_mxfp4_res_bias_layer(
                         input=attn_out,
                         mxfp4_weight=w_o_mxfp4,

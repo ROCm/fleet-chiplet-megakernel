@@ -61,7 +61,42 @@ __device__ __forceinline__ void
              output_ptr);
     }
 #endif
-    if (wordIdx >= 0) {
+#ifdef MPK_EMBED_WIDE
+    // Copy 8 bytes per lane instead of one element. The scalar arm below moves
+    // sizeof(T) bytes per lane per trip, so a 2944-wide bf16 row takes 23 trips
+    // at blockDim.x == 128, and blockDim.x is a runtime value so the trip count
+    // is not known at compile time and the loop keeps its load->store waitcnt.
+    // Four elements per lane cuts that to 6 trips over the same bytes.
+    //
+    // Guarded rather than unconditional because this kernel is shared by every
+    // model in the tree: VALS_PER_LANE has to divide both the per-task chunk
+    // and the row stride, and both base pointers have to be 8-byte aligned.
+    // The alignment test is a runtime scalar branch (the pointers are uniform),
+    // so an odd offset falls back to the scalar arm instead of faulting.
+    constexpr int VALS_PER_LANE = 8 / sizeof(T);
+    constexpr bool WIDE_SHAPE_OK = sizeof(T) * VALS_PER_LANE == 8 &&
+                                   CHUNK_SIZE % VALS_PER_LANE == 0 &&
+                                   OUTPUT_DIM_SIZE % VALS_PER_LANE == 0;
+    bool const wide_aligned = ((reinterpret_cast<uintptr_t>(embedding) |
+                                reinterpret_cast<uintptr_t>(output)) &
+                               7u) == 0;
+    if (WIDE_SHAPE_OK && wide_aligned) {
+      struct __align__(8) wide_t {
+        uint32_t lo, hi;
+      };
+      wide_t const *__restrict__ src =
+          reinterpret_cast<wide_t const *>(embedding) +
+          (wordIdx >= 0 ? wordIdx * (OUTPUT_DIM_SIZE / VALS_PER_LANE) : 0);
+      wide_t *__restrict__ dst = reinterpret_cast<wide_t *>(output) +
+                                 batch_idx * (OUTPUT_DIM_SIZE / VALS_PER_LANE);
+      wide_t const zero{0u, 0u};
+      for (int i = threadIdx.x; i < CHUNK_SIZE / VALS_PER_LANE;
+           i += blockDim.x) {
+        dst[i] = wordIdx >= 0 ? src[i] : zero;
+      }
+    } else
+#endif
+        if (wordIdx >= 0) {
 #pragma unroll
       for (int i = threadIdx.x; i < CHUNK_SIZE; i += blockDim.x) {
         output[batch_idx * OUTPUT_DIM_SIZE + i] =
