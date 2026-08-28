@@ -1,107 +1,134 @@
 # Local vs remote AID access on MI350/MI355
 
-This machine is one MI350 package: 8 XCDs (chiplets) grouped onto 2 AIDs, with
-the HBM stacks attached to the AIDs. A chiplet reaching memory owned by the
-*other* AID crosses the inter-AID interconnect, which costs latency and
-interconnect power. This is the effect GTAC'25 paper 48 (Starscream) motivates
-its CPX/NPS4 partitioning with; the paper measures it on MI300X (4 AIDs), where
-75% of a CU's traffic is remote under SPX/NPS1.
+This machine is one MI350 package: 8 XCDs (chiplets) split into two groups of
+four, with HBM stacks attached to the AIDs. Traffic that has to reach the other
+side crosses the inter-AID interconnect. This is the effect GTAC'25 paper 48
+(Starscream) motivates its CPX/NPS4 partitioning with; the paper measures it on
+MI300X (4 AIDs), where 75% of a CU's traffic is remote under SPX/NPS1.
 
-## Build and run
+The GPU here runs SPX/NPS1 and cannot be put in NPS2 without also splitting
+compute (`amd-smi partition --accelerator`: SPX offers NPS1 only; NPS2 needs
+DPX/QPX/CPX). The question these benchmarks answer is what can be done *without*
+touching partition modes.
 
-```bash
-hipcc -O3 -std=c++17 --offload-arch=gfx950 \
-  benchmark/aid_remote_hbm/aid_remote_hbm.hip -o /tmp/aid_remote_hbm
-HIP_VISIBLE_DEVICES=0 /tmp/aid_remote_hbm
+**Answer: memory can be placed AID-locally from software.** The home AID is a
+property of each 4 KiB page, it is stable and probeable at runtime, so an
+allocator can hand out pages whose home matches the chiplets that will read
+them. Details below.
+
+## Tools
+
+| file | what it does |
+|---|---|
+| `aid_remote_hbm.hip` | flag ping-pong between two named chiplets, plus NT STREAM phases |
+| `xcd_pair_matrix.hip` | round-trip latency for all 28 chiplet pairs, then a flag-address sweep |
+| `aid_home_map.hip` | classifies the home side of each address granule; finds the granularity |
+| `aid_page_map.hip` | single-chiplet atomic latency probe — **negative result, see caveat** |
+
+All of them read `HW_REG_XCC_ID` so each phase runs only on the chiplet it
+names, and they allocate probe flags with `hipDeviceMallocUncached` so the
+traffic actually reaches the fabric instead of sitting in L2.
+
+## What the chiplet-pair matrix shows
+
+`xcd_pair_matrix` on an idle GPU (`0000:06:00.0`), round-trip ns:
+
+```
+     XCD0 XCD1 XCD2 XCD3 XCD4 XCD5 XCD6 XCD7
+XCD0    . 1090 1152 1109  984  956  999  972
+XCD1 1090    . 1111 1085  954  814  970  815
+XCD2 1152 1111    . 1089  916  818 1010  922
+XCD3 1109 1085 1089    .  950  817  951  889
+XCD4  984  954  916  950    .  731  765  687
+XCD5  956  814  818  817  731    .  742  626
+XCD6  999  970 1010  951  765  742    .  749
+XCD7  972  815  922  889  687  626  749    .
 ```
 
-The benchmark reads `HW_REG_XCC_ID` to learn which chiplet each block landed on,
-so every phase runs only on the chiplet it names. The ping-pong flag is
-allocated with `hipDeviceMallocUncached` so the round trip actually reaches
-HBM/fabric instead of hitting L2.
+Pair cost behaves like `c_a + c_b`: every chiplet has its own distance to the
+flag, and the pair pays both. For *this* flag the {4,5,6,7} group is close and
+{0,1,2,3} is far. Grouping the pairs as same-AID vs cross-AID gives a 1.01x
+"penalty", i.e. nothing — the structure is about where the *flag* lives, not
+about which pairs span a boundary.
 
-## Result (GPU `0000:76:00.0`, NPS1/SPX, idle 239 W)
+## The home AID is an address property
 
-Uncached HBM flag ping-pong, one wave per chiplet, 2M rounds:
+Sweeping the flag address (same pair, different offsets) flips which group is
+fast:
 
-| pair        | topology  | ns/round    | socket power | wall   |
-|-------------|-----------|-------------|--------------|--------|
-| XCD0 ↔ XCD1 | same AID  | 768         | 281 W        | 1.54 s |
-| XCD0 ↔ XCD4 | other AID | 961 (1.25×) | 284 W        | 1.92 s |
+| flag offset | XCD0-1 | XCD4-5 |
+|---|---|---|
+| 1 MiB | 713 | 1164 |
+| 3 MiB | 1210 | 682 |
+| 1024 MiB | 704 | 1067 |
+| 1024 MiB + 4 KiB | 1060 | 707 |
 
-Crossing to the other AID costs **25% more latency** per round trip.
+Two addresses 4 KiB apart land on opposite sides. `aid_home_map` turns this into
+a classifier — the fast/slow split is wide and bimodal (692 vs 1180 ns), so one
+ping-pong run classifies one address, and the XCD4-XCD5 pair inverts it as a
+check (8/8 agreement).
 
-Socket `power1_input` is nearly flat between the two cases (281 W vs 284 W).
-Two spinning waves are far too small a load to move a 1000 W package rail, and
-the sysfs counter is whole-socket, not per-AID, so this benchmark cannot resolve
-the paper's AID-power claim. The latency gap is the clean signal here.
+Granularity, from the classifier:
 
-## STREAM does not split under NPS1
+| stride | pattern | reading |
+|---|---|---|
+| 256 B x32 (within a page) | all identical | a 4 KiB page has one home |
+| 1 KiB x32 | transitions only every 4th sample | boundaries land on 4 KiB |
+| 4 KiB x64 | 38/64 on side 1, 32 transitions | per-page, hashed, ~50/50 |
+| 2 MiB x32 | 19/32 on side 1, 18 transitions | same at coarse stride |
 
-Phases 2 and 3 stream 4 GiB from XCD 0 with non-temporal loads, selecting
-address subsets by 256 B channel group and by 2 MiB page parity:
+So the assignment is per 4 KiB page and looks hashed rather than a simple
+round-robin, but it is deterministic: re-probing pages 0-7 in a later kernel
+launch reproduced `1 1 0 1 1 0 0 1` exactly.
 
-| selection                | GB/s  |
-|--------------------------|-------|
-| all stacks               | 17.5  |
-| stacks 0-3 / stacks 4-7  | 8.6 / 8.6 |
-| even / odd 2 MiB pages   | 142.3 / 143.9 |
+## How to use it
 
-Neither coloring separates the AIDs. NPS1 hashes physical addresses across all
-stacks on both AIDs, so no address-bit trick pins a buffer to one AID's memory —
-that needs a memory partitioning mode (NPS2 on this part), which is a
-driver-level reconfiguration of the whole GPU.
+Probe once at init, then allocate accordingly:
 
-The low absolute bandwidth in phase 2 is expected: it is one chiplet out of
-eight, and the strided variants touch one 256 B line per 2 KiB of address space,
-so they are latency-bound rather than bandwidth-bound.
+1. Allocate the pool (physical pages are pinned for its lifetime).
+2. Classify each 4 KiB page with one ping-pong between a chiplet from each
+   group. The map follows the physical address, so it must be re-probed per
+   allocation, not cached across runs.
+3. Hand out only pages whose home matches the chiplet group that will consume
+   them.
 
-# Can an allocation be pinned to the local AID? (`aid_page_map.hip`)
+What is not yet measured: whether this pays for bulk streaming. The 1.7x
+measured here is a coherence round trip on a single flag, which is the
+sync-primitive case. The payoff for weight streaming needs a bandwidth run over
+a working set larger than the 224 MiB L3, comparing local-page and remote-page
+buffers read from one chiplet group.
 
-No, not in the mode this GPU runs in. `aid_page_map` times a dependent chain of
-agent-scope atomics that stays on one address, so each step is a fabric round
-trip to whatever owns that address. Plain loads are useless here: they sit in
-L1/L2 at ~56 ns and hide the topology entirely. Atomics land at ~94 ns.
+## Caveat on `aid_page_map` (negative result, and why it is wrong)
 
-Measured on an idle GPU (`0000:06:00.0`), latency in ns from every chiplet to a
-fixed address:
+`aid_page_map` times a dependent chain of agent-scope atomics that stays on one
+address, probed from each chiplet in turn. It reports every chiplet as
+equidistant from every address (all 88-102 ns, AIDs agreeing within 0.5 ns), and
+concluding from it that no allocation can be AID-local would be wrong.
 
-| offset    | XCD0 | XCD1 | XCD2 | XCD3 | XCD4 | XCD5 | XCD6 | XCD7 | AID0 avg | AID1 avg |
-|-----------|------|------|------|------|------|------|------|------|----------|----------|
-| 0 KiB     | 99   | 101  | 97   | 88   | 99   | 97   | 88   | 99   | 96.1     | 95.6     |
-| 4 KiB     | 95   | 97   | 95   | 84   | 97   | 95   | 84   | 97   | 92.9     | 93.4     |
-| 1 MiB     | 99   | 101  | 97   | 88   | 99   | 97   | 88   | 99   | 96.1     | 95.7     |
-| 17 MiB    | 101  | 102  | 99   | 88   | 101  | 99   | 88   | 101  | 97.4     | 97.0     |
-| 129 MiB   | 99   | 101  | 97   | 87   | 99   | 97   | 88   | 99   | 95.9     | 95.6     |
-| 400 MiB   | 101  | 102  | 99   | 87   | 101  | 99   | 88   | 101  | 97.2     | 97.0     |
+The probe is blind by construction: when a single chiplet hammers one address,
+the line stays owned by that chiplet and the atomic never has to travel to the
+home node. The home only becomes visible when ownership has to move, which is
+why the two-chiplet ping-pong sees a 1.7x split on the same addresses. The file
+is kept because the failure mode is worth knowing: single-agent latency probes
+cannot map NUMA structure on this part.
 
-The two AIDs agree to within 0.5 ns on every address. The spread that does exist
-(88-102 ns) repeats with period 4 across the chiplets and is identical for all
-six addresses, so it is a property of the chiplet, not of where the data lives.
+## Power
 
-Sweeping 128 addresses at 256 B, 4 KiB and 2 MiB strides gives the same answer:
-the XCD0-vs-XCD4 delta is 0 +/- 2 ns with no bimodality, no single address bit
-correlates with it, and the same-AID XCD0-vs-XCD1 control is just as flat.
+Socket `power1_input` moves only 281 W -> 284 W between the local and remote
+ping-pong cases against a ~239 W idle. Two spinning waves are far too small a
+load for a 1000 W package, and the counter is whole-socket rather than per-AID,
+so nothing here substantiates the paper's AID-power claim. The latency figures
+are the usable signal.
 
-So under NPS1 every address is equidistant from both AIDs: physical memory is
-interleaved across all stacks on both AIDs at a granularity finer than a cache
-line. No page coloring, no `hipMalloc` trick, and no address-bit filter can make
-an allocation AID-local.
+## Build
 
-## What would actually work
+```bash
+for f in aid_remote_hbm xcd_pair_matrix aid_home_map aid_page_map; do
+  hipcc -O3 -std=c++17 --offload-arch=gfx950 \
+    benchmark/aid_remote_hbm/$f.hip -o /tmp/$f
+done
+HIP_VISIBLE_DEVICES=1 /tmp/aid_home_map
+```
 
-`amd-smi partition --accelerator` on this part:
-
-| compute mode | XCCs per partition | memory modes |
-|--------------|--------------------|--------------|
-| SPX (current)| 8                  | NPS1 only    |
-| DPX          | 4                  | NPS1, NPS2   |
-| QPX          | 2                  | NPS1, NPS2   |
-| CPX          | 1                  | NPS1, NPS2   |
-
-AID-local memory requires NPS2, and NPS2 is not offered under SPX. Getting
-locality therefore means giving up the single-device view and splitting compute
-too, which is exactly the trade the Starscream paper takes on: it runs CPX/NPS4
-and then has to repair the tensor-parallel partitioning that the split breaks.
-Switching modes is a `sudo amd-smi set -M` reconfiguration of an idle GPU, not
-something a process can request for one allocation.
+Run on an idle GPU; a neighbouring process on the same package perturbs the
+latency split.

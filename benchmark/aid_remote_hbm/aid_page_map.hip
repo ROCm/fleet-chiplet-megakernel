@@ -1,3 +1,12 @@
+// NEGATIVE RESULT -- this probe is blind. Use aid_home_map.hip instead.
+//
+// Hammering one address with atomics from a single chiplet leaves the line
+// owned by that chiplet, so the request never travels to the home node and
+// every address reads back the same ~94 ns from every XCD. The home only shows
+// up when ownership has to move between chiplets, which aid_home_map does with
+// a two-chiplet ping-pong and which resolves the same addresses into a 1.7x
+// bimodal split. Kept as a record of the failure mode.
+//
 // Is a physical address owned by one AID, and can software see which?
 //
 // For each probed address we time a dependent self-loop load (uncached, so
