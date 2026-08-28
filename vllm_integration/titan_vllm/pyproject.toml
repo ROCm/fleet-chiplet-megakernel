@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "titan-vllm"
+version = "0.1.0"
+description = "Titan fused Qwen3 decode megakernel as an out-of-tree vLLM plugin"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[tool.setuptools]
+packages = ["titan_vllm"]
+package-dir = { "titan_vllm" = "." }
+
+# vLLM discovers this entry point at engine startup and calls register(),
+# which swaps in TitanQwen3ForCausalLM for the Qwen3ForCausalLM architecture.
+[project.entry-points."vllm.general_plugins"]
+titan = "titan_vllm.plugin:register"

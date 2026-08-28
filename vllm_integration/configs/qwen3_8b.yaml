@@ -1,0 +1,67 @@
+## Qwen3-8B model configuration for Titan code generator
+## Source: Qwen/Qwen3-8B HuggingFace config.json
+##
+## Usage: python3 titan_generate.py configs/qwen3_8b.yaml
+
+model:
+  name: qwen3-8b
+  arch: dense
+  num_layers: 36
+  hidden_size: 4096
+  intermediate_size: 12288
+  vocab_size: 151936
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  activation: swiglu
+  has_qk_norm: true       # Qwen3-specific per-head QK RMSNorm
+  has_bias: false
+  rope_theta: 1000000.0
+  rms_norm_eps: 1.0e-6
+  max_position_embeddings: 40960
+
+gpu:
+  target: gfx950
+  num_xcds: 8
+  workers_per_xcd: 30
+  ## KV pages, in tokens. Compile-time: a template parameter to both
+  ## rope_kv_update and paged_attention_minimal_decode_hd64, so the driver's
+  ## page_size and the kernel's PAGE_SIZE must be generated together or KV
+  ## addressing is silently wrong.
+  ##
+  ## 128 rather than 4096 for the same reason as gpt_oss_120b.yaml: vLLM caps
+  ## block_size at 256 (BlockSize = Literal[1, 8, 16, 32, 64, 128, 256],
+  ## vllm/config/cache.py), and titan_vllm aliases vLLM's KV pool zero-copy,
+  ## which requires block_size == PAGE_SIZE. At 4096 the dense path registers
+  ## but cannot bind the alias.
+  ##
+  ## Measured free: 6.768 vs 6.798 ms/tok, identical generated text, same
+  ## 106 SGPR / 241 VGPR / 0 VGPR spills / 2 waves per SIMD / 360 B LDS.
+  ## It also makes the demo's 149-token run span 2 pages instead of fitting
+  ## inside one, so cross-page addressing is now on the default path.
+  page_size: 128
+  max_seq_len: 512
+  num_kv_chunks: 8
+
+quantization:
+  weight_format: mxfp4
+  output_per_wg: 64
+  gateup_opw: 128         # Doubled for fused SwiGLU (64 gate + 64 up per WG)
+
+build:
+  ## The dense kernel calls exactly two device functions that commit f2354a7
+  ## fenced behind TITAN_ENABLE_LEGACY: titan::gemm_mxfp4 and
+  ## titan::rope_kv_update. Without this define hipcc reports 14 errors, all
+  ## tracing to those two; with it, zero.
+  ##
+  ## Defining it here rather than moving the #ifdefs is deliberate. The guards
+  ## landed in f2354a7 -- the same commit that landed 2.520 ms/tok -- inside
+  ## the one 116 KB header BOTH architectures include. Relocating them is a
+  ## large edit to shared code that risks the GPT-OSS result for no measurable
+  ## gain on this one. Opt in per model instead.
+  ##
+  ## This intentionally breaks byte-identity of build_qwen3_8b.sh against the
+  ## version on disk before this change. That is the fix, not a regression:
+  ## the old script did not build.
+  extra_defines:
+    - TITAN_ENABLE_LEGACY

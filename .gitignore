@@ -92,3 +92,11 @@ tests/standalone/test_mfma_pipeline_hazards
 *-host-x86_64-unknown-linux-gnu.hipi
 *-host-x86_64-unknown-linux-gnu.s
 *-hip-amdgcn-amd-amdhsa.hipfb
+
+# vllm_integration: generated kernels are build outputs, but the two artifacts
+# the round-trip gate compares are checked in on purpose. Allowlist them
+# explicitly -- do NOT rely on `git add -f`, which is how these drifted out of
+# sync with the generator for three weeks.
+vllm_integration/generated/*
+!vllm_integration/generated/*_kernel.cuh
+!vllm_integration/generated/*_launch.hip

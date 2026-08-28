@@ -1,0 +1,2644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Titan — Architecture, Contrast with Mirage, and vLLM Integration</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a6472;
+    --rule: #e2e6eb;
+    --accent: #0b5fa5;
+    --accent-soft: #eef5fb;
+    --warn-bg: #fff8e6;
+    --warn-br: #e0b400;
+    --bad-bg: #fdf0ef;
+    --bad-br: #c0392b;
+    --good-bg: #eef8f0;
+    --good-br: #2e7d4f;
+    --code-bg: #f6f7f9;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 96px; }
+  header.title { border-bottom: 3px solid var(--fg); padding-bottom: 22px; margin-bottom: 36px; }
+  header.title h1 { margin: 0 0 8px; font-size: 34px; letter-spacing: -0.5px; }
+  header.title .sub { color: var(--muted); font-size: 16px; }
+  header.title .meta { color: var(--muted); font-size: 13px; margin-top: 14px; font-family: var(--mono); }
+
+  h2 {
+    font-size: 24px; margin: 54px 0 14px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--rule); letter-spacing: -0.3px;
+  }
+  h3 { font-size: 18px; margin: 32px 0 10px; }
+  h4 { font-size: 15px; margin: 22px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+  p { margin: 12px 0; }
+  ul, ol { margin: 12px 0; padding-left: 26px; }
+  li { margin: 6px 0; }
+  code {
+    font-family: var(--mono); font-size: 0.88em;
+    background: var(--code-bg); padding: 1px 5px; border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+    padding: 14px 16px; overflow-x: auto; border-radius: 4px; margin: 14px 0;
+  }
+  pre code { background: none; padding: 0; font-size: 13px; line-height: 1.55; }
+
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14.5px; }
+  th, td { border: 1px solid var(--rule); padding: 8px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--accent-soft); font-weight: 600; }
+  td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
+  tbody tr:nth-child(even) { background: #fafbfc; }
+
+  .box { border-radius: 5px; padding: 14px 18px; margin: 20px 0; border-left: 4px solid; }
+  .box p:first-child { margin-top: 0; } .box p:last-child { margin-bottom: 0; }
+  .box .lbl { font-weight: 700; text-transform: uppercase; font-size: 12px; letter-spacing: 0.8px; display: block; margin-bottom: 4px; }
+  .warn { background: var(--warn-bg); border-color: var(--warn-br); }
+  .bad  { background: var(--bad-bg);  border-color: var(--bad-br); }
+  .good { background: var(--good-bg); border-color: var(--good-br); }
+  .note { background: var(--accent-soft); border-color: var(--accent); }
+
+  .toc { background: #fafbfc; border: 1px solid var(--rule); border-radius: 5px; padding: 18px 26px; }
+  .toc ol { margin: 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+
+  .pipeline { display: flex; flex-wrap: wrap; gap: 6px; margin: 18px 0; align-items: stretch; }
+  .ph {
+    flex: 1 1 118px; border: 1px solid var(--rule); border-top: 3px solid var(--accent);
+    border-radius: 4px; padding: 9px 10px; background: #fff; font-size: 12.5px;
+  }
+  .ph .n { font-family: var(--mono); color: var(--accent); font-weight: 700; font-size: 11px; }
+  .ph .t { font-weight: 600; margin: 3px 0; }
+  .ph .d { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; font-size: 14.5px; margin: 14px 0; }
+  .kv dt { font-family: var(--mono); color: var(--muted); }
+  .kv dd { margin: 0; }
+
+  .stat-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 20px 0; }
+  .stat { flex: 1 1 150px; border: 1px solid var(--rule); border-radius: 5px; padding: 12px 14px; background: #fff; }
+  .stat .v { font-size: 24px; font-weight: 700; font-family: var(--mono); letter-spacing: -1px; }
+  .stat .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+
+  footer { margin-top: 70px; padding-top: 20px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 13px; }
+  .del { color: var(--bad-br); font-weight: 600; }
+  .add { color: var(--good-br); font-weight: 600; }
+
+  figure { margin: 26px 0; }
+  figure svg { display: block; width: 100%; height: auto; }
+  figcaption {
+    font-size: 13px; color: var(--muted); margin-top: 8px;
+    padding-left: 2px; line-height: 1.5;
+  }
+  figcaption b { color: var(--fg); }
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  svg text.m { font-family: var(--mono); }
+
+  .ex {
+    border: 1px solid var(--rule); border-left: 4px solid var(--muted);
+    border-radius: 5px; padding: 4px 18px 14px; margin: 22px 0; background: #fcfcfd;
+  }
+  .ex > .lbl {
+    font-weight: 700; text-transform: uppercase; font-size: 12px; letter-spacing: 0.8px;
+    color: var(--muted); display: block; margin: 14px 0 6px;
+  }
+  .ex pre { background: #fff; }
+  .ex table { font-size: 13.5px; }
+</style>
+</head>
+<body>
+
+<!-- Shared SVG arrowhead markers. Inline SVGs share one DOM, so every figure
+     below resolves url(#ar) / url(#arR) / url(#ag) / url(#ab) against these. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <marker id="ar"  markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#5a6472"/></marker>
+  <marker id="ab"  markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#5a6472"/></marker>
+  <marker id="arR" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#c0392b"/></marker>
+  <marker id="ag"  markerWidth="9" markerHeight="9" refX="8" refY="3.2" orient="auto">
+    <path d="M0,0 L8,3.2 L0,6.4 z" fill="#0b5fa5"/></marker>
+</defs></svg>
+
+<div class="wrap">
+
+<header class="title">
+  <h1>Titan</h1>
+  <div class="sub">A code generator for fused persistent decode megakernels — what it is, how it
+  differs from Mirage, and how it was integrated into vLLM.</div>
+  <div class="meta">
+    Target: AMD MI350X / gfx950 / ROCm &nbsp;·&nbsp; Models: GPT-OSS 120B (MoE), Qwen3-8B (dense)
+    &nbsp;·&nbsp; Batch size 1, decode only &nbsp;·&nbsp; Last measured 2026-08-04
+  </div>
+  <div class="meta">
+    This document is the engineering reference: repository shape, reproduction commands,
+    process hazards, every measurement. For the argument on its own — 16 slides, no runbook —
+    see <a href="titan-talk.html"><strong>titan-talk.html</strong></a>.
+  </div>
+</header>
+
+<div class="box note" style="margin-top:0">
+<span class="lbl">The whole thing in seven lines</span>
+<ol style="margin:6px 0 0;padding-left:22px">
+<li><strong>What.</strong> A YAML file describing a transformer becomes a HIP persistent
+megakernel: <strong>one launch decodes one token</strong>, all 36 layers plus the LM head and
+argmax inside it. <a href="#what">§1</a>, <a href="#what">fig 1</a></li>
+<li><strong>What that looks like in practice.</strong> 34 lines of YAML → 1674 lines of
+HIP in under a second → a model that did not exist an hour ago compiling at 0 register
+spills. Executed start to finish, failures included — including a three-week-old build break
+in a <em>shipped</em> config, sitting behind a green test, because
+<strong>a gate that checks self-consistency cannot detect a fault shared by both sides</strong>.
+<a href="#newmodel">§3</a>, <a href="#newmodel">fig 3</a>, <a href="#gates">fig 5</a></li>
+<li><strong>Why it is faster.</strong> At batch size 1 the GEMMs are GEMVs, so kernel-launch
+boundaries and activation round-trips through HBM <em>are</em> the runtime. Fusing at two
+levels — registers <em>and</em> LDS — takes per-layer intermediate HBM traffic to
+<strong>zero</strong>. <a href="#fusion">§4</a>, <a href="#fusion">fig 6</a></li>
+<li><strong>Why it generalizes.</strong> Mirage's compiler emits <em>call sites</em>; its
+50 433-line device library is hand-written, and its superoptimizer never mentions those
+kernels. So the assembling layer can be a static generator — and a new model becomes a
+table of shapes, not a search. <a href="#vs-mirage">§8</a>, <a href="#vs-mirage">fig 10</a></li>
+<li><strong>What it costs.</strong> No launch boundary means no free ordering, so Titan builds
+its own: 35 device-wide barriers × 3.56 µs = <strong>124.5 µs/token</strong>, sitting on
+a measured 3.50 µs hardware floor. <a href="#barriers">§6</a>, <a href="#barriers">fig 8</a></li>
+<li><strong>Where the time goes.</strong> MoE is ~40% of a layer. Inside one 13.4 µs tile:
+0.88 µs of HBM wait, ~0.8 µs of math, and <strong>3.65 µs just issuing loads</strong>. The
+phase is latency-bound, not bandwidth-bound. <a href="#measured">§7</a>,
+<a href="#measured">fig 9</a></li>
+<li><strong>The number, and the caveat.</strong> 2.921 ms/token through vLLM vs stock's 4.658
+— <strong>1.59× faster</strong>; also 0.78 ms <em>behind</em> Mirage's standalone driver.
+And GPT-OSS beats stock while Qwen3-8B is 1.63× <em>slower</em>, because the dense path
+never got this pipeline. Two architectures on opposite sides of stock is the finding.
+<a href="#perf">§12</a>, <a href="#perf">fig 13</a></li>
+</ol>
+</div>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+  <li><a href="#what">What Titan is</a></li>
+  <li><a href="#generator">The generator: one YAML, five artifacts</a></li>
+  <li><a href="#newmodel"><strong>End to end: supporting a model Titan has never seen</strong></a></li>
+  <li><a href="#fusion">Two-level fusion — why it is fast</a></li>
+  <li><a href="#pipeline">Inside one layer: the 8-phase pipeline</a></li>
+  <li><a href="#barriers">Barriers, counters, and why they dominate</a></li>
+  <li><a href="#measured">Measured constants and negative results</a></li>
+  <li><a href="#vs-mirage"><strong>The device-function library: why a static generator can support any model</strong></a></li>
+  <li><a href="#vllm">vLLM integration</a></li>
+  <li><a href="#zerocopy">Zero-copy KV</a></li>
+  <li><a href="#logits">Fused logits: deleting vLLM's redundant LM head</a></li>
+  <li><a href="#perf">Performance, stated honestly</a></li>
+  <li><a href="#open">Open items and known-dead directions</a></li>
+  <li><a href="#repro">Reproduction</a></li>
+</ol>
+<p style="margin:14px 0 0;font-size:13.5px;color:var(--muted)">
+<strong style="color:var(--fg)">Figures &amp; worked examples.</strong>
+<a href="#what">1</a> launch model &nbsp;·&nbsp;
+<a href="#generator">2</a> generator fan-out, <a href="#generator">ex.</a> YAML → constants &nbsp;·&nbsp;
+<a href="#newmodel">3</a> the seven steps, <a href="#newmodel">4</a> emitted vs library, <a href="#gates">5</a> the five gates, <a href="#ex-template">ex.</a> the emitted layer body, <a href="#newmodel">ex.</a> the four rejection asserts &nbsp;·&nbsp;
+<a href="#fusion">6</a> register fusion, <a href="#fusion">ex.</a> SwiGLU in 4 VGPRs &nbsp;·&nbsp;
+<a href="#pipeline">7</a> who is busy in each phase &nbsp;·&nbsp;
+<a href="#barriers">8</a> barrier scopes, <a href="#barriers">ex.</a> the epoch counter &nbsp;·&nbsp;
+<a href="#measured">9</a> inside one MoE tile &nbsp;·&nbsp;
+<a href="#vs-mirage">10</a> compiler vs library, <a href="#vs-mirage">11</a> cost of a new model &nbsp;·&nbsp;
+<a href="#zerocopy">12</a> KV aliasing &nbsp;·&nbsp;
+<a href="#perf">13</a> performance waterfall
+</p>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="what">1. What Titan is</h2>
+
+<p><strong>Titan is a code generator.</strong> Given a YAML description of a transformer, it
+emits a self-contained HIP <strong>persistent megakernel</strong> in which <em>one GPU
+launch</em> executes an entire decode step — all layers, the final RMSNorm, the LM head GEMM,
+and the argmax — for one token at batch size 1.</p>
+
+<div class="stat-row">
+  <div class="stat"><div class="v">1</div><div class="k">kernel launch per token</div></div>
+  <div class="stat"><div class="v">36</div><div class="k">layers inside it (GPT-OSS)</div></div>
+  <div class="stat"><div class="v">240</div><div class="k">workgroups (8 XCD × 30)</div></div>
+  <div class="stat"><div class="v">MXFP4</div><div class="k">weights, fp8 activations</div></div>
+  <div class="stat"><div class="v">2.50 ms</div><div class="k">standalone decode / token</div></div>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 300" role="img" aria-label="Conventional per-operator launches versus one persistent megakernel">
+  <!-- ── conventional ── -->
+  <text x="0" y="16" font-size="13" font-weight="700" fill="#c0392b">CONVENTIONAL — one kernel per operator</text>
+  <text x="0" y="34" font-size="11.5" fill="#5a6472">6–10 launches per layer × 36 layers = several hundred per token</text>
+
+  <!-- HBM band -->
+  <rect x="0" y="46" width="1040" height="26" fill="#fdf0ef" stroke="#e8c4bf"/>
+  <text x="10" y="63" font-size="11" font-weight="700" fill="#c0392b" class="m">HBM</text>
+
+  <g font-size="10.5" fill="#1a1a1a" text-anchor="middle">
+    <!-- kernels -->
+    <g>
+      <rect x="96"  y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="139" y="125">RMSNorm</text>
+      <rect x="212" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="255" y="125">QKV GEMM</text>
+      <rect x="328" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="371" y="125">RoPE</text>
+      <rect x="444" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="487" y="125">Attention</text>
+      <rect x="560" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="603" y="125">O-proj</text>
+      <rect x="676" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="719" y="125">Router</text>
+      <rect x="792" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="835" y="125">MoE W13</text>
+      <rect x="908" y="104" width="86" height="34" fill="#fff" stroke="#c0392b" rx="3"/><text x="951" y="125">MoE W2</text>
+    </g>
+  </g>
+  <!-- round-trip arrows: up to HBM and back down -->
+  <g stroke="#c0392b" stroke-width="1.2" fill="none" marker-end="url(#arR)">
+    <path d="M182,112 L196,86 L212,86"/><path d="M298,112 L312,86 L328,86"/>
+    <path d="M414,112 L428,86 L444,86"/><path d="M530,112 L544,86 L560,86"/>
+    <path d="M646,112 L660,86 L676,86"/><path d="M762,112 L776,86 L792,86"/>
+    <path d="M878,112 L892,86 L908,86"/>
+  </g>
+  <g stroke="#c0392b" stroke-width="1.2" fill="none" marker-end="url(#arR)">
+    <path d="M212,86 L212,104"/><path d="M328,86 L328,104"/><path d="M444,86 L444,104"/>
+    <path d="M560,86 L560,104"/><path d="M676,86 L676,104"/><path d="M792,86 L792,104"/>
+    <path d="M908,86 L908,104"/>
+  </g>
+  <text x="96" y="156" font-size="10.5" fill="#c0392b">every gap is a launch boundary + a full activation round-trip through HBM</text>
+  <path d="M0,120 L92,120" stroke="#5a6472" stroke-width="1.2" marker-end="url(#ar)"/>
+  <text x="0" y="112" font-size="10.5" fill="#5a6472" class="m">x</text>
+
+  <!-- ── titan ── -->
+  <text x="0" y="204" font-size="13" font-weight="700" fill="#2e7d4f">TITAN — one persistent megakernel</text>
+  <text x="0" y="222" font-size="11.5" fill="#5a6472">1 launch per token; the whole box below is inside it</text>
+
+  <rect x="96" y="234" width="898" height="46" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+  <g font-size="10.5" fill="#1a1a1a" text-anchor="middle">
+    <text x="139" y="255">RMSNorm</text><text x="255" y="255">QKV</text><text x="371" y="255">RoPE</text>
+    <text x="487" y="255">Attention</text><text x="603" y="255">O-proj</text><text x="719" y="255">Router</text>
+    <text x="835" y="255">W13</text><text x="951" y="255">W2</text>
+  </g>
+  <g stroke="#2e7d4f" stroke-width="1" stroke-dasharray="3 3">
+    <line x1="197" y1="240" x2="197" y2="274"/><line x1="313" y1="240" x2="313" y2="274"/>
+    <line x1="429" y1="240" x2="429" y2="274"/><line x1="545" y1="240" x2="545" y2="274"/>
+    <line x1="661" y1="240" x2="661" y2="274"/><line x1="777" y1="240" x2="777" y2="274"/>
+    <line x1="893" y1="240" x2="893" y2="274"/>
+  </g>
+  <g font-size="9.5" fill="#2e7d4f" text-anchor="middle">
+    <text x="197" y="271">VGPR</text><text x="313" y="271">VGPR</text><text x="429" y="271">LDS</text>
+    <text x="545" y="271">LDS</text><text x="661" y="271">VGPR</text><text x="777" y="271">LDS</text>
+    <text x="893" y="271">VGPR</text>
+  </g>
+  <path d="M0,257 L92,257" stroke="#5a6472" stroke-width="1.2" marker-end="url(#ar)"/>
+  <text x="0" y="249" font-size="10.5" fill="#5a6472" class="m">x</text>
+</svg>
+<figcaption><b>Figure 1.</b> The same eight operators, two execution models. Above: each
+boundary drains the activation to HBM and reloads it. Below: the boundaries become dashed
+lines inside one kernel — the activation never leaves registers or LDS, and there are no
+launches to pay for. At batch size 1 the GEMMs are GEMVs, so those boundaries, not the math,
+are the runtime.</figcaption>
+</figure>
+
+<p><strong>Decode only.</strong> Prefill is compute-bound rather than latency-bound and stock
+kernels already handle it well; under vLLM it stays on the stock path.</p>
+
+<h3>Repository shape</h3>
+
+<table>
+<thead><tr><th>Path</th><th class="num">Lines</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>titan_generate.py</code></td><td class="num">5379</td><td>The generator. Single source of truth for every emitted artifact and the ABI.</td></tr>
+<tr><td><code>configs/*.yaml</code></td><td class="num">—</td><td>Model descriptions: <code>gpt_oss_120b.yaml</code>, <code>qwen3_8b.yaml</code>, <code>llama3_8b.yaml</code>.</td></tr>
+<tr><td><code>kernels/device_functions.cuh</code></td><td class="num">2914</td><td>The composable device-function library: GEMM mainloop, epilogues, RMSNorm, quant, TopK.</td></tr>
+<tr><td><code>kernels/barriers.cuh</code></td><td class="num">229</td><td>Four barrier primitives + the per-layer counter-slot map.</td></tr>
+<tr><td><code>kernels/titan_phases.cuh</code></td><td class="num">746</td><td>Phase-split device functions (A/B/C) for register-pressure scoping.</td></tr>
+<tr><td><code>kernels/fused_layer.cuh</code></td><td class="num">107</td><td>Include-order contract + interface documentation for the Mirage sub-kernels.</td></tr>
+<tr><td><code>generated/gpt_oss_120b_kernel.cuh</code></td><td class="num">850</td><td>Emitted: constants, <code>GptConfig</code>, layer loop, tail.</td></tr>
+<tr><td><code>generated/gpt_oss_120b_launch.hip</code></td><td class="num">620</td><td>Emitted: four C entrypoints, hipGraph helpers, decode-loop bridge.</td></tr>
+<tr><td><code>demo_gpt_oss_120b.py</code></td><td class="num">1261</td><td>Emitted: standalone driver — weight packing, pointer table, four decode strategies.</td></tr>
+<tr><td><code>titan_vllm/</code></td><td class="num">~2189</td><td>The vLLM plugin (11 modules). See §9.</td></tr>
+</tbody>
+</table>
+
+<div class="box note">
+<span class="lbl">The generator is the artifact, not the kernel</span>
+<p>Everything under <code>generated/</code> and the standalone driver are <em>outputs</em>.
+The regression gate is a byte-identity round-trip — run the generator in-process, compare
+against disk, all three architectures, sub-second, no GPU. Any kernel change must go through
+<code>titan_generate.py</code> or the round-trip goes red. It is the cheapest gate here and
+also the one with the sharpest limit — <a href="#gates">§3</a> shows a real bug it let through
+for three weeks, and why no stricter version of it would have helped.</p>
+<pre><code>python3 check_roundtrip.py     # kernel / launch / driver / build × {gptoss, qwen3, llama3}</code></pre>
+</div>
+
+<div class="box bad">
+<span class="lbl">Process hazard</span>
+<p>Never run <code>titan_generate.py</code> without <code>--output-dir</code>. Its
+<code>main()</code> writes the driver and build script to the <em>repo root</em>, overwriting
+the live <code>demo_gpt_oss_120b.py</code>. Also, <code>generated/</code> is gitignored — a
+<code>git clean -xfd</code> deletes every built <code>.so</code> and the dense artifacts.</p>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="generator">2. The generator: one YAML, five artifacts</h2>
+
+<figure>
+<svg viewBox="0 0 1040 340" role="img" aria-label="One YAML config fans out to five generated artifacts">
+  <!-- YAML source -->
+  <rect x="0" y="76" width="196" height="150" fill="#fff" stroke="#1a1a1a" stroke-width="1.6" rx="4"/>
+  <text x="14" y="98" font-size="12.5" font-weight="700" class="m">gpt_oss_120b.yaml</text>
+  <g font-size="11" class="m">
+    <text x="14" y="120" fill="#0b5fa5">model:</text>
+    <text x="24" y="135" fill="#5a6472">36 layers, 2880 hidden</text>
+    <text x="14" y="153" fill="#0b5fa5">moe:</text>
+    <text x="24" y="168" fill="#5a6472">128 experts, topk 4</text>
+    <text x="14" y="186" fill="#0b5fa5">gpu:</text>
+    <text x="24" y="201" fill="#5a6472">gfx950, 8 XCD × 30</text>
+    <text x="14" y="219" fill="#c0392b">measured:</text>
+  </g>
+
+  <!-- validate -->
+  <rect x="242" y="118" width="152" height="66" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+  <text x="318" y="142" font-size="12" font-weight="700" text-anchor="middle" class="m">load_and_validate()</text>
+  <text x="318" y="160" font-size="10.5" text-anchor="middle" fill="#5a6472">derive every dimension</text>
+  <text x="318" y="174" font-size="10.5" text-anchor="middle" fill="#5a6472">cross-check every constant</text>
+  <path d="M196,151 L238,151" stroke="#0b5fa5" stroke-width="1.4" marker-end="url(#ag)"/>
+
+  <!-- fan out -->
+  <g stroke="#0b5fa5" stroke-width="1.3" fill="none" marker-end="url(#ag)">
+    <path d="M394,151 L420,151 L420,30  L462,30"/>
+    <path d="M394,151 L420,151 L420,90  L462,90"/>
+    <path d="M394,151 L420,151 L420,151 L462,151"/>
+    <path d="M394,151 L420,151 L420,212 L462,212"/>
+    <path d="M394,151 L420,151 L420,273 L462,273"/>
+  </g>
+
+  <g font-size="11.5">
+    <rect x="466" y="12" width="574" height="36" fill="#fff" stroke="#e2e6eb" rx="3"/>
+    <text x="478" y="28" class="m" font-weight="700">generated/gpt_oss_120b_kernel.cuh</text>
+    <text x="478" y="42" font-size="10.5" fill="#5a6472">constants, GptConfig, the 36-layer loop, the tail</text>
+
+    <rect x="466" y="72" width="574" height="36" fill="#fff" stroke="#e2e6eb" rx="3"/>
+    <text x="478" y="88" class="m" font-weight="700">generated/gpt_oss_120b_launch.hip</text>
+    <text x="478" y="102" font-size="10.5" fill="#5a6472">four C entrypoints, hipGraph helpers, decode bridge</text>
+
+    <rect x="466" y="133" width="574" height="36" fill="#fff" stroke="#e2e6eb" rx="3"/>
+    <text x="478" y="149" class="m" font-weight="700">demo_gpt_oss_120b.py</text>
+    <text x="478" y="163" font-size="10.5" fill="#5a6472">standalone driver: weight packing, pointer table, decode</text>
+
+    <rect x="466" y="194" width="574" height="36" fill="#fff" stroke="#e2e6eb" rx="3"/>
+    <text x="478" y="210" class="m" font-weight="700">build_gpt_oss_120b.sh</text>
+    <text x="478" y="224" font-size="10.5" fill="#5a6472">hipcc flags — opt level, rdc, extra defines</text>
+
+    <rect x="466" y="255" width="574" height="36" fill="#fff" stroke="#e2e6eb" rx="3"/>
+    <text x="478" y="271" class="m" font-weight="700">titan_vllm/spec.py</text>
+    <text x="478" y="285" font-size="10.5" fill="#5a6472">the plugin reads the same YAML through the same validator</text>
+  </g>
+
+  <!-- roundtrip gate -->
+  <rect x="466" y="306" width="574" height="30" fill="#eef8f0" stroke="#2e7d4f" rx="3"/>
+  <text x="478" y="325" font-size="11" class="m" fill="#2e7d4f">check_roundtrip.py → all five must come back byte-identical, sub-second, no GPU</text>
+</svg>
+<figcaption><b>Figure 2.</b> Five artifacts, one source. The generated files are
+<em>outputs</em>, never edited by hand — the regression gate re-runs the generator in-process
+and diffs against disk for all three architectures.</figcaption>
+</figure>
+
+<p>Five sections. <code>model:</code> and <code>moe:</code> are facts about the checkpoint,
+<code>gpu:</code> the target topology, <code>build:</code> compiler flags. <code>measured:</code>
+is the interesting one: search results, each annotated with the alternative tried and what it
+cost.</p>
+
+<div class="ex">
+<span class="lbl">Worked example — 12 YAML lines become the whole work decomposition</span>
+<p>Nothing below is written down anywhere. Every number is derived by
+<code>load_and_validate</code> from the config on the left, then emitted as a
+<code>static constexpr int</code>.</p>
+
+<table>
+<thead><tr><th>YAML says</th><th>Derivation</th><th class="num">Emitted constant</th></tr></thead>
+<tbody>
+<tr><td><code>hidden_size: 2880</code></td>
+    <td>pad up to the MFMA alignment (64)</td>
+    <td class="num"><code>HIDDEN_SIZE = 2944</code></td></tr>
+<tr><td><code>num_q_heads: 64</code>, <code>num_kv_heads: 8</code>, <code>head_dim: 64</code></td>
+    <td>64×64 + 2×8×64</td>
+    <td class="num"><code>QKV_OUTPUT_SIZE = 5120</code></td></tr>
+<tr><td>&nbsp;&nbsp;… with <code>output_per_wg: 64</code></td>
+    <td>5120 / 64 = 80 tiles, over 8 XCDs</td>
+    <td class="num"><code>QKV_N_WGS_PER_XCD = 10</code></td></tr>
+<tr><td><code>oproj_output_per_wg: 16</code></td>
+    <td>2944 / 16 = 184, / 8 XCDs</td>
+    <td class="num"><code>OPROJ_TILES_PER_XCD = 23</code></td></tr>
+<tr><td><code>moe_intermediate_size: 2880</code></td>
+    <td>pad to 2944, ×2 for gate+up interleaved</td>
+    <td class="num"><code>W13_OUTPUT_SIZE = 5888</code></td></tr>
+<tr><td>&nbsp;&nbsp;… with <code>w13_output_per_wg: 128</code></td>
+    <td>5888 / 128</td>
+    <td class="num"><code>W13_N_WGS = 46</code></td></tr>
+<tr><td>&nbsp;&nbsp;… with <code>w2_output_per_wg: 64</code></td>
+    <td>2944 / 64</td>
+    <td class="num"><code>W2_N_WGS = 46</code></td></tr>
+</tbody>
+</table>
+
+<span class="lbl">And then the one that gets cross-checked</span>
+<p>The MoE phase's per-XCD tile count is derivable, so the <code>measured:</code> value is
+asserted against the derivation rather than trusted:</p>
+<pre><code>w13_tiles  = topk 4 × (5888 / 128)        = 184
+w13_padded = pad_up(184, 240 workers)      = 240   ← 56 padding tiles, deliberately
+w2_tiles   = topk 4 × (2944 / 64)         = 184
+total      = pad_up(240 + 184, 8) / 8      =  53   == measured.moe_total_tiles_per_xcd ✓</code></pre>
+<p>Set <code>w13_output_per_wg</code> to 64 and this becomes 83; set
+<code>w2_output_per_wg</code> to 128 and it becomes 42. The assert fires on a stale YAML rather
+than letting a wrong tile count run — and the formula reproducing all three historical values
+is what makes it trustworthy.</p>
+</div>
+
+<h3>Validation is where the bugs are caught</h3>
+
+<p><code>load_and_validate</code> does three distinct kinds of check, and the distinction
+matters:</p>
+
+<table>
+<thead><tr><th>Kind</th><th>Example</th><th>What it protects</th></tr></thead>
+<tbody>
+<tr><td><strong>Structural</strong> — not tunable, each names its authority</td>
+    <td><code>num_kv_heads == num_xcds</code>; <code>head_dim == 64</code></td>
+    <td>Mirage hardcodes <code>kv_head_idx = xcd_id</code>; the hd64 attention kernel
+        <code>static_assert</code>s the head dim. Violating either is silent garbage.</td></tr>
+<tr><td><strong>Derived-vs-declared</strong> — compute it, then assert it agrees with the measured value</td>
+    <td><code>moe_total_tiles_per_xcd</code>, <code>oproj_output_per_wg</code></td>
+    <td>Keeps the auto-derivation honest without letting it silently override a measurement.
+        The tile formula reproduces all three historical values (53 / 83 / 42).</td></tr>
+<tr><td><strong>Header cross-parse</strong></td>
+    <td><code>COUNTERS_PER_LAYER</code> is parsed out of <code>device_functions.cuh</code> and asserted</td>
+    <td>The generator once emitted 40 × 16 while the header said 103 × 16 — a 2.5× counter
+        under-allocation that corrupts live barriers with no crash.</td></tr>
+</tbody>
+</table>
+
+<h3>Facts that exist in more than one place get emitted from one definition</h3>
+
+<p>The most dangerous class of bug in this codebase is a constant that appears in two files
+and drifts. Three examples, all now single-sourced in the generator:</p>
+
+<ul>
+<li><strong>The pointer table.</strong> <code>MIRAGE_IN_COUNT</code> (24) and
+<code>MIRAGE_OUT_COUNT</code> (11) in the kernel, <code>PTRS_PER_LAYER</code> (36), and the
+10368-entry table built in the driver (8 XCD × 36 layers × 36 slots) are four views of one
+fact. They are emitted from a single Python list. A mismatch here is not a crash — it is a
+pointer pointing at the wrong buffer.</li>
+<li><strong>The <code>*_OPW</code> tile widths.</strong> These control <em>weight packing</em>
+in the driver and <em>GEMM tiling</em> in the kernel. Change one file only and the output is
+garbage with no error.</li>
+<li><strong>The launch ABI.</strong> One Python parameter list produces both the emitted C
+signature and the ctypes <code>argtypes</code>. A ctypes list that is short or transposed is
+stack corruption, reproducible only under one of four env-var-selected decode paths.</li>
+</ul>
+
+<div class="box warn">
+<span class="lbl">The 23-parameter trap</span>
+<p>Mirage's full-layer orchestrator takes 23 template parameters, every one <code>int</code>
+or <code>bool</code>. Transposing two compiles cleanly and produces wrong numbers. So they are
+emitted from a list of <code>(name, value_expr)</code> pairs — parameter order is <em>data</em>
+— with an assert on the list length. <a href="#ex-template">The emitted call is shown in full
+in §3.</a></p>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="newmodel">3. End to end: supporting a model Titan has never seen</h2>
+
+<p>Everything below was executed on this machine, in order, on 2026-08-11, against
+<strong>Mistral-7B</strong> — chosen because Titan had never been pointed at it and there is no
+Mistral code anywhere in the tree. Outputs are verbatim, <em>including the two places it
+failed</em>, since that is where the real cost of adding a model lives.</p>
+
+<figure>
+<svg viewBox="0 0 1040 232" role="img" aria-label="Seven steps from a YAML config to a running model">
+  <g font-size="10.5" text-anchor="middle">
+    <!-- step boxes -->
+    <g>
+      <rect x="0"   y="58" width="126" height="52" fill="#eef5fb" stroke="#0b5fa5" stroke-width="1.4" rx="4"/>
+      <text x="63" y="79"  font-weight="700" font-size="11.5">1 · write YAML</text>
+      <text x="63" y="96"  fill="#5a6472">34 lines</text>
+
+      <rect x="152" y="58" width="126" height="52" fill="#eef5fb" stroke="#0b5fa5" stroke-width="1.4" rx="4"/>
+      <text x="215" y="79" font-weight="700" font-size="11.5">2 · validate</text>
+      <text x="215" y="96" fill="#5a6472">--dry-run, no GPU</text>
+
+      <rect x="304" y="58" width="126" height="52" fill="#eef5fb" stroke="#0b5fa5" stroke-width="1.4" rx="4"/>
+      <text x="367" y="79" font-weight="700" font-size="11.5">3 · generate</text>
+      <text x="367" y="96" fill="#5a6472">4 files, 1674 lines</text>
+
+      <rect x="456" y="58" width="126" height="52" fill="#eef5fb" stroke="#0b5fa5" stroke-width="1.4" rx="4"/>
+      <text x="519" y="79" font-weight="700" font-size="11.5">4 · inspect</text>
+      <text x="519" y="96" fill="#5a6472">diff vs a sibling</text>
+
+      <rect x="608" y="58" width="126" height="52" fill="#fdf6ec" stroke="#b8860b" stroke-width="1.6" rx="4"/>
+      <text x="671" y="79" font-weight="700" font-size="11.5">5 · build</text>
+      <text x="671" y="96" fill="#b8860b">failed first try</text>
+
+      <rect x="760" y="58" width="126" height="52" fill="#fdf6ec" stroke="#b8860b" stroke-width="1.6" rx="4"/>
+      <text x="823" y="79" font-weight="700" font-size="11.5">6 · load weights</text>
+      <text x="823" y="96" fill="#b8860b">the real work</text>
+
+      <rect x="912" y="58" width="128" height="52" fill="#eef8f0" stroke="#2e7d4f" stroke-width="1.4" rx="4"/>
+      <text x="976" y="79" font-weight="700" font-size="11.5">7 · run + gate</text>
+      <text x="976" y="96" fill="#5a6472">token id, ms/tok</text>
+    </g>
+  </g>
+  <g stroke="#0b5fa5" stroke-width="1.3" fill="none" marker-end="url(#ag)">
+    <path d="M126,84 L148,84"/><path d="M278,84 L300,84"/><path d="M430,84 L452,84"/>
+    <path d="M582,84 L604,84"/><path d="M734,84 L756,84"/><path d="M886,84 L908,84"/>
+  </g>
+
+  <!-- effort band -->
+  <rect x="0" y="140" width="582" height="30" fill="#eef8f0" stroke="#2e7d4f" rx="3"/>
+  <text x="291" y="159" font-size="11.5" text-anchor="middle" fill="#2e7d4f">
+    steps 1–4: <tspan font-weight="700">~10 minutes</tspan>, no GPU, fully mechanical</text>
+  <rect x="608" y="140" width="432" height="30" fill="#fdf0ef" stroke="#c0392b" rx="3"/>
+  <text x="824" y="159" font-size="11.5" text-anchor="middle" fill="#c0392b">
+    steps 5–7: <tspan font-weight="700">where every hour goes</tspan> — build flags and checkpoint mapping</text>
+
+  <text x="0" y="196" font-size="11.5" fill="#5a6472">The generator is not the hard part. It never was. Two of these seven steps failed on the</text>
+  <text x="0" y="213" font-size="11.5" fill="#5a6472">first attempt, and neither failure was in steps 1–4.</text>
+</svg>
+<figcaption><b>Figure 3.</b> The seven steps, and where the effort actually is. Steps 1–4
+are the part the generator automates and they cost minutes. Steps 5–7 are build flags and
+checkpoint-to-kernel weight mapping — unautomated, and the entire real cost of adding a
+model.</figcaption>
+</figure>
+
+<h3>Step 1 — Write the config (34 lines)</h3>
+
+<p>Copied from Mistral-7B's HuggingFace <code>config.json</code>. Three sections; a dense
+model needs no <code>moe:</code> and inherits the default <code>build:</code>.</p>
+
+<pre><code>model:
+  name: mistral-7b
+  arch: dense
+  num_layers: 32
+  hidden_size: 4096
+  intermediate_size: 14336
+  vocab_size: 32768
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  activation: swiglu
+  has_qk_norm: false
+  has_bias: false
+  rope_theta: 1000000.0
+  rms_norm_eps: 1.0e-5
+  max_position_embeddings: 32768
+
+gpu:
+  target: gfx950
+  num_xcds: 8
+  workers_per_xcd: 30
+  page_size: 4096
+  max_seq_len: 512
+  num_kv_chunks: 8
+
+quantization:
+  weight_format: mxfp4
+  output_per_wg: 64
+  gateup_opw: 128</code></pre>
+
+<h3>Step 2 — Validate before writing anything</h3>
+
+<pre><code>$ python3 titan_generate.py /tmp/mistral_7b.yaml --dry-run
+
+Loaded config: mistral-7b (dense)
+  Layers=32, Hidden=4096, Intermediate=14336
+  Heads: 32Q / 8KV, head_dim=128
+  QKV output=6144, GateUp output=28672
+  Padded vocab=32768, LM WGs/XCD=64
+  PTRS_IN=16, PTRS_OUT=9, PTRS_PER_LAYER=25
+  Would write: generated/mistral_7b_kernel.cuh (787 lines)
+  Would write: generated/mistral_7b_launch.hip (152 lines)
+  Would write: demo_mistral_7b.py (686 lines)
+  Would write: build_mistral_7b.sh (49 lines)</code></pre>
+
+<p>Six lines of YAML became the entire work decomposition, and nothing has touched the disk.
+<code>--dry-run</code> is also how you avoid the repo-root overwrite hazard while
+experimenting.</p>
+
+<div class="ex">
+<span class="lbl">Worked example — the four asserts that reject a model, verbatim</span>
+<p>The interesting output of step 2 is the <em>failures</em>. Each perturbation below is one
+changed YAML line; each message names the file and line hardcoding the constraint, so a
+rejection is never folklore. All four were produced by actually running the generator:</p>
+
+<pre><code># num_kv_heads: 8 -> 4
+AssertionError: The fused MoE path requires num_kv_heads (4) == num_xcds (8):
+mirage hardcodes kv_head_idx = xcd_id at gang_full_layer_fused_mi300.cuh:260,297.
+
+# head_dim: 64 -> 128   (on the MoE config)
+AssertionError: The fused MoE path requires head_dim == 64, got 128:
+paged_attention_minimal_decode_hd64 static_asserts it.
+
+# weight_format: mxfp4 -> fp8
+AssertionError: Only 'mxfp4' supported, got 'fp8'
+
+# num_q_heads: 32 -> 30
+AssertionError: QKV WGs 92 not divisible by num_xcds 8</code></pre>
+
+<p>Note which asserts did <em>not</em> fire. Mistral declares <code>head_dim: 128</code> and
+would fail the hd64 check — but that assert sits inside <code>if cfg.arch == "moe":</code>, and
+Mistral is dense. <strong>Both hard structural constraints bind the fused MoE path only.</strong>
+That is the single most useful fact when sizing "can Titan run model X": a dense model has far
+more freedom than the GPT-OSS numbers suggest.</p>
+</div>
+
+<h3>Step 3 — Generate</h3>
+
+<pre><code>$ python3 titan_generate.py /tmp/mistral_7b.yaml --output-dir /tmp/titan_mistral
+
+  Wrote: /tmp/titan_mistral/generated/mistral_7b_kernel.cuh (787 lines)
+  Wrote: /tmp/titan_mistral/generated/mistral_7b_launch.hip (152 lines)
+  Wrote: /tmp/titan_mistral/demo_mistral_7b.py (686 lines)
+  Wrote: /tmp/titan_mistral/build_mistral_7b.sh (49 lines)
+
+Generation complete for mistral-7b.</code></pre>
+
+<p>1674 lines in under a second. (<code>--output-dir</code> is not optional: without it the
+driver and build script land in the <em>repo root</em> and overwrite the live
+<code>demo_gpt_oss_120b.py</code>.)</p>
+
+<p>What is in those four files:</p>
+
+<table>
+<thead><tr><th>Artifact</th><th class="num">Mistral</th><th class="num">GPT-OSS</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td><code>generated/&lt;m&gt;_kernel.cuh</code></td><td class="num">787</td><td class="num">850</td>
+    <td>The <code>__global__</code> entry point. ~56 <code>static constexpr</code> shape
+        constants, a POD config struct of runtime pointers, and the kernel body: derive
+        <code>xcd_id</code> and XCD-local rank, load this layer's pointer slice, run the layer
+        loop, then the LM-head GEMM and argmax tail.</td></tr>
+<tr><td><code>generated/&lt;m&gt;_launch.hip</code></td><td class="num">152</td><td class="num">620</td>
+    <td>The host ABI — <code>extern "C"</code> entrypoints. Dense emits three
+        (<code>init</code> / <code>launch</code> / <code>finalize</code>); the MoE path emits
+        ten, the extra seven being hipGraph capture-replay and the C-side decode loop. This is
+        the <em>only</em> translation unit compiled; it includes the kernel header.</td></tr>
+<tr><td><code>demo_&lt;m&gt;.py</code></td><td class="num">686</td><td class="num">1261</td>
+    <td>Standalone driver: checkpoint load, weight packing into the tile layout each GEMM
+        expects, MXFP4 quantization, workspace allocation, the pointer table, prefill through
+        PyTorch, the decode loop, and the ctypes bindings.</td></tr>
+<tr><td><code>build_&lt;m&gt;.sh</code></td><td class="num">49</td><td class="num">51</td>
+    <td>One <code>hipcc</code> invocation: include paths, <code>--offload-arch=gfx950</code>,
+        and the <code>-D</code> flags from the YAML <code>build:</code> block.</td></tr>
+</tbody>
+</table>
+
+<h3>What the generator writes: a specialization, not an implementation</h3>
+
+<p>Nothing in the layer body is an algorithm. The 850-line GPT-OSS kernel is 56 constants, six
+<code>#include</code>s, and a per-layer body that is <strong>one call</strong> —
+<code>gang_full_layer_fused_kernel_mi300</code>, 23 template parameters, five library symbols named
+in total. The exception is the 194-line LM-head GEMM and argmax tail, emitted inline because the
+vocabulary shard is the one tile shape that genuinely differs per model.</p>
+
+<div class="ex" id="ex-template">
+<span class="lbl">Worked example — the entire per-layer body, verbatim from the generated file</span>
+<p>This is everything the generator emits for one of the 36 layers, copied unmodified from
+<code>generated/gpt_oss_120b_kernel.cuh:512</code>. Read it as the claim above made literal: a
+template instantiation and an argument list, with no loop, no memory movement, and no
+arithmetic of its own.</p>
+
+<pre><code>// GPT-OSS alternates attention types per layer: even layers use a
+// 128-token sliding window, odd layers use full attention. Pass the
+// window at runtime so the layer body is instantiated only once.
+int const layer_sliding_window = (layer &amp; 1) == 0 ? SLIDING_WINDOW : 0;
+
+// Call mirage's full-layer orchestrator
+kernel::gang_full_layer_fused_kernel_mi300&lt;
+    /*QKV_BATCH_SIZE=*/1,                            /*QKV_OUTPUT_PER_WG=*/OUTPUT_PER_WG,
+    /*QKV_REDUCTION_SIZE=*/HIDDEN_SIZE,              /*ACTUAL_HIDDEN_DIM=*/ACTUAL_HIDDEN_DIM,
+    /*HEAD_DIM=*/HEAD_DIM,                           /*NUM_Q_PER_KV=*/NUM_Q_PER_KV,
+    /*PAGE_SIZE=*/PAGE_SIZE,                         /*MAX_SEQ_LEN=*/MAX_SEQ_LEN,
+    /*NUM_KV_CHUNKS=*/NUM_KV_CHUNKS,                 /*Q_WORKSPACE_STRIDE=*/Q_WORKSPACE_STRIDE,
+    /*KV_CACHE_STRIDE=*/KV_CACHE_STRIDE,             /*NUM_KV_HEADS=*/NUM_KV_HEADS,
+    /*SLIDING_WINDOW=*/0,                            /*HAS_SINKS=*/1,
+    /*OPROJ_OUTPUT_PER_WG=*/OPROJ_OPW,               /*OPROJ_REDUCTION_SIZE=*/OPROJ_REDUCTION,
+    /*NUM_EXPERTS=*/NUM_EXPERTS,                     /*TOPK_K=*/NUM_TOPK,
+    /*MOE_INTERMEDIATE_SIZE=*/MOE_INTERMEDIATE_SIZE, /*MOE_HIDDEN_SIZE=*/HIDDEN_SIZE,
+    /*MOE_W13_OUTPUT_PER_WG=*/W13_OPW,               /*MOE_W2_OUTPUT_PER_WG=*/W2_OPW,
+    /*DECODE_ONLY=*/true&gt;(
+    mirage_in, mirage_out, config.cos_ptr, config.sin_ptr,
+    config.qo_indptr, config.kv_indptr, config.kv_indices,
+    config.kv_last_page_len, config.num_active_tokens,
+    QKV_N_WGS_PER_XCD, KV_CACHE_STRIDE, Q_WORKSPACE_STRIDE, config.attn_scale,
+    QKV_N_WGS_PER_XCD, OPROJ_N_WGS_PER_XCD, HIDDEN_SIZE, ROUTER_TILE_N,
+    OPROJ_N_WGS, TOTAL_TOPK_TILES, OPROJ_TILES_PER_XCD,
+    MOE_TOTAL_TILES_PER_XCD, WORKERS_PER_XCD, tile_idx, layer_sliding_window);</code></pre>
+
+<p>Every identifier in capitals is a <code>static constexpr int</code> emitted earlier in the
+same file and derived from the YAML — the table two subsections up. Nothing here was written by
+a person for this model. Three things are worth reading closely:</p>
+
+<ul>
+<li><strong>23 template parameters, then 24 runtime arguments</strong>, and every one of the
+    47 is an <code>int</code>, <code>bool</code>, <code>float</code>, or pointer. That is the
+    trap named in <a href="#generator">§2</a>: transposing any two compiles without a
+    diagnostic. The generator emits them from a list of <code>(name, expr)</code> pairs with
+    <code>assert len(...) == 23</code> and <code>== 24</code> beside it, so the order is data
+    that can be checked rather than 47 lines of hand-aligned text that an edit can permute.</li>
+<li><strong><code>/*SLIDING_WINDOW=*/0</code> is pinned, and the real window arrives as the
+    last runtime argument.</strong> GPT-OSS alternates windowed and full attention by layer
+    parity. Baking 128 into the template would instantiate the entire layer body a second time
+    to vary one integer — 36 layers of code for one branch. The runtime override costs a
+    register.</li>
+<li><strong>The <code>/*NAME=*/</code> comments are on the template arguments and not on the
+    runtime ones.</strong> The compiler checks neither; they exist because a template argument
+    list is the thing a human actually has to read when the output is wrong.</li>
+</ul>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 288" role="img" aria-label="The emitted kernel is a thin specialization over a large hand-written library">
+  <!-- emitted -->
+  <rect x="0" y="26" width="272" height="140" fill="#eef5fb" stroke="#0b5fa5" stroke-width="1.6" rx="4"/>
+  <text x="14" y="16" font-size="12" font-weight="700" fill="#0b5fa5">EMITTED PER MODEL</text>
+  <text x="14" y="48" font-size="11.5" font-weight="700" class="m">gpt_oss_120b_kernel.cuh</text>
+  <g font-size="11" fill="#1a1a1a">
+    <text x="14" y="72"><tspan class="m" font-weight="700">56</tspan>  static constexpr constants</text>
+    <text x="14" y="93"><tspan class="m" font-weight="700">6</tspan>  #include of the library</text>
+    <text x="14" y="114"><tspan class="m" font-weight="700">1</tspan>  call to the layer orchestrator</text>
+    <text x="14" y="135"><tspan class="m" font-weight="700">194</tspan>  LM-head GEMM + argmax tail</text>
+  </g>
+  <text x="14" y="157" font-size="10.5" fill="#5a6472">no GEMM mainloop, no attention, no barrier, no epilogue</text>
+
+  <path d="M278,96 L332,96" stroke="#0b5fa5" stroke-width="1.6" fill="none" marker-end="url(#ag)"/>
+  <text x="305" y="86" font-size="10" text-anchor="middle" fill="#0b5fa5">instantiates</text>
+
+  <!-- library -->
+  <rect x="340" y="26" width="700" height="140" fill="#fff" stroke="#1a1a1a" stroke-width="1.6" rx="4"/>
+  <text x="354" y="16" font-size="12" font-weight="700">HAND-WRITTEN, MODEL-INDEPENDENT, SHARED BY EVERY MODEL</text>
+  <rect x="354" y="42" width="672" height="52" fill="#fafbfc" stroke="#e2e6eb" rx="3"/>
+  <text x="366" y="60" font-size="11.5" font-weight="700" class="m">titan/kernels/ — 4206 lines</text>
+  <text x="366" y="80" font-size="10.5" fill="#5a6472">epilogue structs, the MXFP4 GEMM mainloop, RMSNorm, fp8 quant, TopK router, paged attention, four barrier primitives</text>
+  <rect x="354" y="102" width="672" height="52" fill="#fafbfc" stroke="#e2e6eb" rx="3"/>
+  <text x="366" y="120" font-size="11.5" font-weight="700" class="m">mirage tasks/mi300/ — 7293 lines</text>
+  <text x="366" y="140" font-size="10.5" fill="#5a6472">the fused-layer orchestrator and the phase kernels it drives: QKV+RoPE, split-KV attention, O-proj+router+TopK, MoE W13/W2</text>
+
+  <!-- proportional bar -->
+  <text x="0" y="206" font-size="11.5" font-weight="700">Lines of HIP reached by one decode step</text>
+  <rect x="0" y="216" width="72" height="26" fill="#0b5fa5"/>
+  <rect x="72" y="216" width="968" height="26" fill="#e8ecf1" stroke="#c8d0d8"/>
+  <text x="556" y="234" font-size="11.5" text-anchor="middle" fill="#1a1a1a">11 499 lines of shared library</text>
+  <path d="M36,248 L36,262 L96,262" stroke="#0b5fa5" stroke-width="1.2" fill="none"/>
+  <text x="104" y="266" font-size="11" fill="#0b5fa5">850 emitted — 6.9% of the total, and none of it is a kernel</text>
+</svg>
+<figcaption><b>Figure 4.</b> The generator writes constants and a call site. Two dense models
+of the same shape therefore differ by ~60 lines (step 4 below), and a model that needs a
+<em>new</em> shape — MLA, a different head dim on the MoE path — needs work on the
+right-hand box instead, which is the last row of the cost table and the reason it reads
+"weeks".</figcaption>
+</figure>
+
+<h3>The device-function library</h3>
+
+<p>This is where the performance lives, and it is deliberately not generated — a split that
+<a href="#vs-mirage">§8</a> argues is the interesting part of the whole system. Every quantity a
+model can change is already a template parameter. What is left to vary — MFMA scheduling,
+LDS layout, cache modifiers — are search results rather than derivations, and they live in
+the YAML <code>measured:</code> block.</p>
+
+<table>
+<thead><tr><th>File</th><th class="num">Lines</th><th>Holds</th></tr></thead>
+<tbody>
+<tr><td><code>device_functions.cuh</code></td><td class="num">2914</td>
+    <td>The six epilogue structs (§4), the templated MXFP4 GEMM mainloop and its LDS-prefetch
+        variants, <code>rmsnorm</code>, <code>fp8_quant</code>, <code>topk_router</code>, three
+        paged-attention variants, and the per-layer counter-slot map
+        (<code>COUNTERS_PER_LAYER = 103 × 16</code>).</td></tr>
+<tr><td><code>titan_phases.cuh</code></td><td class="num">746</td>
+    <td>Phase-split device functions. Splitting a phase into A/B/C scopes its register
+        pressure so the whole layer body fits the occupancy target.</td></tr>
+<tr><td><code>barriers.cuh</code></td><td class="num">229</td>
+    <td>The four barrier primitives and the epoch-counter protocol (§6).</td></tr>
+<tr><td><code>common.cuh</code></td><td class="num">210</td>
+    <td>Agent-scope fences, <code>sc0/sc1</code> atomics, non-temporal polling loads.</td></tr>
+<tr><td><code>fused_layer.cuh</code></td><td class="num">107</td>
+    <td>Include-order contract for the Mirage sub-kernels.</td></tr>
+</tbody>
+</table>
+
+<p>The two paths barely overlap: the dense path calls <code>titan::gemm_mxfp4</code> and
+friends directly, while the MoE path goes through Mirage's orchestrator to its own copies. So
+2156 of the 2914 lines — <strong>74%</strong> — sit behind four
+<code>#ifdef TITAN_ENABLE_LEGACY</code> guard pairs, opted into per model from the YAML
+<code>build:</code> block. Step 5 below trips over exactly that partition.</p>
+
+<h3>Step 4 — Inspect what came out</h3>
+
+<p>The emitted constants for a model the generator has never seen — every one derived, none
+written down anywhere:</p>
+
+<pre><code>static constexpr int QKV_OUTPUT_SIZE   = 6144;   // 32×128 + 2×8×128
+static constexpr int QKV_N_WGS         = 96;     // 6144 / OUTPUT_PER_WG(64)
+static constexpr int QKV_N_WGS_PER_XCD = 12;     // 96 / 8
+static constexpr int OPROJ_N_WGS_PER_XCD = 8;    // 4096 / 64 / 8
+static constexpr int GATEUP_OUTPUT_SIZE  = 28672;  // 2 × 14336, gate+up interleaved
+static constexpr int GATEUP_N_WGS_PER_XCD = 28;  // 28672 / GATEUP_OPW(128) / 8
+static constexpr int LM_N_WGS_PER_XCD    = 64;   // 32768 / 64 / 8
+static constexpr int PTRS_PER_LAYER      = 25;   // 16 in + 9 out</code></pre>
+
+<p>The sharpest view of what the generator actually parameterises is a diff against
+Llama3-8B. Both are 32×4096×14336 with 32Q/8KV heads; they differ only in vocab
+size:</p>
+
+<pre><code>$ diff generated/llama3_8b_kernel.cuh /tmp/titan_mistral/generated/mistral_7b_kernel.cuh
+# 60 lines. Substantively:
+&lt; static constexpr int VOCAB_SIZE = 128256;      &gt; VOCAB_SIZE = 32768;
+&lt; static constexpr int PADDED_VOCAB_SIZE = 128512;  &gt; PADDED_VOCAB_SIZE = 32768;
+&lt; static constexpr int LM_N_WGS_PER_XCD = 251;   &gt; LM_N_WGS_PER_XCD = 64;
+# everything else is the identifier rename llama3_8b -> mistral_7b</code></pre>
+
+<p>That is the honest scope. Two dense models of identical shape produce byte-identical
+kernels modulo names and the constants that genuinely differ. The structure — the 8-phase loop,
+the barriers, the epilogues — is shared code, not regenerated per model.</p>
+
+<h3>Step 5 — Build, which failed</h3>
+
+<pre><code>$ bash /tmp/titan_mistral/build_mistral_7b.sh
+...
+mistral_7b_kernel.cuh:283:24: error: no member named 'gemm_mxfp4' in namespace 'titan'
+mistral_7b_kernel.cuh:313:20: error: no member named 'rope_kv_update' in namespace 'titan'
+66 warnings and 14 errors generated when compiling for gfx950.</code></pre>
+
+<p>All 14 trace to two device functions. Commit <code>f2354a7</code> — the one that landed
+2.520 ms/token — fenced them behind <code>#ifdef TITAN_ENABLE_LEGACY</code> inside the 116 KB
+header both architectures include. The MoE path stopped calling them; the dense path still does.
+The fix is one YAML block:</p>
+
+<pre><code>build:
+  extra_defines:
+    - TITAN_ENABLE_LEGACY</code></pre>
+
+<p>Regenerate, rebuild, and a model that did not exist an hour earlier compiles clean:</p>
+
+<pre><code>$ bash /tmp/titan_mistral/build_mistral_7b.sh      # exit 0, 0 errors
+    TotalSGPRs: 106
+    VGPRs: 241            AGPRs: 4
+    Occupancy [waves/SIMD]: 2
+    SGPRs Spill: 0        VGPRs Spill: 0
+    LDS Size [bytes/block]: 344</code></pre>
+
+<h3>Step 6 — Map the checkpoint, which is the actual work</h3>
+
+<p>The emitted driver is 686 lines and already handles pointer tables, MXFP4 quantization,
+padding, and the decode loop. What it cannot know is your checkpoint's attribute names. It emits
+the Llama-family convention:</p>
+
+<pre><code>layer = model.model.layers[li]
+w_q = pad_weight_2d(layer.self_attn.q_proj.weight.data.to("cuda"), target_cols=HIDDEN_SIZE)
+w_k = ...k_proj...   w_v = ...v_proj...   w_o = ...o_proj...
+norm_w1_raw = layer.input_layernorm.weight.data
+norm_w2_raw = layer.post_attention_layernorm.weight.data
+w_gate = layer.mlp.gate_proj.weight.data     w_up = layer.mlp.up_proj.weight.data
+w_down = layer.mlp.down_proj.weight.data
+embed_weight = model.model.embed_tokens.weight.data</code></pre>
+
+<p>Mistral uses exactly these names, so here step 6 is zero work — the point of picking a
+Llama-shaped model. A model that names things differently (DeepSeek's MLA, a fused
+<code>qkv_proj</code>, tied embeddings) needs this block edited, and that edit is not generated.
+It is also not the interesting part: a rename, not a kernel change.</p>
+
+<p>The layout the packing must satisfy is non-obvious, and the one place a mistake is silent.
+QKV is <em>not</em> concatenated Q, K, V — it is interleaved by KV group, so one workgroup's tile
+holds the heads it needs:</p>
+
+<pre><code>for g in range(NUM_KV_HEADS):            # 8 groups
+    chunks.append(w_q[g*4*128 : (g+1)*4*128])   # 4 Q heads for this group
+    chunks.append(w_k[g*128 : (g+1)*128])       # its K head
+    chunks.append(w_v[g*128 : (g+1)*128])       # its V head
+w_qkv = torch.cat(chunks, dim=0)                # (6144, 4096)
+assert w_qkv.shape == (QKV_OUTPUT_SIZE, HIDDEN_SIZE)</code></pre>
+
+<p>Get the interleave wrong and nothing crashes: the GEMM is the right shape, the kernel runs
+at full speed, and the model emits fluent nonsense. The assert catches shape errors, not ordering
+errors — which is why the step-7 gate is an exact token id rather than a perplexity score.</p>
+
+<h3>Step 7 — Run and gate</h3>
+
+<p>Mistral-7B weights are not on this box, so the walkthrough honestly stops at "compiles
+clean, 0 spills". Here is step 7 executed for real, this session, on the model that does have
+weights:</p>
+
+<pre><code>$ HIP_VISIBLE_DEVICES=0 python3 demo_gpt_oss_120b.py \
+    --model-path /home/claudeuser/models/gpt-oss-120b \
+    --prompt "Tell me the history of america" --max-seq-length 512
+
+  Pointer table: 10368 entries (8x36x36)
+=== Decode (438 tokens) ===
+  iter 1: next_token=35644 ('analysis')
+  iter 2: next_token=200008 ('&lt;|message|&gt;')
+  iter 3: next_token=976 ('The')
+  iter 4: next_token=1825 (' user')
+  iter 5: next_token=10648 (' wants')
+
+Decode avg:       2.721 ms/token
+Outliers (&gt;5ms):  6 tokens, avg=13.7ms
+Non-outlier avg:  2.567 ms/token</code></pre>
+
+<p>Two gates, both non-negotiable. Correctness is <code>next_token=35644</code> — an exact
+integer, because a bad weight layout fails as fluent-but-wrong text no eyeball catches. Latency
+is the <strong>Non-outlier avg</strong> line, never the tail: the 6 outliers averaging 13.7 ms
+are host scheduling hiccups worth 0.15 ms of mean.</p>
+
+<div class="box note">
+<span class="lbl">What adding a model actually costs</span>
+<table style="margin:8px 0 0">
+<thead><tr><th>Step</th><th>Automated?</th><th class="num">Cost</th></tr></thead>
+<tbody>
+<tr><td>1–4 &nbsp;YAML → validated → 1674 lines of HIP</td><td>Fully</td><td class="num">~10 min</td></tr>
+<tr><td>5 &nbsp;&nbsp;&nbsp;Build flags</td><td>Via <code>build:</code>, once you know which</td><td class="num">1 line, 1 hour to find</td></tr>
+<tr><td>6 &nbsp;&nbsp;&nbsp;Checkpoint attribute names</td><td>No — emitted as Llama convention</td><td class="num">0 if Llama-shaped</td></tr>
+<tr><td>7 &nbsp;&nbsp;&nbsp;Correctness + latency gate</td><td>Manual, and must be exact-token</td><td class="num">one run</td></tr>
+<tr><td><strong>A new attention shape</strong> (MLA, head_dim ≠ 64 on MoE)</td><td><strong>No</strong> — new device functions</td><td class="num"><strong>weeks</strong></td></tr>
+</tbody>
+</table>
+<p style="margin-bottom:0">The cliff is between rows 4 and 5, and again — much more steeply —
+at the last row. A model that fits the existing attention and FFN shapes is an afternoon. A
+model that does not is a kernel project, and the asserts in step 2 exist to tell you which
+one you have <em>before</em> you start.</p>
+</div>
+
+<h3 id="gates">What that walkthrough proved about gates, and the one that could not work</h3>
+
+<p>Both failures in that walkthrough were at step 5, and chasing the first turned up a second.
+<code>build_llama3_8b.sh</code> has not compiled since <code>f2354a7</code> either — the identical
+14 errors.
+<code>qwen3_8b.yaml</code> got the <code>TITAN_ENABLE_LEGACY</code> define when the guards landed;
+<code>llama3_8b.yaml</code> did not, and nobody rebuilt it. <code>generated/llama3_8b.so</code>
+on disk predates the guards by three weeks. Fixed the same way, one YAML block, and it now builds
+at 241 VGPRs / 0 spills / 2 waves per SIMD.</p>
+
+<p>The interesting part is not the bug. It is that the project's cheapest gate — the byte-identity
+round-trip, the one that runs in under a second with no GPU — <em>did not catch this, and could
+not have</em>. It regenerates each model's artifacts from its YAML and compares them to the files
+on disk. Both sides were missing the same define, so both sides agreed. It printed
+<code>OK build 1409 bytes</code> and passed. After the fix it prints
+<code>OK build 1437 bytes</code> — 28 bytes, one <code>-DTITAN_ENABLE_LEGACY \</code> line — and
+passes for the same reason it passed before.</p>
+
+<div class="box bad">
+<span class="lbl">The transferable claim</span>
+<p><strong>A gate that checks self-consistency cannot detect a fault shared by both sides.</strong>
+The round-trip's guarantee is exactly "the generator and the checked-in artifact agree" — which
+is worth having, and is a different property from "the artifact is correct". Only invoking
+<code>hipcc</code> distinguishes them, and the corollary is a rule this project now runs on:
+<em>every config not exercised by a real compile is presumed broken.</em> Three dense configs
+existed at that moment — qwen3, llama3, and the new Mistral. The only one that was correct was
+the one somebody had actually compiled.</p>
+</div>
+
+<p>Each gate in Titan is defined by what the one below it cannot see. That is the useful way to
+read the ladder — not as increasing rigor, but as a sequence of distinct blind spots, each closed
+by paying more:</p>
+
+<figure>
+<svg viewBox="0 0 1040 352" role="img" aria-label="Five gates ordered by cost; each catches what the one below cannot, and the byte-identity round-trip is blind to a fault shared by both sides">
+  <g font-size="11" font-weight="700" fill="#5a6472">
+    <text x="0" y="12">GATE — and what it costs</text>
+    <text x="286" y="12">CATCHES</text>
+    <text x="662" y="12">BLIND TO</text>
+  </g>
+
+  <!-- row 1: YAML asserts -->
+  <rect x="0" y="22" width="276" height="52" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+  <text x="12" y="42" font-size="11.5" font-weight="700" class="m">load_and_validate asserts</text>
+  <text x="12" y="60" font-size="10.5" fill="#5a6472">instant · no build · §3 step 2</text>
+  <rect x="286" y="22" width="366" height="52" fill="#f4faf5" stroke="#2e7d32" rx="4"/>
+  <text x="298" y="42" font-size="11">a shape the library cannot run —</text>
+  <text x="298" y="60" font-size="11">head_dim ≠ 64, kv_heads ≠ 8, non-MXFP4</text>
+  <rect x="662" y="22" width="378" height="52" fill="#fdf6f6" stroke="#c62828" rx="4"/>
+  <text x="674" y="42" font-size="11">anything the asserts do not already name.</text>
+  <text x="674" y="60" font-size="11">A new constraint is folklore until written here.</text>
+
+  <!-- row 2: round trip -->
+  <rect x="0" y="82" width="276" height="52" fill="#eef5fb" stroke="#0b5fa5" stroke-width="1.8" rx="4"/>
+  <text x="12" y="102" font-size="11.5" font-weight="700" class="m">check_roundtrip.py</text>
+  <text x="12" y="120" font-size="10.5" fill="#5a6472">sub-second · no GPU · byte-identity</text>
+  <rect x="286" y="82" width="366" height="52" fill="#f4faf5" stroke="#2e7d32" rx="4"/>
+  <text x="298" y="102" font-size="11">drift between generator and checked-in file</text>
+  <text x="298" y="120" font-size="11">— it caught the 40×16 vs 103×16 counter bug</text>
+  <rect x="662" y="82" width="378" height="52" fill="#fdecea" stroke="#c62828" stroke-width="1.8" rx="4"/>
+  <text x="674" y="102" font-size="11" font-weight="700" fill="#b3261e">a fault present on BOTH sides.</text>
+  <text x="674" y="120" font-size="11" fill="#b3261e">llama3 · missing define · reported OK, 3 weeks</text>
+
+  <!-- row 3: hipcc -->
+  <rect x="0" y="142" width="276" height="52" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+  <text x="12" y="162" font-size="11.5" font-weight="700" class="m">hipcc, actually invoked</text>
+  <text x="12" y="180" font-size="10.5" fill="#5a6472">~2 min per model · no weights needed</text>
+  <rect x="286" y="142" width="366" height="52" fill="#f4faf5" stroke="#2e7d32" rx="4"/>
+  <text x="298" y="162" font-size="11">the missing <tspan class="m">TITAN_ENABLE_LEGACY</tspan> — and every</text>
+  <text x="298" y="180" font-size="11">other drift in the 116 KB shared header</text>
+  <rect x="662" y="142" width="378" height="52" fill="#fdf6f6" stroke="#c62828" rx="4"/>
+  <text x="674" y="162" font-size="11">everything that compiles. A transposed template</text>
+  <text x="674" y="180" font-size="11">argument is well-formed C++.</text>
+
+  <!-- row 4: registers -->
+  <rect x="0" y="202" width="276" height="52" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+  <text x="12" y="222" font-size="11.5" font-weight="700" class="m">build-log resource check</text>
+  <text x="12" y="240" font-size="10.5" fill="#5a6472">free, in the same build · hard fail</text>
+  <rect x="286" y="202" width="366" height="52" fill="#f4faf5" stroke="#2e7d32" rx="4"/>
+  <text x="298" y="222" font-size="11">any VGPR spill, or 1 wave/SIMD occupancy —</text>
+  <text x="298" y="240" font-size="11">a silent 2× that no correctness test sees</text>
+  <rect x="662" y="202" width="378" height="52" fill="#fdf6f6" stroke="#c62828" rx="4"/>
+  <text x="674" y="222" font-size="11">whether the kernel computes the right thing.</text>
+  <text x="674" y="240" font-size="11">Garbage spills just as cleanly as truth.</text>
+
+  <!-- row 5: token id -->
+  <rect x="0" y="262" width="276" height="52" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+  <text x="12" y="282" font-size="11.5" font-weight="700" class="m">next_token == 35644</text>
+  <text x="12" y="300" font-size="10.5" fill="#5a6472">one run · needs weights · exact integer</text>
+  <rect x="286" y="262" width="366" height="52" fill="#f4faf5" stroke="#2e7d32" rx="4"/>
+  <text x="298" y="282" font-size="11">a wrong QKV interleave — which produces fluent</text>
+  <text x="298" y="300" font-size="11">nonsense, at full speed, that no eyeball catches</text>
+  <rect x="662" y="262" width="378" height="52" fill="#fdf6f6" stroke="#c62828" rx="4"/>
+  <text x="674" y="282" font-size="11">performance. Hence the last gate: the</text>
+  <text x="674" y="300" font-size="11"><tspan class="m">Non-outlier avg</tspan> line, never the tail.</text>
+
+  <path d="M-0,22 L-0,314" stroke="#c8d0d8" stroke-width="0" fill="none"/>
+  <text x="0" y="336" font-size="11" fill="#5a6472">Reading down: cost rises from microseconds to a weights-resident run. No gate above subsumes the one below — each closes a different blind spot.</text>
+</svg>
+<figcaption><b>Figure 5.</b> The five gates, ordered by cost, each labelled with what it cannot
+see. The second rung is the one this walkthrough falsified: its blind spot is not a gap in
+coverage that a stricter comparison would close, but a property of comparing a thing to
+itself.</figcaption>
+</figure>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="fusion">4. Two-level fusion — why it is fast</h2>
+
+<p><em>Fusion</em> means computing two adjacent operators without letting the value between
+them reach memory. Everything below follows from one question: <strong>how far can the value
+travel before it must be written down?</strong> There are two answers, they are independent, and
+prior systems pick one.</p>
+
+<div class="kv">
+<dt>Level 1</dt><dd><strong>Register fusion.</strong> The consumer runs on the producer's
+accumulator while it is still in VGPRs. Scope: one GEMM plus its elementwise tail.</dd>
+<dt>Level 2</dt><dd><strong>LDS fusion.</strong> Consecutive GEMMs hand values to each other
+through LDS inside one persistent kernel. Scope: the whole model.</dd>
+</div>
+
+<p>Level 1 removes the write; Level 2 removes the <em>reason</em> for the write, which is the
+kernel boundary. Doing both leaves zero intermediate HBM traffic per layer.</p>
+
+<h3>Level 1 — register fusion (GEMM epilogues)</h3>
+
+<p>Element-wise work is attached to the <em>preceding</em> GEMM and runs on the MFMA
+accumulator <strong>while it is still in VGPRs</strong>. The intermediate tensor is never
+materialized at all.</p>
+
+<figure>
+<svg viewBox="0 0 1040 226" role="img" aria-label="Unfused GEMM plus activation versus register-fused epilogue">
+  <!-- unfused -->
+  <text x="0" y="14" font-size="12.5" font-weight="700" fill="#c0392b">UNFUSED</text>
+  <rect x="86"  y="26" width="118" height="52" fill="#fff" stroke="#5a6472" rx="3"/>
+  <text x="145" y="48" font-size="11.5" text-anchor="middle">MFMA loop</text>
+  <text x="145" y="65" font-size="10" text-anchor="middle" fill="#5a6472">acc in VGPRs</text>
+
+  <rect x="252" y="26" width="118" height="52" fill="#fdf0ef" stroke="#c0392b" rx="3"/>
+  <text x="311" y="48" font-size="11.5" text-anchor="middle">store acc</text>
+  <text x="311" y="65" font-size="10" text-anchor="middle" fill="#c0392b">→ HBM</text>
+
+  <rect x="418" y="26" width="118" height="52" fill="#fdf0ef" stroke="#c0392b" rx="3"/>
+  <text x="477" y="48" font-size="11.5" text-anchor="middle">kernel 2 loads</text>
+  <text x="477" y="65" font-size="10" text-anchor="middle" fill="#c0392b">← HBM</text>
+
+  <rect x="584" y="26" width="118" height="52" fill="#fff" stroke="#5a6472" rx="3"/>
+  <text x="643" y="48" font-size="11.5" text-anchor="middle">SwiGLU</text>
+  <text x="643" y="65" font-size="10" text-anchor="middle" fill="#5a6472">4 flops/elem</text>
+
+  <rect x="750" y="26" width="118" height="52" fill="#fdf0ef" stroke="#c0392b" rx="3"/>
+  <text x="809" y="48" font-size="11.5" text-anchor="middle">store</text>
+  <text x="809" y="65" font-size="10" text-anchor="middle" fill="#c0392b">→ HBM</text>
+
+  <g stroke="#5a6472" stroke-width="1.2" fill="none" marker-end="url(#ab)">
+    <path d="M204,52 L248,52"/><path d="M370,52 L414,52"/>
+    <path d="M536,52 L580,52"/><path d="M702,52 L746,52"/>
+  </g>
+  <text x="880" y="56" font-size="11" fill="#c0392b" font-weight="600">3 HBM touches</text>
+
+  <!-- fused -->
+  <text x="0" y="130" font-size="12.5" font-weight="700" fill="#2e7d4f">REGISTER-FUSED</text>
+  <rect x="86" y="142" width="450" height="52" fill="#eef8f0" stroke="#2e7d4f" rx="3"/>
+  <line x1="311" y1="142" x2="311" y2="194" stroke="#2e7d4f" stroke-dasharray="3 3"/>
+  <text x="198" y="164" font-size="11.5" text-anchor="middle">MFMA loop</text>
+  <text x="198" y="181" font-size="10" text-anchor="middle" fill="#2e7d4f">acc in VGPRs</text>
+  <text x="424" y="164" font-size="11.5" text-anchor="middle">Epilogue&#8203;::&#8203;operator()</text>
+  <text x="424" y="181" font-size="10" text-anchor="middle" fill="#2e7d4f">same VGPRs, never spilled</text>
+
+  <rect x="584" y="142" width="118" height="52" fill="#fff" stroke="#5a6472" rx="3"/>
+  <text x="643" y="164" font-size="11.5" text-anchor="middle">write LDS</text>
+  <text x="643" y="181" font-size="10" text-anchor="middle" fill="#5a6472">next phase reads it</text>
+  <path d="M536,168 L580,168" stroke="#5a6472" stroke-width="1.2" fill="none" marker-end="url(#ab)"/>
+  <text x="726" y="172" font-size="11" fill="#2e7d4f" font-weight="600">0 HBM touches</text>
+</svg>
+<figcaption><b>Figure 6.</b> Level 1. The epilogue is a template parameter to a single
+<code>gemm_mxfp4</code> mainloop, so the elementwise work executes on the accumulator
+registers the MFMA just produced. The intermediate tensor is never allocated, let alone
+written.</figcaption>
+</figure>
+
+<div class="ex">
+<span class="lbl">Worked example — SwiGLU with no intermediate, in registers only</span>
+<p>W13 emits gate and up interleaved: <code>W13_OUTPUT_SIZE = 5888</code> is 2 × 2944,
+gate in tile-iteration 0 and up in tile-iteration 1. The epilogue is called twice on the same
+wave and carries the gate across in four registers:</p>
+<pre><code>__device__ void operator()(f32x4_t acc, int wave_tile, ...) {
+    bool is_gate = (wave_tile &lt; 4);            // iter 0 = gate, iter 1 = up
+    if (is_gate) {
+        for (int i = 0; i &lt; 4; i++)
+            gate_save[i] = acc[i] + bias[abs_n];   // stays in a VGPR
+    } else {
+        for (int i = 0; i &lt; 4; i++)
+            out[..] = swiglu(gate_save[i], acc[i] + bias[abs_n]);
+    }
+}</code></pre>
+<p><code>gate_save[4]</code> lives in the epilogue struct — entirely in registers. A
+conventional stack would have written 2944 f32 of gate to HBM, written 2944 of up, read both
+back, and written 2944 of product: <strong>four HBM passes over the intermediate, replaced by
+four VGPRs.</strong></p>
+</div>
+
+<pre><code>template&lt;typename Epilogue, int BATCH_SIZE, int REDUCTION_SIZE, int OUTPUT_PER_WG&gt;
+__device__ __noinline__ void gemm_mxfp4(
+    void const *input,    // [bs, REDUCTION_SIZE] bf16 or fp8
+    void const *weight,   // [n_wgs, wg_bytes] packed MXFP4
+    int wg_idx, int num_active_tokens,
+    Epilogue &amp;epilogue);</code></pre>
+
+<p>One depth-4 MFMA mainloop serves <em>every</em> GEMM in the model — QKV, O-proj, gate/up,
+down, LM head, MoE W13, MoE W2 — on
+<code>__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4</code> (FP4 weights × FP8
+activations, K = 128). Only the epilogue template parameter changes:</p>
+
+<table>
+<thead><tr><th>Epilogue</th><th>Operation on the live accumulator</th><th>Attached to</th></tr></thead>
+<tbody>
+<tr><td><code>EpilogueRoPE</code></td><td>rotate accumulator pairs, write to LDS</td><td>QKV GEMM</td></tr>
+<tr><td><code>EpilogueSwiGLU</code></td><td><code>SiLU(gate) × up</code>, write to LDS</td><td>Gate/Up, MoE W13</td></tr>
+<tr><td><code>EpilogueResAdd</code></td><td><code>acc + residual</code></td><td>O-proj, Down-proj, MoE W2</td></tr>
+<tr><td><code>EpilogueArgmax</code></td><td>update running <code>(max_val, max_idx)</code> per thread</td><td>LM head</td></tr>
+<tr><td><code>EpilogueStoreLDS</code></td><td>f32 → bf16 into LDS</td><td>QKV output feeding attention</td></tr>
+<tr><td><code>EpilogueBiasAdd</code></td><td><code>acc + bias</code></td><td>biased GEMMs</td></tr>
+</tbody>
+</table>
+
+<h3>Level 2 — LDS fusion (persistent kernel phases)</h3>
+
+<p>A kernel launch is a memory-scope boundary: registers and LDS die at the end of it, so
+anything the next operator needs must be in HBM. That is why an operator-per-kernel stack pays
+for round-trips it does not logically need — the traffic is an artifact of the launch model, not
+of the math.</p>
+
+<p>Titan launches once per token. All 240 workgroups stay resident for all 36 layers, so LDS
+holds live values across phase and layer boundaries and the residual stream is the only thing
+that has to be written at all. The bill for this arrives in §6: a launch boundary is also a
+free device-wide barrier, and with one launch you have to build your own.</p>
+
+<h3>What that leaves in HBM</h3>
+
+<table>
+<thead><tr><th>Approach</th><th class="num">Intermediate writes</th><th class="num">Intermediate reads</th><th class="num">Round-trips/layer</th></tr></thead>
+<tbody>
+<tr><td>Kernel-per-operator</td><td class="num">~10 × H</td><td class="num">~10 × H</td><td class="num">10</td></tr>
+<tr><td>Register fusion only (CODA-style)</td><td class="num">~4 × H</td><td class="num">~4 × H</td><td class="num">4</td></tr>
+<tr><td>Persistent kernel only (Mirage-style)</td><td class="num">~4 × H</td><td class="num">~4 × H</td><td class="num">4</td></tr>
+<tr><td><strong>Two-level (both)</strong></td><td class="num"><strong>0</strong></td><td class="num"><strong>0</strong></td><td class="num"><strong>0</strong></td></tr>
+</tbody>
+</table>
+
+<p>With both levels the only per-layer HBM traffic left is irreducible: MXFP4 weight reads,
+KV cache reads and writes, and two residual-stream writes.</p>
+
+<div class="box note">
+<span class="lbl">Positioning</span>
+<p><strong>CODA</strong> — <em>Rewriting Transformer Blocks as GEMM-Epilogue Programs</em>,
+Guo et&nbsp;al., <a href="https://arxiv.org/abs/2605.19269">arXiv:2605.19269</a>, May 2026 — is the
+prior work on Level 1 and the source of the term. It fixes the GEMM mainloop and exposes the
+epilogue as a composable programming surface: elementwise maps, vector broadcasts, tile
+loads/stores, reductions, and stateful running max/sum-exp. CUTLASS CuTeDSL, Hopper, framed around
+training. Titan's epilogue set is the same idea on an AMD MFMA mainloop.</p>
+
+<p><strong>The two part company on scope.</strong> A CODA epilogue sees only its own output
+tile, so a global reduction — a full RMSNorm, a softmax denominator — has to become
+tile-local partials plus a separate finishing pass. That is structural: the epilogue ends when
+the kernel does. Level 2 removes the boundary imposing it, which is why RMSNorm and the router
+are phases inside Titan's layer rather than kernels after it.</p>
+
+<table>
+<thead><tr><th></th><th>CODA</th><th>Mirage / MPK</th><th>Titan</th></tr></thead>
+<tbody>
+<tr><td>Fusion level</td><td>register (Level 1)</td><td>LDS (Level 2)</td><td><strong>both</strong></td></tr>
+<tr><td>Kernel launches</td><td>6–8 per layer</td><td>1 per token</td><td>1 per token</td></tr>
+<tr><td>Global reductions</td><td>separate auxiliary pass</td><td>in-kernel</td><td>in-kernel</td></tr>
+<tr><td>Multi-die awareness</td><td>none (single-die Hopper)</td><td>partial (runtime dispatch)</td><td>XCD-aware barriers, weight partitioning, work distribution</td></tr>
+<tr><td>Target</td><td>NVIDIA Hopper, training</td><td>NVIDIA + AMD, inference</td><td>AMD gfx950, decode</td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="pipeline">5. Inside one layer: the 8-phase pipeline</h2>
+
+<p>All 240 workgroups run the same layer body, deriving their identity at runtime
+(<code>xcd_id = get_xcd_id()</code> plus an XCD-local rank from an atomic counter).</p>
+
+<div class="pipeline">
+  <div class="ph"><div class="n">PHASE 1</div><div class="t">RMSNorm + QKV</div><div class="d">ResAdd from f32 workspace, RMSNorm, fp8 quant, QKV GEMM with RoPE epilogue, KV cache write.</div></div>
+  <div class="ph"><div class="n">PHASE 2</div><div class="t">QKV epoch barrier</div><div class="d">Per-XCD only. L2-coherent within the die; no cross-XCD traffic.</div></div>
+  <div class="ph"><div class="n">PHASE 3</div><div class="t">Split-KV attention</div><div class="d">8 KV chunks in parallel. XCD <em>n</em> owns KV head <em>n</em>.</div></div>
+  <div class="ph"><div class="n">PHASE 4</div><div class="t">Chunk barrier</div><div class="d">Per-XCD. Last chunk to arrive elects itself to run the merge.</div></div>
+  <div class="ph"><div class="n">PHASE 5</div><div class="t">Merge split-KV</div><div class="d">Online-softmax rescale across chunks + GPT-OSS attention-sink correction.</div></div>
+  <div class="ph"><div class="n">PHASE 6</div><div class="t">Cross-XCD release</div><div class="d">Write-through store + non-temporal poll, not a full barrier.</div></div>
+  <div class="ph"><div class="n">PHASE 7</div><div class="t">O-proj → TopK</div><div class="d">O-proj + ResAdd + RMSNorm + router GEMV + TopK, one fused gang task.</div></div>
+  <div class="ph"><div class="n">PHASE 8</div><div class="t">MoE W13 → W2</div><div class="d">W13 with SwiGLU epilogue, W2 with f32 atomicAdd ResAdd into the workspace.</div></div>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 340" role="img" aria-label="Which of the 30 workers per XCD are active in each of the 8 phases">
+  <!-- axis -->
+  <text x="0" y="14" font-size="12" font-weight="700">One XCD, 30 workers — who is busy in each phase</text>
+  <text x="0" y="30" font-size="11" fill="#5a6472">All 8 XCDs run this identically and in parallel; XCD <tspan font-style="italic">n</tspan> owns KV head <tspan font-style="italic">n</tspan>.</text>
+
+  <!-- worker axis label -->
+  <text x="8" y="196" font-size="11" fill="#5a6472" transform="rotate(-90 8,196)" text-anchor="middle">worker rank 0 → 29</text>
+
+  <g font-size="10.5">
+  <!-- P1 -->
+  <rect x="34"  y="52" width="112" height="230" fill="#eef5fb" stroke="#0b5fa5"/>
+  <rect x="38"  y="56" width="104" height="77" fill="#0b5fa5" opacity="0.75"/>
+  <text x="90" y="98" font-size="10.5" fill="#fff" text-anchor="middle" font-weight="700">ranks 0–9</text>
+  <text x="90" y="112" font-size="9.5" fill="#fff" text-anchor="middle">QKV tiles</text>
+  <text x="90" y="200" font-size="10" fill="#5a6472" text-anchor="middle">ranks 10–29</text>
+  <text x="90" y="214" font-size="10" fill="#5a6472" text-anchor="middle">idle</text>
+  <text x="90" y="298" font-size="10.5" text-anchor="middle" font-weight="700">1. RMSNorm+QKV</text>
+  <text x="90" y="312" font-size="9.5" fill="#5a6472" text-anchor="middle">10 tiles × OPW 64</text>
+
+  <!-- barrier 2 -->
+  <rect x="150" y="52" width="26" height="230" fill="#fff8e6" stroke="#e0b400"/>
+  <text x="163" y="170" font-size="10" text-anchor="middle" transform="rotate(-90 163,170)" font-weight="700">2. QKV epoch — per-XCD</text>
+
+  <!-- P3 -->
+  <rect x="180" y="52" width="112" height="230" fill="#eef5fb" stroke="#0b5fa5"/>
+  <rect x="184" y="56" width="104" height="61" fill="#0b5fa5" opacity="0.75"/>
+  <text x="236" y="82" font-size="10.5" fill="#fff" text-anchor="middle" font-weight="700">ranks 0–7</text>
+  <text x="236" y="96" font-size="9.5" fill="#fff" text-anchor="middle">1 KV chunk each</text>
+  <text x="236" y="200" font-size="10" fill="#5a6472" text-anchor="middle">ranks 8–29 idle</text>
+  <text x="236" y="298" font-size="10.5" text-anchor="middle" font-weight="700">3. Split-KV attn</text>
+  <text x="236" y="312" font-size="9.5" fill="#5a6472" text-anchor="middle">8 chunks in parallel</text>
+
+  <!-- barrier 4 -->
+  <rect x="296" y="52" width="26" height="230" fill="#fff8e6" stroke="#e0b400"/>
+  <text x="309" y="170" font-size="10" text-anchor="middle" transform="rotate(-90 309,170)" font-weight="700">4. Chunk — last elects merge</text>
+
+  <!-- P5 -->
+  <rect x="326" y="52" width="70" height="230" fill="#eef5fb" stroke="#0b5fa5"/>
+  <rect x="330" y="56" width="62" height="18" fill="#0b5fa5" opacity="0.75"/>
+  <text x="361" y="90" font-size="9.5" fill="#0b5fa5" text-anchor="middle" font-weight="700">1 worker</text>
+  <text x="361" y="200" font-size="10" fill="#5a6472" text-anchor="middle">29 idle</text>
+  <text x="361" y="298" font-size="10.5" text-anchor="middle" font-weight="700">5. Merge</text>
+  <text x="361" y="312" font-size="9.5" fill="#5a6472" text-anchor="middle">+ sink correction</text>
+
+  <!-- barrier 6 -->
+  <rect x="400" y="52" width="26" height="230" fill="#eef8f0" stroke="#2e7d4f"/>
+  <text x="413" y="170" font-size="10" text-anchor="middle" transform="rotate(-90 413,170)" font-weight="700">6. Release — st_wt / ld_nt</text>
+
+  <!-- P7 -->
+  <rect x="430" y="52" width="196" height="230" fill="#eef5fb" stroke="#0b5fa5"/>
+  <rect x="434" y="56" width="188" height="177" fill="#0b5fa5" opacity="0.75"/>
+  <text x="528" y="140" font-size="10.5" fill="#fff" text-anchor="middle" font-weight="700">ranks 0–22</text>
+  <text x="528" y="155" font-size="9.5" fill="#fff" text-anchor="middle">23 O-proj tiles × OPW 16</text>
+  <text x="528" y="258" font-size="10" fill="#5a6472" text-anchor="middle">ranks 23–29 idle</text>
+  <text x="528" y="298" font-size="10.5" text-anchor="middle" font-weight="700">7. O-proj → ResAdd → RMSNorm → router → TopK</text>
+  <text x="528" y="312" font-size="9.5" fill="#5a6472" text-anchor="middle">one fused gang task; 7 idle workers cost 16 µs in the phase-7b poll</text>
+
+  <!-- P8 -->
+  <rect x="634" y="52" width="406" height="230" fill="#eef5fb" stroke="#0b5fa5"/>
+  <rect x="638" y="56" width="398" height="222" fill="#0b5fa5" opacity="0.75"/>
+  <text x="837" y="150" font-size="11" fill="#fff" text-anchor="middle" font-weight="700">all 30 workers, 53 tiles each</text>
+  <text x="837" y="168" font-size="9.5" fill="#fff" text-anchor="middle">240 W13 tiles (184 real + 56 padding) then 184 W2 tiles</text>
+  <text x="837" y="186" font-size="9.5" fill="#fff" text-anchor="middle">W13 → SwiGLU epilogue → LDS → W2 → f32 atomicAdd into workspace</text>
+  <text x="837" y="298" font-size="10.5" text-anchor="middle" font-weight="700">8. MoE W13 → W2</text>
+  <text x="837" y="312" font-size="9.5" fill="#5a6472" text-anchor="middle">the only phase that saturates the die — and ~40% of the layer</text>
+  </g>
+</svg>
+<figcaption><b>Figure 7.</b> Box height is the fraction of the XCD's 30 workers doing work;
+width is roughly proportional to time. The shape is the argument: attention occupies 8 of 30
+workers and the merge exactly one, while MoE is the only phase that fills the die. Yellow
+bars are per-XCD barriers (L2-coherent, no cross-die traffic); the green bar is a
+single-producer release, which is cheaper than a symmetric barrier.</figcaption>
+</figure>
+
+<h4>Sliding window is a runtime value, not a template parameter</h4>
+<p>Even layers use a 128-token sliding window, odd layers are full attention. The obvious
+encoding is a template parameter — but that instantiates the entire layer body twice, doubling
+I-cache pressure and register allocation for a predicate. The emitted code pins the template to 0
+and passes the window at runtime:</p>
+<pre><code>int const layer_sliding_window = (layer &amp; 1) == 0 ? SLIDING_WINDOW : 0;
+kernel::gang_full_layer_fused_kernel_mi300&lt;..., /*SLIDING_WINDOW=*/0, ...&gt;(
+    ..., layer_sliding_window);</code></pre>
+
+<h4>The last-layer ResAdd is parallel, deliberately</h4>
+<p>Mirage runs the final residual add on a single worker. Ported verbatim it cost
+<strong>~1.1 ms/token</strong>, serializing 2944 elements through one workgroup. Titan splits it
+across all 240 workers on <em>disjoint</em> column strides — safe precisely because they are
+disjoint: no worker reads a cache line another is zeroing.</p>
+
+<h3>Register pressure and the phase split</h3>
+<p><code>titan_phases.cuh</code> exists to give the compiler register <em>scopes</em>: three
+<code>__noinline__</code> functions (A: QKV+attention+merge, B: O-proj+TopK, C: MoE) let it
+reclaim registers between phases instead of holding every live range at once. The build lands
+at 226 VGPRs, 0 VGPR spills, 12 SGPR spills, 512 B LDS, 2 waves/SIMD. Any VGPR spill or a drop
+to 1 wave/SIMD is a hard fail regardless of what the clock says.</p>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="barriers">6. Barriers, counters, and why they dominate</h2>
+
+<p>No launch boundary means no free ordering. Titan has five primitives, and picking the
+cheapest correct one per site is most of the performance work.</p>
+
+<table>
+<thead><tr><th>Primitive</th><th>Scope</th><th>Mechanism</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><code>barrier_per_xcd</code> (QKV epoch)</td><td>30 workers, 1 die</td>
+    <td>atomic arrive; last worker resets and bumps an epoch; others poll the epoch</td>
+    <td>QKV completion. L2-coherent within the XCD — no cross-die traffic.</td></tr>
+<tr><td>chunk barrier</td><td>8 chunks, 1 die</td>
+    <td>atomic arrive; the last arrival returns <code>true</code> and runs the merge</td>
+    <td>Elects a merge worker without a second sync.</td></tr>
+<tr><td><code>barrier_single_producer</code></td><td>1 writer, N readers</td>
+    <td><code>st_wt_u32</code> release + <code>ld_nt_s32</code> poll</td>
+    <td>Attention release, routing-ready. Cheaper than a symmetric barrier.</td></tr>
+<tr><td><code>barrier_global</code> / <code>barrier_wt_release_no_wbl2</code></td><td>all 240 workers, 8 dies</td>
+    <td>hierarchical: per-XCD local arrive → one global counter → per-XCD release flags</td>
+    <td>Inter-layer, embedding write, LM head.</td></tr>
+<tr><td><code>barrier_epoch</code></td><td>any</td>
+    <td>monotonic counters + modular arithmetic</td>
+    <td>Reusable across decode iterations without a memset.</td></tr>
+</tbody>
+</table>
+
+<figure>
+<svg viewBox="0 0 1040 268" role="img" aria-label="Per-XCD barrier scope versus device-wide hierarchical barrier">
+  <!-- LEFT: per-XCD -->
+  <text x="0" y="14" font-size="12.5" font-weight="700" fill="#e0b400">PER-XCD (phases 2, 4)</text>
+  <text x="0" y="30" font-size="11" fill="#5a6472">30 workers, one die. Stays in that die's L2.</text>
+
+  <g>
+    <rect x="0" y="42" width="118" height="130" fill="#fff8e6" stroke="#e0b400" rx="4"/>
+    <text x="59" y="60" font-size="11" text-anchor="middle" font-weight="700">XCD 0</text>
+    <g fill="#0b5fa5" opacity="0.7">
+      <rect x="10" y="70" width="14" height="14"/><rect x="28" y="70" width="14" height="14"/>
+      <rect x="46" y="70" width="14" height="14"/><rect x="64" y="70" width="14" height="14"/>
+      <rect x="82" y="70" width="14" height="14"/><rect x="96" y="70" width="14" height="14"/>
+      <rect x="10" y="88" width="14" height="14"/><rect x="28" y="88" width="14" height="14"/>
+      <rect x="46" y="88" width="14" height="14"/><rect x="64" y="88" width="14" height="14"/>
+      <rect x="82" y="88" width="14" height="14"/><rect x="96" y="88" width="14" height="14"/>
+    </g>
+    <text x="59" y="118" font-size="9.5" text-anchor="middle" fill="#5a6472">30 workers</text>
+    <rect x="10" y="128" width="98" height="32" fill="#fff" stroke="#e0b400" rx="3"/>
+    <text x="59" y="141" font-size="9.5" text-anchor="middle" class="m">qkv_epoch[0]</text>
+    <text x="59" y="153" font-size="9" text-anchor="middle" fill="#5a6472">this die's L2</text>
+  </g>
+  <text x="132" y="112" font-size="26" fill="#e2e6eb">×8</text>
+  <g opacity="0.35">
+    <rect x="170" y="42" width="118" height="130" fill="#fff8e6" stroke="#e0b400" rx="4"/>
+    <text x="229" y="60" font-size="11" text-anchor="middle" font-weight="700">XCD 7</text>
+    <rect x="180" y="128" width="98" height="32" fill="#fff" stroke="#e0b400" rx="3"/>
+    <text x="229" y="147" font-size="9.5" text-anchor="middle" class="m">qkv_epoch[7]</text>
+  </g>
+  <text x="0" y="196" font-size="11" fill="#2e7d4f" font-weight="600">✓ no cross-die traffic — the 8 dies never talk</text>
+  <text x="0" y="214" font-size="11" fill="#5a6472">Correct here because attention for KV head <tspan font-style="italic">n</tspan> only ever needs</text>
+  <text x="0" y="230" font-size="11" fill="#5a6472">QKV written by XCD <tspan font-style="italic">n</tspan>'s own workers.</text>
+
+  <line x1="356" y1="8" x2="356" y2="250" stroke="#e2e6eb" stroke-width="2"/>
+
+  <!-- RIGHT: global hierarchical -->
+  <text x="392" y="14" font-size="12.5" font-weight="700" fill="#0b5fa5">DEVICE-WIDE, HIERARCHICAL (inter-layer)</text>
+  <text x="392" y="30" font-size="11" fill="#5a6472">All 240 workers, 8 dies. Three stages, not one flat atomic.</text>
+
+  <g font-size="10">
+    <!-- stage 1 -->
+    <text x="392" y="52" font-size="10.5" font-weight="700" fill="#5a6472">1. local arrive</text>
+    <g fill="#0b5fa5" opacity="0.7">
+      <rect x="392" y="60" width="10" height="10"/><rect x="406" y="60" width="10" height="10"/>
+      <rect x="420" y="60" width="10" height="10"/><rect x="434" y="60" width="10" height="10"/>
+      <rect x="448" y="60" width="10" height="10"/><rect x="462" y="60" width="10" height="10"/>
+      <rect x="476" y="60" width="10" height="10"/><rect x="490" y="60" width="10" height="10"/>
+    </g>
+    <text x="392" y="86" fill="#5a6472">each die's 30 workers hit</text>
+    <text x="392" y="99" class="m" fill="#5a6472">layer_local[xcd]</text>
+
+    <!-- stage 2 -->
+    <text x="596" y="52" font-size="10.5" font-weight="700" fill="#5a6472">2. one global counter</text>
+    <rect x="596" y="58" width="122" height="30" fill="#eef5fb" stroke="#0b5fa5" rx="3"/>
+    <text x="657" y="77" class="m" text-anchor="middle" font-size="10">layer_done_global</text>
+    <text x="596" y="103" fill="#5a6472">8 arrivals, not 240</text>
+
+    <!-- stage 3 -->
+    <text x="812" y="52" font-size="10.5" font-weight="700" fill="#5a6472">3. per-XCD release</text>
+    <g>
+      <rect x="812" y="58" width="26" height="30" fill="#eef8f0" stroke="#2e7d4f" rx="2"/>
+      <rect x="844" y="58" width="26" height="30" fill="#eef8f0" stroke="#2e7d4f" rx="2"/>
+      <rect x="876" y="58" width="26" height="30" fill="#eef8f0" stroke="#2e7d4f" rx="2"/>
+      <rect x="908" y="58" width="26" height="30" fill="#eef8f0" stroke="#2e7d4f" rx="2"/>
+      <text x="948" y="78" fill="#5a6472">… ×8</text>
+    </g>
+    <text x="812" y="103" class="m" fill="#5a6472">st_wt → workers poll ld_nt</text>
+  </g>
+  <g stroke="#0b5fa5" stroke-width="1.3" fill="none" marker-end="url(#ag)">
+    <path d="M506,70 L590,70"/><path d="M722,70 L806,70"/>
+  </g>
+
+  <rect x="392" y="126" width="648" height="62" fill="#fdf0ef" stroke="#c0392b" rx="4"/>
+  <text x="404" y="145" font-size="11.5" font-weight="700" fill="#c0392b">Cost: 3.56 µs measured × 35 inter-layer barriers = 124.5 µs/token</text>
+  <text x="404" y="163" font-size="11" fill="#5a6472">The microbenchmarked floor for <tspan font-weight="700">any</tspan> 240-workgroup device-wide</text>
+  <text x="404" y="179" font-size="11" fill="#5a6472">sync on this part is 3.50 µs — there is 0.06 µs of slack.</text>
+
+  <text x="392" y="208" font-size="11" fill="#5a6472">Flat global atomic: worse. Symmetric hierarchical: 4.28 µs. Per-XCD release flag: <tspan font-weight="700" fill="#2e7d4f">3.50 µs, the winner.</tspan></text>
+  <text x="392" y="226" font-size="11" fill="#5a6472">Deleting it entirely gives 2.008 ms/token — and garbage output. It buys correctness,</text>
+  <text x="392" y="242" font-size="11" fill="#5a6472">so it can only be overlapped, never removed.</text>
+</svg>
+<figcaption><b>Figure 8.</b> Choosing the narrowest correct scope is most of the barrier
+work. Phases 2 and 4 need only die-local ordering and get it for free out of L2; the
+inter-layer boundary genuinely needs all 240 workers, and pays 3.56 µs every time.</figcaption>
+</figure>
+
+<h3>The 3.5 µs floor</h3>
+<p>All three plausible device-wide mechanisms were microbenchmarked at 240 workgroups over
+1000 iterations. A per-XCD release flag wins at <strong>3.50 µs</strong> against a hierarchical
+barrier's 4.28 µs, and a flat global atomic is worse. That is a hardware floor, not an
+implementation defect — the inter-layer barrier measures 3.56 µs, essentially on it.</p>
+
+<div class="box bad">
+<span class="lbl">The barrier cannot simply be deleted</span>
+<p>Removing the inter-layer barrier gives <strong>2.008 ms/token — and garbage output.</strong>
+Layer n+1's QKV ResAdd reads <code>workspace_f32</code> while layer n's MoE W2 is still
+accumulating into it via float <code>atomicAdd</code>. 35 barriers × 3.56 µs = 124.5 µs/token
+is real, but it buys correctness. It can be overlapped, not removed.</p>
+</div>
+
+<div class="box warn">
+<span class="lbl">Heavier barriers are worse than the thing they fix</span>
+<p>Strengthening the inter-layer sync with a heavier primitive pushed register pressure past
+the threshold, triggered SGPR spills, and cost 40%+. On this kernel <strong>barrier cost and
+register pressure are coupled</strong>: the correct move for a device-wide sync is the lightest
+primitive that is still correct.</p>
+</div>
+
+<div class="ex">
+<span class="lbl">Worked example — the QKV epoch barrier, and why nothing is ever reset</span>
+<p>The phase-2 barrier in full. Ten workers per XCD produce QKV tiles; all ten must finish
+before any reads the result. The obvious implementation — count to 10, then zero the counter —
+<strong>deadlocks on token 2</strong>, because the hipGraph decode path skips the memset and the
+counter is still live. So the counter is monotonic and correctness comes from modular
+arithmetic:</p>
+<pre><code>// before the GEMM: snapshot the epoch I am waiting to see
+int qkv_expected = load(&amp;qkv_epoch[xcd_id * 16]) + 1;
+
+    ... QKV GEMM, 10 tiles across 10 workers ...
+
+// arrive. s_prev is my 0-based arrival index, and it never resets.
+int s_prev = atom_add_release_gpu_s32(&amp;qkv_barrier[xcd_id], 1);
+
+// exactly one worker sees this true, once per layer per XCD, forever
+if ((s_prev % 10) == 9)
+    atom_add_release_gpu_s32(&amp;qkv_epoch[xcd_id * 16], 1);
+
+while (load(&amp;qkv_epoch[xcd_id * 16]) &lt; qkv_expected)
+    s_sleep(1);
+fence_acquire("agent");  buffer_inv;</code></pre>
+
+<table>
+<thead><tr><th>token</th><th>layer</th><th class="num">arrivals so far</th><th class="num">s_prev of last arrival</th><th class="num">s_prev % 10</th><th>epoch bumped?</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>0</td><td class="num">0…9</td><td class="num">9</td><td class="num">9</td><td>✓ epoch 0 → 1</td></tr>
+<tr><td>1</td><td>1</td><td class="num">10…19</td><td class="num">19</td><td class="num">9</td><td>✓ epoch 1 → 2</td></tr>
+<tr><td>1</td><td>35</td><td class="num">350…359</td><td class="num">359</td><td class="num">9</td><td>✓ epoch 35 → 36</td></tr>
+<tr><td>2</td><td>0</td><td class="num">360…369</td><td class="num">369</td><td class="num">9</td><td>✓ epoch 36 → 37</td></tr>
+</tbody>
+</table>
+
+<p>Both counters climb without bound and the barrier keeps working, because every worker
+compares against <em>its own snapshot</em> rather than an absolute value. Same reasoning behind
+the modulo in XCD rank assignment:</p>
+<pre><code>s_xcd_rank = atomicAdd(&amp;rank_counters[xcd_id * 16], 1) % WORKERS_PER_XCD;</code></pre>
+<p>Drop that <code>% 30</code> and rank assignment silently walks off the end on token 2 —
+no crash, just workers computing tiles that do not exist.</p>
+</div>
+
+<h3>Counter layout is an allocation problem</h3>
+<p>All synchronization state lives in one <code>counter_buf</code>, carved into per-layer
+blocks of <code>COUNTERS_PER_LAYER = 103 × 16</code> ints — the 16-int stride keeps each counter
+on its own cache line so atomics do not false-share. Within a layer:</p>
+
+<pre><code>[  0..  9]×16  OProj hierarchical barrier
+[ 10.. 18]×16  routing_ready (per-XCD release)
+[ 19    ]×16  attn_global_counter
+[ 20.. 27]×16  qkv_epoch[xcd]
+[ 28.. 35]×16  chunk_barrier[xcd]
+[ 36.. 43]×16  attn_release[xcd]
+[ 44.. 51]×16  qkv_barrier arrival
+[ 52    ]×16  layer_done          [53.. 60]×16  layer_local[xcd]
+[ 61    ]×16  tail_lmhead         [62.. 64]×16  tail_argmax
+[ 65.. 72]×16  layer_release[xcd]  [73    ]×16  layer_done_global
+── past all 36 per-layer blocks ──
+rank_counters[xcd], then EMBED_BARRIER_BASE: embed_done, embed_local[xcd]</code></pre>
+
+<div class="box bad">
+<span class="lbl">Every barrier hang traced back to slot overlap</span>
+<p>A class of hangs was chased through register pressure, inlining attributes, and
+reference-vs-value parameters — all misdiagnosis. The cause: tail counters at 36×16
+collided with another barrier's release flags at 36×16&#8202;..&#8202;43×16. Two rules
+came out of it. The per-layer block is fully allocated, so new state goes past it — hence
+<code>EMBED_BARRIER_BASE = NUM_LAYERS × COUNTERS_PER_LAYER</code>. And the generator now
+parses and asserts the header's <code>COUNTERS_PER_LAYER</code>.</p>
+</div>
+
+<div class="box warn">
+<span class="lbl">The rank-counter modulo is required</span>
+<pre><code>s_xcd_rank = atomicAdd(&amp;rank_counters[xcd_id * 16], 1) % WORKERS_PER_XCD;</code></pre>
+</div>
+
+<h3>The embedding barrier bug</h3>
+<p>The embedding lookup was moved on-device to save a host round-trip: worker (0,0) writes
+the token's embedding into layer 0's residual buffer, guarded by <code>__syncthreads()</code>
+— <strong>workgroup-scoped</strong>, ordering nothing across the other 239 workers, which
+therefore read the <em>previous</em> token's embedding. Symptom: doubled tokens in the output.
+Fix: a real device-wide barrier ending in <code>buffer_inv</code>, at no measurable cost.</p>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="measured">7. Measured constants and negative results</h2>
+
+<p>Several kernel constants are not derivable — they are search results. The YAML records each
+with the alternative tried and what it cost, so the next person does not re-run the
+experiment.</p>
+
+<table>
+<thead><tr><th>Constant</th><th class="num">Value</th><th>Alternative tried</th><th class="num">Cost</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>w13_output_per_wg</code></td><td class="num">128</td><td>64 — eliminates all 60 padding tiles</td>
+    <td class="num">+280 µs/tok</td><td>W13 wants <strong>fat</strong> tiles: LDS weight reuse across 2 MFMA rounds.</td></tr>
+<tr><td><code>w2_output_per_wg</code></td><td class="num">64</td><td>128 — halves the tile count</td>
+    <td class="num">+142 µs/tok</td><td>W2 wants <strong>thin</strong> tiles: more parallelism hides HBM latency.</td></tr>
+<tr><td><code>oproj_output_per_wg</code></td><td class="num">16</td><td>64, 32 — rejected by derivation</td>
+    <td class="num">—</td><td>2944/64 = 46 tiles and 46 mod 8 ≠ 0, so neither divides evenly across XCDs.</td></tr>
+<tr><td><code>num_kv_chunks</code></td><td class="num">8</td><td>16, 32</td>
+    <td class="num">—</td><td>Only help at seq ≥ 1024; 16 hangs at seq 512.</td></tr>
+<tr><td><code>page_size</code></td><td class="num">128</td><td>4096 (the original)</td>
+    <td class="num">−10 µs/tok</td><td>Forced down by vLLM backend caps (§10). Free, and it exercises multi-page addressing.</td></tr>
+</tbody>
+</table>
+
+<div class="box bad">
+<span class="lbl">Do not symmetrize W13 and W2</span>
+<p>The two <code>*_OPW</code> constants pull in <em>opposite</em> directions. Making them match
+is the most tempting and most expensive wrong move available: 280 µs or 142 µs depending on which
+way you unify. Both experiments have been run.</p>
+</div>
+
+<h4>Other measured negative results</h4>
+<ul>
+<li><strong>Single-worker last-layer ResAdd</strong> (Mirage's version, ported verbatim): ~1.1 ms/token.</li>
+<li><strong>Per-expert MoE barriers</strong>: failed on pipeline-drain overhead.</li>
+<li><strong>BF16 router GEMV fused into RMSNorm2</strong>: 3.5× slower than the separate MXFP4 path.</li>
+<li><strong>Fusing SwiGLU into the W2 quantization step</strong>: 7× regression — <code>v_exp_f32</code> cost.</li>
+<li><strong>Deleting the inter-layer barrier</strong>: 2.008 ms, garbage output.</li>
+</ul>
+
+<h3>Inside one MoE W13 tile — where the microseconds actually are</h3>
+
+<p>MoE is ~40% of the layer, and one W13 tile is 13.4 µs. Twelve <code>s_memrealtime</code>
+timestamps, with all the reporting atomics deferred past the release barrier, say this:</p>
+
+<figure>
+<svg viewBox="0 0 1040 210" role="img" aria-label="Figure 8: measured breakdown of one 13.4 microsecond W13 tile">
+  <!-- 13.4us over x=0..1020 => 76.1 px/us -->
+  <g font-size="10.5" text-anchor="middle">
+    <!-- ent .28 -->
+    <rect x="0" y="40" width="21" height="46" fill="#9aa5b1"/>
+    <!-- iss0 1.90 -->
+    <rect x="21" y="40" width="145" height="46" fill="#0b5fa5"/><text x="93" y="68" fill="#fff">iss0 1.90</text>
+    <!-- quant 1.83 -->
+    <rect x="166" y="40" width="139" height="46" fill="#3f86c4"/><text x="235" y="68" fill="#fff">quant 1.83</text>
+    <!-- drain0 .56 -->
+    <rect x="305" y="40" width="43" height="46" fill="#c0392b"/>
+    <!-- mf0 1.45 -->
+    <rect x="348" y="40" width="110" height="46" fill="#2e7d4f"/><text x="403" y="68" fill="#fff">mf0 1.45</text>
+    <!-- iss1 1.75 -->
+    <rect x="458" y="40" width="133" height="46" fill="#0b5fa5"/><text x="524" y="68" fill="#fff">iss1 1.75</text>
+    <!-- swi0 1.66 -->
+    <rect x="591" y="40" width="126" height="46" fill="#7d5ba6"/><text x="654" y="68" fill="#fff">swi0 1.66</text>
+    <!-- drain1 .32 -->
+    <rect x="717" y="40" width="24" height="46" fill="#c0392b"/>
+    <!-- mf1 1.84 -->
+    <rect x="741" y="40" width="140" height="46" fill="#2e7d4f"/><text x="811" y="68" fill="#fff">mf1 1.84</text>
+    <!-- epi .79 -->
+    <rect x="881" y="40" width="60" height="46" fill="#e0b400"/><text x="911" y="68" fill="#fff">epi</text>
+  </g>
+
+  <!-- callouts -->
+  <g font-size="10" fill="#5a6472">
+    <line x1="10" y1="40" x2="10" y2="26" stroke="#9aa5b1"/><text x="14" y="24" font-size="10">ent 0.28</text>
+    <line x1="326" y1="86" x2="326" y2="104" stroke="#c0392b"/>
+    <line x1="729" y1="86" x2="729" y2="104" stroke="#c0392b"/>
+    <text x="326" y="118" text-anchor="middle" fill="#c0392b" font-weight="700">drain0 0.56</text>
+    <text x="729" y="118" text-anchor="middle" fill="#c0392b" font-weight="700">drain1 0.32</text>
+    <text x="527" y="136" text-anchor="middle" fill="#c0392b" font-weight="700">total exposed HBM wait = 0.88 µs of 13.4 (6.6%)</text>
+    <line x1="881" y1="40" x2="881" y2="26" stroke="#e0b400"/><text x="886" y="24" font-size="10">epi 0.79 — release barrier</text>
+  </g>
+
+  <!-- legend / conclusion -->
+  <g font-size="11">
+    <rect x="0" y="158" width="12" height="12" fill="#0b5fa5"/>
+    <text x="20" y="168" fill="#1a1a1a"><tspan font-weight="700">issuing loads: 3.65 µs.</tspan> <tspan fill="#5a6472">The single largest cost in the tile — more than both MFMA loops combined.</tspan></text>
+    <rect x="0" y="180" width="12" height="12" fill="#2e7d4f"/>
+    <text x="20" y="190" fill="#1a1a1a"><tspan font-weight="700">MFMA loops: 3.29 µs</tspan> <tspan fill="#5a6472">— of which only ~0.8 µs is actual math; the rest is ds_read and accvgpr moves.</tspan></text>
+  </g>
+</svg>
+<figcaption><b>Figure 9.</b> The intuition this overturns: the tile is not waiting on HBM
+(0.88 µs) and it is not doing math (~0.8 µs). It is <em>issuing</em> loads. Each
+<code>buffer_load_dwordx4 … lds</code> needs its LDS destination in <code>m0</code>, which is
+SGPR-only, so every load carries a <code>v_add_u32</code> → <code>v_readfirstlane_b32</code>
+→ <code>s_mov_b32 m0</code> chain — 124 instructions to issue 24 loads.</figcaption>
+</figure>
+
+<div class="ex">
+<span class="lbl">What this answers — "why did cutting the work 4× only save 6%?"</span>
+<p>A single-expert probe (topk 4 → 1, one quarter of the tiles) moved a W13 tile only
+15.5 → 11.9 µs. Figure 9 says why: roughly three quarters of a tile is per-tile fixed
+overhead — load issue, address arithmetic, LDS staging, the release barrier — and none of it
+shrinks when you delete other tiles. One worker reading ~200 KB in 11.9 µs is 17 GB/s, not a
+bandwidth number on a part with TB/s of HBM.</p>
+<p><strong>MoE is latency- and overhead-bound, not bandwidth-bound.</strong> The direct
+consequence: tensor parallelism cannot help, because TP reduces bytes per GPU and bytes are not
+the constraint.</p>
+
+<span class="lbl">Two measurement traps, both hit while producing that chart</span>
+<table>
+<thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Inline timing atomics contend</td>
+    <td>W13 read 19.1 µs and W2 — <em>which has no instrumentation at all</em> — read 8.0 µs.
+        Deferring the atomics gave 13.5 and 5.0. Every earlier number was contaminated by the probe.</td>
+    <td>Accumulate raw timestamps into registers; do all <code>atomicAdd</code>s once, after
+        the release barrier.</td></tr>
+<tr><td><code>s_memrealtime</code> is not a scheduling barrier</td>
+    <td>The disassembly shows 16 <code>v_cvt_scalef32_pk_fp8_f32</code> sunk into the window
+        labelled "load issue", so <code>iss0</code> and <code>quant</code> individually are fiction.</td>
+    <td>Only report a span whose boundaries something else pins. Here, only the 3.7 µs
+        <em>sum</em> is trustworthy.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box bad">
+<span class="lbl">Rejected — prefetching the SwiGLU bias</span>
+<p><code>swi0</code> at 1.66 µs does four unprefetched <code>d_w13_bias</code> HBM reads for 4
+elements of ALU — contiguous, 8-byte aligned, an obvious single <code>dwordx2</code> prefetch. The
+compiler hoisted it correctly, registers unchanged, and it <strong>bought nothing</strong>:
+<code>swi0</code> fell to 1.90 µs while <code>drain1</code> went 0.32 → 0.018 µs, their enclosing
+span holding at 3.66 µs to three digits. End-to-end 2.551–2.557 ms against a 2.561 ms baseline,
+inside the spread.</p>
+<p>The wait moved; it did not disappear. <code>swi0</code> sits downstream of 24 in-flight
+<code>buffer_load_lds</code> ops, so removing the bias load just lets the epilogue run further
+before the next drain catches the same loads. <strong>In a span already covered by outstanding
+VMEM, removing one load relocates the stall rather than removing it.</strong> Only cutting the
+<em>last</em> outstanding load in a drain group shortens the tile.</p>
+</div>
+
+<h3>Two hard-won assembly-level lessons</h3>
+
+<p><strong>LLVM serializes <code>buffer_load ... lds</code>.</strong> The compiler inserts
+<code>s_waitcnt vmcnt(0)</code> between every such intrinsic, turning 24 concurrent loads into a
+serial chain: 840 ns instead of 75 ns. Fix: a single inline-asm block issuing all 24. Worth −1.3%
+TPOT and a 70% cut in vmcnt stall time.</p>
+
+<p><strong>A <code>global_load</code> on an LDS pointer poisons the MFMA loop.</strong> In the
+O-proj GEMM the compiler converted a <code>vmcnt(0)</code> into <code>lgkmcnt(1)</code>, producing
+636K stall cycles for 8 MFMAs. The MoE W13 loop, hand-written in asm with
+<code>lgkmcnt(4)</code>, runs at 1.01× theoretical. Same hardware, same operation
+count.</p>
+
+<div class="box note">
+<span class="lbl">Working rule</span>
+<p><strong>Never guess at performance.</strong> After every kernel change, disassemble, verify
+the compiler emitted the intended pattern, and compare register counts against baseline. Several
+of the largest wins here were invisible in the source and obvious in the assembly.</p>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="vs-mirage">8. The device-function library: why a static generator can support any model</h2>
+
+<p><a href="#fusion">§4</a> explained why Titan is fast. This section is about why it
+<em>generalizes</em> — and the two answers are unrelated. Titan is not a faster Mirage. It is what
+becomes possible once you notice what Mirage's compiler is actually compiling.</p>
+
+<h3>The problem: the compiler does not write the kernels</h3>
+
+<p>Mirage (MPK) is a persistent-kernel compiler with a superoptimizer. The advertised pipeline is
+a search over algebraic rewrites, a transpiler, and generated code. That is true of the
+<em>graph</em>. It is not true of the code that runs on the SIMDs. Three measurements on this
+tree:</p>
+
+<ul>
+<li><strong>The device kernels are hand-written C++.</strong> <code>tasks/mi300/</code> is
+    <strong>60 files, 26 505 lines</strong> of hand-tuned HIP — MFMA mainloops, CK-FMHA split-KV
+    attention, the fused MoE kernel (1 806 lines by itself). Across all five architectures the
+    task library is <strong>137 files, 50 433 lines</strong>. None of it is generated.</li>
+<li><strong>The superoptimizer has never seen it.</strong> <code>src/search/</code> — 32 files,
+    6 598 lines — contains <strong>zero</strong> occurrences of <code>MI300</code> and
+    <strong>zero</strong> of <code>gang</code>. The search space and the fast kernels do not
+    intersect. The fused path is reached only through 102 hand-written
+    <code>register_task</code> call sites in <code>persistent_kernel.py</code>.</li>
+<li><strong>What the compiler emits is a call, not a body.</strong> Every registration in
+    <code>task_register.cc</code> ends the same way: build an argument list, name a symbol,
+    return the string.</li>
+</ul>
+
+<pre><code>code.e("kernel::gang_moe_pipelined_mxfp4_kernel_mi300&lt;$, $, $, $, $, $, $, $, $&gt;(",
+       batch_size, output_size, output_stride, reduction_size, num_experts,
+       num_experts_per_tok, tiles_per_expert, output_per_wg, w13_linear ? "true" : "false");
+code.e("    task_desc-&gt;input_ptrs[0],");   // input activation
+code.e("    task_desc-&gt;input_ptrs[1],");   // expert weights (MXFP4 packed)
+...
+return register_task_variant(TASK_GANG_MOE_W13_LINEAR_MXFP4_MI300, code.to_string());</code></pre>
+
+<p>The generated file is a dispatch switch over <strong>117 task types</strong> (55 of them
+MI300) whose arms are those strings. <strong>81 distinct <code>kernel::</code> symbols are named
+this way, and the compiler writes the body of none of them.</strong> 8 066 lines of codegen
+produce parameter substitution and a switch; 50 433 lines of kernels are typed by a person.</p>
+
+<p>Titan's generated kernel reaches the same library the same way — emitted from a Python
+f-string rather than a C++ string-builder, but naming a symbol from the same header set. Its
+whole per-layer body is <a href="#ex-template">the worked example in §3</a>: 23 template
+parameters, 24 runtime arguments, and not one line of algorithm. Two independent generators,
+written in different languages by different people, converge on the same output shape — because
+that is the only output shape the library admits.</p>
+
+<div class="box note">
+<span class="lbl">The observation everything below rests on</span>
+<p>If the compiler's device-level output is <em>a template instantiation and an argument
+list</em>, then the compiler is not the part doing the work — the library is. And an argument
+list does not need a superoptimizer to produce it. It needs a table of shapes.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 344" role="img" aria-label="Mirage's compiler emits calls into a hand-written device library; Titan emits the same calls from a YAML table">
+  <text x="0" y="13" font-size="13" font-weight="700" fill="#0b5fa5">MIRAGE (MPK) — dynamic: search the graph, then schedule a DAG at runtime</text>
+
+  <g font-size="11" text-anchor="middle">
+    <rect x="0"   y="26" width="150" height="48" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+    <text x="75"  y="46" font-weight="600">superoptimizer</text>
+    <text x="75"  y="62" font-size="10" fill="#5a6472">src/search · 6 598 ln</text>
+
+    <rect x="186" y="26" width="150" height="48" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+    <text x="261" y="46" font-weight="600">transpile + codegen</text>
+    <text x="261" y="62" font-size="10" fill="#5a6472">8 863 + 8 066 ln</text>
+
+    <rect x="372" y="26" width="164" height="48" fill="#fff" stroke="#0b5fa5" rx="4"/>
+    <text x="454" y="46" font-weight="600">301-task DAG</text>
+    <text x="454" y="62" font-size="10" fill="#5a6472">+ 8 scheduler workgroups</text>
+  </g>
+  <g stroke="#5a6472" fill="none" marker-end="url(#ar)">
+    <path d="M150,50 L182,50"/><path d="M336,50 L368,50"/><path d="M536,50 L586,50"/>
+  </g>
+
+  <rect x="590" y="26" width="450" height="48" fill="#fff8e6" stroke="#e0b400" rx="4"/>
+  <text x="602" y="45" font-size="11" font-weight="700" fill="#8a6d00">…and what it emits is a CALL STRING, never a body</text>
+  <text x="602" y="63" font-size="10" class="m" fill="#5a6472">kernel::gang_moe_pipelined_mxfp4_kernel_mi300&lt;…&gt;(ptrs, tile_idx);</text>
+
+  <text x="0" y="112" font-size="13" font-weight="700" fill="#2e7d4f">TITAN — static: at batch size 1 the shapes are known at generate time, so skip the search</text>
+
+  <g font-size="11" text-anchor="middle">
+    <rect x="0"   y="125" width="150" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+    <text x="75"  y="145" font-weight="600">one YAML</text>
+    <text x="75"  y="161" font-size="10" fill="#5a6472">34–93 lines</text>
+
+    <rect x="186" y="125" width="150" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+    <text x="261" y="145" font-weight="600">derive + assert</text>
+    <text x="261" y="161" font-size="10" fill="#5a6472">titan_generate.py</text>
+
+    <rect x="372" y="125" width="164" height="48" fill="#fff" stroke="#2e7d4f" rx="4"/>
+    <text x="454" y="145" font-weight="600">850-line layer loop</text>
+    <text x="454" y="161" font-size="10" fill="#5a6472">no scheduler, no DAG</text>
+  </g>
+  <g stroke="#5a6472" fill="none" marker-end="url(#ar)">
+    <path d="M150,149 L182,149"/><path d="M336,149 L368,149"/><path d="M536,149 L586,149"/>
+  </g>
+
+  <rect x="590" y="125" width="450" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+  <text x="602" y="144" font-size="11" font-weight="700" fill="#2e7d4f">…and it emits the SAME CALL, from a table of constants</text>
+  <text x="602" y="162" font-size="10" class="m" fill="#5a6472">kernel::gang_full_layer_fused_kernel_mi300&lt;…&gt;(ptrs, tile_idx);</text>
+
+  <g stroke="#5a6472" stroke-dasharray="4 3" fill="none">
+    <path d="M815,74 L815,120"/><path d="M815,173 L815,208"/>
+  </g>
+
+  <rect x="0" y="214" width="1040" height="126" fill="#f6f7f9" stroke="#5a6472" rx="4"/>
+  <text x="16" y="236" font-size="13" font-weight="700">THE DEVICE-FUNCTION LIBRARY — hand-written, shared, and the actual asset</text>
+  <text x="16" y="254" font-size="11" fill="#5a6472">50 433 lines. Both paths bottom out here. Neither generator writes a line of it.</text>
+
+  <g font-size="10" text-anchor="middle">
+    <rect x="16"  y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="112" y="286" font-size="11" font-weight="600">MFMA mainloops</text>
+    <text x="112" y="302" fill="#5a6472">depth-4 pipeline,</text><text x="112" y="315" fill="#5a6472">mfma_scale_f32_16x16x128</text>
+
+    <rect x="220" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="316" y="286" font-size="11" font-weight="600">CK-FMHA split-KV</text>
+    <text x="316" y="302" fill="#5a6472">paged attention,</text><text x="316" y="315" fill="#5a6472">8 chunks + merge</text>
+
+    <rect x="424" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="520" y="286" font-size="11" font-weight="600">fused MoE</text>
+    <text x="520" y="302" fill="#5a6472">W13 + SwiGLU + W2,</text><text x="520" y="315" fill="#5a6472">1 806 lines</text>
+
+    <rect x="628" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="724" y="286" font-size="11" font-weight="600">epilogues</text>
+    <text x="724" y="302" fill="#5a6472">ResAdd, RMSNorm,</text><text x="724" y="315" fill="#5a6472">SwiGLU, TopK, argmax</text>
+
+    <rect x="832" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="928" y="286" font-size="11" font-weight="600">sync + cache ops</text>
+    <text x="928" y="302" fill="#5a6472">per-XCD release,</text><text x="928" y="315" fill="#5a6472">st_wt / ld_nt</text>
+  </g>
+</svg>
+<figcaption><b>Figure 10.</b> Mirage's superoptimizer searches the operator graph, but its
+compiler's device-level output is a template instantiation naming a hand-written symbol — 81 such
+symbols, zero generated bodies, and <code>src/search</code> mentions none of them. Titan emits the
+same instantiation from a YAML table instead of from a search. Both bottom out in the same
+library, which is why replacing the top layer costs no kernel performance.</figcaption>
+</figure>
+
+<h3>Why the dynamic machinery can be dropped at batch size 1</h3>
+
+<p>Mirage's scheduler exists to resolve a dependency DAG whose shape is unknown until runtime.
+For decode at batch size 1, it is known at <em>generate</em> time:</p>
+
+<ul>
+<li><strong>The token count is 1.</strong> No ragged batch, no prefill mix, no data-dependent
+    tile counts — the whole work decomposition is a function of the config.</li>
+<li><strong>The layer sequence is a straight line.</strong> 36 identical layers, no
+    data-dependent control flow. The DAG has no branches to schedule around.</li>
+<li><strong>Every tile bound is derivable.</strong> <code>moe_total_tiles_per_xcd</code>,
+    <code>total_qkv_tiles_per_xcd</code>, <code>oproj_tiles_per_xcd</code> — all computed by
+    <code>load_and_validate</code> and asserted against the emitted header (§2).</li>
+</ul>
+
+<p>So the 8 scheduler workgroups and the 301-entry task graph are solving a problem with no
+unknowns in it. Titan deletes them and pays a different bill instead: 35 explicit device-wide
+barriers at 3.56 µs. That is the entire trade, and it is quantified below.</p>
+
+<h3>What Titan replaces, precisely</h3>
+
+<p>Titan calls Mirage's device-level sub-kernels — six headers, reached through
+<code>-I&lt;mirage&gt;/include/mirage/persistent_kernel</code> and nothing more elaborate than an
+include path. What it replaces is the layer above: how work is scheduled and synchronized across
+the whole model.</p>
+
+<table>
+<thead><tr><th>Layer</th><th>Mirage</th><th>Titan</th><th>Shared?</th></tr></thead>
+<tbody>
+<tr><td>Operator search</td><td>Superoptimizer, hours</td><td>None — shapes come from YAML</td><td>no</td></tr>
+<tr><td>Work decomposition</td><td>301-task DAG, built at init</td><td><code>static constexpr</code>, emitted</td><td>no</td></tr>
+<tr><td>Dispatch</td><td>8 scheduler workgroups, runtime</td><td>A layer loop; no scheduler</td><td>no</td></tr>
+<tr><td>Ordering</td><td>Falls out of the DAG</td><td>35 explicit barriers, 124.5 µs/token</td><td>no</td></tr>
+<tr><td><strong>Device kernels</strong></td>
+    <td colspan="2"><strong>The same hand-written library — same MFMA mainloops, same CK-FMHA attention, same fused MoE</strong></td>
+    <td><strong>yes</strong></td></tr>
+</tbody>
+</table>
+
+<h3>The consequence: adding a model becomes a table, not a search</h3>
+
+<p>Once the fast code is a library of templates and the generator's job is to instantiate them,
+supporting a new model stops being a compilation problem. Every axis a transformer varies along
+is already a template parameter or a constant:</p>
+
+<div class="kv">
+<dt>shape</dt><dd>hidden dim, head dim, Q/KV heads, intermediate size, vocab — derived from the YAML, emitted as <code>static constexpr</code></dd>
+<dt>topology</dt><dd>workers per XCD, tiles per XCD, output-per-workgroup — derived, then asserted against the header</dd>
+<dt>architecture</dt><dd>dense vs MoE selects <em>which</em> library entry points the layer body names</dd>
+<dt>tuning</dt><dd>MFMA scheduling, LDS layout, cache modifiers — <em>not</em> derivable. These are search results, recorded by hand in the YAML <code>measured:</code> block (§7)</dd>
+</div>
+
+<p>So a new model is a new argument list — which is what <a href="#newmodel">§3</a> was
+actually demonstrating, read in this light. Mistral-7B's ten mechanical minutes and its 60-line
+diff against Llama3-8B were not evidence that the generator is clever. They are evidence that
+<strong>the performance was already in the library, and the new model simply inherited
+it.</strong></p>
+
+<figure>
+<svg viewBox="0 0 1040 254" role="img" aria-label="Cost of adding a model: what is reused, what is written, and what is not covered">
+  <text x="0" y="13" font-size="13" font-weight="700">ADDING A MODEL — what gets borrowed, what gets written</text>
+
+  <text x="0" y="44" font-size="11.5" font-weight="600" fill="#2e7d4f">Reused, unmodified</text>
+  <rect x="0" y="52" width="1040" height="32" fill="#eef8f0" stroke="#2e7d4f" rx="3"/>
+  <text x="14" y="72" font-size="11" class="m" fill="#2e7d4f">50 433 lines of device library · 8-phase pipeline · barrier protocol · epilogue set · MXFP4 packing · vLLM plugin · byte-identity gate</text>
+
+  <text x="0" y="112" font-size="11.5" font-weight="600" fill="#0b5fa5">Written per model</text>
+  <rect x="0" y="120" width="92" height="32" fill="#eef5fb" stroke="#0b5fa5" rx="3"/>
+  <text x="46" y="140" font-size="11" class="m" text-anchor="middle" fill="#0b5fa5">34–93 ln</text>
+  <text x="104" y="134" font-size="11.5" fill="#5a6472">one YAML — shapes, topology, build flags, and the measured tuning constants</text>
+  <text x="104" y="151" font-size="10.5" fill="#5a6472">gpt-oss-120b 93 · qwen3-8b 67 · llama3-8b 48 · mistral-7b 34</text>
+
+  <text x="0" y="182" font-size="11.5" font-weight="600" fill="#c0392b">Not covered — needs library work</text>
+  <rect x="0" y="190" width="1040" height="32" fill="#fdf0ef" stroke="#c0392b" rx="3"/>
+  <text x="14" y="210" font-size="11.5" fill="#c0392b">a genuinely new tile shape: MLA, head_dim ≠ 64 on the MoE path, a new quantization format — weeks of work, and it lands in the green bar for everyone afterwards</text>
+
+  <text x="0" y="246" font-size="11" fill="#5a6472">The green bar is the asset. Each model added widens it; none of them rewrite it.</text>
+</svg>
+<figcaption><b>Figure 11.</b> The economics of the split. A model that fits the existing tile
+shapes costs a YAML file, because the library already holds every kernel it needs. A model that
+does not costs weeks of device-function work — but that work is written once into the shared
+library and every later model inherits it. This is why the four rejection asserts in §3 each name
+a file and a line: they mark exactly where the green bar ends.</figcaption>
+</figure>
+
+<div class="box good">
+<span class="lbl">Why this, and not the 1.59×, is the interesting claim</span>
+<p>Mirage demonstrated that a megakernel beats an operator-per-kernel stack. Titan's contribution
+is orthogonal: <strong>the megakernel's performance lives in a device-function library, not in the
+compiler that assembles it</strong> — so the assembling layer can be a static generator, and the
+library becomes a reusable asset across models and across frameworks. One library now serves a
+dense and an MoE architecture, a standalone driver and a vLLM backend, from four YAML files.</p>
+</div>
+
+<h3>The 0.36 ms standalone gap, accounted</h3>
+
+<p>Dropping the scheduler is not free, and the bill arrives as barriers. Titan's standalone driver
+is 0.358 ms/token behind Mirage. That gap has been measured, not estimated:</p>
+
+<table>
+<thead><tr><th>Component</th><th class="num">ms/tok</th><th class="num">Δ</th><th>Cause</th></tr></thead>
+<tbody>
+<tr><td>Mirage standalone</td><td class="num">2.144</td><td class="num">—</td>
+    <td>Scheduler supplies inter-layer ordering for free.</td></tr>
+<tr><td>Titan megakernel GPU time (<code>[TITAN_TIME]</code>)</td><td class="num">~2.39</td><td class="num">+0.25</td>
+    <td><strong>124.5 µs is the inter-layer barrier</strong>, measured. The rest (~0.12 ms) is spread thin across phases.</td></tr>
+<tr><td>Titan standalone end-to-end</td><td class="num">2.502</td><td class="num">+0.11</td>
+    <td>Its own Python driver, ~46 µs/token of host work.</td></tr>
+</tbody>
+</table>
+
+<p>Register pressure is explicitly ruled out: Titan has strictly fewer registers and far fewer
+spills than Mirage — 226 VGPRs and 0 VGPR spills against 261 and 181. The gap is
+synchronization, and it is structural: the price of not having a scheduler.</p>
+
+<table>
+<thead><tr><th>Dimension</th><th>Mirage (MPK)</th><th>Titan</th></tr></thead>
+<tbody>
+<tr><td><strong>What it is</strong></td>
+    <td>A persistent-kernel compiler with a superoptimizer.</td>
+    <td>A code generator: YAML → HIP source.</td></tr>
+<tr><td><strong>Execution model</strong></td>
+    <td>240 worker workgroups + 8 scheduler workgroups. Tasks carry a dependency DAG; a worker advances as soon as <em>its</em> dependency is satisfied.</td>
+    <td>240 workers, no scheduler. A monolithic layer loop with explicit device-wide barriers at phase boundaries.</td></tr>
+<tr><td><strong>Inter-layer ordering</strong></td>
+    <td>Falls out of the DAG. Costs nothing extra.</td>
+    <td>An explicit barrier: 35 × 3.56 µs = <strong>124.5 µs/token</strong>.</td></tr>
+<tr><td><strong>Adding a model</strong></td>
+    <td>Re-run the superoptimizer (hours), then hand-write the Python wiring.</td>
+    <td>Write a YAML, regenerate (seconds).</td></tr>
+<tr><td><strong>Fusion level</strong></td>
+    <td>LDS (persistent kernel).</td>
+    <td>Registers <em>and</em> LDS (§4).</td></tr>
+<tr><td><strong>Register pressure</strong></td>
+    <td>261 VGPRs, 181 spills.</td>
+    <td>226 VGPRs, 0 VGPR spills, 12 SGPR spills.</td></tr>
+<tr><td><strong>Serving integration</strong></td>
+    <td>None — a standalone benchmark driver.</td>
+    <td>A vLLM plugin (§9): continuous batching, sampler, paged KV, OpenAI API.</td></tr>
+<tr><td><strong>GPT-OSS 120B decode</strong></td>
+    <td class="num">2.144 ms/tok (standalone)</td>
+    <td class="num">2.502 ms/tok (standalone) · 2.921 ms/tok (through vLLM)</td></tr>
+</tbody>
+</table>
+
+<div class="box note">
+<span class="lbl">The trade being made</span>
+<p>Mirage's scheduler is genuinely better at inter-layer ordering, and 124.5 µs/token is what
+that is worth here. In exchange Titan gets a model added by writing YAML instead of running a
+superoptimizer, one device-function library serving both architectures, a byte-identity regression
+gate, and a real serving backend. Whether that trade is right depends on what you are optimizing
+for — it is a trade, not a win.</p>
+</div>
+
+<h3>Where a compiler still wins, and the open problem underneath</h3>
+
+<p>The honest limit of the static approach: it cannot invent a kernel it does not have. Three
+cases where the dynamic machinery is the right answer —</p>
+
+<ul>
+<li><strong>Batch &gt; 1 with ragged sequences.</strong> Tile counts become data-dependent and a
+    runtime scheduler earns its keep. Titan's decomposition is frozen at generate time.</li>
+<li><strong>A tile shape nobody has written.</strong> MLA, a new quantization format,
+    <code>head_dim ≠ 64</code> on the MoE path. Titan rejects these at validate time with an
+    assert naming a file and a line (§3) — and Mirage would fail too, since the library is
+    shared. The constraint is the library's, not the generator's.</li>
+<li><strong>Fusion decisions that depend on a checkpoint's values, not its shape.</strong>
+    Nothing in Titan's pipeline is value-dependent, so this has not arisen — but it is where a
+    search would find something a table cannot.</li>
+</ul>
+
+<p>Which points at the research direction this section makes visible. <strong>If the library is
+the asset, the compiler's real job is generating library entries, not scheduling calls to
+them.</strong> Neither system does that today: Mirage's superoptimizer searches a graph whose
+leaves are hand-written, and Titan's generator instantiates those same leaves. Closing the gap —
+a compiler that emits the MFMA mainloop, the LDS staging, and the cache-modifier choice rather
+than selecting among human-written ones — is the open problem both systems are standing next
+to.</p>
+
+<h3>An older gap analysis, and what happened to it</h3>
+<p><code>docs/titan_vs_mirage_perf_gap.md</code> recorded Titan at 8.08 ms against Mirage's
+2.19 ms, enumerated 5.09 ms of gap, and predicted ~3.0 ms post-fix. Actual: <strong>2.50
+ms</strong> — beaten, because adopting Mirage's fused layer body wholesale collapsed several
+line items at once rather than fixing each phase separately. Its per-phase reasoning is still
+correct and worth reading; its top-line numbers are historical.</p>
+
+<h2 id="vllm">9. vLLM integration</h2>
+
+<p>A fast kernel that only runs in a benchmark script is not a serving backend. The integration
+makes Titan's megakernel the decode path of a real vLLM engine — continuous batching, paged KV,
+the full sampler, the OpenAI-compatible API — while prefill stays stock.</p>
+
+<h3>Discovery: a general plugin, not a fork</h3>
+
+<p>vLLM exposes a <code>vllm.general_plugins</code> entry point. At engine startup it calls
+<code>register()</code>, which swaps each stock model class for a Titan subclass:</p>
+
+<pre><code>def register():
+    from vllm import ModelRegistry
+    from .model import TitanQwen3ForCausalLM, _make_gptoss_class
+    ModelRegistry.register_model("Qwen3ForCausalLM", TitanQwen3ForCausalLM)
+    try:   # separate vLLM module; may be absent in older builds
+        ModelRegistry.register_model("GptOssForCausalLM", _make_gptoss_class())
+    except Exception as e:
+        log.info("titan: GptOssForCausalLM not registered (%s); dense path unaffected.", e)</code></pre>
+
+<p>Registering both is harmless: vLLM instantiates whichever architecture the checkpoint
+declares. Enable with <code>VLLM_PLUGINS=titan</code>; the stock baseline is
+<code>VLLM_PLUGINS=</code> (empty). No vLLM source is modified.</p>
+
+<h3>Three seams, and nothing else</h3>
+
+<p>The subclasses are thin. Everything model-agnostic lives in <code>TitanModelMixin</code>,
+parameterized by a <code>ModelSpec</code>. The mixin overrides exactly three methods:</p>
+
+<table>
+<thead><tr><th>Override</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>load_weights()</code></td>
+    <td>Calls <code>super()</code> to load the standard modules, then MXFP4-packs them into
+    Titan's per-XCD layout, builds RoPE tables, <code>dlopen</code>s <code>&lt;model&gt;.so</code>,
+    and allocates workspace buffers.</td></tr>
+<tr><td><code>forward()</code></td>
+    <td>Reads vLLM's attention metadata and branches on query length. Prefill →
+    <code>super().forward()</code>. Decode → <code>titan.decode_step()</code>.</td></tr>
+<tr><td><code>compute_logits()</code></td>
+    <td>After a Titan MoE decode, returns the bf16 logit row the megakernel already computed
+    (§11); otherwise falls through to stock.</td></tr>
+</tbody>
+</table>
+
+<p>MRO matters: the mixin is listed <strong>first</strong>
+(<code>class T(TitanModelMixin, StockModel)</code>) so its overrides win while
+<code>super()</code> still reaches the stock implementation.</p>
+
+<h4>The routing predicate</h4>
+<pre><code>attn_md = self._get_attn_metadata()
+# No metadata (profiling/dummy run) or a multi-token query -> stock path.
+if attn_md is None or getattr(attn_md, "max_query_len", 2) != 1:
+    return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
+# Decode: exactly one new token.
+self._ensure_titan_kv_bound()
+...</code></pre>
+<p>The default of <code>2</code> in the <code>getattr</code> is deliberate: a metadata object
+without <code>max_query_len</code> routes to <em>stock</em>, not Titan. Unknown state falls
+back to the safe path.</p>
+
+<h3>Module map</h3>
+<table>
+<thead><tr><th>File</th><th class="num">Lines</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>plugin.py</code></td><td class="num">27</td><td>Entry point; registers the model overrides.</td></tr>
+<tr><td><code>model.py</code></td><td class="num">198</td><td>The two subclasses: per-model weight packing and the layer-attention accessor.</td></tr>
+<tr><td><code>mixin.py</code></td><td class="num">292</td><td>All model-agnostic machinery: kernel load, buffers, RoPE, KV binding, routing.</td></tr>
+<tr><td><code>spec.py</code></td><td class="num">398</td><td><code>ModelSpec</code>: every dimension and layout constant, from the same YAML the generator reads.</td></tr>
+<tr><td><code>runtime.py</code></td><td class="num">467</td><td>ctypes ABI loader, <code>TitanBuffers</code>, <code>build_ptr_table</code>, <code>decode_step</code>.</td></tr>
+<tr><td><code>packing.py</code> / <code>packing_moe.py</code></td><td class="num">161 / 281</td><td>Dense and MoE MXFP4 packing + the 36-slot per-layer pointer table.</td></tr>
+<tr><td><code>harness.py</code> / <code>bench.py</code> / <code>profile_step.py</code></td><td class="num">98 / 103 / 139</td><td>Parity harness, latency benchmark, per-kernel decode attribution.</td></tr>
+</tbody>
+</table>
+
+<div class="box good">
+<span class="lbl">There is deliberately no constants.py</span>
+<p>Every number in the plugin comes from <code>spec.py</code>, which parses the same YAML the
+generator does and reaches into <code>titan_generate</code> for the two facts the YAML does not
+carry: <code>counter_slots()</code> for the QKV barrier offset, and
+<code>MIRAGE_IN</code>/<code>MIRAGE_OUT</code> for the pointer-table shape. A second
+hand-maintained copy of these constants is how the plugin silently drifted once before; that file
+was deleted rather than updated.</p>
+</div>
+
+<div class="box warn">
+<span class="lbl">Silent-failure trap: the plugin must be pip-installed</span>
+<p><code>titan_vllm</code> is not on <code>sys.path</code> by default. Without
+<code>pip install -e</code>, <code>VLLM_PLUGINS=titan</code> <strong>silently does nothing</strong>
+— you get stock vLLM and a plausible-looking result with no warning. Verify the entry point is
+discoverable before trusting any number.</p>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="zerocopy">10. Zero-copy KV</h2>
+
+<h3>The problem</h3>
+<p>Attention needs every past token's K and V, and vLLM owns a paged KV cache — here roughly
+184 GiB — in its own layout. Titan's kernel originally read and wrote its own K/V buffers, so a
+per-request gather-copy reshuffled vLLM's prefill KV before decode could start: two full KV stores
+plus a per-request copy.</p>
+
+<h3>The trick</h3>
+<p>Rather than converting between layouts, force a vLLM attention backend whose
+<em>physical</em> KV layout is already byte-identical to Titan's, then alias the pointers.</p>
+
+<p>The aiter backends allocate KV as <code>(2, num_blocks, block_size, num_kv_heads,
+head_size)</code> — the leading 2 makes K and V each contiguous — and write it through
+<code>reshape_and_cache_flash</code>, the non-reordered layout. Reshaped, that is bit-for-bit
+Titan's flat <code>[entries, num_kv_heads × head_dim]</code> buffer. (vLLM's default Triton/ROCm
+backends reorder K or interleave the leading 2 — incompatible with a single flat pointer.)</p>
+
+<pre><code>kvc = attn.kv_cache[0]                          # [2, num_blocks, block_size, n_kv, head]
+k_alias = kvc[0].reshape(entries, n_kv * head)  # a view, not a copy
+v_alias = kvc[1].reshape(entries, n_kv * head)
+assert k_alias.data_ptr() == kvc[0].data_ptr()  # zero-copy invariant guard
+buffers.set_kv_aliases(k_aliases, v_aliases)    # titan's K/V now point at vLLM's pool</code></pre>
+
+<figure>
+<svg viewBox="0 0 1040 268" role="img" aria-label="Gather-copy between two KV layouts versus pointer aliasing">
+  <!-- BEFORE -->
+  <text x="0" y="14" font-size="12.5" font-weight="700" fill="#c0392b">BEFORE — two allocations, a per-request gather-copy</text>
+
+  <rect x="0" y="26" width="300" height="72" fill="#fdf0ef" stroke="#c0392b" rx="4"/>
+  <text x="12" y="45" font-size="11" font-weight="700">vLLM paged KV pool</text>
+  <text x="12" y="62" font-size="10.5" class="m" fill="#5a6472">[2, num_blocks, block_size,</text>
+  <text x="12" y="76" font-size="10.5" class="m" fill="#5a6472"> num_kv_heads, head_size]</text>
+  <text x="12" y="92" font-size="10.5" fill="#c0392b">~184 GiB</text>
+
+  <rect x="420" y="26" width="300" height="72" fill="#fdf0ef" stroke="#c0392b" rx="4"/>
+  <text x="432" y="45" font-size="11" font-weight="700">Titan's own K/V buffers</text>
+  <text x="432" y="62" font-size="10.5" class="m" fill="#5a6472">[entries, num_kv_heads × head_dim]</text>
+  <text x="432" y="92" font-size="10.5" fill="#c0392b">a second copy of the same bytes</text>
+
+  <path d="M304,62 L414,62" stroke="#c0392b" stroke-width="1.6" fill="none" marker-end="url(#arR)"/>
+  <text x="359" y="54" font-size="10.5" fill="#c0392b" text-anchor="middle" font-weight="700">gather-copy</text>
+  <text x="359" y="80" font-size="10" fill="#c0392b" text-anchor="middle">per request, before decode</text>
+
+  <text x="740" y="52" font-size="11" fill="#c0392b">Two full KV stores plus a</text>
+  <text x="740" y="68" font-size="11" fill="#c0392b">per-request reshuffle.</text>
+
+  <!-- AFTER -->
+  <text x="0" y="140" font-size="12.5" font-weight="700" fill="#2e7d4f">AFTER — one allocation, two views of it</text>
+
+  <rect x="0" y="152" width="440" height="90" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+  <text x="12" y="171" font-size="11" font-weight="700">vLLM paged KV pool — the only allocation</text>
+  <text x="12" y="188" font-size="10.5" class="m" fill="#5a6472">aiter backend: [2, num_blocks, block_size, n_kv, head]</text>
+  <text x="12" y="204" font-size="10.5" fill="#5a6472">reshape_and_cache_flash — the non-reordered layout</text>
+  <rect x="12" y="212" width="416" height="22" fill="#fff" stroke="#2e7d4f" rx="2"/>
+  <text x="20" y="227" font-size="10" class="m" fill="#2e7d4f">reshaped, this is bit-for-bit Titan's flat [entries, n_kv × head_dim]</text>
+
+  <g stroke="#2e7d4f" stroke-width="1.4" fill="none" marker-end="url(#ag)">
+    <path d="M444,182 L560,182"/>
+    <path d="M444,212 L560,212"/>
+  </g>
+  <text x="502" y="176" font-size="10" fill="#2e7d4f" text-anchor="middle">.reshape()</text>
+  <text x="502" y="230" font-size="10" fill="#2e7d4f" text-anchor="middle">.reshape()</text>
+
+  <rect x="566" y="166" width="200" height="32" fill="#fff" stroke="#2e7d4f" rx="3"/>
+  <text x="666" y="186" font-size="10.5" class="m" text-anchor="middle">k_alias — a view, not a copy</text>
+  <rect x="566" y="198" width="200" height="32" fill="#fff" stroke="#2e7d4f" rx="3"/>
+  <text x="666" y="218" font-size="10.5" class="m" text-anchor="middle">v_alias — a view, not a copy</text>
+
+  <text x="786" y="180" font-size="11" fill="#2e7d4f" font-weight="700">0 bytes copied.</text>
+  <text x="786" y="198" font-size="11" fill="#5a6472">The megakernel appends the</text>
+  <text x="786" y="214" font-size="11" fill="#5a6472">new token's K/V into vLLM's</text>
+  <text x="786" y="230" font-size="11" fill="#5a6472">block and reads prior KV in place.</text>
+
+  <rect x="0" y="250" width="1040" height="0" fill="none"/>
+</svg>
+<figcaption><b>Figure 12.</b> No layout conversion — a backend is chosen whose physical layout
+already matches, and the pointers are aliased. The whole mechanism rests on one invariant, so
+it is asserted on every bind: <code>k_alias.data_ptr() == kvc[0].data_ptr()</code>. That, plus
+<code>block_size == PAGE_SIZE</code>, is why one vLLM block is exactly one Titan page.</figcaption>
+</figure>
+
+<p>Binding is lazy, on the first decode, because vLLM allocates the KV cache after
+<code>load_weights()</code>. Titan's page-indirection array <code>kv_indices</code> is then
+driven straight from vLLM's <code>block_table</code>: during decode the megakernel appends the
+new K/V into vLLM's block and reads all prior KV in place.</p>
+
+<h3>Why PAGE_SIZE is 128</h3>
+<table>
+<thead><tr><th>Backend</th><th>Limiting mechanism</th><th class="num">block_size cap</th></tr></thead>
+<tbody>
+<tr><td><code>rocm_aiter_fa</code> (MHA)</td>
+    <td><code>paged_attention_v1</code> → <code>static_assert(BLOCK_SIZE &lt;= k_thread_per_block)</code>, which is 32</td>
+    <td class="num">≤ 32</td></tr>
+<tr><td><code>rocm_aiter_unified_attn</code> (Triton)</td>
+    <td>LDS use = <code>block_size × 1024 B</code> against the 160 KB cap</td>
+    <td class="num">≤ 160</td></tr>
+<tr><td>vLLM itself</td><td><code>BlockSize = Literal[1, 8, 16, 32, 64, 128, 256]</code></td><td class="num">≤ 256</td></tr>
+</tbody>
+</table>
+<p>So the kernel's original <code>PAGE_SIZE = 4096</code> could never bind; 128 is the largest
+power of two under the unified backend's LDS budget. Measured cost is negative — 2.501
+→ 2.491 ms/tok on GPT-OSS, 6.798 → 6.768 on Qwen3, identical registers and output
+— because <code>PAGE_SIZE</code> only feeds address arithmetic and <code>seqlen_k</code>. It
+also buys coverage: at 4096 the demos' ~150-token runs fit in page 0, so cross-page addressing was
+never exercised.</p>
+
+<div class="box warn">
+<span class="lbl">Hybrid KV cache must be disabled for GPT-OSS</span>
+<p>vLLM's hybrid KV-cache manager overlays GPT-OSS's two attention types on shared physical
+memory with separate per-group block tables; Titan's decode uses ONE block table for all layers.
+<code>disable_hybrid_kv_cache_manager=True</code> unifies every layer to
+<code>FullAttentionSpec</code>. Titan's kernel still applies the sliding-window mask itself, so
+only the KV-memory saving is lost. No-op for uniform models such as Qwen3.</p>
+</div>
+
+<p>Three asserts guard the scheme and fail loud rather than producing garbage tokens: the
+backend must be an aiter flash backend, <code>block_size</code> must equal
+<code>PAGE_SIZE</code>, and the reshape must be a view (<code>data_ptr</code> equality) rather
+than a silent copy.</p>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="logits">11. Fused logits: deleting vLLM's redundant LM head</h2>
+
+<p>This is the clearest example of an optimization that only becomes visible once the kernel
+is inside a real serving stack.</p>
+
+<p>The megakernel's argmax epilogue computes <code>sum + bias</code> for every vocab entry and
+discards all but the maximum. Fine for the standalone driver, which only wants the argmax. But
+vLLM's sampler needs the full logit row — and it was getting it by running its own bf16
+<code>lm_head</code>, <strong>recomputing exactly what the megakernel had just thrown
+away.</strong></p>
+
+<div class="stat-row">
+  <div class="stat"><div class="v">1.16 GB</div><div class="k">bf16 lm_head weight read (201088 × 2880 × 2 B)</div></div>
+  <div class="stat"><div class="v">0.200 ms</div><div class="k">measured, per token</div></div>
+  <div class="stat"><div class="v">315 MB</div><div class="k">MXFP4 weights already resident</div></div>
+  <div class="stat"><div class="v">402 KB</div><div class="k">cost of just storing the row</div></div>
+</div>
+
+<p><code>GptConfig</code> gained an optional <code>logits_output</code>. Null — the standalone
+default — keeps the argmax-only tail. Non-null makes the epilogue also store the bf16 row:</p>
+
+<pre><code>float val = sum + bv;
+long long abs_idx = (long long)(partition_start + out_n);
+// Same value the argmax compares, at the same absolute vocab index -- so the
+// stored row cannot disagree with the token the argmax picks. Predicated on a
+// null check, not #ifdef: one build serves both drivers.
+if (logits_out != nullptr) {
+    unsigned vb; __builtin_memcpy(&amp;vb, &amp;val, 4);
+    logits_out[abs_idx] = (unsigned short)(vb &gt;&gt; 16);
+}
+if (val &gt; thread_max) { ... }</code></pre>
+
+<p>Three details carry most of the correctness argument:</p>
+<ul>
+<li><strong>A null check, not an <code>#ifdef</code>.</strong> One compiled <code>.so</code>
+serves both drivers; the standalone path pays only a predicated branch.</li>
+<li><strong>The stored value is the same <code>val</code> the argmax compares</strong>, at the
+same absolute vocab index — so the fused row cannot disagree with Titan's own greedy pick.</li>
+<li><strong><code>compute_logits()</code> consumes its flag rather than just reading it.</strong>
+Prefill, dummy runs, and stock-path fallbacks fall through to vLLM's <code>lm_head</code>.
+Silently returning a stale row on those paths would be wrong output with no error.</li>
+</ul>
+
+<table>
+<thead><tr><th></th><th class="num">before</th><th class="num">after</th></tr></thead>
+<tbody>
+<tr><td>vLLM decode</td><td class="num">3.211 ms/tok</td><td class="num"><strong>2.921 ms/tok</strong></td></tr>
+<tr><td>Non-megakernel GPU time</td><td class="num">~0.30 ms/tok</td><td class="num">0.096 ms/tok</td></tr>
+<tr><td>Standalone driver</td><td class="num">2.520 ms/tok</td><td class="num">2.502 ms/tok</td></tr>
+<tr><td>Kernel registers</td><td class="num">210 VGPR</td><td class="num">226 VGPR, 0 spills, 2 waves/SIMD</td></tr>
+</tbody>
+</table>
+
+<p>The extra 16 VGPRs did not cost occupancy. After the change the only non-megakernel GPU work
+left in a decode step is a 0.030 ms device-to-device memcpy — the <code>wvSplitK_hf_sml</code>
+lm_head GEMV is gone from the profile entirely.</p>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="perf">12. Performance, stated honestly</h2>
+
+<div class="box bad">
+<span class="lbl">Read this before quoting any number</span>
+<p><code>enforce_eager</code> disables hipGraph capture, and it is <em>not neutral between the
+two sides</em>. Stock vLLM's decode is a long tail of small kernel launches, so graph capture is
+most of its performance; Titan's decode is ONE launch with almost nothing to gain. Eager mode
+therefore flatters Titan by a large factor.</p>
+<p>An earlier revision reported GPT-OSS as 8.3× faster than stock. That was an artifact:
+the benchmark hardcoded <code>enforce_eager=True</code>. Stock GPT-OSS with graphs is 4.658
+ms/token, not 26.113 — a 5.6× swing belonging entirely to the baseline. <strong>Always state
+which capture mode a number came from.</strong></p>
+</div>
+
+<h3>Method</h3>
+<p>Prefill-cancelling: time greedy <code>generate()</code> for a short and a long output of the
+<em>same</em> prompt and difference out the identical prefill.</p>
+<pre><code>ms/token = 1000 × (T_long − T_short) / (N_long − N_short)     # 8 vs 128 tokens, best of 3</code></pre>
+<p>Two traps this method and the profiler share: vLLM v1 runs the engine in a subprocess
+(profiling needs <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code>), and <code>key_averages()</code>
+lists the CPU launcher op alongside its kernel with both carrying device time — naive summing
+double-counts.</p>
+
+<h3>Through vLLM, batch size 1, gfx950</h3>
+
+<table>
+<thead><tr><th>Model</th><th class="num">stock, graphs ON</th><th class="num">stock, eager</th><th class="num">titan (eager)</th><th></th></tr></thead>
+<tbody>
+<tr><td><strong>GPT-OSS 120B</strong></td><td class="num">4.658 (215 tok/s)</td><td class="num">26.113</td>
+    <td class="num"><strong>2.921 (342 tok/s)</strong></td><td class="add">1.59× faster</td></tr>
+<tr><td><strong>Qwen3-8B</strong></td><td class="num">4.469 (224 tok/s)</td><td class="num">5.720 (175 tok/s)</td>
+    <td class="num">7.282 (137 tok/s)</td><td class="del">1.63× slower</td></tr>
+</tbody>
+</table>
+
+<div class="box warn">
+<span class="lbl">What 1.59× does and does not mean</span>
+<p>It is Titan versus stock vLLM, <em>both running under vLLM</em>. It is not a claim that Titan
+beats Mirage. Mirage's standalone driver decodes GPT-OSS 120B at 2.144 ms/token; Titan through
+vLLM is 2.921 — <strong>0.78 ms behind</strong>, and that has to be said in the same breath as the
+1.59×.</p>
+</div>
+
+<h3>The full decomposition</h3>
+
+<table>
+<thead><tr><th>Stage</th><th class="num">ms/tok</th><th class="num">Δ</th><th>What the delta is</th></tr></thead>
+<tbody>
+<tr><td>Mirage, standalone</td><td class="num">2.144</td><td class="num">—</td>
+    <td>Reference. Scheduler supplies inter-layer ordering for free.</td></tr>
+<tr><td>Titan megakernel, GPU only</td><td class="num">~2.39</td><td class="num">+0.25</td>
+    <td>124.5 µs of inter-layer barrier (measured), plus ~0.12 ms spread across phases.</td></tr>
+<tr><td>Titan standalone, end-to-end</td><td class="num">2.502</td><td class="num">+0.11</td>
+    <td>Its own Python driver, ~46 µs/token of host work.</td></tr>
+<tr><td><strong>Titan through vLLM</strong></td><td class="num"><strong>2.921</strong></td><td class="num">+0.42</td>
+    <td>vLLM's scheduler, the sampler, block-table bookkeeping, host round-trip.</td></tr>
+<tr><td>Stock through vLLM</td><td class="num">4.658</td><td class="num">+1.74</td><td>—</td></tr>
+</tbody>
+</table>
+
+<figure>
+<svg viewBox="0 0 1040 300" role="img" aria-label="Waterfall from Mirage standalone to stock vLLM">
+  <!-- scale: 0 to 5.0 ms over x=170..1010 => 168 px per ms -->
+  <g stroke="#e2e6eb" stroke-width="1">
+    <line x1="170" y1="34" x2="170" y2="250"/><line x1="338" y1="34" x2="338" y2="250"/>
+    <line x1="506" y1="34" x2="506" y2="250"/><line x1="674" y1="34" x2="674" y2="250"/>
+    <line x1="842" y1="34" x2="842" y2="250"/><line x1="1010" y1="34" x2="1010" y2="250"/>
+  </g>
+  <g font-size="10" fill="#5a6472" text-anchor="middle">
+    <text x="170" y="268">0</text><text x="338" y="268">1</text><text x="506" y="268">2</text>
+    <text x="674" y="268">3</text><text x="842" y="268">4</text><text x="1010" y="268">5</text>
+    <text x="590" y="286" font-size="11">ms per decoded token, batch size 1 — shorter is better</text>
+  </g>
+
+  <g font-size="11.5">
+    <!-- Mirage 2.144 -->
+    <text x="164" y="52" text-anchor="end">Mirage, standalone</text>
+    <rect x="170" y="40" width="360" height="24" fill="#5a6472" opacity="0.55"/>
+    <text x="540" y="57" class="m" font-size="11">2.144</text>
+
+    <!-- Titan GPU 2.39 -->
+    <text x="164" y="92" text-anchor="end">Titan megakernel, GPU only</text>
+    <rect x="170" y="80" width="360" height="24" fill="#0b5fa5" opacity="0.75"/>
+    <rect x="530" y="80" width="41" height="24" fill="#c0392b" opacity="0.7"/>
+    <text x="581" y="97" class="m" font-size="11">~2.39</text>
+    <text x="630" y="97" font-size="10.5" fill="#c0392b">+0.25 — 124.5 µs is the inter-layer barrier, measured</text>
+
+    <!-- Titan standalone 2.502 -->
+    <text x="164" y="132" text-anchor="end">Titan, standalone e2e</text>
+    <rect x="170" y="120" width="401" height="24" fill="#0b5fa5" opacity="0.75"/>
+    <rect x="571" y="120" width="19" height="24" fill="#e0b400" opacity="0.8"/>
+    <text x="600" y="137" class="m" font-size="11">2.502</text>
+    <text x="650" y="137" font-size="10.5" fill="#5a6472">+0.11 — its own Python driver, ~46 µs/token of host work</text>
+
+    <!-- Titan vllm 2.921 -->
+    <text x="164" y="172" text-anchor="end" font-weight="700">Titan through vLLM</text>
+    <rect x="170" y="160" width="420" height="24" fill="#0b5fa5"/>
+    <rect x="590" y="160" width="70" height="24" fill="#e0b400" opacity="0.8"/>
+    <text x="670" y="177" class="m" font-size="11" font-weight="700">2.921</text>
+    <text x="722" y="177" font-size="10.5" fill="#5a6472">+0.42 — scheduler, sampler, block tables</text>
+
+    <!-- stock 4.658 -->
+    <text x="164" y="212" text-anchor="end">Stock vLLM, graphs ON</text>
+    <rect x="170" y="200" width="782" height="24" fill="#c0392b" opacity="0.55"/>
+    <text x="962" y="217" class="m" font-size="11">4.658</text>
+  </g>
+
+  <!-- brackets -->
+  <line x1="590" y1="192" x2="952" y2="192" stroke="#2e7d4f" stroke-width="1.4"/>
+  <text x="771" y="188" font-size="11" fill="#2e7d4f" text-anchor="middle" font-weight="700">1.59× faster than stock</text>
+  <line x1="530" y1="18" x2="590" y2="18" stroke="#c0392b" stroke-width="1.4"/>
+  <text x="560" y="14" font-size="10.5" fill="#c0392b" text-anchor="middle">0.78 behind Mirage</text>
+
+  <!-- legend -->
+  <g font-size="10" fill="#5a6472">
+    <rect x="170" y="0" width="11" height="11" fill="#0b5fa5"/><text x="187" y="9">megakernel</text>
+    <rect x="262" y="0" width="11" height="11" fill="#c0392b" opacity="0.7"/><text x="279" y="9">barrier</text>
+    <rect x="336" y="0" width="11" height="11" fill="#e0b400" opacity="0.8"/><text x="353" y="9">host / integration</text>
+  </g>
+</svg>
+<figcaption><b>Figure 13.</b> Every step is measured, not modelled. The two facts that have to
+be said together: Titan is 1.59× faster than stock vLLM, and 0.78 ms behind Mirage's
+standalone driver. Roughly 0.42 ms of that 0.78 is the price of being a real serving backend;
+the remaining ~0.36 ms is the kernel, and it is the barrier.</figcaption>
+</figure>
+
+<p>That 0.42 ms is sampler, continuous batching, and vLLM block-table bookkeeping &#8212; work
+Mirage's greedy-only standalone driver simply does not do. Not a kernel deficiency, and not
+free either.</p>
+
+<p>Qwen3 shows the same overhead through a different kernel: 6.85 ms standalone → 7.28 ms
+through vLLM, about 0.43 ms. Two models paying a similar absolute cost through different kernels
+is good evidence the overhead belongs to the integration, not to either kernel.</p>
+
+<h3>The two architectures land on opposite sides of stock, and that is the finding</h3>
+<p>GPT-OSS runs the fused single-barrier pipeline and beats stock. Qwen3 still runs the older
+multi-barrier dense kernel — re-converged against the generator, but its body never
+rewritten. Its number barely moved across the rebase (7.33 → 7.28), placing the regression in
+the kernel, not the plugin. "Titan is ~23% slower than stock" still holds for the dense path, but
+is a statement about which kernel, not about Titan.</p>
+
+<p>One incidental observation worth keeping: stock vLLM decodes 120B-MoE and 8B-dense at nearly
+the same rate (4.658 vs 4.469 ms/tok). At batch size 1 with graphs, stock's decode is dominated by
+per-layer launch and dispatch rather than weight traffic — and GPT-OSS activates only 4 of 128
+experts per token, so its active parameter count is nowhere near 15× Qwen3's.</p>
+
+<h3>Correctness verification</h3>
+<ul>
+<li><strong>GPT-OSS through vLLM:</strong> token ids <code>[200005, 35644, 200008, 976, 1825,
+10648, 261, 5678]</code> — identical to the standalone driver. First token 35644
+(<code>'analysis'</code>) is the standing correctness gate. Output is coherent prose with the
+correct channel structure.</li>
+<li><strong>Qwen3 through vLLM:</strong> token ids identical to the standalone
+<code>demo_qwen3_8b.py</code> run — the tighter check, since it is the same kernel and weights
+under a different driver.</li>
+<li><strong>Zero-copy invariant:</strong> the <code>data_ptr</code> guard passes for all 36
+layers; the <code>block_size == PAGE_SIZE</code> assert passes at 128.</li>
+<li><strong>Parity vs stock:</strong> GPT-OSS 15/20 tokens identical, Qwen3 14/20, each then
+branching to a fluent synonym.</li>
+</ul>
+
+<div class="box note">
+<span class="lbl">Divergence position is not a corruption signal</span>
+<p>Titan runs MXFP4 weights and fp8 activations against stock's bf16, so logits differ slightly
+and a near-tie eventually resolves the other way. Expected, not a defect — corruption looks
+like a re-emitted prefill token, doubled words, or a degenerate repeat, not a fluent synonym 14
+tokens in. MoE W2 also accumulates 4 experts with float <code>atomicAdd</code>, so
+bit-reproducibility is a bonus, not a gate.</p>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="open">13. Open items and known-dead directions</h2>
+
+<h3>Open: Titan cannot be hipGraph-captured</h3>
+<pre><code>File "titan_vllm/mixin.py", line 180, in forward
+    cur_pos = int(positions[0].item())
+torch.AcceleratorError: HIP error: operation not permitted when stream is capturing</code></pre>
+
+<p><code>.item()</code> is a device-to-host sync, which HIP forbids inside a capture region.
+There are two such syncs, and removing them is more than deleting the <code>.item()</code>:</p>
+<ul>
+<li><code>cur_pos</code> drives <strong>host-side control flow</strong>:
+<code>num_pages_used = (cur_pos + page_size) // page_size</code> sizes a <em>dynamic-length</em>
+slice of <code>kv_indices</code>. A captured graph freezes whatever length it recorded.</li>
+<li><code>token_id</code> is a <strong>by-value launch argument</strong>, so a captured graph
+would decode the same token forever — a plausible degenerate repeat, not a clean error.</li>
+</ul>
+<p>The <code>token_id</code> half is already solved in the kernel ABI and merely unused by the
+plugin: <code>GptConfig</code> carries <code>cur_token_ptr</code> alongside
+<code>cur_token_id</code>, and the kernel does <code>int cur_token = config.cur_token_ptr ?
+*config.cur_token_ptr : config.cur_token_id;</code> — a device-side read, which is capture-safe.
+The plugin passes <code>nullptr</code> today. <code>cur_pos</code> is the harder half and needs
+the page-count arithmetic moved on-device.</p>
+
+<div class="box note">
+<span class="lbl">Bound the payoff before doing the work</span>
+<p>With <code>TITAN_PROFILE=1</code> the megakernel's own GPU time is ~2.38 ms against 2.921 ms
+end-to-end, so everything host-side — scheduler, sampler, launch, round-trip — is ~0.54 ms/token.
+That is the ceiling on what capture could recover, and capture would take only part of it. It was
+~0.83 ms before the fused-logits change took a bite out of it.</p>
+</div>
+
+<h3>Open: the dense pipeline</h3>
+<p>Qwen3 is 1.63× slower than stock because it still runs the multi-barrier dense kernel.
+Porting the fused single-barrier pipeline to it is the change that would close this. The
+fused-logits trick does not apply — the dense kernel has no <code>logits_output</code> in its ABI
+— and would not close the gap anyway.</p>
+
+<h3>Two levers remain on GPT-OSS, and neither reaches 2.1 through vLLM</h3>
+<ol>
+<li><strong>hipGraph capture</strong> — ceiling 0.54 ms, realistically a fraction of it.</li>
+<li><strong>Overlapping the inter-layer barrier</strong> — 124.5 µs, and it cannot be deleted
+outright (§6).</li>
+</ol>
+
+<h3>Known-dead — do not re-litigate</h3>
+<table>
+<thead><tr><th>Attempt</th><th class="num">Result</th></tr></thead>
+<tbody>
+<tr><td><code>W13_OPW = 64</code></td><td class="num">+280 µs/tok</td></tr>
+<tr><td><code>W2_OPW = 128</code></td><td class="num">+142 µs/tok</td></tr>
+<tr><td>Single-worker last-layer ResAdd (Mirage's version)</td><td class="num">~1.1 ms/tok</td></tr>
+<tr><td>Per-expert MoE barriers</td><td class="num">failed — pipeline drain</td></tr>
+<tr><td>BF16 router GEMV fused into RMSNorm2</td><td class="num">3.5× slower</td></tr>
+<tr><td>SwiGLU fused into W2 quantization</td><td class="num">7× regression</td></tr>
+<tr><td>Deleting the inter-layer barrier</td><td class="num">2.008 ms, garbage output</td></tr>
+<tr><td>Heavier inter-layer barrier primitive</td><td class="num">SGPR spills, 40%+ slower</td></tr>
+</tbody>
+</table>
+
+<h3>Silent-corruption hazards, collected</h3>
+<ul>
+<li>The three <code>*_OPW</code> constants control weight packing in the driver <em>and</em>
+GEMM tiling in the kernel. Change one file only → garbage, no crash.</li>
+<li>All 23 Mirage template parameters are <code>int</code>/<code>bool</code>. Transposing two
+compiles cleanly.</li>
+<li><code>COUNTERS_PER_LAYER</code>: 40 vs the real 103 is a 2.5× under-allocation that
+corrupts live barriers.</li>
+<li>Dropping the rank-counter modulo breaks on token 2, not token 1.</li>
+<li>A ctypes <code>argtypes</code> list that is short or transposed is stack corruption
+reproducible only under one of four env-selected decode paths.</li>
+<li>Without <code>pip install -e</code>, <code>VLLM_PLUGINS=titan</code> silently runs stock.</li>
+</ul>
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<h2 id="repro">14. Reproduction</h2>
+
+<h4>Regenerate and build</h4>
+<pre><code># NEVER omit --output-dir: main() writes the driver to the repo root.
+python3 titan_generate.py configs/gpt_oss_120b.yaml --output-dir /tmp/titan_regen
+
+cmp /tmp/titan_regen/generated/gpt_oss_120b_kernel.cuh generated/gpt_oss_120b_kernel.cuh
+cmp /tmp/titan_regen/demo_gpt_oss_120b.py             demo_gpt_oss_120b.py
+# cmp, not diff -- it catches CRLF, trailing whitespace, and final-newline drift.
+
+bash build_gpt_oss_120b.sh          # expect: 226 VGPR, 0 VGPR spills, 2 waves/SIMD
+nm -D --defined-only generated/gpt_oss_120b.so | grep -c ' T '   # expect 14</code></pre>
+
+<h4>Standalone decode</h4>
+<pre><code>HIP_VISIBLE_DEVICES=0 timeout 300 python3 demo_gpt_oss_120b.py \
+  --model-path /home/claudeuser/models/gpt-oss-120b \
+  --prompt "Tell me the history of america" --max-seq-length 150
+# gate: iter 1 next_token=35644 ('analysis'); Non-outlier avg ~2.50 ms/token</code></pre>
+
+<h4>Through vLLM</h4>
+<pre><code># once, or VLLM_PLUGINS=titan silently does nothing
+python3 -m pip install -e titan_vllm --no-deps --no-build-isolation
+python3 -c "import importlib.metadata as m; \
+  print([e.value for e in m.entry_points(group='vllm.general_plugins')])"
+
+export TITAN_MODEL=/home/claudeuser/models/gpt-oss-120b
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=      python3 -m titan_vllm.harness   # stock baseline
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan TITAN_TEMP=0 python3 -m titan_vllm.harness
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan python3 -m titan_vllm.bench     # graphs ON for stock
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan BENCH_EAGER=1 python3 -m titan_vllm.bench</code></pre>
+
+<p>The harness and bench set the required environment automatically:
+<code>VLLM_ROCM_USE_AITER=1</code>, <code>VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1</code>,
+<code>block_size=128</code>, <code>disable_hybrid_kv_cache_manager=True</code>.
+<code>VLLM_ATTENTION_BACKEND=ROCM_AITER_FA</code> is deliberately <em>not</em> used — that string
+forces the removed V0 engine.</p>
+
+<h4>Regression gate (no GPU, sub-second)</h4>
+<pre><code>python3 check_roundtrip.py    # byte-identity for kernel/launch/driver/build × 3 architectures</code></pre>
+
+<div class="box warn">
+<span class="lbl">Operational rules</span>
+<p>Always <code>HIP_VISIBLE_DEVICES=0</code>. Any run past ~3 minutes is hanging — kill it,
+then <code>rm -f /tmp/gpucore*</code>. Read the summary "Non-outlier avg" line rather than
+eyeballing the tail. One incremental change at a time, measured, before the next.</p>
+</div>
+
+<footer>
+Sources: <code>titan_generate.py</code>, <code>configs/gpt_oss_120b.yaml</code>,
+<code>kernels/{barriers,fused_layer,titan_phases,device_functions}.cuh</code>,
+<code>generated/gpt_oss_120b_{kernel.cuh,launch.hip}</code>,
+<code>titan_vllm/*.py</code>, <code>titan_vllm/INTEGRATION.md</code>,
+<code>docs/two_level_fusion.md</code>, <code>docs/titan_vs_mirage_perf_gap.md</code>,
+and the mirage wiki (<code>.claude/wiki/articles/</code>).
+All performance figures are batch size 1, greedy, gfx950, prefill-cancelled, best of 3.
+</footer>
+
+</div>
+</body>
+</html>

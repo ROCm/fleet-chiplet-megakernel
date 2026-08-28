@@ -1,0 +1,48 @@
+## Llama-3.1-8B model configuration for Titan code generator
+## Source: NousResearch/Meta-Llama-3.1-8B HuggingFace config.json
+##
+## Usage: python3 titan_generate.py configs/llama3_8b.yaml
+
+model:
+  name: llama3-8b
+  arch: dense
+  num_layers: 32
+  hidden_size: 4096
+  intermediate_size: 14336
+  vocab_size: 128256
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  activation: swiglu
+  has_qk_norm: false      # Llama does NOT have per-head QK RMSNorm
+  has_bias: false
+  rope_theta: 500000.0
+  rms_norm_eps: 1.0e-5
+  max_position_embeddings: 131072
+
+gpu:
+  target: gfx950
+  num_xcds: 8
+  workers_per_xcd: 30
+  page_size: 4096
+  max_seq_len: 512
+  num_kv_chunks: 8
+
+quantization:
+  weight_format: mxfp4
+  output_per_wg: 64
+  gateup_opw: 128         # Doubled for fused SwiGLU (64 gate + 64 up per WG)
+
+build:
+  ## Same reason as configs/qwen3_8b.yaml: the dense kernel calls
+  ## titan::gemm_mxfp4 and titan::rope_kv_update, both of which commit f2354a7
+  ## fenced behind TITAN_ENABLE_LEGACY. Without this define hipcc reports 14
+  ## errors, all tracing to those two.
+  ##
+  ## qwen3_8b.yaml got the define when the guards landed; this config did not,
+  ## so build_llama3_8b.sh has not compiled since f2354a7 -- generated/llama3_8b.so
+  ## predates it. The round-trip gate did not catch this because it compares the
+  ## emitted script to the on-disk script and both were equally broken; only
+  ## actually running hipcc finds it.
+  extra_defines:
+    - TITAN_ENABLE_LEGACY

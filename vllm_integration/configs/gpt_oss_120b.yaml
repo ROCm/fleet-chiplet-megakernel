@@ -1,0 +1,127 @@
+## GPT-OSS 120B MoE model configuration for Titan code generator
+## Source: /home/claudeuser/models/gpt-oss-120b/config.json
+##
+## Usage: python3 titan_generate.py configs/gpt_oss_120b.yaml
+
+model:
+  name: gpt-oss-120b
+  arch: moe
+  num_layers: 36
+  hidden_size: 2880
+  intermediate_size: 2880           # dense intermediate (not used for MoE FFN)
+  vocab_size: 201088
+  num_q_heads: 64
+  num_kv_heads: 8
+  head_dim: 64
+  activation: swiglu
+  has_qk_norm: false
+  has_bias: true                    # attention_bias=True
+  rope_theta: 150000.0
+  rms_norm_eps: 1.0e-5
+  max_position_embeddings: 131072
+
+moe:
+  num_experts: 128
+  num_experts_per_tok: 4
+  moe_intermediate_size: 2880
+  shared_expert_intermediate_size: 0  # no shared expert
+  ## w13_output_per_wg / w2_output_per_wg live in the `measured:` section below:
+  ## they are search results, not properties of the model.
+
+gpu:
+  target: gfx950
+  num_xcds: 8
+  workers_per_xcd: 30
+  ## KV pages, in tokens. Compile-time: it is a template parameter to both
+  ## rope_kv_update and paged_attention_minimal_decode_hd64, so the driver's
+  ## page_size and the kernel's PAGE_SIZE must be generated together or KV
+  ## addressing is silently wrong.
+  ##
+  ## 16 rather than 4096 because titan_vllm aliases vLLM's KV pool zero-copy,
+  ## which requires block_size == PAGE_SIZE, and 16 is vLLM's *default* ROCm
+  ## block size. Running at the default is the point: it means titan binds to a
+  ## stock-configured engine with no block_size override, rather than requiring
+  ## every caller to know titan's page size.
+  ##
+  ## History: 4096 -> 128 was the first step (vLLM caps block_size at 256,
+  ## BlockSize = Literal[1, 8, 16, 32, 64, 128, 256] in vllm/config/cache.py),
+  ## measured free at 2.501 -> 2.491 ms/tok with identical registers. 128 was
+  ## chosen then as the largest power of two fitting the aiter unified backend's
+  ## LDS budget (block_size * 1024 B against 160 KB).
+  ##
+  ## PAGE_SIZE only feeds address arithmetic (kv_indices[tok / PAGE_SIZE],
+  ## tok % PAGE_SIZE) and seqlen_k -- no LDS sizing, no unroll factor -- so
+  ## there is no reason to expect a page-size sweep to pay either way. What 16
+  ## *does* change is that a 512-token sequence now spans 32 pages instead of 4,
+  ## so kv_indices is 8x longer and the per-page indirection runs 8x as often.
+  ## That is address arithmetic, not bandwidth, but it is not nothing -- measure
+  ## rather than assume the 128 number carries over.
+  page_size: 16
+  max_seq_len: 512
+  num_kv_chunks: 8
+
+quantization:
+  weight_format: mxfp4
+  output_per_wg: 64
+
+attention:
+  ## GPT-OSS alternates attention types per layer: even layers are
+  ## "sliding_attention" with a 128-token window, odd layers are
+  ## "full_attention" (window 0 = unlimited). Only 'uniform' and 'alternating'
+  ## are supported -- anything else needs a new emitter arm, not a new value.
+  sliding_window: 128
+  sliding_window_pattern: alternating
+
+build:
+  ## The live 2.548 ms/tok build uses all of these. The dense models keep the
+  ## O2 / no-rdc / no-extra / mirage-headers defaults so their build scripts stay
+  ## byte-identical -- check_roundtrip.py gates that.
+  opt_level: O3
+  rdc: true
+
+  ## GPT-OSS is the only config ported to fleet's calling convention, so it is
+  ## the only one that may flip the header tree. Setting this also emits
+  ## -DTITAN_FLEET_HEADERS, -DMPK_MAX_NUM_BATCHED_REQUESTS=1 and
+  ## -DMPK_PREFETCH_NEXT_QKV: those are the convention, not tuning, and two of
+  ## the three miscompile SILENTLY if dropped, so they are derived from this key
+  ## rather than listed by hand in extra_defines.
+  ##
+  ## Fleet is used out of the box -- on the include path, never copied, never
+  ## edited. Branch amd&lowbar;mi355&lowbar;gpt&lowbar;oss120b.
+  ##
+  ## Since this tree moved under fleet (as vllm&lowbar;integration/), header&lowbar;dir names
+  ## its OWN grandparent. It is still an absolute path rather than a derived one
+  ## because it is interpolated into the emitted build script, which
+  ## check&lowbar;roundtrip.py compares BYTE for byte -- deriving it would change those
+  ## bytes and would have to be landed as a regeneration, not an edit. The
+  ## emitted script honours $FLEET&lowbar;DIR from the environment, so a checkout
+  ## elsewhere overrides it without touching this file.
+  headers: fleet
+  header_dir: /home/claudeuser/fleet-chiplet-megakernel
+
+  ## MPK_W13_LDS_PREFETCH is NOT in extra_defines: it needs to be switchable off
+  ## from the environment (TITAN_NO_W13_PREFETCH=1) so an A/B pair can differ in
+  ## the prefetch and nothing else.
+  w13_prefetch_toggle: true
+
+measured:
+  ## Search results, not derivations. Each carries the alternative that was tried
+  ## and what it cost, so the next person does not re-run the experiment.
+  ##
+  ## oproj_output_per_wg: pinned, not corrected. The auto-derivation tries
+  ## 64, 32, 16 and lands on 16 by itself -- 2944/64 = 46 tiles and 46 % 8 != 0,
+  ## so 64 and 32 are both rejected. Declared here so the measured value is
+  ## visible next to the other two, and so the derivation is asserted against
+  ## it rather than trusted silently.
+  oproj_output_per_wg: 16
+  ## w13: OPW=64 measured +280 us/tok (2.818 vs 2.537 ms) despite eliminating all
+  ## 60 padding tiles. W13 wants FAT tiles -- LDS weight reuse across 2 MFMA rounds.
+  w13_output_per_wg: 128
+  ## w2: OPW=128 measured +142 us/tok (2517 vs 2375 us) despite halving tile count.
+  ## W2 wants THIN tiles -- parallelism hides HBM latency. OPPOSITE sign to w13.
+  ## Symmetrizing these two is the most tempting and most expensive wrong move.
+  w2_output_per_wg: 64
+  ## Derivable, and cross-checked against the formula in load_and_validate. The
+  ## formula reproduces all three historical values: 53 (128/64), 83 (64/64),
+  ## 42 (128/128).
+  moe_total_tiles_per_xcd: 53

@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Titan — a static generator for fused decode megakernels</title>
+<style>
+  :root {
+    --bg:#ffffff; --fg:#1a1a1a; --muted:#5a6472; --rule:#e2e6eb;
+    --accent:#0b5fa5; --accent-soft:#eef5fb;
+    --warn-bg:#fff8e6; --warn-br:#e0b400;
+    --bad-bg:#fdf0ef;  --bad-br:#c0392b;
+    --good-bg:#eef8f0; --good-br:#2e7d4f;
+    --code-bg:#f6f7f9;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; background:#e9edf1; color:var(--fg);
+    font:16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+
+  /* ---- one slide = one 16:9 page ---- */
+  .slide {
+    position:relative; width:1120px; min-height:630px; margin:26px auto;
+    background:var(--bg); border:1px solid #c9d2da; border-radius:6px;
+    padding:44px 56px 58px; display:flex; flex-direction:column;
+    box-shadow:0 2px 10px rgba(20,30,40,.09);
+  }
+  .slide > .num {
+    position:absolute; right:22px; bottom:14px;
+    font-family:var(--mono); font-size:12px; color:#9aa5b1;
+  }
+  .slide > .tag {
+    position:absolute; left:56px; top:18px;
+    font-size:11px; letter-spacing:1.4px; text-transform:uppercase;
+    color:var(--accent); font-weight:700;
+  }
+  h1 { font-size:40px; line-height:1.15; margin:0 0 10px; letter-spacing:-0.8px; }
+  h2 { font-size:29px; line-height:1.2; margin:14px 0 6px; letter-spacing:-0.4px; }
+  .sub { font-size:17px; color:var(--muted); margin:0 0 18px; }
+  p { margin:11px 0; }
+  ul { margin:12px 0; padding-left:24px; } li { margin:9px 0; }
+  b, strong { font-weight:700; }
+  code { font-family:var(--mono); font-size:0.87em; background:var(--code-bg);
+         padding:1px 5px; border-radius:3px; }
+  pre { background:var(--code-bg); border:1px solid var(--rule); border-left:3px solid var(--accent);
+        padding:12px 14px; overflow-x:auto; border-radius:4px; margin:12px 0; }
+  pre code { background:none; padding:0; font-size:12.5px; line-height:1.5; }
+
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14.5px; }
+  th,td { border:1px solid var(--rule); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--accent-soft); font-weight:600; }
+  td.num, th.num { text-align:right; font-family:var(--mono); white-space:nowrap; }
+  tbody tr:nth-child(even) { background:#fafbfc; }
+
+  .box { border-radius:5px; padding:13px 17px; margin:16px 0; border-left:4px solid; }
+  .box p:first-child { margin-top:0; } .box p:last-child { margin-bottom:0; }
+  .box .lbl { font-weight:700; text-transform:uppercase; font-size:11.5px;
+              letter-spacing:.8px; display:block; margin-bottom:4px; }
+  .warn{background:var(--warn-bg);border-color:var(--warn-br);}
+  .bad {background:var(--bad-bg); border-color:var(--bad-br);}
+  .good{background:var(--good-bg);border-color:var(--good-br);}
+  .note{background:var(--accent-soft);border-color:var(--accent);}
+
+  .stat-row { display:flex; flex-wrap:wrap; gap:12px; margin:18px 0; }
+  .stat { flex:1 1 150px; border:1px solid var(--rule); border-radius:5px;
+          padding:11px 13px; background:#fff; }
+  .stat .v { font-size:25px; font-weight:700; font-family:var(--mono); letter-spacing:-1px; }
+  .stat .k { font-size:11.5px; color:var(--muted); text-transform:uppercase;
+             letter-spacing:.5px; margin-top:2px; }
+
+  figure { margin:14px 0; }
+  figure svg { display:block; width:100%; height:auto; }
+  figcaption { font-size:12.5px; color:var(--muted); margin-top:7px; line-height:1.45; }
+  figcaption b { color:var(--fg); }
+  svg text { font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  svg text.m { font-family:var(--mono); }
+
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:22px; }
+  .kicker { font-size:19px; line-height:1.45; }
+  .big { font-size:23px; line-height:1.4; font-weight:600; letter-spacing:-.3px; }
+  .muted { color:var(--muted); }
+  .rule { border:0; border-top:1px solid var(--rule); margin:16px 0; }
+  .cite { font-size:12.5px; color:var(--muted); font-style:normal; }
+  .cite a { color:var(--accent); text-decoration:none; }
+
+  /* deck index */
+  .index { width:1120px; margin:26px auto; background:#fff; border:1px solid #c9d2da;
+           border-radius:6px; padding:30px 56px 36px; }
+  .index ol { columns:2; column-gap:44px; font-size:14.5px; }
+  .index a { color:var(--accent); text-decoration:none; }
+  .index a:hover { text-decoration:underline; }
+
+  @media print {
+    html,body { background:#fff; }
+    .index { display:none; }
+    .slide { margin:0; border:0; border-radius:0; box-shadow:none;
+             page-break-after:always; width:100%; min-height:0; height:100vh; }
+    @page { size:1120px 630px; margin:0; }
+  }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <marker id="ar"  markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#5a6472"/></marker>
+  <marker id="ab"  markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#5a6472"/></marker>
+  <marker id="arR" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#c0392b"/></marker>
+  <marker id="ag"  markerWidth="9" markerHeight="9" refX="8" refY="3.2" orient="auto">
+    <path d="M0,0 L8,3.2 L0,6.4 z" fill="#0b5fa5"/></marker>
+</defs></svg>
+<div class="index"><h2 style="margin-top:0">Titan — deck contents</h2>
+<ol><li><a href="#s1">Mirage: dynamic task dispatch is not free</a></li><li><a href="#s2">Titan</a></li><li><a href="#s3">Make it static, and generate it</a></li><li><a href="#s4">What is generated, what is not</a></li><li><a href="#s5">What the generator emits</a></li><li><a href="#s6">The whole model is one kernel</a></li><li><a href="#s7">Inside one layer: the library, called in order</a></li><li><a href="#s8">Adding a model: Mistral-7B, start to finish</a></li><li><a href="#s9">Prefill on vLLM, decode on the megakernel</a></li><li><a href="#s10">Zero-copy KV</a></li><li><a href="#s11">Where it lands</a></li><li><a href="#s12">What did not work</a></li><li><a href="#s13">Where this falls over</a></li><li><a href="#s14">What we would build next</a></li><li><a href="#s15">Where this sits</a></li><li><a href="#s16">Takeaways</a></li></ol>
+<p class="cite">16 slides, 16:9. Print to PDF at 1120×630. Full architecture document: <a href="titan-architecture.html">titan-architecture.html</a>.</p></div>
+<div class="slide" id="s1">
+<div class="tag">Problem</div>
+<h2>Mirage: dynamic task dispatch is not free</h2>
+
+<p>The megakernel systems we build on (MPK / Mirage) run a <b>task graph inside the
+kernel</b>:</p>
+<ul style="margin:10px 0">
+<li>Work is cut into <b>tasks</b>, each with a <code>dependent_event</code> and a
+    <code>trigger_event</code>.</li>
+<li><b>Scheduler workgroups</b> pop ready events into <b>per-worker queues</b>.</li>
+<li>A <b>worker</b> polls its queue, loads a <code>TaskDesc</code>, runs it, bumps an event counter.</li>
+</ul>
+<p>That machinery buys real things: ragged batches, load balancing, and any workload whose <em>tile
+count</em> is only known at runtime — <b>sparse attention</b> above all. Under <b>expert parallelism</b>
+across GPUs it earns its keep twice over: top-<i>k</i> routing sends a data-dependent number of tokens
+to each expert, so without rebalancing some GPUs sit idle while others queue.</p>
+
+<p><b>None of that applies to dense decode at small batch sizes</b> — and it is still paid for, at
+every task boundary, per layer, per token.</p>
+<div class="num">1 / 16</div>
+</div>
+<div class="slide" id="s2">
+<div style="margin:auto 0">
+<h1 style="font-size:46px">Titan</h1>
+<p class="sub" style="font-size:20px;max-width:870px">A <b>static generator</b> for fused
+decode kernels. One launch runs the whole model, and what each worker does is
+decided when the kernel is generated — not while it executes.</p>
+
+<hr class="rule">
+
+<div class="stat-row">
+  <div class="stat"><div class="v">no scheduler</div><div class="k">work → worker is compile-time</div></div>
+  <div class="stat"><div class="v">no task queue</div><div class="k">no dispatch on the critical path</div></div>
+  <div class="stat"><div class="v">one YAML</div><div class="k">to add a model</div></div>
+  <div class="stat"><div class="v">one launch</div><div class="k">per token, all layers inside</div></div>
+</div>
+
+<p class="muted" style="font-size:14px;margin-top:26px">
+AMD MI350X · gfx950 · ROCm &nbsp;·&nbsp; GPT-OSS 120B (MoE, MXFP4) and Qwen3-8B (dense)
+&nbsp;·&nbsp; batch size 1, decode only &nbsp;·&nbsp; served through vLLM</p>
+</div>
+<div class="num">2 / 16</div>
+</div>
+<div class="slide" id="s3">
+<div class="tag">Approach</div>
+<h2>Make it static, and generate it</h2>
+
+<div class="box note" style="margin-top:6px">
+<p class="big" style="margin:0">If the fast configuration of a dynamic system is the one where
+dispatch has been precomputed by hand, emit that end state directly — and emit it from a
+<em>description of the model</em>, so it costs nothing to do again for the next one.</p>
+</div>
+
+<div class="two" style="margin-top:16px">
+<div>
+<p><b>Static.</b> No task graph, no scheduler, no queues. Each worker derives the tiles it owns
+from <code>static constexpr</code> arithmetic on its own id, and ordering is a fixed sequence of
+phases separated by explicit barriers.</p>
+<p><b>Generated.</b> That mapping comes from a YAML description — shapes, head counts, quantization,
+tile widths — written out as HIP source against the existing device library.</p>
+</div>
+<div>
+<div class="box good" style="margin:0">
+<span class="lbl">The goal</span>
+<p>Support a new model <b>without writing kernels</b>. The generator can be cheap precisely because
+the library is expensive.</p>
+</div>
+<p class="muted" style="font-size:14.5px;margin-top:12px">The claim is that static is
+<em>sufficient at this operating point</em> — not that runtime scheduling is wrong in general.</p>
+</div>
+</div>
+<div class="num">3 / 16</div>
+</div>
+<div class="slide" id="s4">
+<div class="tag">How</div>
+<h2>What is generated, what is not</h2>
+<figure>
+<svg viewBox="0 0 1040 344" role="img" aria-label="Mirage's compiler emits calls into a hand-written device library; Titan emits the same calls from a YAML table">
+  <text x="0" y="13" font-size="13" font-weight="700" fill="#0b5fa5">MIRAGE (MPK) — dynamic: search the graph, then schedule a DAG at runtime</text>
+
+  <g font-size="11" text-anchor="middle">
+    <rect x="0"   y="26" width="150" height="48" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+    <text x="75"  y="46" font-weight="600">superoptimizer</text>
+    <text x="75"  y="62" font-size="10" fill="#5a6472">src/search · 6 598 ln</text>
+
+    <rect x="186" y="26" width="150" height="48" fill="#eef5fb" stroke="#0b5fa5" rx="4"/>
+    <text x="261" y="46" font-weight="600">transpile + codegen</text>
+    <text x="261" y="62" font-size="10" fill="#5a6472">8 863 + 8 066 ln</text>
+
+    <rect x="372" y="26" width="164" height="48" fill="#fff" stroke="#0b5fa5" rx="4"/>
+    <text x="454" y="46" font-weight="600">301-task DAG</text>
+    <text x="454" y="62" font-size="10" fill="#5a6472">+ 8 scheduler workgroups</text>
+  </g>
+  <g stroke="#5a6472" fill="none" marker-end="url(#ar)">
+    <path d="M150,50 L182,50"/><path d="M336,50 L368,50"/><path d="M536,50 L586,50"/>
+  </g>
+
+  <rect x="590" y="26" width="450" height="48" fill="#fff8e6" stroke="#e0b400" rx="4"/>
+  <text x="602" y="45" font-size="11" font-weight="700" fill="#8a6d00">…and what it emits is a CALL STRING, never a body</text>
+  <text x="602" y="63" font-size="10" class="m" fill="#5a6472">kernel::gang_moe_pipelined_mxfp4_kernel_mi300&lt;…&gt;(ptrs, tile_idx);</text>
+
+  <text x="0" y="112" font-size="13" font-weight="700" fill="#2e7d4f">TITAN — static: at batch size 1 the shapes are known at generate time, so skip the search</text>
+
+  <g font-size="11" text-anchor="middle">
+    <rect x="0"   y="125" width="150" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+    <text x="75"  y="145" font-weight="600">one YAML</text>
+    <text x="75"  y="161" font-size="10" fill="#5a6472">34–93 lines</text>
+
+    <rect x="186" y="125" width="150" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+    <text x="261" y="145" font-weight="600">derive + assert</text>
+    <text x="261" y="161" font-size="10" fill="#5a6472">titan_generate.py</text>
+
+    <rect x="372" y="125" width="164" height="48" fill="#fff" stroke="#2e7d4f" rx="4"/>
+    <text x="454" y="145" font-weight="600">850-line layer loop</text>
+    <text x="454" y="161" font-size="10" fill="#5a6472">no scheduler, no DAG</text>
+  </g>
+  <g stroke="#5a6472" fill="none" marker-end="url(#ar)">
+    <path d="M150,149 L182,149"/><path d="M336,149 L368,149"/><path d="M536,149 L586,149"/>
+  </g>
+
+  <rect x="590" y="125" width="450" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+  <text x="602" y="144" font-size="11" font-weight="700" fill="#2e7d4f">…and it emits the SAME CALL, from a table of constants</text>
+  <text x="602" y="162" font-size="10" class="m" fill="#5a6472">kernel::gang_full_layer_fused_kernel_mi300&lt;…&gt;(ptrs, tile_idx);</text>
+
+  <g stroke="#5a6472" stroke-dasharray="4 3" fill="none">
+    <path d="M815,74 L815,120"/><path d="M815,173 L815,208"/>
+  </g>
+
+  <rect x="0" y="214" width="1040" height="126" fill="#f6f7f9" stroke="#5a6472" rx="4"/>
+  <text x="16" y="236" font-size="13" font-weight="700">THE DEVICE-FUNCTION LIBRARY — hand-written, shared, and the actual asset</text>
+  <text x="16" y="254" font-size="11" fill="#5a6472">50 433 lines. Both paths bottom out here. Neither generator writes a line of it.</text>
+
+  <g font-size="10" text-anchor="middle">
+    <rect x="16"  y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="112" y="286" font-size="11" font-weight="600">MFMA mainloops</text>
+    <text x="112" y="302" fill="#5a6472">depth-4 pipeline,</text><text x="112" y="315" fill="#5a6472">mfma_scale_f32_16x16x128</text>
+
+    <rect x="220" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="316" y="286" font-size="11" font-weight="600">CK-FMHA split-KV</text>
+    <text x="316" y="302" fill="#5a6472">paged attention,</text><text x="316" y="315" fill="#5a6472">8 chunks + merge</text>
+
+    <rect x="424" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="520" y="286" font-size="11" font-weight="600">fused MoE</text>
+    <text x="520" y="302" fill="#5a6472">W13 + SwiGLU + W2,</text><text x="520" y="315" fill="#5a6472">1 806 lines</text>
+
+    <rect x="628" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="724" y="286" font-size="11" font-weight="600">epilogues</text>
+    <text x="724" y="302" fill="#5a6472">ResAdd, RMSNorm,</text><text x="724" y="315" fill="#5a6472">SwiGLU, TopK, argmax</text>
+
+    <rect x="832" y="266" width="192" height="56" fill="#fff" stroke="#5a6472" rx="3"/>
+    <text x="928" y="286" font-size="11" font-weight="600">sync + cache ops</text>
+    <text x="928" y="302" fill="#5a6472">per-XCD release,</text><text x="928" y="315" fill="#5a6472">st_wt / ld_nt</text>
+  </g>
+</svg>
+<figcaption>Mirage's superoptimizer searches the operator graph, but its
+compiler's device-level output is a template instantiation naming a hand-written symbol — 81 such
+symbols, zero generated bodies, and <code>src/search</code> mentions none of them. Titan emits the
+same instantiation from a YAML table instead of from a search. Both bottom out in the same
+library, which is why replacing the top layer costs no kernel performance.</figcaption>
+</figure>
+<div class="two" style="gap:26px;margin-top:2px">
+<div>
+<p style="margin:0 0 6px"><b>Generated per model, from YAML</b></p>
+<ul style="margin:0;font-size:15px">
+<li>Derived constants: tile counts, workers per XCD, strides, padded sizes</li>
+<li>The layer loop, the end-of-layer barrier, the LM-head tail</li>
+<li>One template instantiation per layer body, with its argument list</li>
+<li>Host driver, weight packing, build flags, plugin constants</li>
+</ul>
+</div>
+<div>
+<p style="margin:0 0 6px"><b>Device function library — hand-written, shared by every model</b></p>
+<ul style="margin:0;font-size:15px">
+<li>MFMA GEMM mainloops; MXFP4 and FP8 paths</li>
+<li>Fused epilogues: SwiGLU, bias, residual add, quantize</li>
+<li>Split-KV attention and its merge, RoPE, RMSNorm, TopK</li>
+<li>The barrier primitives</li>
+</ul>
+</div>
+</div>
+<p class="muted" style="font-size:14.5px;margin:10px 0 0">Upstream reaches this library through a
+superoptimizer; Titan reaches it through a table. <b>Neither generates a kernel body.</b></p>
+<div class="num">4 / 16</div>
+</div>
+<div class="slide" id="s5">
+<div class="tag">How</div>
+<h2>What the generator emits</h2>
+
+<div class="two" style="gap:20px">
+<div>
+<p class="muted" style="margin:0 0 6px;font-size:13.5px">You write this —
+<code>configs/qwen3_8b.yaml</code>, near enough entire:</p>
+<pre style="margin:0;padding:9px 12px"><code style="font-size:11.2px;line-height:1.44">model:
+  arch: dense
+  num_layers: 36
+  hidden_size: 4096
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  activation: swiglu
+gpu:
+  num_xcds: 8
+  workers_per_xcd: 30
+quantization:
+  weight_format: mxfp4
+  output_per_wg: 64</code></pre>
+</div>
+<div>
+<p class="muted" style="margin:0 0 6px;font-size:13.5px">You get this — derived, never typed, and
+asserted against the device header:</p>
+<pre style="margin:0;padding:9px 12px"><code style="font-size:11.2px;line-height:1.44">static constexpr int NUM_XCDS        = 8;
+static constexpr int WORKERS_PER_XCD = 30;
+static constexpr int HIDDEN_SIZE     = 2944;
+static constexpr int NUM_KV_HEADS    = 8;
+
+static constexpr int OPROJ_N_WGS =
+        HIDDEN_SIZE / OPROJ_OPW;
+static constexpr int OPROJ_N_WGS_PER_XCD =
+        OPROJ_N_WGS / NUM_XCDS;
+static constexpr int W13_N_WGS =
+        W13_OUTPUT_SIZE / W13_OPW;</code></pre>
+</div>
+</div>
+<p class="muted" style="font-size:14.5px;margin:10px 0 0">Those constants <em>are</em> the work
+decomposition — what replaces the task graph. Only the tile widths are measured; every other
+constant is derived from them by arithmetic.</p>
+<div class="box note" style="margin:10px 0 0;padding:10px 15px">
+<span class="lbl">The mechanism, deliberately boring</span>
+<p>YAML into a validated config object, then string substitution. <b>No IR, no pattern matching, no
+autotuner</b> — the derivation is arithmetic, and ~30 asserts encode what the device library assumes,
+so an unsupported shape fails at generate time rather than hanging. The counter layout is
+<em>parsed</em> out of the device header rather than restated, so it cannot drift.</p>
+</div>
+<div class="num">5 / 16</div>
+</div>
+<div class="slide" id="s6">
+<div class="tag">How</div>
+<h2>The whole model is one kernel</h2>
+
+<p class="muted" style="margin:0 0 7px;font-size:13.5px">Everything the generator emits for
+GPT-OSS 120B, abbreviated but structurally complete.</p>
+
+<div class="two" style="gap:20px">
+<div>
+<pre style="margin:0;padding:9px 13px"><code style="font-size:11.5px;line-height:1.5">__global__ void <b>model_kernel</b>(cfg, ptr_table)
+{
+  <span class="muted">// who am I — arithmetic, no descriptor</span>
+  int <b>tile</b> = xcd * WORKERS_PER_XCD + rank;
+
+  <b>embed</b>(cfg.cur_token);
+  <b>barrier_global</b>(embed_done);
+
+  for (layer = 0; layer &lt; <b>NUM_LAYERS</b>; layer++)
+    <b>full_layer_fused</b>&lt;<span class="muted">tile widths, counts,</span>
+        <span class="muted">head dims, DECODE_ONLY</span>&gt;(
+        ptrs[layer], <b>tile</b>, window(layer));
+
+  <b>barrier_global</b>(layer_done);
+  <b>rmsnorm</b> → <b>lm_head</b> → <b>argmax</b>;
+}</code></pre>
+</div>
+<div>
+<p style="margin-top:0">A model description becomes <b>one templated kernel</b> whose body is calls
+into the device library — one per op, with the derived constants as template arguments. Every
+<b>bold</b> name already existed in the library.</p>
+<p>The generator's whole job is the constant list, the loop, the barriers, and this argument list.
+Nothing is searched for; nothing is scheduled.</p>
+<div class="box note" style="margin:11px 0 0;padding:10px 15px">
+<span class="lbl">Template arguments, not runtime arguments</span>
+<p>Tile widths and counts are <code>constexpr</code>, so the compiler unrolls against them and
+allocates registers for the shape it will actually run — spending at compile time what the dynamic
+version spends per token.</p>
+</div>
+<p class="muted" style="font-size:13.5px;margin:11px 0 0">Next: what one of those calls expands
+to.</p>
+</div>
+</div>
+<div class="num">6 / 16</div>
+</div>
+<div class="slide" id="s7">
+<div class="tag">How</div>
+<h2>Inside one layer: the library, called in order</h2>
+
+<div class="two" style="gap:22px">
+<div>
+<pre style="margin:0;padding:9px 13px"><code style="font-size:11.5px;line-height:1.5"><span class="muted">// this worker's share of layer L, on XCD x</span>
+
+<b>ResAdd→RMSNorm→QKV→RoPE→KV()</b>
+<b>qkv_done()</b>      <span class="muted">// 10 tiles/XCD arrive · XCD-local</span>
+
+<b>Attention()</b>      <span class="muted">// KV chunk `rank`</span>
+<b>chunks_done()</b>   <span class="muted">// 8 chunks arrive · last one merges</span>
+
+<b>Merge()</b>          <span class="muted">// 8 partials, + sinks</span>
+<b>attn_done()</b>     <span class="muted">// 8 merges arrive · frees all 240</span>
+                <span class="muted">// O-proj DMA runs inside this wait</span>
+
+<b>O-proj→ResAdd→RMSNorm→Router→TopK()</b>
+<b>routing_done()</b>  <span class="muted">// 1 WG per expert (128) · last picks top-4</span>
+
+<b>W13→SwiGLU→W2→accumulate()</b>
+<b>layer_done()</b>    <span class="muted">// all 240 arrive · drains the layer</span></code></pre>
+</div>
+<div>
+<p style="margin-top:0">Every name above is a <b>hand-written device function</b>:</p>
+<pre style="margin:0;padding:8px 13px"><code style="font-size:11px;line-height:1.45"><span class="muted">// every library function: 256 threads, 4×wave64</span>
+template&lt;int HEAD_DIM, int NUM_Q_PER_KV,
+         int NUM_KV_HEADS, int PAGE_SIZE,
+         bool HAS_QK_NORM&gt;
+__device__ void <b>rope_kv_update</b>(
+    qkv_output, cos, sin, q_workspace,
+    <b>k_cache</b>, <b>v_cache</b>,   <span class="muted">// vLLM's pages</span>
+    kv_indptr, <b>kv_indices</b>, …,
+    <b>kv_head_idx</b>)      <span class="muted">// = xcd_id</span></code></pre>
+
+</div>
+</div>
+<div class="num">7 / 16</div>
+</div>
+<div class="slide" id="s8">
+<div class="tag">How</div>
+<h2>Adding a model: Mistral-7B, start to finish</h2>
+
+<div class="two" style="gap:20px">
+<div>
+<p class="muted" style="margin:0 0 6px;font-size:13.5px"><b>1.</b> Transcribe
+<code>config.json</code> into a YAML. Nothing here is a decision — it is the model card:</p>
+<pre style="margin:0;padding:8px 12px"><code style="font-size:10.9px;line-height:1.4">model:
+  name: mistral-7b
+  arch: dense
+  num_layers: 32
+  hidden_size: 4096
+  intermediate_size: 14336
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  activation: swiglu
+gpu:
+  num_xcds: 8
+  workers_per_xcd: 30
+quantization:
+  weight_format: mxfp4
+  output_per_wg: 64</code></pre>
+
+<p class="muted" style="margin:9px 0 6px;font-size:13.5px"><b>2.</b> Run the generator:</p>
+<pre style="margin:0;padding:8px 12px"><code style="font-size:10.9px;line-height:1.4">$ python3 titan_generate.py \
+      configs/mistral_7b.yaml</code></pre>
+</div>
+
+<div>
+<p class="muted" style="margin:0 0 6px;font-size:13.5px"><b>3.</b> It derives the constants, checks
+~30 asserts, and emits <b>everything needed to run</b> — nothing else is written by hand:</p>
+<table style="font-size:12.6px;margin:0">
+<tbody>
+<tr><td style="width:47%"><code>mistral_7b_kernel.cuh</code><br>
+    <span class="muted">787 lines</span></td>
+    <td>The constants, the layer loop, the barriers, the LM-head tail</td></tr>
+<tr><td><code>mistral_7b_launch.hip</code><br><span class="muted">152 lines</span></td>
+    <td><code>extern "C"</code> entry point: grid, block, LDS size, one launch, and the
+        CPython wrapper Python calls it through</td></tr>
+<tr><td><code>demo_mistral_7b.py</code><br><span class="muted">686 lines</span></td>
+    <td>Host driver — loads HF weights, <b>quantizes and packs them to the layout the kernel
+        addresses</b>, decodes. Also builds the <b>pointer table</b>: every weight and scratch
+        address, indexed <code>[XCD][layer][slot]</code>, so the kernel resolves all 32 layers
+        without host contact</td></tr>
+<tr><td><code>build_mistral_7b.sh</code><br><span class="muted">49 lines</span></td>
+    <td>The <code>hipcc</code> line: arch, include paths, every <code>-D</code></td></tr>
+</tbody>
+</table>
+
+<p class="muted" style="margin:8px 0 6px;font-size:13.5px"><b>4.</b> Build, then run:</p>
+<pre style="margin:0;padding:8px 12px"><code style="font-size:10.9px;line-height:1.4">$ bash build_mistral_7b.sh
+$ python3 demo_mistral_7b.py --model-path &lt;hf&gt;</code></pre>
+</div>
+</div>
+<div class="num">8 / 16</div>
+</div>
+<div class="slide" id="s9">
+<div class="tag">Serving</div>
+<h2>Prefill on vLLM, decode on the megakernel</h2>
+
+<div class="two" style="gap:22px">
+<div>
+<p style="margin-top:0">vLLM discovers a <code>vllm.general_plugins</code> entry point at startup
+and calls <code>register()</code>, which swaps the stock architecture for a subclass.
+<b>No fork, no patch:</b></p>
+<pre style="margin:8px 0 0;padding:9px 13px"><code style="font-size:11.5px;line-height:1.5">ModelRegistry.<b>register_model</b>(
+    "Qwen3ForCausalLM", TitanQwen3ForCausalLM)
+
+class TitanQwen3ForCausalLM(
+        <b>TitanModelMixin</b>, Qwen3ForCausalLM): …</code></pre>
+<p style="margin:9px 0 0">Mixin first in the MRO, so its <code>forward()</code> shadows the stock
+model's and <code>super().forward()</code> still reaches it. One predicate decides everything:</p>
+<pre style="margin:8px 0 0;padding:9px 13px"><code style="font-size:11.5px;line-height:1.5">def forward(self, input_ids, positions, …):
+  md = self._get_attn_metadata()
+
+  <span class="muted"># anything that is not a single-token decode</span>
+  if md is None or md.max_query_len != 1:
+      return <b>super().forward</b>(…)   <span class="muted"># stock vLLM</span>
+
+  <span class="muted"># decode: one token, batch 1</span>
+  self._ensure_titan_kv_bound()   <span class="muted"># once → next slide</span>
+  self.titan.<b>decode_step</b>(embed, cur_pos,
+        block_table=md.block_table[0])</code></pre>
+<p class="muted" style="margin:8px 0 0;font-size:13.5px">Prefill is compute-bound and already well
+served. The megakernel claims only the memory-bound case it was built for.</p>
+</div>
+<div>
+<p style="margin-top:0">Titan inherits everything it deliberately left out: continuous batching,
+the scheduler, preemption, sampling, the OpenAI API, paged KV, prefix caching.</p>
+<div class="box warn" style="margin:12px 0 0;padding:11px 15px">
+<span class="lbl">The handoff is a pointer, not a copy</span>
+<p>Decode reads the KV prefill just wrote, in place — which works only because one vLLM block is
+exactly one Titan page, so vLLM's block table drives the kernel's page indirection directly.</p>
+</div>
+<p class="muted" style="font-size:14.5px;margin-top:10px">The scheduler, sampler and host
+round-trip sit between kernel time and end-to-end latency; the results slide separates them rather
+than quoting the kernel alone.</p>
+</div>
+</div>
+<div class="num">9 / 16</div>
+</div>
+<div class="slide" id="s10">
+<div class="tag">Serving</div>
+<h2>Zero-copy KV</h2>
+
+<p>The KV cache is the largest allocation in the system, and vLLM lays it out the serving stack's way
+while the kernel wants one flat buffer. The obvious bridge — a per-request gather-copy — would put
+two full KV stores and a reshuffle on the decode path, every token.</p>
+
+<figure>
+<svg viewBox="0 0 1040 268" role="img" aria-label="Gather-copy between two KV layouts versus pointer aliasing">
+  <!-- BEFORE -->
+  <text x="0" y="14" font-size="12.5" font-weight="700" fill="#c0392b">BEFORE — two allocations, a per-request gather-copy</text>
+
+  <rect x="0" y="26" width="300" height="72" fill="#fdf0ef" stroke="#c0392b" rx="4"/>
+  <text x="12" y="45" font-size="11" font-weight="700">vLLM paged KV pool</text>
+  <text x="12" y="62" font-size="10.5" class="m" fill="#5a6472">[2, num_blocks, block_size,</text>
+  <text x="12" y="76" font-size="10.5" class="m" fill="#5a6472"> num_kv_heads, head_size]</text>
+  <text x="12" y="92" font-size="10.5" fill="#c0392b">~184 GiB</text>
+
+  <rect x="420" y="26" width="300" height="72" fill="#fdf0ef" stroke="#c0392b" rx="4"/>
+  <text x="432" y="45" font-size="11" font-weight="700">Titan's own K/V buffers</text>
+  <text x="432" y="62" font-size="10.5" class="m" fill="#5a6472">[entries, num_kv_heads × head_dim]</text>
+  <text x="432" y="92" font-size="10.5" fill="#c0392b">a second copy of the same bytes</text>
+
+  <path d="M304,62 L414,62" stroke="#c0392b" stroke-width="1.6" fill="none" marker-end="url(#arR)"/>
+  <text x="359" y="54" font-size="10.5" fill="#c0392b" text-anchor="middle" font-weight="700">gather-copy</text>
+  <text x="359" y="80" font-size="10" fill="#c0392b" text-anchor="middle">per request, before decode</text>
+
+  <text x="740" y="52" font-size="11" fill="#c0392b">Two full KV stores plus a</text>
+  <text x="740" y="68" font-size="11" fill="#c0392b">per-request reshuffle.</text>
+
+  <!-- AFTER -->
+  <text x="0" y="140" font-size="12.5" font-weight="700" fill="#2e7d4f">AFTER — one allocation, two views of it</text>
+
+  <rect x="0" y="152" width="440" height="90" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
+  <text x="12" y="171" font-size="11" font-weight="700">vLLM paged KV pool — the only allocation</text>
+  <text x="12" y="188" font-size="10.5" class="m" fill="#5a6472">aiter backend: [2, num_blocks, block_size, n_kv, head]</text>
+  <text x="12" y="204" font-size="10.5" fill="#5a6472">reshape_and_cache_flash — the non-reordered layout</text>
+  <rect x="12" y="212" width="416" height="22" fill="#fff" stroke="#2e7d4f" rx="2"/>
+  <text x="20" y="227" font-size="10" class="m" fill="#2e7d4f">reshaped, this is bit-for-bit Titan's flat [entries, n_kv × head_dim]</text>
+
+  <g stroke="#2e7d4f" stroke-width="1.4" fill="none" marker-end="url(#ag)">
+    <path d="M444,182 L560,182"/>
+    <path d="M444,212 L560,212"/>
+  </g>
+  <text x="502" y="176" font-size="10" fill="#2e7d4f" text-anchor="middle">.reshape()</text>
+  <text x="502" y="230" font-size="10" fill="#2e7d4f" text-anchor="middle">.reshape()</text>
+
+  <rect x="566" y="166" width="200" height="32" fill="#fff" stroke="#2e7d4f" rx="3"/>
+  <text x="666" y="186" font-size="10.5" class="m" text-anchor="middle">k_alias — a view, not a copy</text>
+  <rect x="566" y="198" width="200" height="32" fill="#fff" stroke="#2e7d4f" rx="3"/>
+  <text x="666" y="218" font-size="10.5" class="m" text-anchor="middle">v_alias — a view, not a copy</text>
+
+  <text x="786" y="180" font-size="11" fill="#2e7d4f" font-weight="700">0 bytes copied.</text>
+  <text x="786" y="198" font-size="11" fill="#5a6472">The megakernel appends the</text>
+  <text x="786" y="214" font-size="11" fill="#5a6472">new token's K/V into vLLM's</text>
+  <text x="786" y="230" font-size="11" fill="#5a6472">block and reads prior KV in place.</text>
+
+  <rect x="0" y="250" width="1040" height="0" fill="none"/>
+</svg>
+<figcaption>No layout conversion — a backend is chosen whose physical layout
+already matches, and the pointers are aliased. The whole mechanism rests on one invariant, so
+it is asserted on every bind: <code>k_alias.data_ptr() == kvc[0].data_ptr()</code>. That, plus
+<code>block_size == PAGE_SIZE</code>, is why one vLLM block is exactly one Titan page.</figcaption>
+</figure>
+
+<pre style="margin:6px 0 4px;padding:8px 13px"><code style="font-size:11.3px;line-height:1.45"><span class="muted">def <b>_ensure_titan_kv_bound</b>(self):   # first decode only — vLLM allocates KV after load_weights</span>
+k_alias = attn.kv_cache[0][0].reshape(entries, KV_STRIDE)   <span class="muted"># contiguous reshape = <b>view</b></span>
+assert k_alias.data_ptr() == kvc[0].data_ptr()   <span class="muted"># or it silently copied</span>
+ptr_table[… + <b>K_CACHE</b>] = k_alias.data_ptr()   <span class="muted"># same slot the demo fills</span></code></pre>
+
+<div class="two" style="gap:20px;margin-top:11px">
+<div>
+<div class="box warn" style="margin:0">
+<span class="lbl">The price: one vLLM block = one Titan page</span>
+<p>The engine is launched at <code>block_size = PAGE_SIZE</code>, which also picks the backend: aiter's
+MHA path static_asserts <code>BLOCK_SIZE &lt;= 32</code> — why the ROCm default is 16 — so decode runs
+on the unified path, which stages a page-sized tile in LDS and tops out at 160.</p>
+</div>
+</div>
+<div>
+<div class="box bad" style="margin:0">
+<span class="lbl">And prefill inherits it</span>
+<p>One pool, one block size — so prefill runs there too, off its tuned default. <b>Cost to prefill
+unmeasured.</b> No vLLM code changed; one config value did.</p>
+</div>
+</div>
+</div>
+<div class="num">10 / 16</div>
+</div>
+<div class="slide" id="s11">
+<div class="tag">Results</div>
+<h2>Where it lands</h2>
+<figure>
+<svg viewBox="0 0 1040 300" role="img" aria-label="Waterfall from Mirage standalone to stock vLLM">
+  <!-- scale: 0 to 5.0 ms over x=170..1010 => 168 px per ms -->
+  <g stroke="#e2e6eb" stroke-width="1">
+    <line x1="170" y1="34" x2="170" y2="250"/><line x1="338" y1="34" x2="338" y2="250"/>
+    <line x1="506" y1="34" x2="506" y2="250"/><line x1="674" y1="34" x2="674" y2="250"/>
+    <line x1="842" y1="34" x2="842" y2="250"/><line x1="1010" y1="34" x2="1010" y2="250"/>
+  </g>
+  <g font-size="10" fill="#5a6472" text-anchor="middle">
+    <text x="170" y="268">0</text><text x="338" y="268">1</text><text x="506" y="268">2</text>
+    <text x="674" y="268">3</text><text x="842" y="268">4</text><text x="1010" y="268">5</text>
+    <text x="590" y="286" font-size="11">ms per decoded token, batch size 1 — shorter is better</text>
+  </g>
+
+  <g font-size="11.5">
+    <!-- Mirage 2.144 -->
+    <text x="164" y="52" text-anchor="end">Mirage, standalone</text>
+    <rect x="170" y="40" width="360" height="24" fill="#5a6472" opacity="0.55"/>
+    <text x="540" y="57" class="m" font-size="11">2.144</text>
+
+    <!-- Titan GPU 2.39 -->
+    <text x="164" y="92" text-anchor="end">Titan megakernel, GPU only</text>
+    <rect x="170" y="80" width="360" height="24" fill="#0b5fa5" opacity="0.75"/>
+    <rect x="530" y="80" width="41" height="24" fill="#c0392b" opacity="0.7"/>
+    <text x="581" y="97" class="m" font-size="11">~2.39</text>
+    <text x="630" y="97" font-size="10.5" fill="#c0392b">+0.25 — 124.5 µs is the inter-layer barrier, measured</text>
+
+    <!-- Titan standalone 2.502 -->
+    <text x="164" y="132" text-anchor="end">Titan, standalone e2e</text>
+    <rect x="170" y="120" width="401" height="24" fill="#0b5fa5" opacity="0.75"/>
+    <rect x="571" y="120" width="19" height="24" fill="#e0b400" opacity="0.8"/>
+    <text x="600" y="137" class="m" font-size="11">2.502</text>
+    <text x="650" y="137" font-size="10.5" fill="#5a6472">+0.11 — its own Python driver, ~46 µs/token of host work</text>
+
+    <!-- Titan vllm 2.921 -->
+    <text x="164" y="172" text-anchor="end" font-weight="700">Titan through vLLM</text>
+    <rect x="170" y="160" width="420" height="24" fill="#0b5fa5"/>
+    <rect x="590" y="160" width="70" height="24" fill="#e0b400" opacity="0.8"/>
+    <text x="670" y="177" class="m" font-size="11" font-weight="700">2.921</text>
+    <text x="722" y="177" font-size="10.5" fill="#5a6472">+0.42 — scheduler, sampler, block tables</text>
+
+    <!-- stock 4.658 -->
+    <text x="164" y="212" text-anchor="end">Stock vLLM, graphs ON</text>
+    <rect x="170" y="200" width="782" height="24" fill="#c0392b" opacity="0.55"/>
+    <text x="962" y="217" class="m" font-size="11">4.658</text>
+  </g>
+
+  <!-- brackets -->
+  <line x1="590" y1="192" x2="952" y2="192" stroke="#2e7d4f" stroke-width="1.4"/>
+  <text x="771" y="188" font-size="11" fill="#2e7d4f" text-anchor="middle" font-weight="700">1.59× faster than stock</text>
+  <line x1="530" y1="18" x2="590" y2="18" stroke="#c0392b" stroke-width="1.4"/>
+  <text x="560" y="14" font-size="10.5" fill="#c0392b" text-anchor="middle">0.78 behind Mirage</text>
+
+  <!-- legend -->
+  <g font-size="10" fill="#5a6472">
+    <rect x="170" y="0" width="11" height="11" fill="#0b5fa5"/><text x="187" y="9">megakernel</text>
+    <rect x="262" y="0" width="11" height="11" fill="#c0392b" opacity="0.7"/><text x="279" y="9">barrier</text>
+    <rect x="336" y="0" width="11" height="11" fill="#e0b400" opacity="0.8"/><text x="353" y="9">host / integration</text>
+  </g>
+</svg>
+<figcaption>Every step is measured, not modelled. The two facts that have to
+be said together: Titan is 1.59× faster than stock vLLM, and 0.78 ms behind Mirage's
+standalone driver. Roughly 0.42 ms of that 0.78 is the price of being a real serving backend;
+the remaining ~0.36 ms is the kernel, and it is the barrier.</figcaption>
+</figure>
+<div class="two">
+<div>
+<p>Titan is substantially faster than stock vLLM on the MoE model, and still behind the dynamic
+system it is built on — half that gap the price of being a real serving backend, half the kernel's
+barriers.</p>
+<p>The dense model runs the <em>older</em> multi-barrier kernel — the fused pipeline was never
+ported to it — and lands on the wrong side of stock. Its number barely moved across a full plugin
+rebase, placing the regression in the kernel, not the integration.</p>
+</div>
+<div>
+<div class="box bad" style="margin:0">
+<span class="lbl">Read this before quoting any of it</span>
+<p><code>enforce_eager</code> is <b>not neutral between the two sides</b>. Stock vLLM's decode is a
+long tail of small launches, so graph capture is most of its performance; Titan's is one launch with
+nothing to gain. An earlier revision reported a far larger speedup that belonged entirely to a
+handicapped baseline.</p>
+</div>
+<p class="muted" style="font-size:14.5px;margin-top:12px">Correctness is gated on an exact token
+id, not perplexity — a wrong weight layout produces fluent nonsense at full speed.</p>
+</div>
+</div>
+<div class="num">11 / 16</div>
+</div>
+<div class="slide" id="s12">
+<div class="tag">Results</div>
+<h2>What did not work</h2>
+
+<p class="muted" style="margin:2px 0 10px">Each is recorded in the model YAML so the next person
+does not re-run it. These shaped the design more than the successes.</p>
+
+<table style="font-size:14.5px;margin:0">
+<tbody>
+<tr><td style="width:47%">Widen the MoE W13 tile to remove all padding tiles</td>
+    <td><b>Worse.</b> W13 wants fat tiles — LDS weight reuse across MFMA rounds.</td></tr>
+<tr><td>Widen the W2 tile to match it</td>
+    <td><b>Worse, in the opposite direction.</b> W2 wants thin tiles: more parallelism to hide
+        latency.</td></tr>
+<tr><td>Fuse SwiGLU into the W2 quantization step</td>
+    <td><b>Large regression.</b> Transcendental cost. More fusion is not monotonically
+        better.</td></tr>
+<tr><td>Fuse the router GEMV into the preceding RMSNorm</td>
+    <td><b>Worse.</b> Loses the quantized path.</td></tr>
+<tr><td>Finer-grained per-expert MoE barriers</td>
+    <td><b>Failed.</b> Pipeline-drain overhead exceeded the ordering saved.</td></tr>
+<tr><td>Delete the inter-layer barrier</td>
+    <td><b>Faster, wrong output.</b> Included because it is the tempting one.</td></tr>
+<tr><td>Prefetch the SwiGLU bias — an apparently free win</td>
+    <td><b>No change.</b> The wait moved to the next stall; the enclosing span was
+        constant.</td></tr>
+</tbody>
+</table>
+
+<div class="box note" style="margin:12px 0 0;padding:10px 16px">
+<span class="lbl">The pair that matters is the pair that disagrees</span>
+<p>The two MoE tile-width constants pull in <b>opposite</b> directions. Unifying them is the most
+tempting wrong move available — and exactly what an autotuner searching one shared tile-size
+parameter would do.</p>
+</div>
+<div class="num">12 / 16</div>
+</div>
+<div class="slide" id="s13">
+<div class="tag">Limitations</div>
+<h2>Where this falls over</h2>
+
+<div class="two">
+<div>
+<p style="margin-top:4px"><b>Scope of the evaluation:</b></p>
+<ul style="margin:8px 0">
+<li><b>Batch size 1 only.</b> The whole static argument is conditioned on it, and we have not
+    measured where ragged batches make the dynamic machinery start earning its cost.</li>
+<li><b>One GPU.</b> Every fence is agent-scope; tensor parallelism needs new primitives.</li>
+<li><b>Two models, one target.</b> Both are 8-KV-head; the fused path ties KV heads to XCDs.</li>
+<li><b>One prompt, greedy decode.</b></li>
+</ul>
+<p class="muted" style="font-size:14.5px">Also open: the plugin cannot yet be graph-captured,
+leaving host time on the table that no kernel work can reach.</p>
+</div>
+<div>
+<div class="box bad" style="margin-top:4px">
+<span class="lbl">The thesis, inverted</span>
+<p>The generator is cheap <em>because</em> the library is expensive, and nothing here makes writing
+that library cheaper. A search that could produce competitive MFMA mainloops would move the
+boundary — that, not the assembling layer, is the open problem.</p>
+</div>
+<div class="box warn" style="margin:14px 0 0">
+<span class="lbl">Where dynamic is the right answer</span>
+<p>Ragged batches, and <b>sparse attention</b> — which breaks the static argument even at batch size 1,
+because the block count per step is genuinely data-dependent. Also any tile shape nobody has
+written: Titan rejects those at validate time rather than running them slowly, which is correct
+behaviour and also the honest limit of a static system.</p>
+</div>
+</div>
+</div>
+<div class="num">13 / 16</div>
+</div>
+<div class="slide" id="s14">
+<div class="tag">Future work</div>
+<h2>What we would build next</h2>
+
+<table style="font-size:13.5px;margin:6px 0 0">
+<thead><tr><th style="width:26%">Idea</th><th style="width:39%">What it takes</th>
+<th>What decides whether it pays</th></tr></thead>
+<tbody>
+<tr><td><b>Tensor-parallel the expert FFN</b></td>
+    <td>Replicate attention and the KV cache, shard only the MoE intermediate. One all-reduce per
+        layer, on a buffer that already exists. Needs <b>system-scope</b> fences; every fence today
+        is agent-scope.</td>
+    <td>The die is already under-subscribed at batch size 1. Sharding removes <em>bytes per GPU</em>,
+        not serial work, so the win is bounded by how bandwidth-bound MoE really is.
+        Sublinear by construction.</td></tr>
+<tr><td><b>Graph-capture the vLLM path</b></td>
+    <td>The standalone decode loop is captured; the plugin is not, because launch state lives in
+        file-scope statics. Make it per-device and capture per rank.</td>
+    <td>Nothing technical. It is host time no kernel work can reach — and the largest remaining
+        <em>known</em> win.</td></tr>
+<tr><td><b>The fused pipeline on the dense path</b></td>
+    <td>Dense models still run the unfused per-op sequence; the eight-phase layer is MoE-only.</td>
+    <td>The real generality test — a second <em>architecture</em>, not a second model of the same
+        one. Until it passes, the YAML claim is weaker than it sounds.</td></tr>
+<tr><td><b>Find the crossover</b></td>
+    <td>Ragged batches, and sparse attention. Measure where dynamic dispatch starts earning its
+        cost rather than asserting that it does not.</td>
+    <td>Nothing — this one we simply owe. The static argument is <em>conditioned</em> on batch size
+        1, and we have never measured where that ends.</td></tr>
+</tbody>
+</table>
+
+<div class="box note" style="margin:10px 0 0;padding:9px 16px">
+<span class="lbl">Each of these gets a stopping rule before it gets built</span>
+<p>Two GPUs answer the tensor-parallel question; if that is not a real win over one, the remaining
+degrees do not get built. The negative results are cheap only because they were <em>designed</em>
+to be cheap to abandon.</p>
+</div>
+<div class="num">14 / 16</div>
+</div>
+<div class="slide" id="s15">
+<div class="tag">Related work</div>
+<h2>Where this sits</h2>
+
+<table style="font-size:13.5px;margin:8px 0">
+<thead><tr><th>System</th><th>How the megakernel is built</th><th>Relation to this work</th></tr></thead>
+<tbody>
+<tr><td><b>Hazy Research</b><br><span class="cite">Spector et al., 2025</span></td>
+    <td>Hand-written on-GPU <b>interpreter</b>; instructions request and release shared-memory
+        pages</td>
+    <td>Established the bs=1 case. Dynamic at the instruction level — though their throughput
+        follow-up builds the schedule <b>ahead of time on the CPU</b>.</td></tr>
+<tr><td><b>Mirage / MPK</b><br><span class="cite">Cheng et al., arXiv:2512.22219</span></td>
+    <td><b>Compiler plus in-kernel runtime.</b> SM-level task graph, decentralized scheduling, JIT
+        task launch for data-dependent attention</td>
+    <td><b>The system we build on.</b> We consume its device library and delete its scheduler.</td></tr>
+<tr><td><b>Kog monokernel</b><br><span class="cite">Kog Labs, MI300X</span></td>
+    <td><b>Programmer-managed compile-time partition.</b> Fixed CU assignment per stage, no dynamic
+        task scheduling</td>
+    <td>Independent convergence on the static choice, same vendor — but by hand, for one
+        model.</td></tr>
+<tr><td><b>CODA</b><br><span class="cite">Guo et al., arXiv:2605.19269</span></td>
+    <td>Transformer blocks as <b>GEMM-epilogue programs</b> over a fixed mainloop</td>
+    <td>Prior work on the epilogue fusion our device library uses. Stops at the kernel boundary;
+        one kernel per token removes it.</td></tr>
+<tr><td><b>FlashInfer · CK/CUTLASS · Triton</b></td>
+    <td>Kernel libraries and DSLs — the layer <em>below</em> all of the above</td>
+    <td>The layer that holds the performance. Our claim is about <em>who calls it</em>.</td></tr>
+</tbody>
+</table>
+
+<div class="box note" style="margin:10px 0 0;padding:10px 16px">
+<span class="lbl">The axis, stated carefully</span>
+<p>All four call a hand-written device library — <b>that is not the distinction</b>. The axis is
+<b>who decides the work assignment, and when</b>. Hazy and MPK decide at runtime; Kog at compile
+time by hand, per model. Titan decides at compile time and <b>generates that decision from a model
+description</b> — which makes the static choice reusable instead of bespoke.</p>
+</div>
+<div class="num">15 / 16</div>
+</div>
+<div class="slide" id="s16">
+<div class="tag">Takeaways</div>
+<h2>Takeaways</h2>
+
+<div class="box good" style="margin:12px 0;padding:11px 17px">
+<span class="lbl">1 — At batch size 1, dynamic dispatch is a cost that buys nothing</span>
+<p style="margin:0;font-size:17px">Queues, event counters and descriptor loads sit on the critical
+path of a workload whose work assignment was knowable before launch — and the dynamic system's
+fastest build precomputes its dispatch away.</p>
+</div>
+
+<div class="box note" style="margin:12px 0;padding:11px 17px">
+<span class="lbl">2 — The performance is in the device library, so the layer above can be a table</span>
+<p style="margin:0;font-size:17px">Both front ends bottom out in the same hand-written kernels;
+what either emits is derived constants and a template instantiation. So adding a model can be a YAML
+file instead of a search, at no cost in performance.</p>
+</div>
+
+<div class="box warn" style="margin:12px 0;padding:11px 17px">
+<span class="lbl">3 — Static is a trade, and the price is legible</span>
+<p style="margin:0;font-size:17px">Deleting the launches deletes the free ordering they provided,
+and the barriers that replace it are the largest thing Titan adds. We report that next to the
+speedup, with the negative results that produced the design.</p>
+</div>
+
+<hr class="rule" style="margin:12px 0 6px">
+<p class="cite" style="margin:0">Engineering reference — repository shape, reproduction commands,
+every measurement: <a href="titan-architecture.html"><code>titan-architecture.html</code></a>.
+&nbsp;·&nbsp; Sources —
+<a href="https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles">Hazy Research megakernel</a> ·
+<a href="https://arxiv.org/abs/2512.22219">MPK, arXiv:2512.22219</a> ·
+<a href="https://blog.kog.ai/building-a-single-kernel-latency-optimized-llm-inference-engine-on-amd-mi300x-gpus/">Kog monokernel</a> ·
+CODA, arXiv:2605.19269</p>
+<div class="num">16 / 16</div>
+</div>
+</body>
+</html>
