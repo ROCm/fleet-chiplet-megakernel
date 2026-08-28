@@ -23,6 +23,7 @@ them. Details below.
 | `aid_remote_hbm.hip` | flag ping-pong between two named chiplets, plus NT STREAM phases |
 | `xcd_pair_matrix.hip` | round-trip latency for all 28 chiplet pairs, then a flag-address sweep |
 | `aid_home_map.hip` | classifies the home side of each address granule; finds the granularity |
+| `hipmalloc_pages.hip` | how hipMalloc lays out pages, and the AID granularity/periodicity |
 | `aid_alloc.hip` | AID-pinned allocator built on 4 KiB VMM handles, plus the bandwidth payoff |
 | `aid_page_map.hip` | single-chiplet atomic latency probe — **negative result, see caveat** |
 
@@ -128,6 +129,52 @@ Two caveats worth keeping:
   and the home stops mattering.
 - **The map follows physical addresses**, so it must be re-probed per
   allocation and cannot be cached across runs.
+
+## How hipMalloc lays out pages (`hipmalloc_pages.hip`)
+
+Observed mechanics:
+
+- Allocations up to 1 MiB all come back at the *same* address after being
+  freed: ROCr suballocates them from a larger block. That is the fragment
+  allocator, and `HSA_DISABLE_FRAGMENT_ALLOCATOR` turns it off.
+- Allocations of 8 MiB and up are 2 MiB aligned. The kernel-side VRAM manager
+  is a buddy allocator with 4 KiB chunks (`amdgpu_vram_mm` in debugfs).
+- The home side is a deterministic function of the physical address: two
+  separate 16 MiB allocations line up at **100%** agreement under a pure page
+  shift (-768, +1536 and -512 pages seen on different runs).
+
+Is it round-robin across the stacks? Partly.
+
+- **Even spread, yes.** Every 16 MiB allocation lands 2341/4096 pages on one
+  side, run after run. A big `hipMalloc` buffer is ~50/50 across the AIDs, which
+  is exactly why an unmodified allocation is half-remote to whichever chiplets
+  read it.
+- **But the AID bit is not a simple modulo.** 4 KiB round-robin over 8 stacks
+  with stacks 0-3 on one AID would give runs of exactly 4 pages and a period of
+  8. Measured run lengths are 615x1, 1049x2, 347x3, 61x4, 16x5, 3x6, and the
+  match at P=8 is 0.47, i.e. chance (P=2 0.28, P=4 0.59, P=16 0.52, P=512 0.43).
+  It behaves like an address hash.
+- **Granularity is 4 KiB, not 256 B.** Probing 16 sub-page offsets in each of 8
+  pages gives a uniform side within every page while the side varies between
+  pages:
+
+```
+page 0: 1111111111111111   uniform
+page 1: 0000000000000000   uniform
+page 2: 1111111111111111   uniform
+...
+```
+
+  So the AID selection changes only at page boundaries. Fine-grained striping
+  across the four channels *inside* an AID is not ruled out — this probe only
+  reports which side of the machine an address lives on, never which of the 8
+  stacks — but whatever the hardware does below 4 KiB does not move the AID bit.
+
+The period search reports a 100% match at some large period (8960 pages in one
+run, 14336 in the next). That number moves between runs, so it describes how the
+buddy allocator laid out that particular allocation rather than a hardware
+period. There is no short intrinsic period, which is why `aid_alloc` probes
+rather than predicts.
 
 ## Caveat on `aid_page_map` (negative result, and why it is wrong)
 
