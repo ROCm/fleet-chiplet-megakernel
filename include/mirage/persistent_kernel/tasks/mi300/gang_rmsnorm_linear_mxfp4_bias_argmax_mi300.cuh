@@ -45,6 +45,82 @@
 
 namespace kernel {
 
+#ifdef MPK_ARGMAX_DUAL_REDUCE
+// ── The LM head's g-group argmax, as two VALU swaps instead of four LDS ─────
+//
+// The reduction this replaces is only two steps wide -- xor-16 then xor-32,
+// walking the four `g` groups and leaving `col` alone -- but each step costs
+// two `__shfl_xor`, one for the value and one for the index, and `__shfl_xor`
+// lowers to ds_bpermute: an LDS round trip and an lgkmcnt wait per shuffle for
+// data that never left the register file. Four round trips, two waits.
+//
+// Both steps have an exact VALU-native equivalent on gfx950 and they are the
+// only two the whole reduction needs: `v_permlane16_swap_b32` is xor-16 and
+// `v_permlane32_swap_b32` is xor-32, so unlike the router's six-step chain
+// this one needs no DPP row_shl stages at all.
+//
+// The swaps exchange one operand's low half with the other's high half, so
+// seeding each peer with a copy of its own value makes swap-then-select a
+// lane-uniform butterfly: in the low lanes the peer holds lane i^k's value
+// and in the high lanes it holds the same, which is exactly what the shuffle
+// delivered.
+//
+// The value and the index are two independent partials over the same lane
+// crossing, so they interleave: the swap's result-hazard slot is filled by the
+// other partial's swap rather than by an `s_nop`. That is why this is worth
+// doing at two steps -- the pair costs barely more than one would.
+//
+// ── Contract: the result is valid in g == 0 (lanes 0..15) ──────────────────
+//
+// The value is lane-uniform and matches the butterfly everywhere. The *index*
+// does not, and the reason is the same asymmetry that makes the sum version
+// free: the swap leaves the lower member of each pair holding its own value in
+// `val` and its partner's in `peer`, and the upper member holding them the
+// other way round. A commutative reduction cannot see that. A strict `>`
+// tie-break can -- in the upper member the incumbent is `peer`, so keeping
+// `val` on a tie keeps the wrong side.
+//
+// Lanes 0..15 are the lower member at both steps (bit 4 clear for the xor-16
+// swap, bit 5 clear for the xor-32 swap), so their tie-break is unchanged.
+// That is all the caller reads: `if (g == 0) s_red_val[...] = thread_max`.
+// Hence the name -- do not lift this to a caller that consumes g1..g3.
+//
+// Verified over 4096 cases including an all-equal block where every
+// comparison is a tie: g0 value and index bit-identical to the butterfly,
+// value bit-identical in all 64 lanes.
+// See tests/standalone/test_argmax_dual_reduce.hip.
+__device__ __forceinline__ void argmax_dual_wave_reduce_to_g0(float &val,
+                                                              int &idx) {
+  float val_peer = val;
+  int idx_peer = idx;
+  asm volatile(
+      // ── xor-16: walk g groups 0<->1 and 2<->3 ──
+      "s_nop 1\n"
+      "v_permlane16_swap_b32 %[val], %[val_peer]\n"
+      "v_permlane16_swap_b32 %[idx], %[idx_peer]\n"
+      "v_cmp_gt_f32 vcc, %[val_peer], %[val]\n"
+      "v_cndmask_b32 %[idx], %[idx], %[idx_peer], vcc\n"
+      "v_cndmask_b32 %[val], %[val], %[val_peer], vcc\n"
+      // Re-seed: the swaps are destructive in both operands, so the peer has
+      // to be a fresh copy of the survivor rather than carried across steps.
+      "v_mov_b32_e32 %[val_peer], %[val]\n"
+      "v_mov_b32_e32 %[idx_peer], %[idx]\n"
+      // ── xor-32: walk the two halves ──
+      "s_nop 1\n"
+      "v_permlane32_swap_b32 %[val], %[val_peer]\n"
+      "v_permlane32_swap_b32 %[idx], %[idx_peer]\n"
+      "v_cmp_gt_f32 vcc, %[val_peer], %[val]\n"
+      "v_cndmask_b32 %[idx], %[idx], %[idx_peer], vcc\n"
+      "v_cndmask_b32 %[val], %[val], %[val_peer], vcc"
+      : [val] "+v"(val),
+        [idx] "+v"(idx),
+        [val_peer] "+v"(val_peer),
+        [idx_peer] "+v"(idx_peer)
+      :
+      : "vcc");
+}
+#endif
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -497,6 +573,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     // NOT the full 64-lane butterfly: lanes differing in `col` hold different
     // tokens, so mixing them would return one token's argmax for all 16.
     // XOR on bits 4 and 5 walks the 4 g-groups and leaves `col` alone.
+#ifdef MPK_ARGMAX_DUAL_REDUCE
+    // Same two steps, same order, no LDS. Valid in g == 0 only, which is the
+    // only group the `if (g == 0)` write below reads -- see the contract note
+    // at argmax_dual_wave_reduce_to_g0.
+    argmax_dual_wave_reduce_to_g0(thread_max, thread_max_idx);
+#else
 #pragma unroll
     for (int offset = 16; offset <= 32; offset <<= 1) {
       float other_val = __shfl_xor(thread_max, offset, 64);
@@ -506,6 +588,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         thread_max_idx = other_idx;
       }
     }
+#endif
 
     // ── Cross-wave reduce via LDS, one slot per (wave, token) ───────────
     // No barrier before the write: s_red_* is disjoint from the token region

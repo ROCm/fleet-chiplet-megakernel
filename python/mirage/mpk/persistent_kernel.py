@@ -887,6 +887,31 @@ def get_compile_command(
             # which for a strictly-fewer-instructions change on a strictly
             # worse data path is the expected shape of the result.
             flags = flags + ["-DMPK_ROUTER_DUAL_REDUCE"]
+        # The same transform on the LM head's g-group argmax: two `__shfl_xor`
+        # steps carrying a (value, index) pair become one interleaved
+        # permlane16_swap / permlane32_swap chain. Four ds_bpermute and two
+        # lgkmcnt waits become four VALU ops on data that never left the
+        # register file, and the value and index partials fill each other's
+        # swap hazard slot.
+        #
+        # Only two steps wide, so unlike the router it needs no DPP row_shl
+        # stages -- permlane16_swap *is* xor-16 and permlane32_swap *is*
+        # xor-32.
+        #
+        # Bit-identical in the group that is read: same xor-16 then xor-32
+        # order, and the select keeps the strict `>` so ties still favour the
+        # incumbent lane's index. Verified against the butterfly in
+        # tests/standalone/test_argmax_dual_reduce.hip, which also pins down
+        # why the contract is g == 0 only.
+        #
+        # Off by default: 1.8423 -> 1.8415 ms, one win in three alternating
+        # pairs (+0.001 / +0.006 / -0.0095) with the generated text unchanged.
+        # The router version of this transform saved 12 lane-crossing ops and
+        # bought 1 us; this one saves 4, once per token, on a single wave --
+        # too small to clear the run-to-run spread. Kept because it is correct
+        # and tested, not because it is faster.
+        if os.environ.get("MPK_ARGMAX_DUAL_REDUCE", "0") == "1":
+            flags = flags + ["-DMPK_ARGMAX_DUAL_REDUCE"]
         if _opt("MPK_ML_TABLE_PREFETCH"):
             # Read layer N+1's pointer-table row during layer N's body instead
             # of after layer N's Phase 9 gate. The tables are host-built and
