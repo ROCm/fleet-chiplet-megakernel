@@ -1,0 +1,4 @@
+interface:
+  display_name: "Megakernel Optimization"
+  short_description: "Iterate safely on fused GPU megakernels"
+  default_prompt: "Use $optimize-megakernel to profile, optimize, and validate this megakernel change."
