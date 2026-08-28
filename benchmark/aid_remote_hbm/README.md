@@ -55,3 +55,53 @@ driver-level reconfiguration of the whole GPU.
 The low absolute bandwidth in phase 2 is expected: it is one chiplet out of
 eight, and the strided variants touch one 256 B line per 2 KiB of address space,
 so they are latency-bound rather than bandwidth-bound.
+
+# Can an allocation be pinned to the local AID? (`aid_page_map.hip`)
+
+No, not in the mode this GPU runs in. `aid_page_map` times a dependent chain of
+agent-scope atomics that stays on one address, so each step is a fabric round
+trip to whatever owns that address. Plain loads are useless here: they sit in
+L1/L2 at ~56 ns and hide the topology entirely. Atomics land at ~94 ns.
+
+Measured on an idle GPU (`0000:06:00.0`), latency in ns from every chiplet to a
+fixed address:
+
+| offset    | XCD0 | XCD1 | XCD2 | XCD3 | XCD4 | XCD5 | XCD6 | XCD7 | AID0 avg | AID1 avg |
+|-----------|------|------|------|------|------|------|------|------|----------|----------|
+| 0 KiB     | 99   | 101  | 97   | 88   | 99   | 97   | 88   | 99   | 96.1     | 95.6     |
+| 4 KiB     | 95   | 97   | 95   | 84   | 97   | 95   | 84   | 97   | 92.9     | 93.4     |
+| 1 MiB     | 99   | 101  | 97   | 88   | 99   | 97   | 88   | 99   | 96.1     | 95.7     |
+| 17 MiB    | 101  | 102  | 99   | 88   | 101  | 99   | 88   | 101  | 97.4     | 97.0     |
+| 129 MiB   | 99   | 101  | 97   | 87   | 99   | 97   | 88   | 99   | 95.9     | 95.6     |
+| 400 MiB   | 101  | 102  | 99   | 87   | 101  | 99   | 88   | 101  | 97.2     | 97.0     |
+
+The two AIDs agree to within 0.5 ns on every address. The spread that does exist
+(88-102 ns) repeats with period 4 across the chiplets and is identical for all
+six addresses, so it is a property of the chiplet, not of where the data lives.
+
+Sweeping 128 addresses at 256 B, 4 KiB and 2 MiB strides gives the same answer:
+the XCD0-vs-XCD4 delta is 0 +/- 2 ns with no bimodality, no single address bit
+correlates with it, and the same-AID XCD0-vs-XCD1 control is just as flat.
+
+So under NPS1 every address is equidistant from both AIDs: physical memory is
+interleaved across all stacks on both AIDs at a granularity finer than a cache
+line. No page coloring, no `hipMalloc` trick, and no address-bit filter can make
+an allocation AID-local.
+
+## What would actually work
+
+`amd-smi partition --accelerator` on this part:
+
+| compute mode | XCCs per partition | memory modes |
+|--------------|--------------------|--------------|
+| SPX (current)| 8                  | NPS1 only    |
+| DPX          | 4                  | NPS1, NPS2   |
+| QPX          | 2                  | NPS1, NPS2   |
+| CPX          | 1                  | NPS1, NPS2   |
+
+AID-local memory requires NPS2, and NPS2 is not offered under SPX. Getting
+locality therefore means giving up the single-device view and splitting compute
+too, which is exactly the trade the Starscream paper takes on: it runs CPX/NPS4
+and then has to repair the tensor-parallel partitioning that the split breaks.
+Switching modes is a `sudo amd-smi set -M` reconfiguration of an idle GPU, not
+something a process can request for one allocation.
