@@ -23,6 +23,7 @@ them. Details below.
 | `aid_remote_hbm.hip` | flag ping-pong between two named chiplets, plus NT STREAM phases |
 | `xcd_pair_matrix.hip` | round-trip latency for all 28 chiplet pairs, then a flag-address sweep |
 | `aid_home_map.hip` | classifies the home side of each address granule; finds the granularity |
+| `aid_alloc.hip` | AID-pinned allocator built on 4 KiB VMM handles, plus the bandwidth payoff |
 | `aid_page_map.hip` | single-chiplet atomic latency probe — **negative result, see caveat** |
 
 All of them read `HW_REG_XCC_ID` so each phase runs only on the chiplet it
@@ -81,22 +82,52 @@ So the assignment is per 4 KiB page and looks hashed rather than a simple
 round-robin, but it is deterministic: re-probing pages 0-7 in a later kernel
 launch reproduced `1 1 0 1 1 0 0 1` exactly.
 
-## How to use it
+## Pinning allocations to one AID (`aid_alloc.hip`)
 
-Probe once at init, then allocate accordingly:
+This works, with no partition mode change and no root. HIP's virtual memory API
+reports a 4 KiB allocation granularity on this part, which is exactly the
+granularity at which homing changes, so pages can be selected individually and
+re-mapped into a contiguous virtual range:
 
-1. Allocate the pool (physical pages are pinned for its lifetime).
-2. Classify each 4 KiB page with one ping-pong between a chiplet from each
-   group. The map follows the physical address, so it must be re-probed per
-   allocation, not cached across runs.
-3. Hand out only pages whose home matches the chiplet group that will consume
-   them.
+1. `hipMemCreate` one 4 KiB physical handle per page, map them all into a
+   scratch VA range.
+2. Classify every page in a single kernel launch (one wave on XCD0, one on
+   XCD1, bouncing a flag inside each page in turn).
+3. `hipMemAddressReserve` a fresh range and `hipMemMap` only the matching
+   handles into it, contiguously.
 
-What is not yet measured: whether this pays for bulk streaming. The 1.7x
-measured here is a coherence round trip on a single flag, which is the
-sync-primitive case. The payoff for weight streaming needs a bandwidth run over
-a working set larger than the 224 MiB L3, comparing local-page and remote-page
-buffers read from one chiplet group.
+The caller gets a plain `void*`. Classification runs at **45 us/page**, so a
+256 MiB buffer costs about 9 s of probing over a 768 MiB candidate pool. The
+split is roughly 43/57 rather than exactly even, so oversample by 3x.
+
+Measured on `0000:06:00.0`, 256 MiB buffers, re-probing the finished buffers:
+
+```
+local  buffer: 4096/4096 pages on the expected side, mean  728 ns
+remote buffer: 4091/4096 pages on the expected side, mean 1091 ns
+```
+
+### Does it pay?
+
+NT streaming of 256 MiB, restricted to one chiplet group (GB/s):
+
+| reader | pages homed XCD0-3 | pages homed XCD4-7 | prefers |
+|---|---|---|---|
+| XCD0-3 | **89.0** | 77.9 | its own, 1.14x |
+| XCD4-7 | 73.2 | **83.2** | its own, 1.14x |
+
+Both groups prefer their own pages by the same 1.14x. The crossover is the
+control: if one buffer were simply faster, both rows would pick the same column.
+That is a real 14% of read bandwidth from allocation placement alone, in the
+range of the 20% the paper attributes to avoiding remote-AID access.
+
+Two caveats worth keeping:
+
+- **The working set has to exceed the 224 MiB L3.** At 16 MiB the same test
+  gives 0.94x, i.e. nothing, because the memory-side cache absorbs the traffic
+  and the home stops mattering.
+- **The map follows physical addresses**, so it must be re-probed per
+  allocation and cannot be cached across runs.
 
 ## Caveat on `aid_page_map` (negative result, and why it is wrong)
 
@@ -123,11 +154,11 @@ are the usable signal.
 ## Build
 
 ```bash
-for f in aid_remote_hbm xcd_pair_matrix aid_home_map aid_page_map; do
+for f in aid_remote_hbm xcd_pair_matrix aid_home_map aid_alloc aid_page_map; do
   hipcc -O3 -std=c++17 --offload-arch=gfx950 \
     benchmark/aid_remote_hbm/$f.hip -o /tmp/$f
 done
-HIP_VISIBLE_DEVICES=1 /tmp/aid_home_map
+HIP_VISIBLE_DEVICES=1 /tmp/aid_alloc 256   # argument is the buffer size in MiB
 ```
 
 Run on an idle GPU; a neighbouring process on the same package perturbs the
