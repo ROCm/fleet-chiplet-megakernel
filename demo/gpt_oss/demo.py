@@ -494,7 +494,9 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
 LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
 
 
-W13_KMAJOR_RECYCLE = os.environ.get("MPK_W13_KMAJOR_RECYCLE", "0") == "1"
+# Ships on for batch-1. Host permute (pack site) and kernel flag both go
+# through mpk_opt with the same batch size so they cannot desync. Narrowed
+# off at bs>1 by _BS1_ONLY_OPTS.
 
 
 def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
@@ -2323,7 +2325,8 @@ if __name__ == "__main__":
                 target_out_dim=2 * PADDED_INTERMEDIATE_SIZE,
                 target_num_blocks=w13_target_num_blocks,
             )
-            if W13_KMAJOR_RECYCLE:
+            if _mpk_opt("MPK_W13_KMAJOR_RECYCLE",
+                        args.max_num_batched_tokens):
                 gu_packed = shuffle_w13_workgroups_kmajor(
                     gu_packed, output_per_wg=w13_output_per_wg)
             moe_gate_up_proj_weights.append(gu_packed)

@@ -736,18 +736,18 @@ def get_compile_command(
             # itself is already done in the fused layer's Phase 9. It is the
             # costliest of the six, worth roughly 0.07 ms/token.
             flags = flags + ["-DMPK_QKV_PREFETCH_SCALES"]
-        _w13_kmajor_recycle = (
-            os.environ.get("MPK_W13_KMAJOR_RECYCLE", "0") == "1"
-        )
-        if _w13_kmajor_recycle:
-            # Opt-in production candidate ported from Redline bb53b08b with
-            # the counted-wait ordering from adbf5fa8. The host applies the
-            # matching canonical K128-major permutation under the same env
-            # flag. This schedule recycles each tile-0 fragment's LDS slot
-            # for tile 1 and therefore replaces, rather than composes with,
-            # the split-stage experiment below.
+        if _opt("MPK_W13_KMAJOR_RECYCLE"):
+            # Canonical K128-major W13 layout plus tile-1 fragment recycling
+            # (Redline bb53b08b) and counted tile-0 handoff waits (adbf5fa8).
+            # Replaces the split-stage path. Host applies the matching
+            # permutation under the same flag.
+            #
+            # 1.815/1.819/1.819 -> 1.767/1.768/1.763 ms, three alternating
+            # pairs, identical generated text (Paris). Five ctx-4096
+            # repeats matched the control token dump. Batch-1 only.
             flags = flags + ["-DMPK_W13_KMAJOR_RECYCLE"]
-        if _opt("MPK_W13_T1_SPLIT_LDS_STAGE") and not _w13_kmajor_recycle:
+        if _opt("MPK_W13_T1_SPLIT_LDS_STAGE") and not _opt(
+                "MPK_W13_KMAJOR_RECYCLE"):
             # Split the W13 tile-1 HBM->LDS transfer in two. 11 of its 23 KiB
             # chunks go out *before* the tile-0 MFMA, into an LDS stage buffer
             # disjoint from tile 0 so there is no WAR hazard on the tile the

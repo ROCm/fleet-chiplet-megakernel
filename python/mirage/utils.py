@@ -57,6 +57,8 @@ _BS1_ONLY_OPTS = (
     # Rides on MPK_W13_PREQUANT (it reorders that flag's handoff), so it has
     # to go off wherever that one does.
     "MPK_W13_T0_COUNTED_HANDOFF",
+    # Canonical K128 recycle is batch-1 / OPW=128 only (kernel static_asserts).
+    "MPK_W13_KMAJOR_RECYCLE",
 )
 
 
