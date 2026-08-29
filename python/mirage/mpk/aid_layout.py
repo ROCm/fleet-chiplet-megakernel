@@ -98,7 +98,38 @@ def classify(buf: torch.Tensor):
     return torch.frombuffer(memoryview(side), dtype=torch.uint8).clone(), n0.value, secs.value
 
 
-def build_layout(packed: torch.Tensor, verbose: bool = True):
+def moe_slab_aid(num_experts: int, wgs_per_expert: int, frac_aid0: float):
+    """Assign MoE weight slabs to AIDs so the split holds under any routing.
+
+    The obvious assignment -- slabs in order, first 3/7 to AID0 -- puts whole
+    experts on one AID. Routing picks top-k of 128 experts per token and the
+    active set changes every step, so the AID split of *active* tiles would be
+    43/57 only on average and would swing hard token to token, which is the
+    load imbalance this whole scheme exists to avoid.
+
+    Splitting on the workgroup index inside each expert instead makes every
+    expert carry the same 3:4 proportion, so any subset of experts is still
+    split 3:4.
+    """
+    # 46 workgroups cannot be split 3:7 exactly -- 46*3/7 is 19.71 -- and
+    # rounding every expert the same way to 20 overshoots AID0's page supply.
+    # Carrying the remainder across experts instead makes the cut alternate
+    # 19/20 so the total lands exactly on the ratio.
+    out = torch.empty(num_experts * wgs_per_expert, dtype=torch.uint8)
+    wg = torch.arange(wgs_per_expert)
+    prev = 0
+    for e in range(num_experts):
+        cur = round((e + 1) * wgs_per_expert * frac_aid0)
+        cut = cur - prev
+        prev = cur
+        out[e * wgs_per_expert : (e + 1) * wgs_per_expert] = (wg >= cut).to(
+            torch.uint8
+        )
+    return out
+
+
+def build_layout(packed: torch.Tensor, slab_aid: torch.Tensor = None,
+                 verbose: bool = True):
     """Place a packed weight tensor AID-locally.
 
     `packed` is [num_slabs, slab_bytes] uint8 (or anything reshapeable to it),
@@ -133,20 +164,35 @@ def build_layout(packed: torch.Tensor, verbose: bool = True):
     free1 = torch.nonzero(side == 1, as_tuple=False).flatten()
     npages = side.numel()
 
-    # Proportional split, clamped to what each side can actually hold.
     cap0, cap1 = free0.numel() // pages_per_slab, free1.numel() // pages_per_slab
-    n0 = min(int(nslabs * free0.numel() / npages), cap0)
-    n1 = min(nslabs - n0, cap1)
-    if n0 + n1 < nslabs:
+    if slab_aid is None:
+        n0 = min(int(nslabs * free0.numel() / npages), cap0)
+        slab_aid = torch.zeros(nslabs, dtype=torch.uint8)
+        slab_aid[n0:] = 1
+    else:
+        slab_aid = slab_aid.cpu().to(torch.uint8).reshape(-1)
+        assert slab_aid.numel() == nslabs
+    n0 = int((slab_aid == 0).sum())
+    n1 = nslabs - n0
+    if n0 > cap0 or n1 > cap1:
         raise RuntimeError(
-            f"cannot place {nslabs} slabs: capacity {cap0}+{cap1}={cap0 + cap1}"
+            f"cannot place {n0}/{n1} slabs: capacity {cap0}/{cap1}"
         )
 
+    # Pages are handed out in buffer order within each AID, so slabs that are
+    # adjacent in the original tensor stay roughly adjacent in the new one.
     table = torch.empty(nslabs * pages_per_slab, dtype=torch.int32)
-    table[: n0 * pages_per_slab] = free0[: n0 * pages_per_slab].to(torch.int32)
-    table[n0 * pages_per_slab :] = free1[: n1 * pages_per_slab].to(torch.int32)
-    slab_aid = torch.zeros(nslabs, dtype=torch.uint8)
-    slab_aid[n0:] = 1
+    take0 = take1 = 0
+    order0 = free0.to(torch.int32)
+    order1 = free1.to(torch.int32)
+    for s in range(nslabs):
+        lo = s * pages_per_slab
+        if slab_aid[s] == 0:
+            table[lo : lo + pages_per_slab] = order0[take0 : take0 + pages_per_slab]
+            take0 += pages_per_slab
+        else:
+            table[lo : lo + pages_per_slab] = order1[take1 : take1 + pages_per_slab]
+            take1 += pages_per_slab
 
     table_dev = table.to(packed.device)
     lib = _load_lib()

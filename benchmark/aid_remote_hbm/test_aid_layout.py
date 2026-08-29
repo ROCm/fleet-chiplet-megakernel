@@ -33,9 +33,19 @@ def main():
         0, 256, (N_SLABS, SLAB_BYTES), dtype=torch.uint8, device=dev
     )
 
+    # Split on workgroup index within each expert, so the AID split survives
+    # top-k routing picking a different expert set every token.
+    assign = aid_layout.moe_slab_aid(128, 46, 3.0 / 7.0)
+
     t0 = time.time()
-    dest, table, slab_aid, info = aid_layout.build_layout(packed)
+    dest, table, slab_aid, info = aid_layout.build_layout(packed, slab_aid=assign)
     print(f"  build_layout total {time.time() - t0:.2f}s")
+
+    # Any subset of experts must still be split ~3:4.
+    per_expert = slab_aid.reshape(128, 46)
+    f0 = (per_expert == 0).float().mean(dim=1)
+    print(f"  per-expert AID0 share: min {f0.min():.3f} max {f0.max():.3f} "
+          f"(want {3 / 7:.3f})")
 
     # 1. bit-exact round trip: gather each slab back out of its pages
     ppl = info["pages_per_slab"]
