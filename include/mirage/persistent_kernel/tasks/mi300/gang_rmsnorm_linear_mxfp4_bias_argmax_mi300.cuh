@@ -45,6 +45,47 @@
 
 namespace kernel {
 
+#if defined(MPK_LM_HEAD_GROUP_PIPELINE) && !defined(MPK_LM_HEAD_KMAJOR)
+#error "MPK_LM_HEAD_GROUP_PIPELINE requires MPK_LM_HEAD_KMAJOR"
+#endif
+#if defined(MPK_LM_HEAD_GROUP_PIPELINE) && !defined(MPK_LM_HEAD_WAVE_TILE_DMA)
+#error "MPK_LM_HEAD_GROUP_PIPELINE requires MPK_LM_HEAD_WAVE_TILE_DMA"
+#endif
+
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+// gfx950 does not interlock a SALU write to M0 against the following
+// load-to-LDS MUBUF. Keep the required independent wait state in the same asm
+// block as the destination update and request.
+__device__ __forceinline__ void lm_head_load_lds_dwordx4_hazard_safe(
+    i32x4_t resource,
+    __attribute__((address_space(3))) uint32_t *destination,
+    uint32_t vector_offset,
+    bool non_temporal = true) {
+  unsigned const lds_offset = __builtin_amdgcn_readfirstlane(
+      static_cast<unsigned>(reinterpret_cast<uintptr_t>(destination)));
+  if (non_temporal) {
+    asm volatile(
+        "s_mov_b32 m0, %[lds_offset]\n"
+        "s_nop 0\n"
+        "buffer_load_dwordx4 %[vector_offset], %[resource], 0 offen sc0 nt "
+        "lds\n"
+        :
+        : [vector_offset] "v"(vector_offset), [resource] "s"(resource),
+          [lds_offset] "s"(lds_offset)
+        : "memory", "m0");
+  } else {
+    asm volatile(
+        "s_mov_b32 m0, %[lds_offset]\n"
+        "s_nop 0\n"
+        "buffer_load_dwordx4 %[vector_offset], %[resource], 0 offen lds\n"
+        :
+        : [vector_offset] "v"(vector_offset), [resource] "s"(resource),
+          [lds_offset] "s"(lds_offset)
+        : "memory", "m0");
+  }
+}
+#endif
+
 #ifdef MPK_ARGMAX_DUAL_REDUCE
 // ── The LM head's g-group argmax, as two VALU swaps instead of four LDS ─────
 //
@@ -173,6 +214,13 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   constexpr int QKV_LPT = (qkv_n16_data + 255) / 256;
   constexpr int QKV_TILE_DATA_PADDED = QKV_LPT * 256 * 16;
   constexpr int QKV_TILE_BYTES = QKV_TILE_DATA_PADDED + QKV_TILE_SCALE;
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+  constexpr int QKV_SCALE_TILE_PADDED =
+      ((QKV_TILE_SCALE + 1023) / 1024) * 1024;
+  constexpr int QKV_SCALE_PIPELINE_BYTES = QKV_SCALE_TILE_PADDED * NUM_WAVES;
+#else
+  constexpr int QKV_SCALE_PIPELINE_BYTES = 0;
+#endif
 
   // FP8 token rows sit at the start of LDS, one row per MFMA N column.
   // The +16 pad keeps consecutive rows off one bank group: the 16 lanes of a
@@ -186,12 +234,25 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   constexpr int RED_OFF = ((TOK_REGION + SC_REGION + 15) / 16) * 16;
   constexpr int RED_REGION = NUM_WAVES * MFMA_N * 8;
   constexpr int QKV_LDS_OFF = ((RED_OFF + RED_REGION + 15) / 16) * 16;
-  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES <=
+  static_assert(QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES +
+                            2 * QKV_SCALE_PIPELINE_BYTES <=
                     mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
                         mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
                 "LM-head LDS exceeds the MI350X dynamic LDS budget");
   static_assert(TOK_ROW_STRIDE % 16 == 0,
                 "token row stride must keep the i32x4 B-operand loads aligned");
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+  static_assert(BATCH_SIZE == 1,
+                "MPK_LM_HEAD_GROUP_PIPELINE is batch-1 only");
+  static_assert(REDUCTION_SIZE == 2944,
+                "MPK_LM_HEAD_GROUP_PIPELINE requires K=2944");
+  static_assert(OUTPUT_PER_WG == 64,
+                "MPK_LM_HEAD_GROUP_PIPELINE requires OPW=64");
+  static_assert(NUM_WAVES == 4 && TILES_PER_WAVE == 1,
+                "MPK_LM_HEAD_GROUP_PIPELINE requires four waves, one tile each");
+  static_assert(QKV_TILE_DATA == MFMA_ITERS * 1024,
+                "each K128 fragment must be one 64-lane 16-byte request");
+#endif
 
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
@@ -202,6 +263,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   float *s_red_val = (float *)((uint8_t *)_rnlm_smem + RED_OFF);
   int *s_red_idx = (int *)(s_red_val + NUM_WAVES * MFMA_N);
   uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+  uint8_t *scale_pipeline_lds = qkv_lds_w + QKV_TILE_BYTES * NUM_WAVES;
+#endif
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
@@ -285,12 +349,23 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         s_tok_scales + (tok_active ? col : 0) * SC_STRIDE;
 
     // ── Step 3: Internal tile loop + argmax ────────────────────────────────
+    int group_iteration = 0;
     for (int wg_idx = worker_rank; wg_idx < n_wgs_per_xcd;
-         wg_idx += workers_per_xcd) {
+         wg_idx += workers_per_xcd, ++group_iteration) {
       uint32_t qkv_wg_voff = static_cast<uint32_t>(wg_idx) * WG_BYTES;
 
     // ── Phase A: Prefetch weight data into LDS via buffer_load_dwordx4 lds:1
     // ──
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+      // Group zero remains synchronous. Every later group was streamed into
+      // this recycled tile by the preceding group's MFMA loop. Fleet's queue
+      // stages TaskDesc only immediately before its dependency acquire; unlike
+      // Redline's immutable fixed-rank plan, it has no publication-safe earlier
+      // descriptor from which to prefetch group zero. Adding that hook requires
+      // a separate scheduler protocol change, so this patch deliberately does
+      // not move task-descriptor reads across the dependency loop.
+      if (group_iteration == 0) {
+#endif
 #ifdef MPK_LM_HEAD_WAVE_TILE_DMA
       // ── One wave, one tile, one instruction train ─────────────────────────
       //
@@ -376,6 +451,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       }
     }
 #endif
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+      }
+#endif
 
       // ── Phase B: Drain data loads, load scales via VGPR, scatter to LDS ──
       constexpr int QKV_SC_DW4_PER_TILE = QKV_TILE_SCALE / 16;
@@ -385,7 +463,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 
-      // Issue scale loads from HBM via VGPR
+      // Issue group-zero scales from HBM via VGPR. Later groups use the
+      // ping-pong direct-to-LDS scale buffers filled below.
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+      if (group_iteration == 0) {
+#endif
       uint8_t const *wg_scales_hbm =
           W + static_cast<int64_t>(wg_idx) * WG_BYTES + WG_DATA_BYTES;
       i32x4_t qkv_sc_buf[QKV_SC_LPT];
@@ -415,19 +497,80 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         }
       }
     }
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+      }
+#endif
 
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
     __syncthreads();
+
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+    // Stage the following group's 1,472-byte scale tile per wave into one of
+    // two disjoint buffers. One wave request covers 1 KiB and a second,
+    // partially-executing request covers the exact 448-byte tail.
+    int const pipelined_next_wg_idx = wg_idx + workers_per_xcd;
+    if (pipelined_next_wg_idx < n_wgs_per_xcd) {
+      constexpr int SCALE_TAIL_VECTORS = (QKV_TILE_SCALE - 1024) / 16;
+      static_assert(QKV_TILE_SCALE > 1024);
+      static_assert(QKV_TILE_SCALE - 1024 == SCALE_TAIL_VECTORS * 16);
+      int const next_scale_buffer = group_iteration & 1;
+      auto *next_scale_wave_lds = (__attribute__((address_space(3)))
+                                   uint32_t *)(scale_pipeline_lds +
+                                               next_scale_buffer *
+                                                   QKV_SCALE_PIPELINE_BYTES +
+                                               warp_id *
+                                                   QKV_SCALE_TILE_PADDED);
+      uint32_t next_scale_offset =
+          static_cast<uint32_t>(pipelined_next_wg_idx) * WG_BYTES +
+          WG_DATA_BYTES + warp_id * QKV_TILE_SCALE + lane_id * 16;
+      lm_head_load_lds_dwordx4_hazard_safe(qkv_rsrc, next_scale_wave_lds,
+                                           next_scale_offset, false);
+      if (lane_id < SCALE_TAIL_VECTORS) {
+        lm_head_load_lds_dwordx4_hazard_safe(
+            qkv_rsrc, next_scale_wave_lds + 1024 / sizeof(uint32_t),
+            next_scale_offset + 1024, false);
+      }
+    }
+#endif
 
     // ── Phase C: MFMA loop reading from LDS ──
     for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
       int wave_tile = warp_id + tile_iter * NUM_WAVES;
       uint8_t const *tile_data_lds =
           (uint8_t const *)(qkv_lds_w + wave_tile * QKV_TILE_BYTES);
-      uint8_t const *tile_scale_lds = tile_data_lds + QKV_TILE_DATA_PADDED;
+      uint8_t const *tile_scale_lds;
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+      if (group_iteration == 0) {
+        tile_scale_lds = tile_data_lds + QKV_TILE_DATA_PADDED;
+      } else {
+        int const current_scale_buffer = (group_iteration - 1) & 1;
+        tile_scale_lds =
+            scale_pipeline_lds +
+            current_scale_buffer * QKV_SCALE_PIPELINE_BYTES +
+            warp_id * QKV_SCALE_TILE_PADDED;
+      }
+#else
+      tile_scale_lds = tile_data_lds + QKV_TILE_DATA_PADDED;
+#endif
 
       int w_row_in_tile = col;
       int const row_scale_base = w_row_in_tile * NUM_BLOCKS_32;
+
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+      // This readonly request is older than all 23 next-group data requests.
+      // vmcnt(23) below therefore retires it without draining that train.
+      using BiasDwords = unsigned int __attribute__((ext_vector_type(2)));
+      BiasDwords prefetched_bias;
+      int const rel_idx_base = wave_tile * 16 + g * 4;
+      if (tok_active) {
+        auto const *bias_address =
+            d_bias + wg_idx * OUTPUT_PER_WG + rel_idx_base;
+        asm volatile("global_load_dwordx2 %0, %1, off"
+                     : "=v"(prefetched_bias)
+                     : "v"(bias_address)
+                     : "memory");
+      }
+#endif
 
       // ── Weight fragment addressing ──────────────────────────────────────
       //
@@ -486,6 +629,24 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       i32x8_t a3 = MPK_LM_W_FRAG(3);
       int sa3 = (int)tile_scale_lds[row_scale_base + 3 * 4 + g];
 
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+#define MPK_LM_PIPE_NEXT(KI)                                                   \
+  do {                                                                         \
+    if (pipelined_next_wg_idx < n_wgs_per_xcd) {                               \
+      uint32_t const next_vector_offset =                                      \
+          static_cast<uint32_t>(pipelined_next_wg_idx) * WG_BYTES +            \
+          static_cast<uint32_t>(warp_id * QKV_TILE_DATA) +                     \
+          static_cast<uint32_t>((KI) * 1024 + lane_id * 16);                   \
+      auto *next_destination = (__attribute__((address_space(3)))              \
+                                 uint32_t *)(qkv_lds_w +                        \
+                                             warp_id * QKV_TILE_BYTES +        \
+                                             (KI) * 1024);                     \
+      lm_head_load_lds_dwordx4_hazard_safe(                                    \
+          qkv_rsrc, next_destination, next_vector_offset);                     \
+    }                                                                          \
+  } while (0)
+#endif
+
 #pragma unroll 1
       for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
         {
@@ -493,6 +654,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           int sb = (int)b_scale[ki];
           acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
         }
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+        MPK_LM_PIPE_NEXT(ki);
+#endif
         if (ki + 4 < MFMA_ITERS) {
           a0 = MPK_LM_W_FRAG(ki + 4);
           sa0 = (int)tile_scale_lds[row_scale_base + (ki + 4) * 4 + g];
@@ -502,6 +666,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           int sb = (int)b_scale[ki + 1];
           acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
         }
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+        MPK_LM_PIPE_NEXT(ki + 1);
+#endif
         if (ki + 5 < MFMA_ITERS) {
           a1 = MPK_LM_W_FRAG(ki + 5);
           sa1 = (int)tile_scale_lds[row_scale_base + (ki + 5) * 4 + g];
@@ -511,6 +678,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           int sb = (int)b_scale[ki + 2];
           acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
         }
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+        MPK_LM_PIPE_NEXT(ki + 2);
+#endif
         if (ki + 6 < MFMA_ITERS) {
           a2 = MPK_LM_W_FRAG(ki + 6);
           sa2 = (int)tile_scale_lds[row_scale_base + (ki + 6) * 4 + g];
@@ -519,6 +689,9 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 3) * K_PER_MFMA, g);
           int sb = (int)b_scale[ki + 3];
           acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+          MPK_LM_PIPE_NEXT(ki + 3);
+#endif
         }
         if (ki + 7 < MFMA_ITERS) {
           a3 = MPK_LM_W_FRAG(ki + 7);
@@ -526,6 +699,19 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         }
       }
 #undef MPK_LM_W_FRAG
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+#undef MPK_LM_PIPE_NEXT
+      // Final emitted order per wave is: two next-scale requests, one current
+      // bias request, then exactly 23 next-data requests. Keep the 23 younger
+      // data requests in flight across argmax while retiring every current
+      // consumer. The next iteration's vmcnt(0)/lgkmcnt(0) drains all of them
+      // before the barrier makes the recycled LDS tile visible.
+      if (pipelined_next_wg_idx < n_wgs_per_xcd) {
+        asm volatile("s_waitcnt vmcnt(23)" ::: "memory");
+      } else {
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      }
+#endif
 
       // Argmax epilogue: accumulate across ALL tiles in registers.
       // The guard is on `tok_active`, not `col == 0`: lane (g, col) now holds
@@ -538,8 +724,14 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           int rel_idx = wave_tile * 16 + g * 4 + i;
           int abs_idx = partition_start + wg_idx * OUTPUT_PER_WG + rel_idx;
           float sum = acc[i];
+#ifdef MPK_LM_HEAD_GROUP_PIPELINE
+          unsigned const packed_bias = prefetched_bias[i >> 1];
+          unsigned const bt = (i & 1) != 0 ? packed_bias & 0xffff0000U
+                                            : packed_bias << 16;
+#else
           unsigned bt = (unsigned)d_bias[wg_idx * OUTPUT_PER_WG + rel_idx]
                         << 16;
+#endif
           float bv;
           __builtin_memcpy(&bv, &bt, 4);
           float val = sum + bv;

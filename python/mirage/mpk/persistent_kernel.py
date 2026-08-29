@@ -570,6 +570,19 @@ def get_compile_command(
         # that issue it, so cheaper issue buys nothing.
         if int(os.environ.get("MPK_LM_HEAD_WAVE_TILE_DMA", "0")) == 1:
             flags = flags + ["-DMPK_LM_HEAD_WAVE_TILE_DMA"]
+        # Production Redline LM-head group pipeline: K-major host layout,
+        # synchronous group zero, scale ping-pong, and 23 K128 direct-to-LDS
+        # requests for group g+workers_per_xcd interleaved with group g's
+        # unchanged MFMA chain. Batch-1 qualification won five of six
+        # alternating pairs (-22/+11/-12 and -22/-21/-34 us/token);
+        # aggregate median improved 1.761 -> 1.745 ms/token. Control and
+        # pipeline PPL were identical (NLL 2.599956, 0 argmax mismatches).
+        if _opt("MPK_LM_HEAD_GROUP_PIPELINE"):
+            flags = flags + [
+                "-DMPK_LM_HEAD_GROUP_PIPELINE",
+                "-DMPK_LM_HEAD_KMAJOR",
+                "-DMPK_LM_HEAD_WAVE_TILE_DMA",
+            ]
         # Widen the embedding gather to 8 bytes per lane. The scalar arm moves
         # one element per lane per trip and blockDim.x is a runtime value, so a
         # 2944-wide bf16 row is 23 trips at 128 threads, each paying a

@@ -50,6 +50,7 @@ constexpr int kExperts = 128;
 constexpr int kTopk = 4;
 constexpr int kW13Opw = 128;
 constexpr int kW2Opw = 64;
+constexpr int kLmOpw = 64;
 } // namespace
 
 __global__ void compile_check_moe_fused(void const *input,
@@ -82,4 +83,34 @@ __global__ void compile_check_moe_fused(void const *input,
                                                     workspace_f32,
                                                     barrier,
                                                     tile_idx);
+}
+
+// Keep the LM-head specialization in the same codegen gate. It has the same
+// JIT-only failure mode as the MoE body and carries inline gfx950 M0/D2LDS
+// sequences when MPK_LM_HEAD_GROUP_PIPELINE is enabled.
+__global__ void compile_check_lm_head(void const *norm_input,
+                                      void const *norm_weight,
+                                      void *norm_output,
+                                      void const *lm_weight,
+                                      void const *bias,
+                                      void *argmax_value,
+                                      void *argmax_index,
+                                      int tile_idx) {
+  kernel::gang_rmsnorm_linear_mxfp4_bias_argmax_kernel<kBatch,
+                                                       kLmOpw,
+                                                       kHidden,
+                                                       2880>(norm_input,
+                                                             norm_weight,
+                                                             norm_output,
+                                                             lm_weight,
+                                                             bias,
+                                                             argmax_value,
+                                                             argmax_index,
+                                                             nullptr,
+                                                             0,
+                                                             kBatch,
+                                                             53,
+                                                             31,
+                                                             201216,
+                                                             tile_idx);
 }

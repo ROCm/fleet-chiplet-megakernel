@@ -489,8 +489,8 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
 # Same one-variable contract as MPK_OPROJ_KMAJOR -- a host/kernel disagreement
 # here is silently wrong numerics rather than a build error -- but this one is
 # opt-in rather than default-on, because it measured slower (1.837 -> 1.844 ms,
-# losing all three pairs). Read the raw variable, not mpk_opt(), so both sides
-# agree on the same default of off; persistent_kernel.py does the same.
+# losing all three pairs). The batch-1 group pipeline below also requires this
+# layout and is resolved at the pack site where batch size is available.
 LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
 
 
@@ -1952,7 +1952,9 @@ if __name__ == "__main__":
         lm_head_packed = pack_mxfp4_workgroup(
             lm_blocks, lm_scales, output_per_wg=lm_head_output_per_wg,
         ).squeeze(0)  # [n_wgs, wg_bytes]
-        if LM_HEAD_KMAJOR:
+        lm_head_kmajor = LM_HEAD_KMAJOR or _mpk_opt(
+            "MPK_LM_HEAD_GROUP_PIPELINE", args.max_num_batched_tokens)
+        if lm_head_kmajor:
             lm_head_packed = shuffle_lm_head_record_kmajor(
                 lm_head_packed, output_per_wg=lm_head_output_per_wg)
         print(f"LM head MXFP4: {lm_head_weight.shape} BF16 ({lm_head_weight.numel()*2/1e6:.0f} MB) "
