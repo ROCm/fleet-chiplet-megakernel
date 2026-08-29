@@ -155,6 +155,44 @@ extern "C" int aid_classify_pages(void *base, size_t nbytes,
   return 0;
 }
 
+// Move each slab from its packed position into the pages the layout assigned
+// it. One block per page keeps the copy coalesced, and the last page of a slab
+// is partial (200192 B is 48.875 pages) so it is clamped rather than padded
+// with a branchy tail.
+__global__ void scatter_kernel(char *__restrict dst, const char *__restrict src,
+                               const int *__restrict table, int nslabs,
+                               int slab_bytes, int pages_per_slab) {
+  const long long job = (long long)blockIdx.x;
+  const int slab = (int)(job / pages_per_slab);
+  const int page = (int)(job % pages_per_slab);
+  if (slab >= nslabs)
+    return;
+  const int off = page * (int)kPage;
+  if (off >= slab_bytes)
+    return;
+  const int n = min((int)kPage, slab_bytes - off);
+  const char *s = src + (long long)slab * slab_bytes + off;
+  char *d = dst + (long long)table[(long long)slab * pages_per_slab + page] *
+                      (long long)kPage;
+  for (int i = (int)threadIdx.x * 16; i + 16 <= n; i += 256 * 16)
+    *(uint4 *)(d + i) = *(const uint4 *)(s + i);
+  // ragged tail, byte-wise
+  for (int i = (n & ~15) + (int)threadIdx.x; i < n; i += 256)
+    d[i] = s[i];
+}
+
+extern "C" int aid_scatter_copy(void *dst_base, const void *src,
+                                const int *table_dev, int nslabs,
+                                int slab_bytes, int pages_per_slab) {
+  if (!dst_base || !src || !table_dev)
+    return -1;
+  const long long jobs = (long long)nslabs * pages_per_slab;
+  scatter_kernel<<<(unsigned)jobs, 256>>>((char *)dst_base, (const char *)src,
+                                          table_dev, nslabs, slab_bytes,
+                                          pages_per_slab);
+  return hipDeviceSynchronize() == hipSuccess ? 0 : -2;
+}
+
 // Independent check that a built layout is what it claims: re-classify and
 // count how many of the listed pages really sit on `want_aid`. Destroys the
 // contents of the listed pages, so run it before the weights are written.
