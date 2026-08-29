@@ -494,6 +494,44 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
 LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
 
 
+W13_KMAJOR_RECYCLE = os.environ.get("MPK_W13_KMAJOR_RECYCLE", "0") == "1"
+
+
+def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
+                                  output_per_wg: int = 128) -> torch.Tensor:
+    """Repack W13 data into lane-contiguous K128 fragments.
+
+    Within each 16-row tile the data prefix changes from
+    ``[row, k128, quarter, byte]`` to
+    ``[k128, quarter, row, byte]``. Scales remain row-major.
+    """
+    if packed.ndim != 3:
+        raise ValueError(
+            "expected rank-3 [experts, workgroups, bytes] W13 weights, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg != 128:
+        raise ValueError(
+            "MPK_W13_KMAJOR_RECYCLE requires W13_OPW=128 "
+            f"(got {output_per_wg})")
+
+    experts, workgroups, wg_bytes = packed.shape
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if reduction != PADDED_HIDDEN_SIZE or reduction % 128 != 0:
+        raise ValueError(
+            "MPK_W13_KMAJOR_RECYCLE requires the canonical padded hidden "
+            f"size {PADDED_HIDDEN_SIZE}, got {reduction}")
+    if data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(f"invalid W13 MXFP4 record width {wg_bytes}")
+
+    tiles = output_per_wg // 16
+    data = packed[..., :data_bytes].reshape(
+        experts, workgroups, tiles, 16, reduction // 128, 4, 16)
+    data = data.permute(0, 1, 2, 4, 5, 3, 6).reshape(
+        experts, workgroups, data_bytes)
+    return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()
+
+
 def shuffle_lm_head_record_kmajor(packed: torch.Tensor,
                                   output_per_wg: int = 64) -> torch.Tensor:
     """Repack packed LM-head workgroups into lane-native K128 fragments.
@@ -2285,6 +2323,9 @@ if __name__ == "__main__":
                 target_out_dim=2 * PADDED_INTERMEDIATE_SIZE,
                 target_num_blocks=w13_target_num_blocks,
             )
+            if W13_KMAJOR_RECYCLE:
+                gu_packed = shuffle_w13_workgroups_kmajor(
+                    gu_packed, output_per_wg=w13_output_per_wg)
             moe_gate_up_proj_weights.append(gu_packed)
 
             # down_proj: blocks [E, hidden, nb, 16], scales [E, hidden, nb]

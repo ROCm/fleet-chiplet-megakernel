@@ -479,9 +479,11 @@ def get_compile_command(
         # between consecutive same-accumulator MFMAs with s_nop; these remove
         # it, dropping the adjacent cadence to 8 states.
         #
-        # MPK_MOE_QUAD_ACCUMULATOR (W2) is still a no-op without
-        # MPK_MFMA_PINGPONG_SCHED. MPK_MOE_DUAL_ACCUMULATOR (W13) is not: the
-        # unscheduled arm carries no s_nop but still pays the SrcC RAW as a
+        # The Redline W2 four-chain body is available directly in Fleet's
+        # default unrolled arm; it no longer requires
+        # MPK_MFMA_PINGPONG_SCHED. MPK_MOE_DUAL_ACCUMULATOR (W13) likewise
+        # works in the unscheduled arm, which carries no s_nop but still pays
+        # the SrcC RAW as a
         # hardware stall, roughly 21 states on top of the ~11 issued slots
         # between its two MFMAs, so the chains have something to remove there
         # too. The transform is credited with 47.6 us/token (2.6%) at
@@ -509,13 +511,17 @@ def get_compile_command(
             # W13 tiles 0 and 1: even K blocks on a[0:3], odd on a[4:7].
             flags = flags + ["-DMPK_MOE_DUAL_ACCUMULATOR"]
         if int(os.environ.get("MPK_MOE_QUAD_ACCUMULATOR", "0")) == 1:
-            # W2: K block k on chain k % 4, four blocks per trip.
+            # W2: K block k on chain k % 4, four blocks per unrolled body.
+            # Qualification at seq512 was 1.823/1.819/1.821 control versus
+            # 1.816/1.818/1.815 variant. It stays opt-in because reassociation
+            # changed the generated-token hash and the ~5 us mean win is small.
             flags = flags + ["-DMPK_MOE_QUAD_ACCUMULATOR"]
         # Spend the W2 epilogue's 32-clock Hazard-2 pad on the reduction of the
         # three accumulator chains that already retired, instead of idling it.
         # Requires the quad chains to exist, so the kernel #errors if this is
         # set without MPK_MOE_QUAD_ACCUMULATOR. Merge order is unchanged, so
-        # unlike the two flags above this one is bit-exact.
+        # unlike the two flags above this one is bit-exact. Three paired runs
+        # were mixed (one win, one tie, one loss), so it remains opt-in.
         if int(os.environ.get("MPK_MOE_W2_EPILOGUE_OVERLAP", "0")) == 1:
             flags = flags + ["-DMPK_MOE_W2_EPILOGUE_OVERLAP"]
         # Read the O-proj weight fragments K-major so a wave's 64 ds_read_b128
@@ -730,7 +736,18 @@ def get_compile_command(
             # itself is already done in the fused layer's Phase 9. It is the
             # costliest of the six, worth roughly 0.07 ms/token.
             flags = flags + ["-DMPK_QKV_PREFETCH_SCALES"]
-        if _opt("MPK_W13_T1_SPLIT_LDS_STAGE"):
+        _w13_kmajor_recycle = (
+            os.environ.get("MPK_W13_KMAJOR_RECYCLE", "0") == "1"
+        )
+        if _w13_kmajor_recycle:
+            # Opt-in production candidate ported from Redline bb53b08b with
+            # the counted-wait ordering from adbf5fa8. The host applies the
+            # matching canonical K128-major permutation under the same env
+            # flag. This schedule recycles each tile-0 fragment's LDS slot
+            # for tile 1 and therefore replaces, rather than composes with,
+            # the split-stage experiment below.
+            flags = flags + ["-DMPK_W13_KMAJOR_RECYCLE"]
+        if _opt("MPK_W13_T1_SPLIT_LDS_STAGE") and not _w13_kmajor_recycle:
             # Split the W13 tile-1 HBM->LDS transfer in two. 11 of its 23 KiB
             # chunks go out *before* the tile-0 MFMA, into an LDS stage buffer
             # disjoint from tile 0 so there is no WAR hazard on the tile the
@@ -795,12 +812,30 @@ def get_compile_command(
             # not a per-token gather). Both are enforced in the kernel.
             flags = flags + ["-DMPK_W13_PREQUANT"]
         if int(os.environ.get("MPK_NARROW_GATE_POLL", "0")) == 1:
-            # One thread per block polls the Phase 6 / Phase 7b release lines
-            # instead of all 256, with a __syncthreads to carry the other
-            # waves. At sc0 sc1 every poll is a real trip to the coherency
-            # point, so 240 pollers per XCD contend the very line that is
-            # about to be written.
+            # TESTED AND NOT ADOPTED (mixed/neutral). One thread per block
+            # polls Phase 6 / Phase 7b instead of all 256, then
+            # __syncthreads. Screening once looked like 1.841 -> 1.825; a
+            # 3-pair A/B after W13 counted-wait was 1.817/1.835, 1.823/1.825,
+            # 1.826/1.820 -- one loss, one tie, one small win. The extra
+            # barrier pays back the contention it removes on this path.
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
+        if int(os.environ.get("MPK_SLICE_DUAL_POLL", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Issue the two attention-slice
+            # release loads, then one vmcnt(0), instead of load-wait twice.
+            # 1.814/1.820, 1.826/1.814, 1.826/1.811 -- mean ~7 us, not 3/3.
+            # Text unchanged (Paris) in all six runs.
+            flags = flags + ["-DMPK_SLICE_DUAL_POLL"]
+        if _opt("MPK_NARROW_OPROJ_HIER"):
+            # One tid polls the O-proj hierarchical release; the acquire
+            # __syncthreads already below carries the other 255. Unlike
+            # MPK_NARROW_GATE_POLL this does not add a barrier.
+            #
+            # 1.826 -> 1.814, 1.829 -> 1.820, 1.824 -> 1.818 ms, three
+            # alternating pairs, every pair a win. Qualification (default ON
+            # vs =0) was 1.820/1.824, 1.820/1.824, 1.823/1.818 -- two of
+            # three still favor ON. Incompatible with MPK_OPROJ_LEAN_ACQUIRE
+            # (that arm deletes the rendezvous).
+            flags = flags + ["-DMPK_NARROW_OPROJ_HIER"]
         if _opt("MPK_ATTN_SLICE_RELEASE"):
             # Replace the eight-XCD attention rendezvous with a per-XCD slice
             # publish. Each XCD's merge owns a contiguous 512-element slice of
@@ -851,6 +886,12 @@ def get_compile_command(
             # scalar flat_load_dwords inside the epilogue instead; ATT charges
             # 3.7% of all cycles to waiting on them.
             flags = flags + ["-DMPK_W13_BIAS_PREFETCH"]
+        if _opt("MPK_W13_BIAS_COUNTED_WAIT"):
+            # ATT found the prefetch's compiler-inserted vmcnt(0) waiting for
+            # the 15 younger tile-1 data/scale requests too. Keep those in
+            # flight with vmcnt(15): 1.824 -> 1.819, 1.829 -> 1.828, and
+            # 1.822 -> 1.815 ms in three alternating pairs, text unchanged.
+            flags = flags + ["-DMPK_W13_BIAS_COUNTED_WAIT"]
         if _opt("MPK_W2_ONLY_ARRIVE"):
             # Narrow the Phase 9 arrival to the workers that actually ran a W2
             # tile. The barrier orders this layer's W2 stores against the next

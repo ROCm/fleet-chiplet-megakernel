@@ -426,9 +426,23 @@ __device__ __attribute__((noinline)) void
       // hands it one; the load itself is read-only.
       int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
       int *rel1 = const_cast<int *>(attn_slice_release) + (first_xcd + 1) * 16;
+#ifdef MPK_SLICE_DUAL_POLL
+      // Wave w waits on XCDs 2w and 2w+1. The serial form issues load-wait
+      // twice, so a miss always pays two coherency round trips even though
+      // the flags are independent. Overlap them.
+      int s0, s1;
+      do {
+        ld_sys_s32x2(rel0, rel1, s0, s1);
+        if (s0 >= layer_epoch && s1 >= layer_epoch) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      } while (true);
+#else
       while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
         __builtin_amdgcn_s_sleep(1);
       }
+#endif
       // Cross-XCD acquire, per wave, placed at this wave's observation. The
       // caller's Phase 6 `buffer_inv` runs before any flag has been seen on
       // this path, so it cannot be the acquire for attn_out: a line cached
@@ -1323,6 +1337,14 @@ oproj_barrier :
     // done`; both are a few cycles against the ~2.5 us poll, and leaving them
     // in keeps the acquire argument below untouched.
     if (local_tile < router_tile_n)
+#endif
+#ifdef MPK_NARROW_OPROJ_HIER
+#ifdef MPK_OPROJ_LEAN_ACQUIRE
+#error "MPK_NARROW_OPROJ_HIER needs the acquire __syncthreads that LEAN_ACQUIRE removes"
+#endif
+    // One poller. The acquire rendezvous below is already block-wide, so the
+    // other 255 threads do not need their own sc0 sc1 reads of this line.
+    if (tid == 0)
 #endif
       while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {

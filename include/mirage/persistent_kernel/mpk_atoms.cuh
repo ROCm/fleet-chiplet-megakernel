@@ -123,6 +123,28 @@ __device__ __forceinline__ int ld_sys_s32(int *addr) {
 #endif
 }
 
+// Two independent system-scope polls, one wait. `ld_sys_s32` serializes each
+// load behind its own vmcnt(0), so a two-flag spin pays two HBM round trips
+// per miss. Issue both, then one wait.
+__device__ __forceinline__ void ld_sys_s32x2(int *addr0, int *addr1, int &out0,
+                                             int &out1) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  int v0, v1;
+  asm volatile("global_load_dword %0, %2, off sc0 sc1\n"
+               "global_load_dword %1, %3, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=&v"(v0), "=&v"(v1)
+               : "v"(addr0), "v"(addr1)
+               : "memory");
+  out0 = v0;
+  out1 = v1;
+#else
+  out0 = *reinterpret_cast<int volatile *>(addr0);
+  out1 = *reinterpret_cast<int volatile *>(addr1);
+#endif
+}
+
 // The poll idiom the release gates use. MPK_SYS_POLL_LOAD swaps every gate
 // from the `nt` hint to a true system-scope read in one place, so the two can
 // be compared without touching each site.
