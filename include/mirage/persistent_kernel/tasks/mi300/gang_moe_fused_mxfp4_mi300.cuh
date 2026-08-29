@@ -101,6 +101,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     void const *gate_up_weight_ptr, // [E, W13_WGS, wg_bytes] MXFP4 (interleaved
                                     // gate/up)
     void const *down_weight_ptr,    // [E, W2_WGS, wg_bytes] MXFP4
+    // [E*W13_WGS, ceil(W13_WG_BYTES/4096)] int32, or null. Under
+    // MPK_MOE_AID_LOCAL the gate_up tensor is not a flat array of slabs: each
+    // slab's pages are scattered onto pages homed on the AID of the XCD that
+    // reads it, and this maps slab page -> buffer page. See aid_layout.py.
+    void const *gate_up_page_table_ptr,
     void const *routing_ptr,        // [E, batch] int32
     void const *mask_ptr,           // [E+1] int32
     void const
@@ -186,6 +191,46 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #error "MPK_W13_T0_MFMA_UNROLLED / MPK_W2_T0_MFMA_UNROLLED unroll the "        \
        "unscheduled ping-pong arm and have no effect under "                   \
        "MPK_MFMA_PINGPONG_SCHED. Drop one of the two."
+#endif
+
+// ── AID-local weights: which load paths have been converted ─────────────────
+//
+// MPK_MOE_AID_LOCAL replaces the W13 slab stride with a page table, because on
+// MI350 NPS1 a 49-page slab is always split across both AIDs and no reader
+// steering can make it local. Every site that forms a W13 address has to go
+// through the table -- a single one left computing `base + wg_idx * WG_BYTES`
+// reads another slab's bytes and silently corrupts the layer rather than
+// failing. Only the live configuration is converted, so refuse to build the
+// others instead of half-applying.
+#ifdef MPK_MOE_AID_LOCAL
+#ifndef MPK_W13_LDS_PREFETCH
+#error "MPK_MOE_AID_LOCAL converts the HBM->LDS prefetch path. Without "       \
+       "MPK_W13_LDS_PREFETCH the weights are dereferenced straight into the "  \
+       "MFMA pipeline from wg_data, which still assumes a contiguous slab."
+#endif
+#ifndef MPK_W13_LINEAR_LOAD
+#error "MPK_MOE_AID_LOCAL converts the linear W13 load. The striped path "     \
+       "interleaves four waves across four tiles off w13_wg_voff_base and "    \
+       "has not been ported to the page table."
+#endif
+#ifdef MPK_W13_LDS_WEIGHTS
+#error "MPK_MOE_AID_LOCAL has not been ported to MPK_W13_LDS_WEIGHTS, which "  \
+       "keeps weights in LDS through the MFMA and reads them back by slab "    \
+       "offset."
+#endif
+#ifdef MPK_W13_T1_SPLIT_LDS_STAGE
+#error "MPK_MOE_AID_LOCAL has not been ported to "                             \
+       "MPK_W13_T1_SPLIT_LDS_STAGE, whose staged prefix and .rept 12 suffix "  \
+       "both walk the slab contiguously."
+#endif
+#ifndef MPK_W13_T1_LINEAR_LOAD
+#error "MPK_MOE_AID_LOCAL converts the linear W13 tile-1 load; the striped "   \
+       "T1 fallback still forms addresses from w13_wg_voff_base."
+#endif
+#ifdef MPK_W13_T1_SPLIT_STAGE_PROBE
+#error "MPK_W13_T1_SPLIT_STAGE_PROBE issues a second contiguous T1 burst "     \
+       "that MPK_MOE_AID_LOCAL does not redirect."
+#endif
 #endif
 #ifdef MPK_W13_T0_MFMA_UNROLLED
   // .rept emits (W13_MFMA_ITERS-1)/2 bank pairs and exactly one bank-0 tail,
@@ -712,9 +757,17 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     // Weight pointers
     uint8_t const *expert_weight =
         W_gate_up + static_cast<int64_t>(expert_id) * W13_EXPERT_BYTES;
+#ifndef MPK_MOE_AID_LOCAL
     uint8_t const *wg_data =
         expert_weight + static_cast<int64_t>(wg_idx) * W13_WG_BYTES;
     uint8_t const *wg_scales = wg_data + W13_WG_DATA;
+#else
+    // Deliberately not defined under AID-local placement. The slab is no
+    // longer a contiguous run at `expert_weight + wg_idx * W13_WG_BYTES`, so
+    // any site still forming addresses that way would read another slab's
+    // bytes and corrupt the layer silently. Leaving the names undefined turns
+    // every such site into a build error instead; use w13_page_base() below.
+#endif
 
     // Single-row paths quantize one contiguous row at `tok_idx`; the packed
     // multi-row path gathers via s_row_off and `tok_idx` is a literal 0 there,
@@ -812,9 +865,50 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   "split W13 tile-1 stage exceeds the worker's LDS budget");
     uint8_t *lds_w13_t1_stage = (uint8_t *)_fused_smem + LDS_W13_T1_STAGE_OFF;
 #endif
+#ifdef MPK_MOE_AID_LOCAL
+    // ── AID-local weight addressing ────────────────────────────────────────
+    //
+    // MI350 NPS1 interleaves memory over 7 HBM stacks as a mod-7 hash of the
+    // physical 4 KiB page, and the two AIDs own 3 and 4 of them. A slab is 49
+    // pages, so a contiguous one always straddles both AIDs -- measured 0 of
+    // 10699 single-AID, longest run 6 pages. The host therefore scatters each
+    // slab onto pages homed on the reading XCD's AID and hands us this table.
+    //
+    // The payoff is a tail effect, not a bandwidth one: a tile is 23 chunks
+    // ending in `s_waitcnt vmcnt(0)`, so it is ready only when the *slowest*
+    // chunk lands, and with mixed homing nearly every tile waits on a remote
+    // one. Measured 4040 -> 3820 ns per tile at this phase's operating point,
+    // and 397 -> 355 ns on a dependent chase, against 341 ns for a real NPS2
+    // partition.
+    //
+    // The resource spans the whole tensor rather than one expert, because
+    // voffs are now absolute page offsets into the buffer instead of offsets
+    // within an expert.
+    constexpr int W13_SLAB_PAGES = (W13_WG_BYTES + 4095) / 4096;
+    static_assert(1024 % 1 == 0 && 4096 % 1024 == 0,
+                  "chunk size must divide the page so no chunk straddles two "
+                  "table entries");
+    const int w13_slab = expert_id * W13_WGS + wg_idx;
+    int const *w13_pages = static_cast<int const *>(gate_up_page_table_ptr) +
+                           static_cast<int64_t>(w13_slab) * W13_SLAB_PAGES;
+    i32x4_t w13_rsrc = make_w_buffer_rsrc(
+        W_gate_up, static_cast<uint32_t>(NUM_EXPERTS * W13_WGS *
+                                         W13_SLAB_PAGES * 4096));
+    // Resolve a byte offset inside the slab to a buffer offset. Wave-uniform
+    // by construction, and readfirstlane keeps it in SGPRs: making this a
+    // per-chunk vector load inside the burst would put a dependent round trip
+    // in front of every load and cost far more than locality returns.
+    auto w13_page_base = [&](int off) -> uint32_t {
+      return static_cast<uint32_t>(
+                 __builtin_amdgcn_readfirstlane(w13_pages[off >> 12])) *
+                 4096u +
+             static_cast<uint32_t>(off & 4095);
+    };
+#else
     i32x4_t w13_rsrc = make_w_buffer_rsrc(
         expert_weight, static_cast<uint32_t>(W13_EXPERT_BYTES));
     uint32_t w13_wg_voff_base = static_cast<uint32_t>(wg_idx) * W13_WG_BYTES;
+#endif
 
 #ifdef MPK_W13_T0_COUNTED_HANDOFF
 #ifndef MPK_W13_PREQUANT
@@ -978,6 +1072,33 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                     "linear load assigns one W13 tile per wave");
       unsigned const lds_t0_base = __builtin_amdgcn_readfirstlane(
           (unsigned)(uintptr_t)(lds_w13_base + warp_id * W13_TILE_BYTES));
+#ifdef MPK_MOE_AID_LOCAL
+      // The slab's pages are scattered, so `+0x400` no longer tracks the data
+      // and each chunk carries its own voff. The LDS side still advances
+      // linearly, so the tile lands in exactly the layout the MFMA reader at
+      // `lds_w13_base + warp_id * W13_TILE_BYTES` expects.
+      //
+      // All 23 table lookups are resolved here, ahead of the burst. They are
+      // scalar and hit one 196 B table row, whereas folding them into the
+      // burst would make each load's address depend on a fresh memory read.
+      uint32_t t0_voff[W13_T0_CHUNKS];
+#pragma unroll
+      for (int c = 0; c < W13_T0_CHUNKS; c++)
+        t0_voff[c] = w13_page_base(warp_id * W13_TILE_DATA + c * 1024) +
+                     static_cast<uint32_t>(lane_id * 16);
+#pragma unroll
+      for (int c = 0; c < W13_T0_CHUNKS; c++) {
+        unsigned const m =
+            __builtin_amdgcn_readfirstlane(lds_t0_base + c * 1024);
+        asm volatile(
+            "s_mov_b32 m0, %[m]\n"
+            "s_nop 0\n"
+            "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen sc0 nt lds\n"
+            :
+            : [voff] "v"(t0_voff[c]), [rsrc] "s"(w13_rsrc), [m] "s"(m)
+            : "memory", "m0");
+      }
+#else
       uint32_t t0_voff =
           w13_wg_voff_base +
           static_cast<uint32_t>(warp_id * W13_TILE_ROWS * (W13_K / 2)) +
@@ -995,6 +1116,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           : [voff] "+v"(t0_voff)
           : [rsrc] "s"(w13_rsrc), [lds_base] "s"(lds_t0_base)
           : "memory", "m0");
+#endif
     }
 #else
     {
@@ -1983,6 +2105,30 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                           "below; W13_K changed, so re-derive the chunk count");
             unsigned const lds_t1_base = __builtin_amdgcn_readfirstlane(
                 (unsigned)(uintptr_t)(lds_w13_base + warp_id * W13_TILE_BYTES));
+#ifdef MPK_MOE_AID_LOCAL
+            // Same treatment as tile 0, one wave-tile group further into the
+            // slab: scattered pages mean per-chunk voffs resolved ahead of the
+            // burst, while the LDS side still walks linearly into tile
+            // warp_id's slot.
+            uint32_t t1_voff[W13_T1_CHUNKS];
+#pragma unroll
+            for (int c = 0; c < W13_T1_CHUNKS; c++)
+              t1_voff[c] = w13_page_base(
+                               (warp_id + NUM_WAVES) * W13_TILE_DATA + c * 1024) +
+                           static_cast<uint32_t>(lane_id * 16);
+#pragma unroll
+            for (int c = 0; c < W13_T1_CHUNKS; c++) {
+              unsigned const m =
+                  __builtin_amdgcn_readfirstlane(lds_t1_base + c * 1024);
+              asm volatile(
+                  "s_mov_b32 m0, %[m]\n"
+                  "s_nop 0\n"
+                  "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen sc0 nt lds\n"
+                  :
+                  : [voff] "v"(t1_voff[c]), [rsrc] "s"(w13_rsrc), [m] "s"(m)
+                  : "memory", "m0");
+            }
+#else
             uint32_t t1_voff =
                 w13_wg_voff_base +
                 static_cast<uint32_t>((warp_id + NUM_WAVES) * W13_TILE_ROWS *
@@ -2001,6 +2147,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 : [voff] "+v"(t1_voff)
                 : [rsrc] "s"(w13_rsrc), [lds_base] "s"(lds_t1_base)
                 : "memory", "m0");
+#endif
           }
 #else
           unsigned lds_t1_base =
