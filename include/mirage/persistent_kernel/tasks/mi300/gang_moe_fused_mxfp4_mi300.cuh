@@ -417,9 +417,63 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
     return;
   }
 
+  // ── AID-invariant workgroup map (opt-in) ──────────────────────────────────
+  // Which AID reads weight workgroup w is, by default, a function of the
+  // expert's *position* in the activated list, not of w. Tile e*W13_TILES + p
+  // runs on XCD (e*W13_TILES + p) % 8, and W13_TILES is 46 here, so each
+  // expert's block is rotated by a further 46 % 8 == 6 XCDs. A workgroup
+  // therefore changes AID from token to token and there is no AID its pages
+  // could usefully be homed on.
+  //
+  // Re-deal the same tiles so that the AID is fixed instead. Both phase
+  // regions are already whole multiples of 8 tiles (W13 is padded up to
+  // PAD_MULTIPLE, W2 is MAX_ACTIVATED * W2_TILES), so each splits exactly
+  // half-and-half across the two AIDs, and each half has room for
+  // MAX_ACTIVATED * (TILES/2) workgroups -- W2 to the tile, W13 inside the
+  // padding it already carries. Enumerate one AID's slots as s, hand them out
+  // in runs of TILES/2, and workgroup w < TILES/2 sits on AID 0 for every
+  // expert, always.
+  //
+  // This is a pure re-interpretation of the tile index. The tile -> XCD
+  // mapping, the tile count, and the arrival count per slot (TILES/2 per AID,
+  // TILES in total) are all identical to the default, so scheduling, load
+  // balance and the `% W13_TILES` release below are untouched. On its own it
+  // moves no byte to a different HBM stack -- it is what makes homing the
+  // weight pages meaningful.
+  constexpr bool AID_MAP_OK =
+      PACK_N && (W13_TILES % 2 == 0) && (W2_TILES % 2 == 0) &&
+      (TOTAL_W13 % 8 == 0) && (TOTAL_W2 % 8 == 0) &&
+      (TOTAL_W13 / 2 >= MAX_ACTIVATED * (W13_TILES / 2)) &&
+      (TOTAL_W2 / 2 >= MAX_ACTIVATED * (W2_TILES / 2));
+#ifdef MPK_MOE_AID_INVARIANT_MAP
+  static_assert(AID_MAP_OK,
+                "MPK_MOE_AID_INVARIANT_MAP needs N-packed tiles, an even "
+                "workgroup count in both phases, both phase regions a whole "
+                "multiple of 8 tiles, and room for MAX_ACTIVATED*(TILES/2) "
+                "workgroups in each AID half.");
+  constexpr bool USE_AID_MAP = true;
+#else
+  constexpr bool USE_AID_MAP = false;
+#endif
+
   bool is_w2 = (global_tile >= TOTAL_W13);
   int expert_idx, phase_tile;
-  if (!is_w2) {
+  if constexpr (USE_AID_MAP) {
+    // Offset within the phase region. TOTAL_W13 % 8 == 0 is what keeps
+    // t % 8 equal to the XCD id, so the AID bit survives the rebase.
+    int t = is_w2 ? (global_tile - TOTAL_W13) : global_tile;
+    int aid = (t >> 2) & 1;
+    int s = (t >> 3) * 4 + (t & 3); // slot index within this AID
+    if (!is_w2) {
+      constexpr int HALF = W13_TILES / 2;
+      expert_idx = s / HALF;
+      phase_tile = aid * HALF + (s % HALF);
+    } else {
+      constexpr int HALF = W2_TILES / 2;
+      expert_idx = s / HALF;
+      phase_tile = aid * HALF + (s % HALF);
+    }
+  } else if (!is_w2) {
     expert_idx = global_tile / W13_TILES;
     phase_tile = global_tile % W13_TILES;
   } else {

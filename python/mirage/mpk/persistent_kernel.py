@@ -502,6 +502,14 @@ def get_compile_command(
         # unlike the two flags above this one is bit-exact.
         if int(os.environ.get("MPK_MOE_W2_EPILOGUE_OVERLAP", "0")) == 1:
             flags = flags + ["-DMPK_MOE_W2_EPILOGUE_OVERLAP"]
+        # Deal the MoE tiles so that weight workgroup w is always read by the
+        # same AID, instead of by an AID that rotates with the expert's
+        # position in the activated list. Tile counts and the tile -> XCD
+        # mapping are unchanged, so this needs no host-side counterpart and is
+        # expected to measure flat on its own; it is the prerequisite for
+        # homing the expert weight pages on one AID.
+        if int(os.environ.get("MPK_MOE_AID_INVARIANT_MAP", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_AID_INVARIANT_MAP"]
         # Read the O-proj weight fragments K-major so a wave's 64 ds_read_b128
         # addresses are consecutive instead of 16-way bank-conflicting on the
         # 2048-byte row stride. This is a *contract with the checkpoint*: the
@@ -4279,6 +4287,7 @@ class PersistentKernel:
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_wgs={w13_wgs} w2_wgs={w2_wgs} "
                   f"w13_real={total_w13_real} w13_pad={total_w13_padded} "
                   f"w2={total_w2} all={total_tiles_all} "
                   f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
@@ -4502,6 +4511,7 @@ class PersistentKernel:
         import os as _os
         if _os.environ.get("MPK_MOE_TILE_DEBUG"):
             print(f"[MOETILE2] max_activated={max_activated} n_bblk={n_bblk} "
+                  f"w13_wgs={w13_wgs} w2_wgs={w2_wgs} "
                   f"w13_real={total_w13_real} w13_pad={total_w13_padded} "
                   f"w2={total_w2} all={total_tiles_all} "
                   f"per_xcd={moe_total_tiles_per_xcd} mod30={moe_total_tiles_per_xcd%30}", flush=True)
