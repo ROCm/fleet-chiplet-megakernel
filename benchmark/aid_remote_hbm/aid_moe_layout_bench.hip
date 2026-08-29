@@ -161,8 +161,12 @@ int main() {
 
   // Baseline buffer: slabs back to back, as packed today.
   const size_t base_bytes = (size_t)kNSlabs * kSlabBytes;
-  // AID-local buffer: each slab padded to whole pages so placement is possible.
-  const size_t local_bytes = (size_t)kNSlabs * kSlabPages * kPage;
+  // AID-local buffer: each slab padded to whole pages so placement is
+  // possible, plus slack. An even slab split needs half the slabs on AID0, but
+  // AID0 only owns 42.9% of the pages, so the pool has to be over-allocated to
+  // offer that many.
+  const size_t local_bytes =
+      (size_t)(kNSlabs * 5 / 4) * kSlabPages * kPage;
   printf("one layer W13: %d slabs x %d B = %.2f GiB\n", kNSlabs, kSlabBytes,
          base_bytes / 1073741824.0);
   printf("padded to %d pages/slab -> %.2f GiB (+%.2f%%)\n\n", kSlabPages,
@@ -205,82 +209,148 @@ int main() {
          100.0 * free1.size() / npages, 7.0 * free0.size() / npages,
          7.0 * free1.size() / npages);
 
-  // Slabs are split between AIDs in proportion to available pages, which is
-  // also in proportion to stacks, so neither side waits on the other.
   const int cap0 = (int)(free0.size() / kSlabPages);
   const int cap1 = (int)(free1.size() / kSlabPages);
-  int n0 = (int)((double)kNSlabs * free0.size() / npages);
-  n0 = std::min(n0, cap0);
-  int n1 = std::min(kNSlabs - n0, cap1);
-  printf("  slab split: %d on AID0, %d on AID1 (%.1f%% / %.1f%%)\n\n", n0, n1,
-         100.0 * n0 / (n0 + n1), 100.0 * n1 / (n0 + n1));
 
-  std::vector<int> table((size_t)kNSlabs * kSlabPages);
-  std::vector<int> sl0, sl1;
-  size_t take0 = 0, take1 = 0;
-  for (int s = 0; s < n0 + n1; s++) {
-    const bool on0 = (s < n0);
-    (on0 ? sl0 : sl1).push_back(s);
-    for (int p = 0; p < kSlabPages; p++)
-      table[(size_t)s * kSlabPages + p] =
-          on0 ? free0[take0++] : free1[take1++];
+  // Two placements to compare.
+  //
+  //  prop  slabs split in the stack ratio, 3:4. Bytes per stack are equal so
+  //        both AIDs finish together, but the AID1 XCDs then do ~30% more
+  //        compute than the AID0 XCDs, and the tile map and barrier have to
+  //        change to hand out uneven tile counts.
+  //  even  slabs split 1:1. The uniform tile map and barrier are untouched and
+  //        compute is balanced, but AID0's 3 stacks must carry half the
+  //        traffic. That is only viable if 3 stacks can sustain fleet's
+  //        per-side 2135 GB/s -- which is the thing being measured.
+  int n0p = std::min((int)((double)kNSlabs * free0.size() / npages), cap0);
+  int n1p = std::min(kNSlabs - n0p, cap1);
+  int n0e = kNSlabs / 2, n1e = kNSlabs - n0e;
+  if (n0e > cap0 || n1e > cap1) {
+    printf("not enough pages for an even split (%d/%d vs cap %d/%d)\n", n0e,
+           n1e, cap0, cap1);
+    return 1;
   }
-  int *d_table = nullptr, *d_sl0 = nullptr, *d_sl1 = nullptr;
-  CHECK(hipMalloc(&d_table, table.size() * sizeof(int)));
-  CHECK(hipMalloc(&d_sl0, sl0.size() * sizeof(int)));
-  CHECK(hipMalloc(&d_sl1, sl1.size() * sizeof(int)));
-  CHECK(hipMemcpy(d_table, table.data(), table.size() * sizeof(int),
-                  hipMemcpyHostToDevice));
-  CHECK(hipMemcpy(d_sl0, sl0.data(), sl0.size() * sizeof(int),
-                  hipMemcpyHostToDevice));
-  CHECK(hipMemcpy(d_sl1, sl1.data(), sl1.size() * sizeof(int),
-                  hipMemcpyHostToDevice));
+  printf("  proportional split: %d / %d (%.1f%% / %.1f%%)\n", n0p, n1p,
+         100.0 * n0p / kNSlabs, 100.0 * n1p / kNSlabs);
+  printf("  even split:         %d / %d (50.0%% / 50.0%%)\n\n", n0e, n1e);
 
-  // Baseline gets the same 3:4 slab split, so the only difference between the
-  // arms is where the bytes live -- not how work is shared out.
+  auto build = [&](int n0, int n1, std::vector<int> &table,
+                   std::vector<int> &sl0, std::vector<int> &sl1) {
+    table.assign((size_t)kNSlabs * kSlabPages, 0);
+    sl0.clear();
+    sl1.clear();
+    size_t t0 = 0, t1 = 0;
+    for (int s = 0; s < n0 + n1; s++) {
+      const bool on0 = (s < n0);
+      (on0 ? sl0 : sl1).push_back(s);
+      for (int p = 0; p < kSlabPages; p++)
+        table[(size_t)s * kSlabPages + p] = on0 ? free0[t0++] : free1[t1++];
+    }
+  };
+  std::vector<int> tab_p, sl0p, sl1p, tab_e, sl0e, sl1e;
+  build(n0p, n1p, tab_p, sl0p, sl1p);
+  build(n0e, n1e, tab_e, sl0e, sl1e);
+
+  auto up = [&](const std::vector<int> &v) {
+    int *d = nullptr;
+    CHECK(hipMalloc(&d, v.size() * sizeof(int)));
+    CHECK(hipMemcpy(d, v.data(), v.size() * sizeof(int), hipMemcpyHostToDevice));
+    return d;
+  };
+  int *d_tab_p = up(tab_p), *d_sl0p = up(sl0p), *d_sl1p = up(sl1p);
+  int *d_tab_e = up(tab_e), *d_sl0e = up(sl0e), *d_sl1e = up(sl1e);
+
   CHECK(hipMemsetD8((hipDeviceptr_t)buf, 1, local_bytes));
   uint64_t *d_sink = nullptr;
   CHECK(hipMalloc(&d_sink, (size_t)8192 * 256 * sizeof(uint64_t)));
   hipEvent_t e0, e1;
   CHECK(hipEventCreate(&e0));
   CHECK(hipEventCreate(&e1));
-  const size_t moved = (size_t)(n0 + n1) * kSlabBytes;
+  const size_t moved = (size_t)kNSlabs * kSlabBytes;
   const int iters = std::max(4, (int)((12ull << 30) / moved));
 
-  auto run = [&](bool table_mode, int grid) {
+  // mode 0: today -- contiguous bytes, even work split
+  // mode 1: AID-local, even split (uniform tile map, 3 stacks carry half)
+  // mode 2: AID-local, 3:4 split  (needs a reworked tile map and barrier)
+  auto run = [&](int mode, int grid) {
     auto launch = [&](int it) {
-      if (table_mode)
-        read_slabs<true><<<grid, 256>>>(buf, d_table, d_sl0, (int)sl0.size(),
-                                        d_sl1, (int)sl1.size(), it, d_sink);
+      if (mode == 0)
+        read_slabs<false><<<grid, 256>>>(buf, d_tab_e, d_sl0e, (int)sl0e.size(),
+                                         d_sl1e, (int)sl1e.size(), it, d_sink);
+      else if (mode == 1)
+        read_slabs<true><<<grid, 256>>>(buf, d_tab_e, d_sl0e, (int)sl0e.size(),
+                                        d_sl1e, (int)sl1e.size(), it, d_sink);
       else
-        read_slabs<false><<<grid, 256>>>(buf, d_table, d_sl0, (int)sl0.size(),
-                                         d_sl1, (int)sl1.size(), it, d_sink);
+        read_slabs<true><<<grid, 256>>>(buf, d_tab_p, d_sl0p, (int)sl0p.size(),
+                                        d_sl1p, (int)sl1p.size(), it, d_sink);
     };
-    double v[3];
-    for (int k = 0; k < 3; k++) {
-      launch(1);
-      CHECK(hipDeviceSynchronize());
-      CHECK(hipEventRecord(e0));
-      launch(iters);
-      CHECK(hipEventRecord(e1));
-      CHECK(hipEventSynchronize(e1));
-      float ms = 0;
-      CHECK(hipEventElapsedTime(&ms, e0, e1));
-      v[k] = (double)moved * iters / (ms * 1e6);
-    }
-    std::sort(v, v + 3);
-    return v[1];
+    launch(1);
+    CHECK(hipDeviceSynchronize());
+    CHECK(hipEventRecord(e0));
+    launch(iters);
+    CHECK(hipEventRecord(e1));
+    CHECK(hipEventSynchronize(e1));
+    float ms = 0;
+    CHECK(hipEventElapsedTime(&ms, e0, e1));
+    return (double)moved * iters / (ms * 1e6);
   };
 
-  printf("%-6s %14s %14s %10s %14s\n", "grid", "baseline", "aid-local", "gain",
-         "MoE phase us");
-  for (int grid : {240, 480, 960, 1920, 3840}) {
-    double b = run(false, grid), l = run(true, grid);
-    // fleet's MoE phase moves 52.7 MiB; project the phase time at each rate.
-    const double mib = 52.7 * 1048576.0;
-    printf("%-6d %11.1f GB/s %11.1f %9.3fx %7.2f -> %.2f\n", grid, b, l, l / b,
-           mib / (b * 1e9) * 1e6, mib / (l * 1e9) * 1e6);
+  // Clocks drift under sustained load, so the arms are interleaved inside each
+  // round rather than measured one arm at a time -- otherwise a downclock
+  // lands entirely on whichever arm happened to be running and shows up as a
+  // difference between layouts.
+  constexpr int kRounds = 7;
+  auto measure = [&](int grid, double out[3]) {
+    double v[3][kRounds];
+    for (int k = 0; k < kRounds; k++)
+      for (int m = 0; m < 3; m++)
+        v[m][k] = run(m, grid);
+    for (int m = 0; m < 3; m++) {
+      std::sort(v[m], v[m] + kRounds);
+      out[m] = v[m][kRounds / 2];
+    }
+  };
+
+  // fleet's MoE phase reads 52.7 MiB in 12.9 us = 4270 GB/s. Sweep finely
+  // enough to see which arm leads at that rate rather than interpolating
+  // across the crossover, which sits close to it.
+  const double kFleetGBs = 4270.0;
+  printf("%-6s %13s %13s %9s %13s %9s\n", "grid", "today", "local even",
+         "gain", "local 3:4", "gain");
+  const int grids[] = {160, 240, 320, 400, 480, 560, 640,
+                       720, 800, 960, 1280, 1920, 3840};
+  const int ngrids = (int)(sizeof(grids) / sizeof(grids[0]));
+  std::vector<double> gb(ngrids), ge(ngrids), gp(ngrids);
+  int best_i = 0;
+  double best_d = 1e18;
+  for (int i = 0; i < ngrids; i++) {
+    double o[3];
+    measure(grids[i], o);
+    gb[i] = o[0];
+    ge[i] = o[1];
+    gp[i] = o[2];
+    if (std::abs(o[0] - kFleetGBs) < best_d) {
+      best_d = std::abs(o[0] - kFleetGBs);
+      best_i = i;
+    }
   }
-  printf("\nfleet's MoE phase is 12.9 us of a 1.821 ms layer-loop decode.\n");
+  for (int i = 0; i < ngrids; i++)
+    printf("%-6d %10.1f GB/s %10.1f %8.3fx %10.1f %8.3fx%s\n", grids[i], gb[i],
+           ge[i], ge[i] / gb[i], gp[i], gp[i] / gb[i],
+           i == best_i ? "  <- fleet" : "");
+  const int best_grid = grids[best_i];
+  const double bb = gb[best_i], be = ge[best_i], bp = gp[best_i];
+  const double mib = 52.7 * 1048576.0;
+  printf("\nfleet's MoE phase reads 52.7 MiB at %.0f GB/s (12.9 us), which is\n"
+         "4 experts x 46 slabs x (200192 + 100096) B. Closest sweep point is\n"
+         "grid %d at %.0f GB/s:\n",
+         kFleetGBs, best_grid, bb);
+  printf("  today      %7.2f us\n", mib / (bb * 1e9) * 1e6);
+  printf("  local even %7.2f us  %.3fx  uniform tile map and barrier unchanged\n",
+         mib / (be * 1e9) * 1e6, be / bb);
+  printf("  local 3:4  %7.2f us  %.3fx  needs a reworked tile map and barrier\n",
+         mib / (bp * 1e9) * 1e6, bp / bb);
+  printf("\nthe two arms cross over as AID0's 3 stacks saturate, so which one\n"
+         "to build depends on where fleet actually sits, not on peak numbers.\n");
   return 0;
 }
