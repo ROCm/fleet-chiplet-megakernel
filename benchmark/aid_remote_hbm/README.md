@@ -7,9 +7,14 @@ side crosses the inter-AID interconnect. This is the effect GTAC'25 paper 48
 MI300X (4 AIDs), where 75% of a CU's traffic is remote under SPX/NPS1.
 
 The GPU here runs SPX/NPS1 and cannot be put in NPS2 without also splitting
-compute (`amd-smi partition --accelerator`: SPX offers NPS1 only; NPS2 needs
-DPX/QPX/CPX). The question these benchmarks answer is what can be done *without*
-touching partition modes.
+compute. `sudo amd-smi partition --accelerator` is the authoritative view:
+profile 0 is SPX with `MEMORY_PARTITION_CAPS: NPS1`, and only DPX (4 XCC), QPX
+(2 XCC) and CPX (1 XCC) list `NPS1,NPS2`. The per-GPU `NPS1,NPS2` printed by
+plain `amd-smi partition` is the union over all profiles and does *not* mean SPX
+can take NPS2 -- confirmed the hard way, see "What NPS2 actually costs" at the
+end. So NPS2 is never free here: it is paid for with half the GPU or worse. The
+question these benchmarks answer is what can be done *without* touching
+partition modes.
 
 **Answer: memory can be placed AID-locally from software.** The home AID is a
 property of each 4 KiB page, it is stable and probeable at runtime, so an
@@ -459,3 +464,165 @@ This retires the pinning line. What survives is the tile map, which is free and
 is a prerequisite for anything that later wants a stable AID per workgroup --
 partition modes included, since NPS2 gives AID-local memory in hardware with no
 4 KiB page penalty and no startup cost.
+
+## Locality with the mechanism cost removed (`aid_pure_locality.hip`)
+
+Measuring locality *through* the VMM path was a methodological error: it charged
+the 4 KiB TLB penalty to locality's account and capped every arm before locality
+could show anything. `aid_pure_locality` removes the confound. A plain
+`hipMalloc` buffer already has mixed homing, so instead of moving pages to match
+the readers it classifies the pages and moves the *readers* to match the pages:
+each XCD group gathers only pages already homed on its own AID. Ordinary 2 MiB
+backing, no VMM, no handles, no startup cost, and all arms share one gather
+kernel so the only difference is homing.
+
+Sweeping the remote fraction is the point, because AID count sets where a part
+sits on this curve (grid 1920, 1 GiB, reproduced on two different GPUs):
+
+| remote | GB/s | gain from moving to 0% | |
+|---|---|---|---|
+| 0% | 5190 | 1.000x | |
+| 25% | 5184 | 1.001x | |
+| 50% | 4947 | **1.049x** | MI350 SPX/NPS1 -- this part |
+| 75% | 3810 | **1.362x** | MI300X SPX/NPS1 -- the paper's baseline |
+| 100% | 2965 | 1.751x | no allocator produces this |
+
+The curve is strongly non-linear, and that single fact reconciles the paper with
+these measurements. MI300X has 4 AIDs, so 75% of its traffic is remote and it
+sits on the steep part with 1.36x available; GTAC'25 captured 20% of that. This
+part has 2 AIDs and starts at 50% remote, where the curve is still flat and only
+1.05x exists to be captured. The technique is sound in both cases -- the
+headroom is a property of AID count, not of the method.
+
+Note this also corrects the "5% slower" row above: the 32% was the VMM
+mechanism, not locality. Locality is worth ~1.05x here; it is the *delivery* of
+it that has, so far, cost more than it returns.
+
+## Why no software scheme can deliver it under NPS1 (`aid_interleave.hip`)
+
+The obvious way to avoid remapping entirely is to leave pages where they are and
+choose the *reader* instead: pick which XCD reads which expert so that every
+workgroup reads a slab already homed on its own AID. That requires slabs to be
+single-AID to begin with. They are not.
+
+Classifying every 4 KiB page of a `hipMalloc` buffer and taking run lengths:
+
+| run | count share of buffer |
+|---|---|
+| 2 pages (8 KiB) | 51.3% |
+| 3 pages (12 KiB) | 25.3% |
+| 1 page (4 KiB) | 15.1% |
+| 4 pages (16 KiB) | 6.0% |
+| 5-6 pages | 2.3% |
+
+Longest run anywhere: **6 pages (24 KiB)**. Homing is a deterministic hash of the
+physical address, not a stripe -- the 42.9/57.1 split and every run-length share
+reproduce to two decimals across a 512 MiB and a 2 GiB buffer. Aligned-block
+purity collapses immediately: 100% at 4 KiB, 42.9% at 8 KiB, and **0.0% at
+16 KiB and above**.
+
+A fleet MoE workgroup slab is 200192 B, about 49 pages. **0 of 10699 slabs are
+single-AID.** Not a small fraction -- zero, and necessarily so, since a 49-page
+span cannot fit inside a 6-page run.
+
+So under NPS1 no tile map, expert assignment, or reader-steering scheme can
+produce an AID-local weight read, because no contiguous weight slab is AID-local
+to begin with. This is also why the AID-invariant tile map measured neutral
+(+0.30%, inside run-to-run noise): it was never in a position to matter. Only
+three mechanisms remain, and two are worse than the 1.05x they chase:
+
+| mechanism | status |
+|---|---|
+| VMM 4 KiB page remap | costs 32% to buy 5% -- retired |
+| kernel-side page-granular gather | needs indirection in the weight load path |
+| NPS2 hardware repartition | free at runtime, but see below |
+
+## What NPS2 actually costs (`aid_nps_compare.hip`)
+
+The partition modes were measured directly, which settles the mechanism question
+without any of the software workarounds above. Getting there needs a host-side
+`amdgpu` reload -- the mode only commits on driver reload, all 8 cards are one
+XGMI hive, and from inside a container it cannot be done at all (`amd-smi reset
+-r` returns `AMDSMI_STATUS_AMDGPU_RESTART_ERR`, `modprobe -r amdgpu` exits 1
+with `refcnt` at 1192; `cap_sys_module` is in the bounding set but the module
+belongs to the host).
+
+Comparing the modes fairly takes care, because they do not offer the same
+machine: NPS2 forces DPX or narrower, so a partition has 4 XCDs and 126 GiB
+against SPX's 8 and 252. `aid_nps_compare` therefore runs work on **XCDs 0-3
+only in both modes** -- blocks landing on 4-7 exit -- and sizes the grid
+`nxcd*K` so every XCD gets K blocks. Active workers, bytes touched and access
+pattern are then identical, and homing is the only thing left that differs. Same
+binary, same card:
+
+| workers/XCD | NPS1 latency | NPS2 latency | NPS1 GB/s | NPS2 GB/s |
+|---|---|---|---|---|
+| 64 | 400.0 ns | **340.8 ns** | **3533** | 1802 |
+| 128 | 401.9 ns | **352.6 ns** | **3541** | 1798 |
+| 256 | 414.8 ns | **367.3 ns** | **3553** | 1782 |
+| 512 | 417.0 ns | **395.5 ns** | **3537** | 1796 |
+
+**Locality is worth 15-18% of memory latency.** 400 -> 341 ns, and the p90/p10
+spread tightens from 1.05-1.18x to 1.03-1.09x: the bimodal near/far split of
+NPS1 pages collapses to a single mode. This is the effect with no mechanism
+attached at all, and it is the strongest evidence in this directory that AID
+locality is real.
+
+The bandwidth columns, by contrast, **do not measure locality and must not be
+read as such.** NPS2 delivers 1.97x less at identical worker counts (3540 ->
+1798), and full-card peak shows 5941 GB/s under SPX/NPS1 against 3540 for both
+NPS2 partitions combined. But the two arms do not see the same memory system:
+under NPS1 those 4 XCDs pull from all 8 HBM stacks, while NPS2 confines them to
+their partition's 4. Halving the stacks predicts about the 2x observed on its
+own, so this says nothing about crossings. An earlier version of this file
+concluded "NPS2 costs half the bandwidth" from these columns; that was a
+confound between stack count and locality, and it is withdrawn. See the next
+section for the controlled measurement, which points the other way.
+
+That is moot in any case, because **fleet cannot run under NPS2**. The MoE
+kernel hardcodes 8 XCDs: `global_tile = tile_idx * 8 + xcd_id` cannot address
+tiles with `global_tile % 8` in {4..7} when `xcd_id` only reaches 3, so half the
+tile space is never claimed, and the barrier polls a fixed 8 per-XCD release
+slots (`for (int _x = 0; _x < 8; _x++)`, `MOE_BAR_COUNTER_SLOT = 8`) whose
+arrival count can then never be reached. It deadlocks. Making the tile decode
+and barrier geometry XCD-count-parametric is a prerequisite for even trying, and
+the numbers above say it would not be worth it.
+
+The SPX/NPS1 decode baseline was re-confirmed at **1.821 ms** after two driver
+reloads, against 1.825 ms before, so nothing here rests on a shifted baseline.
+
+## Locality at constant stack count (`aid_stack_controlled.hip`)
+
+To measure crossings rather than stack count, hold the stacks fixed. Everything
+runs under SPX/NPS1 on XCDs 0-3, which are AID0, and those same 4 XCDs read
+either only AID0 pages or only AID1 pages. Four XCDs and four stacks in both
+arms, identical page counts and gather pattern; the crossing is the only
+variable.
+
+| K/XCD | local (AID0) | remote (AID1) | loc/rem |
+|---|---|---|---|
+| 32 | 2629 GB/s | 1978 | 1.329x |
+| 64 | 2661 GB/s | 2040 | 1.305x |
+| 128 | 2633 GB/s | 2035 | 1.293x |
+| 256 | 2621 GB/s | 2037 | 1.287x |
+
+**Locality is worth 1.29-1.33x of bandwidth once stack count is controlled** --
+a real gain, not the loss the confounded comparison suggested.
+
+Three ratios now exist in this directory and they are not contradictory; they
+describe different situations, and picking the wrong one is how the earlier
+mistakes happened:
+
+| ratio | what it compares | when it applies |
+|---|---|---|
+| 1.05x | 50% remote -> 0%, 8 XCDs over all 8 stacks | **fleet**: every XCD active, whole memory system |
+| 1.29x | 100% remote -> 0%, 4 XCDs over 4 stacks | a partition-shaped workload |
+| 1.75x | 100% remote -> 0%, 8 XCDs over all 8 stacks | all-remote pathology, no allocator does this |
+
+fleet's case is the first row: it runs all 8 XCDs against all 8 stacks, and
+`hipMalloc` already gives it a ~50/50 split, so 1.05x is the headroom. The
+larger ratios need a baseline that is further from local than anything fleet
+actually has. Note also that NPS1-local at 4 stacks (2628 GB/s) and the NPS2
+partition (1798) were measured with *different kernels* -- page-gather here,
+contiguous stream there -- and are not comparable; settling that would need this
+binary run under NPS2.
