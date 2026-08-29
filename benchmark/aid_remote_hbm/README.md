@@ -328,3 +328,81 @@ HIP_VISIBLE_DEVICES=1 /tmp/aid_gemv        # ~90 s, most of it page probing
 
 Run on an idle GPU; a neighbouring process on the same package perturbs the
 latency split.
+
+## Does it scale to the whole model? (`aid_bulk_pin.hip`, `aid_pin.hip`)
+
+`aid_alloc` pins a 256 MiB buffer. The MoE weights are 36 layers x 1.77 GB =
+64 GB, or 16.7M pages, so the question is whether the same trick survives a
+250x scale-up. Half of it does.
+
+The classifier does. It was serial -- one wave pair walking every page at
+45 us/page -- but pages are independent addresses, so N pairs need no barrier
+between them. Two XCD pairs x 32 wave pairs give **0.8 us/page at 100%
+agreement** with the serial reference and no timeouts, turning 12 minutes of
+probing into 14 seconds.
+
+The VMM calls do not, and there is no way around them:
+
+| call | rate | for 16.7M pages |
+|---|---|---|
+| `hipMemCreate` 4 KiB | 47 us (2K live) ... 238 us (202K live) | 66 min+ |
+| `hipMemMap` + `SetAccess` 4 KiB | 10 us ... 186 us | 52 min+ |
+| classify | 0.8 us | 14 s |
+
+Three escapes were tried and all are closed:
+
+- **Large handles.** Homing is uniform inside a 4 KiB handle and nothing else:
+  0 of 128 64 KiB handles, 0 of 32 256 KiB handles and 0 of 4 2 MiB handles sit
+  on a single AID. The interleave is per 4 KiB whatever the allocation size, so
+  the cheap 2 MiB create rate is unreachable.
+- **Sub-handle mapping.** `hipMemMap` rejects a non-zero offset into a handle,
+  so a large handle cannot be dealt out page by page either.
+- **Host threads.** The calls anti-scale: 47 -> 112 -> 204 -> 429 us/handle at
+  1/4/16/32 threads. That is a global lock, not work.
+
+`aid_pin.hip` is the working allocator anyway, as a C ABI for demo.py, and it
+is correct: one 562 MiB `down_proj` pins with **100% of pages on the intended
+side** and a clean round trip. It takes **116 s**. Extrapolated to 64 GB that
+is ~3.7 hours, and that is the optimistic reading, because the per-call rate
+grows with the live handle count and the final state holds 16.7M live handles.
+
+The map cannot be cached across runs either -- not because the weights change,
+but because the AID is a property of the *physical* page, and `hipMemCreate`
+returns different physical pages each run. The stable thing is the physical
+address -> AID hash, which userspace cannot see. Caching would save only the
+14 s of classification regardless; the cost is create and map.
+
+## What is the ceiling? (`MPK_PHASE_SLOTS`)
+
+Per-layer phase breakdown of the 1.825 ms decode, averaged over the 240
+compute workers (`MPK_PHASE_SLOTS=1 MPK_PHASE_START_ITER=20`):
+
+| slot | ns | share | phase |
+|---|---|---|---|
+| 6 | 12980 | 23.9% | O-proj + RMSNorm + Router + TopK |
+| 8 | 12927 | **23.8%** | MoE (W13+SwiGLU+W2) |
+| 7 | 7608 | 14.0% | O-proj barrier |
+| 5 | 7372 | 13.6% | cross-XCD attention barrier |
+| 0 | 5550 | 10.2% | inter-layer span |
+| others | 7822 | 14.5% | QKV, attention, layer barrier, tail |
+
+The MoE phase moves 52.7 MiB in 12.9 us, i.e. **4.27 TB/s, 53% of the 8 TB/s
+peak** -- genuinely bandwidth-sensitive. But it is only 23.8% of the layer, so
+crediting the *whole* phase with the 1.11x that AID-local placement is worth
+against an interleaved baseline gives 1.782 ms, **+2.4%**. Even the 1.235x
+inverted-control contrast -- which is not achievable, being local-vs-remote
+rather than local-vs-interleaved -- only reaches 1.742 ms. Both are upper
+bounds: they credit the full memory speedup to SwiGLU, LDS traffic and MFMA
+too, none of which speed up.
+
+**Caveat that matters more than the number.** The 1.10x/1.23x above were
+measured by `aid_gemv` at **296.9 GB/s**. The real MoE phase runs at
+**4270 GB/s** -- a 14x different operating point. Those figures come from a
+regime where the memory system is nearly idle and latency dominates; at 53% of
+peak the inter-AID interconnect is loaded and the penalty may be larger or
+smaller. Until the local-vs-remote gap is re-measured at ~4 TB/s, the 2.4%
+ceiling should be read as provisional.
+
+For scale, the same breakdown puts **38% of every layer in barriers and
+inter-layer wait** (13.6 + 14.0 + 10.2), and Phase 7 alone is as expensive as
+the entire MoE. Those are far larger targets than AID locality.
