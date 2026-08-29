@@ -1,6 +1,6 @@
-# titan in vLLM — integration & architecture
+# fleet_mk in vLLM — integration & architecture
 
-How the **titan** fused decode megakernels (AMD MI350 / gfx950 / ROCm) are plugged
+How the **fleet_mk** fused decode megakernels (AMD MI350 / gfx950 / ROCm) are plugged
 into vLLM, how the decode path works, how KV is shared zero-copy, and measured
 latency vs stock vLLM.
 
@@ -8,69 +8,69 @@ Runs on **vLLM 0.11.x and 0.27.x** from one codebase — see §5b for what diffe
 between them. Sections dated 2026-08-04 were measured on 0.11.1 at page size 128
 and are kept as recorded; page size is now 16 (§5) and 0.27.1 is verified (§5b).
 
-Two architectures are supported, both emitted from `titan_generate.py` + a YAML
+Two architectures are supported, both emitted from `fleet_mk_generate.py` + a YAML
 config: dense **Qwen3-8B** and MoE **GPT-OSS 120B**. GPT-OSS is the maintained
 path and the one all numbers below were measured on.
 
 ---
 
-## 1. What titan is
+## 1. What fleet_mk is
 
-titan is a single **fused persistent HIP megakernel**: one GPU launch
+fleet_mk is a single **fused persistent HIP megakernel**: one GPU launch
 (`<model>_launch`) runs *all* 36 transformer layers + final RMSNorm + LM head +
 argmax for **one decode step** (one generated token, batch size 1). Weights are
 MXFP4, activations fp8. The compiled artifact is `generated/<model>.so`
 (built from `generated/<model>_launch.hip` + `generated/<model>_kernel.cuh` via
 `build_<model>.sh`) — e.g. `generated/gpt_oss_120b.so`.
 
-titan handles **decode only**. Prefill (processing the prompt) stays on vLLM's
+fleet_mk handles **decode only**. Prefill (processing the prompt) stays on vLLM's
 stock path.
 
 ## 2. How it's integrated
 
-vLLM discovers titan through a `vllm.general_plugins` entry point (`pyproject.toml`)
+vLLM discovers fleet_mk through a `vllm.general_plugins` entry point (`pyproject.toml`)
 that calls `plugin.register()` once at engine startup. `register()` swaps each stock
-model class titan supports for a subclass:
+model class fleet_mk supports for a subclass:
 
 ```
 plugin.register()  ->  ModelRegistry.register_model("Qwen3ForCausalLM",
-                                                     TitanQwen3ForCausalLM)
+                                                     FleetMKQwen3ForCausalLM)
                        ModelRegistry.register_model("GptOssForCausalLM",
-                                                     TitanGptOssForCausalLM)
+                                                     FleetMKGptOssForCausalLM)
 ```
 
 Registering both is harmless when only one is served — vLLM instantiates whichever
 architecture the loaded checkpoint declares. The GPT-OSS registration is wrapped in
 a try/except so a vLLM build without `gpt_oss.py` still gets the dense path.
 
-Each subclass is thin: everything model-agnostic lives in `TitanModelMixin`
+Each subclass is thin: everything model-agnostic lives in `FleetMKModelMixin`
 (`mixin.py`), parameterized by a `ModelSpec` (`spec.py`). The mixin overrides three
 seams on the stock model:
 
 | Override | Role |
 |---|---|
-| `load_weights()` | after `super()` loads the standard modules, MXFP4-pack them into titan's layout, build RoPE tables, load `<model>.so`, allocate workspace buffers (`_setup_titan`). |
-| `forward()` | route **prefill → `super().forward()`**, **decode → `titan.decode_step()`**. |
-| `compute_logits()` | after a titan **MoE** decode, return the bf16 logit row the megakernel's argmax epilogue already computed (§8.2); otherwise stock — vLLM's bf16 `lm_head` over the hidden state titan returns. vLLM's sampler runs on top either way. |
+| `load_weights()` | after `super()` loads the standard modules, MXFP4-pack them into fleet_mk's layout, build RoPE tables, load `<model>.so`, allocate workspace buffers (`_setup_fleet_mk`). |
+| `forward()` | route **prefill → `super().forward()`**, **decode → `fleet_mk.decode_step()`**. |
+| `compute_logits()` | after a fleet_mk **MoE** decode, return the bf16 logit row the megakernel's argmax epilogue already computed (§8.2); otherwise stock — vLLM's bf16 `lm_head` over the hidden state fleet_mk returns. vLLM's sampler runs on top either way. |
 
-Enable with `VLLM_PLUGINS=titan`; disable (stock baseline) with `VLLM_PLUGINS=`.
+Enable with `VLLM_PLUGINS=fleet_mk`; disable (stock baseline) with `VLLM_PLUGINS=`.
 
 ### Module map
 
 | File | Responsibility |
 |---|---|
 | `plugin.py` | entry point; registers the model overrides. |
-| `model.py` | `TitanQwen3ForCausalLM` / `TitanGptOssForCausalLM`: per-model weight packing and the layer-attention accessor. Everything else is inherited. |
-| `mixin.py` | `TitanModelMixin`: kernel load, buffers, RoPE, zero-copy KV binding, prefill/decode routing — all model-agnostic. |
-| `spec.py` | `ModelSpec`: every dimension and layout constant, derived from `configs/<model>.yaml` through `titan_generate.load_and_validate()`. |
-| `runtime.py` | ctypes ABI loader, `TitanBuffers` (workspace + aliasable KV), `build_ptr_table`, `TitanDecoder.decode_step`. |
-| `packing.py` | dense MXFP4 weight packing into titan's per-XCD layout. |
+| `model.py` | `FleetMKQwen3ForCausalLM` / `FleetMKGptOssForCausalLM`: per-model weight packing and the layer-attention accessor. Everything else is inherited. |
+| `mixin.py` | `FleetMKModelMixin`: kernel load, buffers, RoPE, zero-copy KV binding, prefill/decode routing — all model-agnostic. |
+| `spec.py` | `ModelSpec`: every dimension and layout constant, derived from `configs/<model>.yaml` through `fleet_mk_generate.load_and_validate()`. |
+| `runtime.py` | ctypes ABI loader, `FleetMKBuffers` (workspace + aliasable KV), `build_ptr_table`, `FleetMKDecoder.decode_step`. |
+| `packing.py` | dense MXFP4 weight packing into fleet_mk's per-XCD layout. |
 | `packing_moe.py` | MoE weight packing + the 36-slot per-layer pointer table. |
 | `harness.py` | single-request greedy/sampler bring-up + parity harness. |
-| `bench.py` | decode-latency benchmark (titan vs stock). |
+| `bench.py` | decode-latency benchmark (fleet_mk vs stock). |
 
 **There is no `constants.py`.** Every number comes from `spec.py`, which parses the
-same YAML the code generator does — and reaches into `titan_generate` directly for
+same YAML the code generator does — and reaches into `fleet_mk_generate` directly for
 the two facts the YAML does not carry (`counter_slots()` for the QKV barrier offset,
 `MIRAGE_IN`/`MIRAGE_OUT` for the pointer-table shape). A second hand-maintained copy
 of these constants is exactly how the plugin silently drifted from the kernel
@@ -83,11 +83,11 @@ before; the file was deleted rather than updated.
 - **`attn_metadata is None`** (profiling/dummy run) or **`max_query_len != 1`**
   (prefill: many prompt tokens in one query) → `super().forward()`. vLLM's stock
   attention runs and writes the prompt's K/V into the paged KV cache.
-- **`max_query_len == 1`** (decode: exactly one new token) → titan.
+- **`max_query_len == 1`** (decode: exactly one new token) → fleet_mk.
   `decode_step(embed, cur_pos, block_table)` runs the megakernel.
 
-On decode, titan writes the post-final-norm hidden state into
-`buf_lm_norm_scratch` and `forward()` returns `hs.clone()`. titan's fused **argmax**
+On decode, fleet_mk writes the post-final-norm hidden state into
+`buf_lm_norm_scratch` and `forward()` returns `hs.clone()`. fleet_mk's fused **argmax**
 is still ignored — vLLM's full sampler runs on top, so temperature / top-p /
 penalties / seeds all work. On the MoE path the fused **logits** are not ignored:
 the epilogue also writes the bf16 row into `buf_logits`, which `compute_logits()`
@@ -99,31 +99,31 @@ redundant matrix-vector product is skipped.
 ### The problem it solves
 
 Attention needs every past token's K/V (the **KV cache**; vLLM reserves ~184 GiB
-here). Originally vLLM owned the KV cache in *its* layout, while titan's kernel
+here). Originally vLLM owned the KV cache in *its* layout, while fleet_mk's kernel
 read/wrote its *own* separate K/V buffers. A per-request gather-copy
-(`_mirror_prefill_kv`, now deleted) reshuffled vLLM's prefill KV into titan's
+(`_mirror_prefill_kv`, now deleted) reshuffled vLLM's prefill KV into fleet_mk's
 buffers before decode. That meant **two KV stores** (vLLM's pool wasted during
 decode) plus a **per-request copy**.
 
-Zero-copy KV makes titan read/write **vLLM's KV pool directly** — one store, no
+Zero-copy KV makes fleet_mk read/write **vLLM's KV pool directly** — one store, no
 copy.
 
 ### How it works
 
 The trick is to force a vLLM attention backend whose *physical KV layout is
-byte-identical to titan's*, then alias pointers:
+byte-identical to fleet_mk's*, then alias pointers:
 
 - The **aiter** backends (`rocm_aiter_fa`, `rocm_aiter_unified_attn`) allocate KV as
   `(2, num_blocks, block_size, num_kv_heads, head_size)` — the leading `2` makes
   K and V each contiguous — and write it via `reshape_and_cache_flash`
   (the *non-reordered* layout). Reshaped to `[num_blocks*block_size, 1024]` this is
-  byte-identical to titan's flat `[entries, num_kv_heads*head_dim]` K (and V)
+  byte-identical to fleet_mk's flat `[entries, num_kv_heads*head_dim]` K (and V)
   buffer. (The default Triton/Rocm backends reorder K or interleave the `2` in the
   middle — incompatible with a single flat pointer.)
-- With **`block_size == PAGE_SIZE`**, one vLLM block == one titan page, so titan's
+- With **`block_size == PAGE_SIZE`**, one vLLM block == one fleet_mk page, so fleet_mk's
   page-indirection table `kv_indices` is driven directly from vLLM's `block_table`.
 
-Binding happens lazily on the **first decode** (`_ensure_titan_kv_bound`), because
+Binding happens lazily on the **first decode** (`_ensure_fleet_mk_kv_bound`), because
 vLLM allocates the KV cache *after* `load_weights()`:
 
 ```python
@@ -132,7 +132,7 @@ k_alias = kvc[0].reshape(entries, n_kv*head)  # view, not copy
 v_alias = kvc[1].reshape(entries, n_kv*head)
 assert k_alias.data_ptr() == kvc[0].data_ptr()  # zero-copy invariant guard
 ...
-buffers.set_kv_aliases(k_aliases, v_aliases)  # titan's K/V point at vLLM's pool
+buffers.set_kv_aliases(k_aliases, v_aliases)  # fleet_mk's K/V point at vLLM's pool
 ptr_table = build_ptr_table(weight_ptrs, buffers)
 ```
 
@@ -143,7 +143,7 @@ KV in place.
 ## 5. Constraints & configuration
 
 Zero-copy requires `block_size == PAGE_SIZE`. Both aiter backends that share
-titan's KV layout **cap `block_size`**, which forced titan's `PAGE_SIZE` down:
+fleet_mk's KV layout **cap `block_size`**, which forced fleet_mk's `PAGE_SIZE` down:
 
 | Backend | Mechanism | `block_size` ceiling |
 |---|---|---|
@@ -155,9 +155,9 @@ vLLM independently caps `block_size` at 256 in its own config
 standalone kernel's original `PAGE_SIZE = 4096` could never bind.
 
 **Chosen: `PAGE_SIZE = block_size = 16`** — vLLM's *default* ROCm block size,
-unified-attention backend. Running at the default is the point: titan binds to a
+unified-attention backend. Running at the default is the point: fleet_mk binds to a
 stock-configured engine with no `block_size` override, so no caller has to know
-titan's page size. A ≤512-token sequence spans ≤32 titan pages.
+fleet_mk's page size. A ≤512-token sequence spans ≤32 fleet_mk pages.
 
 128 was the previous choice (largest power-of-two under the unified backend's LDS
 budget) and is still the ceiling that matters if a larger page is ever wanted.
@@ -166,7 +166,7 @@ budget) and is still the ceiling that matters if a larger page is ever wanted.
 both `rope_kv_update` and `paged_attention_minimal_decode_hd64` — so the driver's
 `page_size` and the kernel's `PAGE_SIZE` must change together or KV addressing goes
 silently wrong. Changing it is now **one line**, `page_size:` in
-`configs/<model>.yaml`, followed by `titan_generate.py --output-dir …` and a
+`configs/<model>.yaml`, followed by `fleet_mk_generate.py --output-dir …` and a
 rebuild; the generator drives all three emitted sites. (The older integration
 hand-edited four files, which is why they drifted.)
 
@@ -181,7 +181,7 @@ same GPU:
 | Qwen3-8B | 4096 | 6.798 ms/tok | 241 VGPR / 2 SGPR spill / 0 VGPR spill / 2 waves per SIMD / 360 B LDS |
 | Qwen3-8B | **128** | **6.768 ms/tok** | identical |
 
-¹ 128→16 was measured under vLLM from the kernel's own `[TITAN_TIME]` per-token
+¹ 128→16 was measured under vLLM from the kernel's own `[FLEET_MK_TIME]` per-token
 totals — ~2360–2397 µs at 128 against ~2356–2386 µs at 16, i.e. inside the
 run-to-run band. These are not `bench.py` "Non-outlier avg" numbers and should not
 be quoted as the headline. The 4096/128 rows above are, which is why the columns
@@ -205,7 +205,7 @@ At 16 they span many pages.
 
 The 4096→128 change left the token stream *identical*, so the natural expectation
 was that 128→16 would too. It did not, and that looked like a regression until it
-was measured properly. `titan_vllm/compare_runs.py` exists for exactly this:
+was measured properly. `fleet_megakernel_vllm/compare_runs.py` exists for exactly this:
 
 | comparison | earliest first-divergence |
 |---|---|
@@ -225,14 +225,14 @@ would have condemned a change that is fine.
 ### Required launch settings (set automatically by `harness.py` / `bench.py`)
 
 ```
-VLLM_PLUGINS=titan
+VLLM_PLUGINS=fleet_mk
 VLLM_ROCM_USE_AITER=1
 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1     # selects the unified aiter backend
-LLM(..., block_size=16)                      # == titan PAGE_SIZE (vLLM's ROCm default)
+LLM(..., block_size=16)                      # == fleet_mk PAGE_SIZE (vLLM's ROCm default)
 ```
 
 `_assert_flash_backend` and the shape/`block_size` asserts in
-`_ensure_titan_kv_bound` fail loud if a mismatched backend or block size is used
+`_ensure_fleet_mk_kv_bound` fail loud if a mismatched backend or block size is used
 (a silent layout mismatch would produce garbage tokens).
 
 > Note: `VLLM_ATTENTION_BACKEND=ROCM_AITER_FA` is **not** used — that string forces
@@ -245,13 +245,13 @@ the installed vLLM exposes, so nothing below needs a flag.
 
 | | 0.11.x | 0.27.x |
 |---|---|---|
-| KV layout, stock aiter | titan's split | **packed** `(nb, n_kv, bs, 2*hs)` |
-| backend used | stock `rocm_aiter_unified_attn` | `TitanAttentionBackend` as `CUSTOM` |
+| KV layout, stock aiter | fleet_mk's split | **packed** `(nb, n_kv, bs, 2*hs)` |
+| backend used | stock `rocm_aiter_unified_attn` | `FleetMKAttentionBackend` as `CUSTOM` |
 | selection | `VLLM_ROCM_USE_AITER*` env | `LLM(attention_backend=CUSTOM)` |
 | `attn.kv_cache` | `list` per virtual engine | the tensor itself |
 | embedding method | `get_input_embeddings` | `embed_input_ids` |
 
-On 0.26+ the stock aiter pool went packed, which titan's flat view cannot alias.
+On 0.26+ the stock aiter pool went packed, which fleet_mk's flat view cannot alias.
 `backend.py` restores the split layout: it subclasses the aiter unified backend
 and overrides only `get_kv_cache_shape` and `_split_kv_cache`, so the attention
 math and the KV write path stay stock. Attention output is bit-identical to the
@@ -266,15 +266,15 @@ Three seams change silently rather than raising, which is why each is guarded:
    block 0" on 0.27. Both index cleanly. `_layer_kv_tensor` discriminates on
    **type**, never on indexability.
 2. **`get_input_embeddings` is gone** on 0.27 — a total rename, not an addition.
-   `_titan_embed_fn` probes for both spellings.
+   `_fleet_mk_embed_fn` probes for both spellings.
 3. **aiter is optional now.** The parent impl imports it in `__init__`, and a
    prebuilt aiter linked against a different torch fails with `undefined symbol:
-   _ZN3c103hip21warn_or_error_on_syncEv`. `TitanUnifiedAttentionImpl` binds
+   _ZN3c103hip21warn_or_error_on_syncEv`. `FleetMKUnifiedAttentionImpl` binds
    vLLM's in-tree Triton `unified_attention` instead (the same kernel the parent
    already uses on its non-causal branch), so no aiter install is needed on
    0.27.x.
 
-Gate before running anything: `python -m titan_vllm.check_backend` — 5 checks,
+Gate before running anything: `python -m fleet_megakernel_vllm.check_backend` — 5 checks,
 including that the impl **constructs** (an earlier version called
 `_split_kv_cache` unbound, so `__init__` never ran and the aiter import escaped
 to engine startup) and that attention matches the stock layout numerically.
@@ -282,32 +282,32 @@ to engine startup) and that attention matches the stock layout numerically.
 ## 6. Running it
 
 Install the plugin once so vLLM can discover the entry point (it is not on
-`sys.path` by default, and without this `VLLM_PLUGINS=titan` silently does nothing —
+`sys.path` by default, and without this `VLLM_PLUGINS=fleet_mk` silently does nothing —
 you get stock vLLM and a plausible-looking result):
 
 ```bash
-python3 -m pip install -e titan_vllm --no-deps --no-build-isolation
+python3 -m pip install -e fleet_megakernel_vllm --no-deps --no-build-isolation
 # verify:
 python3 -c "import importlib.metadata as m; print([e.value for e in m.entry_points(group='vllm.general_plugins')])"
 ```
 
 ```bash
-export TITAN_MODEL=/home/claudeuser/models/gpt-oss-120b
+export FLEET_MK_MODEL=/home/claudeuser/models/gpt-oss-120b
 # stock baseline
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=  python3 -m titan_vllm.harness
-# titan decode (greedy parity)
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan TITAN_TEMP=0 python3 -m titan_vllm.harness
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=  python3 -m fleet_megakernel_vllm.harness
+# fleet_mk decode (greedy parity)
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0 python3 -m fleet_megakernel_vllm.harness
 # sampler (two seeds diverge at temp>0)
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan TITAN_TEMP=0.8 TITAN_SEED=0 python3 -m titan_vllm.harness
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0.8 FLEET_MK_SEED=0 python3 -m fleet_megakernel_vllm.harness
 # latency benchmark
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan python3 -m titan_vllm.bench
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk python3 -m fleet_megakernel_vllm.bench
 ```
 
 Comparing two configurations (page size, quant, backend) — capture several runs of
 *each* build, then:
 
 ```bash
-python3 -m titan_vllm.compare_runs \
+python3 -m fleet_megakernel_vllm.compare_runs \
   --group ps128 /tmp/a1.txt /tmp/a2.txt \
   --group ps16  /tmp/b1.txt /tmp/b2.txt /tmp/b3.txt
 ```
@@ -335,7 +335,7 @@ architectures now run end-to-end through vLLM.
    I need to cover the key` — token ids identical to the standalone
    `demo_qwen3_8b.py` run, which is the tighter check (same kernel, same weights,
    different driver).
-5. **Stability**: two identical GPT-OSS titan runs produced bit-identical streams.
+5. **Stability**: two identical GPT-OSS fleet_mk runs produced bit-identical streams.
    **Superseded 2026-08-24** — that was luck, not a property. Three runs of one
    build at page-16 diverge from each other as early as token 3 (see §5). Do not
    treat a stable stream as a gate; the note below already said so, and the
@@ -344,12 +344,12 @@ architectures now run end-to-end through vLLM.
    branching to a fluent synonym (`"This is"` vs `"That's"`; `"I need to cover the
    key"` vs `"Let me start by breaking down"`).
 
-On (6): a difference is expected and is not by itself a defect — titan runs MXFP4
+On (6): a difference is expected and is not by itself a defect — fleet_mk runs MXFP4
 weights and fp8 activations against stock's bf16, so logits differ slightly and a
 near-tie eventually resolves the other way. The discriminator is *qualitative*, per
 `check_determinism.py`: corruption shows up as re-emitting a prefill token, doubled
 words, or a degenerate repeat, not as a fluent synonym 14 tokens in. Divergence
-*position* is not a signal. The reason is that titan's MoE W2 accumulates 4 experts
+*position* is not a signal. The reason is that fleet_mk's MoE W2 accumulates 4 experts
 into `workspace_f32` with float `atomicAdd`, so summation order — and the last bits
 of every logit — varies run to run. Bit-reproducibility is therefore not a property
 of this kernel at all.
@@ -367,15 +367,15 @@ output of the same prompt, difference out the identical prefill:
 **Always state which graph-capture mode a number came from.** `enforce_eager`
 disables hipGraph capture, and it is *not* neutral between the two sides: stock
 vLLM's decode is a long tail of small kernel launches, so graph capture is most of
-its performance, while titan's decode is ONE megakernel launch and has almost
-nothing to gain. Eager mode therefore flatters titan by a large factor.
+its performance, while fleet_mk's decode is ONE megakernel launch and has almost
+nothing to gain. Eager mode therefore flatters fleet_mk by a large factor.
 
-| model | stock, graphs ON | stock, eager | titan (eager) | |
+| model | stock, graphs ON | stock, eager | fleet_mk (eager) | |
 |---|---:|---:|---:|---|
 | **GPT-OSS 120B** | **4.658 ms/tok (215 tok/s)** | 26.113 ms/tok | **2.921 ms/tok (342 tok/s)** | **1.59× faster** |
 | **Qwen3-8B** | **4.469 ms/tok (224 tok/s)** | 5.720 ms/tok (175 tok/s) | 7.282 ms/tok (137 tok/s) | 1.63× **slower** |
 
-Correcting the baseline moved *both* rows against titan: GPT-OSS from 8.3× to
+Correcting the baseline moved *both* rows against fleet_mk: GPT-OSS from 8.3× to
 1.45×, and Qwen3 from 1.27× slower to **1.63× slower**. GPT-OSS then recovered to
 1.59× when the fused-logits change (§8.2) removed vLLM's redundant bf16 `lm_head`,
 3.211 → 2.921. Qwen3 is dense and does not have the fused path.
@@ -387,13 +387,13 @@ few experts per token, so its *active* parameter count is not 15× Qwen3's.
 
 An earlier revision of this document reported GPT-OSS as **8.3× faster than
 stock**. That number was an artifact: `bench.py` hardcoded `enforce_eager=True`,
-so it compared graph-captured titan against a stock baseline running with graphs
+so it compared graph-captured fleet_mk against a stock baseline running with graphs
 disabled. Stock GPT-OSS with graphs is **4.658 ms/token**, not 26.113 — a 5.6×
 swing that belonged entirely to the baseline. The real margin is ~1.45×.
 
 The comparison is still not like-for-like, and in the direction that *disfavours*
-titan's headline: **titan cannot be graph-captured today** (§8.1), so its column is
-eager. Since titan has little to gain from capture this is a small effect, but it
+fleet_mk's headline: **fleet_mk cannot be graph-captured today** (§8.1), so its column is
+eager. Since fleet_mk has little to gain from capture this is a small effect, but it
 is unmeasured, and the table says "eager" until it is measured.
 
 **The two architectures land on opposite sides of stock, and that is the finding.**
@@ -403,12 +403,12 @@ multi-barrier dense kernel that the generator was re-converged against but whose
 pre-rebase measurement below (7.33 → 7.28), confirming the regression is in the
 kernel, not the plugin.
 
-### 8.1 titan cannot be hipGraph-captured (open)
+### 8.1 fleet_mk cannot be hipGraph-captured (open)
 
 Running `bench.py` without `BENCH_EAGER=1` crashes during engine init:
 
 ```
-File "titan_vllm/mixin.py", line 180, in forward
+File "fleet_megakernel_vllm/mixin.py", line 180, in forward
     cur_pos = int(positions[0].item())
 torch.AcceleratorError: HIP error: operation not permitted when stream is capturing
 ```
@@ -429,7 +429,7 @@ removing them is more than deleting the `.item()`:
 — a device-side read, which is capture-safe. The plugin passes `nullptr` today.
 `cur_pos` is the harder half and needs the page-count arithmetic moved on-device.
 
-**Bound on the payoff first.** With `TITAN_PROFILE=1` the megakernel's own GPU time
+**Bound on the payoff first.** With `FLEET_MK_PROFILE=1` the megakernel's own GPU time
 is ~2.38 ms against 2.921 ms end-to-end, so *everything* host-side — scheduler,
 sampler, launch, round-trip — is ~0.54 ms/token (was ~0.83 before §8.2 removed the
 bf16 `lm_head`). That is the ceiling on what capture could recover, and capture
@@ -447,10 +447,10 @@ MXFP4 weights already resident in the megakernel.
 keeps the argmax-only tail; non-null makes the epilogue also store the bf16 row —
 a 402 KB write. It is a null check rather than an `#ifdef` so one build serves both
 drivers. Since the stored value is the same `val` the argmax compares, at the same
-absolute vocab index, the fused row cannot disagree with titan's own greedy pick.
+absolute vocab index, the fused row cannot disagree with fleet_mk's own greedy pick.
 
 `compute_logits()` returns the fused row only when the preceding `forward()` was a
-titan decode, and **consumes** that flag: prefill, dummy runs and stock-path
+fleet_mk decode, and **consumes** that flag: prefill, dummy runs and stock-path
 fallbacks fall through to vLLM's `lm_head`. Returning a stale row there would be
 wrong output with no error.
 
@@ -468,7 +468,7 @@ predicated branch.
 
 | Component | per token |
 |---|---:|
-| titan megakernel (GPU, from the kernel's own `[TITAN_TIME]` line) | ~2.38 ms |
+| fleet_mk megakernel (GPU, from the kernel's own `[FLEET_MK_TIME]` line) | ~2.38 ms |
 | standalone driver total (`demo_gpt_oss_120b.py`) | 2.50 ms |
 | **through vLLM** | **2.92 ms** |
 
@@ -482,14 +482,14 @@ kernel — and it is not what makes the dense path slow.
 
 ### The earlier conclusion, and what survives of it
 
-An earlier revision recorded stock 5.98 vs titan 7.33 ms/token on Qwen3-8B and
-concluded *"the megakernel itself is the bottleneck… titan is ~23% slower than
+An earlier revision recorded stock 5.98 vs fleet_mk 7.33 ms/token on Qwen3-8B and
+concluded *"the megakernel itself is the bottleneck… fleet_mk is ~23% slower than
 stock."* **For the dense path that is still true** — reverified here at 5.72 vs
 7.28 (both eager). What changed is that it no longer generalizes: GPT-OSS's fused
 kernel is faster than stock, so "the megakernel is the bottleneck" is now a
-statement about which kernel, not about titan.
+statement about which kernel, not about fleet_mk.
 
-The integration-level lever named there — emitting logits from titan to skip vLLM's
+The integration-level lever named there — emitting logits from fleet_mk to skip vLLM's
 redundant bf16 `lm_head` — **landed** (§8.2) and was worth 0.290 ms on GPT-OSS,
 inside the 0.4–0.6 ms estimated. It does not apply to the dense path, whose kernel
 has no `logits_output` in its ABI, and it would not close the dense gap anyway:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Estimate rendered height of every slide in titan-talk.html.
+"""Estimate rendered height of every slide in fleet-mk-talk.html.
 
 There is no headless renderer on this box, so "does it fit on one 16:9 page"
 is computed rather than looked at. The model is deliberately crude and
@@ -18,7 +18,7 @@ import sys
 from html.parser import HTMLParser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT = os.path.normpath(os.path.join(HERE, "..", "..", "titan-talk.html"))
+DEFAULT = os.path.normpath(os.path.join(HERE, "..", "..", "fleet-mk-talk.html"))
 PATH = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
 PAGE_H = 630
 PAD_V = 44 + 58          # .slide padding top + bottom

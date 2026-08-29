@@ -1,7 +1,7 @@
-## Llama-3.1-8B model configuration for Titan code generator
+## Llama-3.1-8B model configuration for Fleet MK code generator
 ## Source: NousResearch/Meta-Llama-3.1-8B HuggingFace config.json
 ##
-## Usage: python3 titan_generate.py configs/llama3_8b.yaml
+## Usage: python3 fleet_mk_generate.py configs/llama3_8b.yaml
 
 model:
   name: llama3-8b
@@ -35,8 +35,8 @@ quantization:
 
 build:
   ## Same reason as configs/qwen3_8b.yaml: the dense kernel calls
-  ## titan::gemm_mxfp4 and titan::rope_kv_update, both of which commit f2354a7
-  ## fenced behind TITAN_ENABLE_LEGACY. Without this define hipcc reports 14
+  ## fleet_mk::gemm_mxfp4 and fleet_mk::rope_kv_update, both of which commit f2354a7
+  ## fenced behind FLEET_MK_ENABLE_LEGACY. Without this define hipcc reports 14
   ## errors, all tracing to those two.
   ##
   ## qwen3_8b.yaml got the define when the guards landed; this config did not,
@@ -45,4 +45,4 @@ build:
   ## emitted script to the on-disk script and both were equally broken; only
   ## actually running hipcc finds it.
   extra_defines:
-    - TITAN_ENABLE_LEGACY
+    - FLEET_MK_ENABLE_LEGACY

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation passes for titan-architecture.html.
+"""Validation passes for fleet-mk-architecture.html.
 
 There is no headless renderer on this box, so "does it look right" is checked
 numerically instead. Four passes:
@@ -178,7 +178,7 @@ def prose_budget(text):
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else 'titan-architecture.html'
+    path = sys.argv[1] if len(sys.argv) > 1 else 'fleet-mk-architecture.html'
     text = open(path).read()
     errors = []
 

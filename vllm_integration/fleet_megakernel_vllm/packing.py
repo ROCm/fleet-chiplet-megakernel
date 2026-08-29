@@ -1,8 +1,8 @@
-"""MXFP4 weight packing for the titan dense (Qwen3-family) megakernel.
+"""MXFP4 weight packing for the fleet_mk dense (Qwen3-family) megakernel.
 
 Extracted verbatim (parameterized into functions) from demo_qwen3.py so the demo
 and the vLLM plugin pack weights identically. The low-level MXFP4 quantize/pack
-primitives live in mxfp4_pack.py, vendored into titan; nothing here reaches into
+primitives live in mxfp4_pack.py, vendored into fleet_mk; nothing here reaches into
 a mirage checkout any more.
 
 Every dimension comes from the ModelSpec argument rather than module constants.
@@ -16,13 +16,13 @@ import torch
 
 
 def import_mirage_packers(mirage_dir=None):
-    """The pad/quantize/pack helpers, now titan's own (see mxfp4_pack.py).
+    """The pad/quantize/pack helpers, now fleet_mk's own (see mxfp4_pack.py).
 
-    Name and signature kept so callers (mixin._setup_titan, the demos) do not
+    Name and signature kept so callers (mixin._setup_fleet_mk, the demos) do not
     change; `mirage_dir` is accepted and ignored. These four functions used to be
     executed out of mirage's demo module through a `_load_gptoss_demo_module`
     handle, which also served the reference-model load; both are gone. Vendoring
-    them is what lets titan_vllm run with no mirage checkout on sys.path.
+    them is what lets fleet_megakernel_vllm run with no mirage checkout on sys.path.
     """
     from . import mxfp4_pack
     return {
@@ -36,7 +36,7 @@ def import_mirage_packers(mirage_dir=None):
 def pack_layer_weights(w_q, w_k, w_v, w_o, w_gate, w_up, w_down,
                        norm_w1, norm_w2, q_norm_w, k_norm_w, packers, spec,
                        q_bias=None, k_bias=None, v_bias=None, o_bias=None):
-    """Pack one dense decoder layer into the 12-slot titan weight list.
+    """Pack one dense decoder layer into the 12-slot fleet_mk weight list.
 
     All weight tensors are the raw HF [out, in] bf16 matrices on CUDA. Returns a
     list of 12 CUDA tensors in the exact per-layer order the ptr table expects:

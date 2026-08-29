@@ -1,4 +1,4 @@
-/* Titan: Unified Device Function Library
+/* Fleet MK: Unified Device Function Library
  *
  * Composable building blocks for persistent kernel compilation.
  * Two-level fusion:
@@ -29,7 +29,7 @@
 // are NOT included here. The model-specific kernel file includes those
 // directly, keeping this library lightweight and fast to compile.
 
-namespace titan {
+namespace fleet_mk {
 
 // ============================================================================
 // Section A: Composable Epilogue Templates
@@ -216,7 +216,7 @@ struct EpilogueArgmax {
 // Dead code guard: these standalone GEMM/RoPE/TopK functions are NOT used
 // when the kernel uses mirage's fused sub-kernels. Guard them to prevent
 // __noinline__ from forcing compilation of unused template instantiations.
-#ifdef TITAN_ENABLE_LEGACY
+#ifdef FLEET_MK_ENABLE_LEGACY
 
 // ============================================================================
 // This is the CORE building block. The depth-4 MFMA pipeline is IDENTICAL
@@ -641,7 +641,7 @@ gemm_mxfp4_lds_weight(
     __syncthreads();
 }
 
-#endif // TITAN_ENABLE_LEGACY (gemm_mxfp4 + variants)
+#endif // FLEET_MK_ENABLE_LEGACY (gemm_mxfp4 + variants)
 
 // ============================================================================
 // Section C: RMSNorm Device Function
@@ -659,7 +659,7 @@ rmsnorm(void const *input, void const *weight, void *output) {
     __syncthreads();
 }
 
-#ifdef TITAN_ENABLE_LEGACY
+#ifdef FLEET_MK_ENABLE_LEGACY
 // Fused ResAddF32 + RMSNorm: reads f32 workspace + bf16 residual, computes
 // resadd, writes bf16 residual output + norm output. All workers redundantly
 // compute the same result. Workspace zeroing done by single worker (is_zero_worker).
@@ -871,7 +871,7 @@ router_gemv_bf16(
     }
     __syncthreads();
 }
-#endif // TITAN_ENABLE_LEGACY (rmsnorm_resadd + fp8_quant + router_gemv_bf16)
+#endif // FLEET_MK_ENABLE_LEGACY (rmsnorm_resadd + fp8_quant + router_gemv_bf16)
 
 // ============================================================================
 // Section D: Barrier Primitives
@@ -1240,7 +1240,7 @@ final_writeback() {
 }
 
 
-#ifdef TITAN_ENABLE_LEGACY
+#ifdef FLEET_MK_ENABLE_LEGACY
 // ============================================================================
 // Section E: RoPE + KV Cache Update
 // ============================================================================
@@ -2161,7 +2161,7 @@ moe_residual_add(
 }
 
 
-#endif // TITAN_ENABLE_LEGACY (RoPE + MoE epilogues + TopK + moe_residual_add)
+#endif // FLEET_MK_ENABLE_LEGACY (RoPE + MoE epilogues + TopK + moe_residual_add)
 
 // ── moe_residual_add_no_zero: same as moe_residual_add but does NOT zero workspace.
 // Used when workspace zeroing is handled separately (after a barrier) to avoid
@@ -2315,7 +2315,7 @@ static constexpr int SLOT_FUSED_OPROJ      = 84 * 16;  // [84..93] oproj Mechani
 // routing_ready: 9 cache lines — [0] global epoch, [1..8] per-XCD release flags
 static constexpr int SLOT_ROUTING_READY    = 94 * 16;  // [94..102] routing ready flags
 
-#ifdef TITAN_ENABLE_LEGACY
+#ifdef FLEET_MK_ENABLE_LEGACY
 // ============================================================================
 // Section K: Fused RMSNorm + Router GEMV + TopK (single-worker)
 // ============================================================================
@@ -2909,6 +2909,6 @@ router_gemv_one_expert(
     __syncthreads();
 }
 
-#endif // TITAN_ENABLE_LEGACY (rmsnorm_router_topk + router_gemv_one_expert)
+#endif // FLEET_MK_ENABLE_LEGACY (rmsnorm_router_topk + router_gemv_one_expert)
 
-} // namespace titan
+} // namespace fleet_mk

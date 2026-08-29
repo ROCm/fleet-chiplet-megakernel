@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Per-slot GPU byte budget for titan's packed weights, split by ALIASED vs OWNED.
+"""Per-slot GPU byte budget for fleet_mk's packed weights, split by ALIASED vs OWNED.
 
 Answers "how many copies of each weight class are resident" with arithmetic that
-can be checked against the [TITAN_MEM] before/after deltas the harness prints,
+can be checked against the [FLEET_MK_MEM] before/after deltas the harness prints,
 instead of eyeballing a total. Every number here is derived from the same
-formulas titan_generate.py uses to emit the kernel constants, so a divergence
+formulas fleet_mk_generate.py uses to emit the kernel constants, so a divergence
 between this and the measured delta is a real discrepancy, not a modelling gap.
 
 Three classes, and the distinction is the whole point:
 
-  ALIASED   titan's pointer table points at vLLM's own allocation. Zero added
+  ALIASED   fleet_mk's pointer table points at vLLM's own allocation. Zero added
             bytes. Only the MoE expert DATA qualifies -- see
-            titan_vllm/model.py:199.
-  OWNED     titan allocates these. They are NOT duplicates of a live vLLM
+            fleet_megakernel_vllm/model.py:199.
+  OWNED     fleet_mk allocates these. They are NOT duplicates of a live vLLM
             tensor: either vLLM deleted its version (MoE scales, dropped in
-            process_weights_after_loading) or titan needs a different numeric
+            process_weights_after_loading) or fleet_mk needs a different numeric
             format than vLLM holds (attention/lm_head, bf16 -> MXFP4).
-  SHADOWED  titan owns a copy AND vLLM still holds its own of the same logical
+  SHADOWED  fleet_mk owns a copy AND vLLM still holds its own of the same logical
             weight, in a different format. This is the only class where "two
             copies" is literally true, and it is what the linear layers are.
 
@@ -64,13 +64,13 @@ def budget(*, num_layers=36, hidden=2880, padded_hidden=2944,
         ("[10] w13 bias    bf16",  bf16(num_experts * w13_out),     "SHADOWED"),
         ("[11] w2 bias     bf16",  bf16(num_experts * w2_out),      "SHADOWED"),
         ("[12] attn sinks  bf16",  bf16(num_q),                     "SHADOWED"),
-        # Expert DATA: aliased, so titan adds zero. Sized at vLLM's pitch, which
+        # Expert DATA: aliased, so fleet_mk adds zero. Sized at vLLM's pitch, which
         # is what the pointer table now spans.
         ("[8] w13 data     MXFP4", num_experts * 2 * vllm_pad * (vllm_pad // 2),
                                                                     "ALIASED"),
         ("[9] w2 data      MXFP4", num_experts * vllm_pad * (vllm_pad // 2),
                                                                     "ALIASED"),
-        # Expert SCALES: titan's own, at titan's own row count (N stride moves
+        # Expert SCALES: fleet_mk's own, at fleet_mk's own row count (N stride moves
         # only the data section -- mxfp4_pack.py:257-266).
         ("[8s] w13 scales  E8M0",  num_experts * w13_out * (ph // 32),
                                                                     "OWNED"),
@@ -90,7 +90,7 @@ def budget(*, num_layers=36, hidden=2880, padded_hidden=2944,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--measured", type=float, default=None,
-                    help="GiB delta from [TITAN_MEM] after-pack, to check against")
+                    help="GiB delta from [FLEET_MK_MEM] after-pack, to check against")
     a = ap.parse_args()
 
     rows = budget()
@@ -105,10 +105,10 @@ def main():
     for cls in ("ALIASED", "OWNED", "SHADOWED"):
         print(f"{cls:<{w}}  {tot.get(cls,0):>16,}  {tot.get(cls,0)/GiB:>8.3f}")
     added = tot.get("OWNED", 0) + tot.get("SHADOWED", 0)
-    print(f"{'titan adds (OWNED+SHADOWED)':<{w}}  {added:>16,}  {added/GiB:>8.3f}")
+    print(f"{'fleet_mk adds (OWNED+SHADOWED)':<{w}}  {added:>16,}  {added/GiB:>8.3f}")
     if a.measured is not None:
         d = added / GiB - a.measured
-        print(f"{'measured [TITAN_MEM] delta':<{w}}  {'':>16}  "
+        print(f"{'measured [FLEET_MK_MEM] delta':<{w}}  {'':>16}  "
               f"{a.measured:>8.3f}\n{'residual (model - measured)':<{w}}  "
               f"{'':>16}  {d:>8.3f}")
 

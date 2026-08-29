@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run one benchmark arm N times against a given .so, sequentially.
 #
-# Titan is non-deterministic by design (MoE float reduction order), so a single
+# Fleet MK is non-deterministic by design (MoE float reduction order), so a single
 # run cannot resolve a sub-1% latency delta -- always run >=3 and feed the logs
 # to tools/compare_runs.py, which reports within-arm spread next to the
 # between-arm delta.
@@ -21,8 +21,8 @@ ARM="${1:?usage: run_arm.sh <arm-name> <so-path> [runs]}"
 SO="${2:?usage: run_arm.sh <arm-name> <so-path> [runs]}"
 RUNS="${3:-3}"
 
-TITAN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LIVE_SO="$TITAN_DIR/generated/gpt_oss_120b.so"
+FLEET_MK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE_SO="$FLEET_MK_DIR/generated/gpt_oss_120b.so"
 MODEL="${MODEL_PATH:-/home/claudeuser/models/gpt-oss-120b}"
 
 # The prompt and --max-seq-length are load-bearing: shorter prompts give
@@ -40,7 +40,7 @@ for i in $(seq 1 "$RUNS"); do
     LOG="/tmp/${ARM}_run${i}.log"
     echo "[run_arm] $ARM run $i/$RUNS -> $LOG"
     # A run over ~3 min is hanging, not slow. Bound it and move on.
-    cd "$TITAN_DIR" && HIP_VISIBLE_DEVICES=0 timeout 280 python3 \
+    cd "$FLEET_MK_DIR" && HIP_VISIBLE_DEVICES=0 timeout 280 python3 \
         demo_gpt_oss_120b.py --model-path "$MODEL" \
         --prompt "$PROMPT" --max-seq-length "$MAXLEN" > "$LOG" 2>&1 || {
         echo "[run_arm] run $i exited $? (see $LOG)"
@@ -51,5 +51,5 @@ for i in $(seq 1 "$RUNS"); do
 done
 
 # Core dumps from a crashed run fill the disk fast (it sits at ~94%).
-rm -f /tmp/gpucore* "$TITAN_DIR"/gpucore* 2>/dev/null || true
+rm -f /tmp/gpucore* "$FLEET_MK_DIR"/gpucore* 2>/dev/null || true
 echo "[run_arm] done: /tmp/${ARM}_run*.log"

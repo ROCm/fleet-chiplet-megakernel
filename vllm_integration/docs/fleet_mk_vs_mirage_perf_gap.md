@@ -1,14 +1,14 @@
-# Titan vs Mirage: Performance Gap Analysis (GPT-OSS 120B)
+# Fleet MK vs Mirage: Performance Gap Analysis (GPT-OSS 120B)
 
 ## Measured Performance
 
-| Metric | Titan | Mirage | Ratio |
+| Metric | Fleet MK | Mirage | Ratio |
 |--------|-------|--------|-------|
 | Decode avg (short seq) | 8.08 ms/tok | 2.19 ms/tok | 3.7x |
 | Decode min | 8.01 ms/tok | 2.14 ms/tok | 3.7x |
 | Per-layer budget | 217.9 us | ~60.8 us | 3.6x |
 
-## Titan Per-Layer Subphase Breakdown
+## Fleet MK Per-Layer Subphase Breakdown
 
 ```
 Phase                      Time (us)  % of Layer
@@ -31,7 +31,7 @@ TOTAL x 36 layers             7.85 ms
 
 ### 1. Global barriers (~20 us/layer, 0.72 ms total)
 
-Titan uses 5 global barriers per layer (QKV, attention, FFN mid, MoE, layer end)
+Fleet MK uses 5 global barriers per layer (QKV, attention, FFN mid, MoE, layer end)
 at ~3.3 us each = ~16.5 us/layer of pure synchronization overhead, plus partial
 barrier cost baked into TopK (12.1 us includes barrier wait after router GEMM).
 
@@ -41,7 +41,7 @@ specific dependency is satisfied, no global sync required.
 
 ### 2. Sequential MoE vs 2TG overlap (~38 us/layer, 1.38 ms total)
 
-Titan runs W13 and W2 **sequentially** with a global barrier between them:
+Fleet MK runs W13 and W2 **sequentially** with a global barrier between them:
 - W13 loop: ~32 us (4 experts x 46 tiles, all 240 workers)
 - Global barrier: ~3 us
 - W2 loop: ~35 us (4 experts x 46 tiles, all 240 workers)
@@ -52,7 +52,7 @@ waves 2-3 execute W2 **simultaneously** via LDS double-buffering. As soon as
 W13 finishes for expert A, W2 starts for expert A while W13 begins expert B.
 Per-expert barriers (not global) coordinate the handoff.
 
-Estimated mirage MoE time: ~42 us/layer vs Titan's 80.3 us/layer.
+Estimated mirage MoE time: ~42 us/layer vs Fleet MK's 80.3 us/layer.
 
 ### 3. Cross-phase overlap (~30 us/layer, 1.08 ms total)
 
@@ -61,12 +61,12 @@ task (`-DMPK_FUSED_LAYER_BATCHING`). While some workers finish OProj, others
 start Router/TopK without waiting. Additionally, workers that finish MoE for
 layer N can start QKV for layer N+1 immediately -- no layer boundary barrier.
 
-Titan has explicit barriers between every phase and every layer, preventing any
+Fleet MK has explicit barriers between every phase and every layer, preventing any
 cross-phase or cross-layer overlap.
 
 ### 4. Attention (~40 us/layer, 1.44 ms total)
 
-Titan: 60.5 us/layer using CK FMHA template (head_dim=64).
+Fleet MK: 60.5 us/layer using CK FMHA template (head_dim=64).
 Mirage: ~20 us/layer using hand-tuned split-KV attention with XCD affinity.
 
 With 64 Q heads x 8 KV chunks = 512 attention tasks in mirage, each taking
@@ -79,10 +79,10 @@ Mirage's "gang" kernels fuse adjacent operations into single tasks, eliminating
 HBM roundtrips between phases:
 
 - **RMSNorm + QKV GEMM**: All workers redundantly compute RMSNorm in registers
-  (microseconds), then cooperatively dispatch MFMA tiles. Titan runs RMSNorm as
+  (microseconds), then cooperatively dispatch MFMA tiles. Fleet MK runs RMSNorm as
   a separate phase (3.8 us) + barrier before QKV GEMM.
 - **OProj GEMM + ResAdd + RMSNorm + Router GEMM + TopK**: Five operations fused
-  into one gang task. Titan runs them as 3 separate phases with 2 barriers
+  into one gang task. Fleet MK runs them as 3 separate phases with 2 barriers
   between them (OProj 12.4 + barrier 3.1 + Router 14.5 + TopK 12.1 = 42.1 us).
   Mirage eliminates the inter-phase barriers and HBM writes/reads.
 
@@ -105,7 +105,7 @@ W13 per-tile latency drops from ~1.5 us to ~0.5 us with LDS prefetch.
 
 ### 7. Depth-4 MFMA pipeline tuning (~3 us/layer, 0.11 ms total)
 
-Both Titan and mirage use depth-4 MFMA pipelines, but mirage's gang kernels
+Both Fleet MK and mirage use depth-4 MFMA pipelines, but mirage's gang kernels
 pipeline more aggressively:
 
 - **Depth-2 pipelined FP8 loop**: Next iteration's weight/token data prefetched
@@ -116,7 +116,7 @@ pipeline more aggressively:
 
 ## Summary Table
 
-| Source | Titan (us/layer) | Mirage est. (us/layer) | Delta (us) | Delta total (ms) |
+| Source | Fleet MK (us/layer) | Mirage est. (us/layer) | Delta (us) | Delta total (ms) |
 |--------|-------------------|------------------------|------------|------------------|
 | Barriers (5/layer) | 16.5 | ~0 | 16.5 | 0.59 |
 | MoE sequential vs 2TG | 80.3 | ~42 | 38.3 | 1.38 |
@@ -127,7 +127,7 @@ pipeline more aggressively:
 | MFMA pipeline tuning | -- | ~3 saved | 3 | 0.11 |
 | **Total** | | | **141.3** | **5.09** |
 
-Predicted Titan after all optimizations: 8.08 - 5.09 = **~3.0 ms** (vs mirage 2.19 ms).
+Predicted Fleet MK after all optimizations: 8.08 - 5.09 = **~3.0 ms** (vs mirage 2.19 ms).
 Remaining ~0.8 ms gap from additional mirage optimizations (weight layout, XCD
 affinity for linear tasks, reduced register pressure from hand-tuned asm, etc.).
 

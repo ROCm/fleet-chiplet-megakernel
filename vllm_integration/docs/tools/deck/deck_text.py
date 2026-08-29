@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump titan-talk.html as plain text, one block per line, slide by slide.
+"""Dump fleet-mk-talk.html as plain text, one block per line, slide by slide.
 
 A regex over `<div class="slide">…</div>` truncates at the first nested
 `</div>`, which silently hides most of a slide's content -- the reason this
@@ -12,7 +12,7 @@ import sys
 from html.parser import HTMLParser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT = os.path.normpath(os.path.join(HERE, "..", "..", "titan-talk.html"))
+DEFAULT = os.path.normpath(os.path.join(HERE, "..", "..", "fleet-mk-talk.html"))
 PATH = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
 BLOCK = {"h1", "h2", "p", "li", "figcaption", "tr", "pre"}
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Token-level determinism and PyTorch-agreement check for a Titan demo.
+"""Token-level determinism and PyTorch-agreement check for a Fleet MK demo.
 
 Usage:
   ./check_determinism.py --demo demo_gpt_oss_120b.py \\
@@ -20,7 +20,7 @@ associative and expert arrival order varies run to run, so near-ties in the
 argmax flip. Divergent-but-coherent prose is the EXPECTED steady state.
 
 Verified 2026-08-04: mirage, a different engine on the same weights, diverges
-between two runs at char 169 -- EARLIER than Titan's char 315. Reproduce with:
+between two runs at char 169 -- EARLIER than Fleet MK's char 315. Reproduce with:
 
   MIRAGE_HOME=/home/claudeuser/mirage \\
   LD_LIBRARY_PATH=/home/claudeuser/mirage/python/mirage:$LD_LIBRARY_PATH \\
@@ -34,8 +34,9 @@ where one run gave 31064 (' asks') and two gave 10648 (' wants') at iteration 5,
 and 31064 is exactly what the PyTorch reference produces. Both are correct
 decodes of a near-tie; neither is corruption.
 
-What this script fails on is the CORRUPTION SIGNATURE from the wiki article
-titan-embedding-barrier-race, which is qualitative, not positional:
+What this script fails on is the CORRUPTION SIGNATURE from the embedding
+barrier race (recorded in the project wiki -- search its articles for
+"embedding barrier race"), which is qualitative, not positional:
 
   1. iteration 1 emits the PREFILL token (200005) instead of 35644 -- means
      239 workers read the previous token's embedding, i.e. a device-wide write
@@ -181,9 +182,9 @@ def main():
         print(f"pytorch: {len(pt)} tokens logged, first 8 = {pt[:8]}")
         d = first_divergence(seqs[0], pt)
         if d is None:
-            print(f"titan vs pytorch: IDENTICAL ({len(pt)} tokens)")
+            print(f"fleet_mk vs pytorch: IDENTICAL ({len(pt)} tokens)")
         else:
-            print(f"titan vs pytorch: DIVERGES at index {d} "
+            print(f"fleet_mk vs pytorch: DIVERGES at index {d} "
                   f"({seqs[0][d] if d < len(seqs[0]) else '-'} vs "
                   f"{pt[d] if d < len(pt) else '-'}); "
                   f"{d} token prefix agrees")

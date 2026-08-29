@@ -3,7 +3,7 @@ HEAD = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Titan — a static generator for fused decode megakernels</title>
+<title>Fleet MK — a static generator for fused decode megakernels</title>
 <style>
   :root {
     --bg:#ffffff; --fg:#1a1a1a; --muted:#5a6472; --rule:#e2e6eb;

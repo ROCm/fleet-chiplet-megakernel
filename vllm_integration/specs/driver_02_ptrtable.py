@@ -8,7 +8,7 @@
 # different buffer than the kernel thinks it passed. Output is garbage and
 # nothing says why.
 #
-# After this both files read from MIRAGE_IN / MIRAGE_OUT in titan_generate.py,
+# After this both files read from MIRAGE_IN / MIRAGE_OUT in fleet_mk_generate.py,
 # which is also where the two asserts below get their numbers, so the assert
 # can no longer pass while the table is wrong.
 

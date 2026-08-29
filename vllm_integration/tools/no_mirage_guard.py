@@ -1,19 +1,19 @@
 """Fail the process if anything imports Python out of a mirage checkout.
 
-Titan used to reach into `mirage/demo/gpt_oss/demo.py` twice -- once for the
+Fleet MK used to reach into `mirage/demo/gpt_oss/demo.py` twice -- once for the
 MXFP4 pack primitives, once for the reference `GptOssForCausalLM` it packed
 from. Both are gone, and this asserts they stay gone.
 
 Renaming the checkout would be the obvious test, but it is destructive here (the
 tree is dirty and is somebody's cwd), so this covers the same ground directly.
-Two hooks are needed, because titan used the deleted module in *both* spellings:
+Two hooks are needed, because fleet_mk used the deleted module in *both* spellings:
 
   * a `sys.meta_path` finder catches ordinary `import x` once a mirage directory
     is on `sys.path` (what `_load_gptoss_demo_module`'s `sys.path.insert` set up);
   * an audit hook catches `importlib.util.spec_from_file_location` +
     `exec_module`, which loads a file by absolute path and never consults
     `sys.path` or `meta_path` at all -- so the finder alone would miss it. That
-    absolute-path load is precisely how titan reached mirage's demo.py.
+    absolute-path load is precisely how fleet_mk reached mirage's demo.py.
 
 Usage -- prepend to any run:
 
@@ -22,7 +22,7 @@ Usage -- prepend to any run:
 or, as used by the harness gate:
 
     python3 -X importtime ... with `-c "import no_mirage_guard; import runpy;
-    runpy.run_module('titan_vllm.harness', run_name='__main__')"`
+    runpy.run_module('fleet_megakernel_vllm.harness', run_name='__main__')"`
 
 Set MIRAGE_GUARD_DIR to check a different root (default /home/claudeuser/mirage).
 """
@@ -59,7 +59,7 @@ class _MirageImportGuard:
                 if os.path.isdir(candidate) or os.path.exists(candidate + ".py"):
                     raise ImportError(
                         f"[no_mirage_guard] '{fullname}' would be imported from "
-                        f"the mirage checkout at {real} -- titan must not depend "
+                        f"the mirage checkout at {real} -- fleet_mk must not depend "
                         f"on mirage Python.")
 
 

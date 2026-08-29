@@ -3,7 +3,7 @@
 
 `hash_packed.py` gates the *packed* bytes, which is the right final check but a
 poor diagnostic: a packed slot is a quantized, padded, workgroup-interleaved slab,
-so a hash mismatch says "something upstream moved" and nothing more. When titan's
+so a hash mismatch says "something upstream moved" and nothing more. When fleet_mk's
 weights are re-sourced from vLLM's live modules instead of mirage's reference
 model, the useful question is asked one level earlier -- is *this* bf16 matrix the
 same matrix? -- and the useful answer is a max-abs-diff, not a boolean.
@@ -14,7 +14,7 @@ transformers' `attention_scaling`. Those can agree to ~1e-3 (bf16 rounding) whil
 never hashing equal, and a hash-only gate would report a failure that is not one.
 
 Used from inside the engine process (the reference model is only alive there),
-under TITAN_SRC_DIFF -- see model.py's `_titan_pack_weights`.
+under FLEET_MK_SRC_DIFF -- see model.py's `_fleet_mk_pack_weights`.
 """
 
 import torch
@@ -96,7 +96,7 @@ def diff_tensors(named_pairs, label="", atol=0.0, out=None):
                              f"cand[{first}][:4]="
                              f"{[round(v, 5) for v in b[first][:4].tolist()]}")
 
-    head = (f"[TITAN_SRC_DIFF] {label}: {exact} exact, {close} within "
+    head = (f"[FLEET_MK_SRC_DIFF] {label}: {exact} exact, {close} within "
             f"atol={atol}, {bad} differing")
     body = "\n".join([head] + lines)
     if out:

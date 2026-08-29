@@ -1,12 +1,12 @@
-"""Thin titan model subclasses: dense (Qwen3) and MoE (GPT-OSS).
+"""Thin fleet_mk model subclasses: dense (Qwen3) and MoE (GPT-OSS).
 
 All the shared machinery (kernel load, buffers, RoPE, zero-copy KV aliasing,
-prefill/decode routing) lives in TitanModelMixin (mixin.py), parameterized by a
+prefill/decode routing) lives in FleetMKModelMixin (mixin.py), parameterized by a
 ModelSpec (spec.py). Each subclass supplies only what is model-specific:
 
-  * TITAN_ARCH            -- vLLM arch name load_spec() keys on.
-  * _titan_layer_attn(li) -- where the per-layer Attention module lives.
-  * _titan_pack_weights() -- MXFP4-pack this model's weights into titan's layout.
+  * FLEET_MK_ARCH            -- vLLM arch name load_spec() keys on.
+  * _fleet_mk_layer_attn(li) -- where the per-layer Attention module lives.
+  * _fleet_mk_pack_weights() -- MXFP4-pack this model's weights into fleet_mk's layout.
 
 The mixin is listed FIRST in each base list so its forward()/load_weights()
 override the stock model's while super() still reaches the stock model.
@@ -16,23 +16,23 @@ import torch
 
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 
-from .mixin import TitanModelMixin
+from .mixin import FleetMKModelMixin
 from .packing import pack_layer_weights, pack_lm_head
 
 
-class TitanQwen3ForCausalLM(TitanModelMixin, Qwen3ForCausalLM):
+class FleetMKQwen3ForCausalLM(FleetMKModelMixin, Qwen3ForCausalLM):
     """Dense Qwen3-8B: fused qkv/gate_up projections, per-head QK-norm."""
 
-    TITAN_ARCH = "Qwen3ForCausalLM"
+    FLEET_MK_ARCH = "Qwen3ForCausalLM"
 
     def __init__(self, *, vllm_config, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self._titan_setup_state(vllm_config)
+        self._fleet_mk_setup_state(vllm_config)
 
-    def _titan_layer_attn(self, li):
+    def _fleet_mk_layer_attn(self, li):
         return self.model.layers[li].self_attn.attn
 
-    def _titan_pack_weights(self, packers, spec, dev):
+    def _fleet_mk_pack_weights(self, packers, spec, dev):
         q_end = spec.num_q_heads * spec.head_dim              # 4096
         k_end = q_end + spec.num_kv_heads * spec.head_dim     # 5120
         v_end = k_end + spec.num_kv_heads * spec.head_dim     # 6144
@@ -80,25 +80,25 @@ def _make_gptoss_class():
     vLLM doesn't break importing this module for the dense path."""
     from vllm.model_executor.models.gpt_oss import GptOssForCausalLM
 
-    class TitanGptOssForCausalLM(TitanModelMixin, GptOssForCausalLM):
+    class FleetMKGptOssForCausalLM(FleetMKModelMixin, GptOssForCausalLM):
         """MoE GPT-OSS 120B: 128 experts top-4, attention sinks, per-layer SW."""
 
-        TITAN_ARCH = "GptOssForCausalLM"
+        FLEET_MK_ARCH = "GptOssForCausalLM"
 
         def __init__(self, *, vllm_config, prefix: str = ""):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
-            self._titan_setup_state(vllm_config)
+            self._fleet_mk_setup_state(vllm_config)
 
-        def _titan_layer_attn(self, li):
+        def _fleet_mk_layer_attn(self, li):
             return self.model.layers[li].attn.attn
 
-        def _titan_pack_weights(self, packers, spec, dev):
-            # Every tensor here comes from vLLM's own live modules. Titan used to
+        def _fleet_mk_pack_weights(self, packers, spec, dev):
+            # Every tensor here comes from vLLM's own live modules. Fleet MK used to
             # load a second full 120B (mirage's reference GptOssForCausalLM) purely
             # to pack from; that copy is gone, so the checkpoint is read once.
             #
             # This works because of *when* we run: base_loader calls
-            # load_weights() -- whose tail invokes _setup_titan -- before
+            # load_weights() -- whose tail invokes _setup_fleet_mk -- before
             # process_weights_after_loading(), so vLLM's parameters are still the
             # raw checkpoint values, not the post-load swizzle. Sourcing them here
             # is byte-identical to re-reading the checkpoint, and was gated as
@@ -107,7 +107,7 @@ def _make_gptoss_class():
             from .moe_layout import MoeLayout
             from .packing_moe import pack_lm_head_moe, pack_moe_layer
 
-            cos, sin = self._titan_rope_from_vllm(spec, dev)
+            cos, sin = self._fleet_mk_rope_from_vllm(spec, dev)
 
             # Expert-buffer geometry: row pitch, expert pitch, section split,
             # and whether the data section is aliased from vLLM rather than
@@ -123,7 +123,7 @@ def _make_gptoss_class():
             for li in range(spec.num_layers):
                 vlayer = self.model.layers[li]      # vLLM TransformerBlock
                 vattn = vlayer.attn                 # OAIAttention
-                w_q, w_k, w_v, q_b, k_b, v_b = self._titan_split_qkv(vattn, spec)
+                w_q, w_k, w_v, q_b, k_b, v_b = self._fleet_mk_split_qkv(vattn, spec)
                 packed, scales = pack_moe_layer(
                     w_q=w_q, w_k=w_k, w_v=w_v,
                     q_bias=q_b, k_bias=k_b, v_bias=v_b,
@@ -137,16 +137,16 @@ def _make_gptoss_class():
                     spec=spec,
                     packers=packers,
                     layout=layout,
-                    **self._titan_experts_from_vllm(li, spec),
-                    **self._titan_foreign_experts(li, layout),
+                    **self._fleet_mk_experts_from_vllm(li, spec),
+                    **self._fleet_mk_foreign_experts(li, layout),
                 )
                 refs.extend(packed)
                 weight_ptrs_host.extend(t.data_ptr() for t in packed)
                 # Scale sections are kept in their own ref list, NOT appended to
-                # `refs`: TITAN_HASH_PACKED names slots by `len(refs) //
+                # `refs`: FLEET_MK_HASH_PACKED names slots by `len(refs) //
                 # num_layers`, so two extra entries per layer would silently
                 # rename every slot rather than fail. They still need a
-                # reference held -- they are ordinary titan allocations and
+                # reference held -- they are ordinary fleet_mk allocations and
                 # nothing else holds them.
                 scale_refs.extend(t for t in scales if t is not None)
                 moe_scale_ptrs.append(
@@ -171,20 +171,20 @@ def _make_gptoss_class():
                 sin=sin,
             )
 
-        def _titan_foreign_experts(self, li, layout):
+        def _fleet_mk_foreign_experts(self, li, layout):
             """vLLM's own expert DATA tensors, when aliasing them.
 
             `{}` otherwise, so the call site reads the same either way.
 
-            These are the tensors titan would otherwise re-pack byte for byte.
-            Titan's hook runs BEFORE `process_weights_after_loading`, so what is
+            These are the tensors fleet_mk would otherwise re-pack byte for byte.
+            Fleet MK's hook runs BEFORE `process_weights_after_loading`, so what is
             captured here is the raw checkpoint layout -- and the address must
             therefore survive that call, since the kernel dereferences it much
             later. It does: `tools/probe_vllm_expert_layout.py` measured the
             storage before and after and found both the address and every byte
             unchanged. ROCm's `StridedLayout` swizzle is identity and the only
             shape change is a transposed *view*, so a linear reader still sees
-            `[E, rows, K/2]` row-major -- titan's own order.
+            `[E, rows, K/2]` row-major -- fleet_mk's own order.
 
             That was measured rather than read off the source because the
             failure mode is silent: the AITER path de-interleaves w13 with an
@@ -202,7 +202,7 @@ def _make_gptoss_class():
             return dict(foreign_w13=exp.w13_weight.data,
                         foreign_w2=exp.w2_weight.data)
 
-        def _titan_experts_from_vllm(self, li, spec):
+        def _fleet_mk_experts_from_vllm(self, li, spec):
             """The six raw MXFP4 expert tensors, sliced out of vLLM's padded ones.
 
             vLLM (0.27.1) rounds both hidden and intermediate up to 3072 and keeps
@@ -217,7 +217,7 @@ def _make_gptoss_class():
 
               * split the byte axis back into (num_blocks, 16) -- 16 bytes is one
                 MXFP4 block of 32 values, so this regroups, it does not reorder;
-              * slice off vLLM's pad rows/blocks and let pack re-pad to titan's
+              * slice off vLLM's pad rows/blocks and let pack re-pad to fleet_mk's
                 2944. Adopting 3072 instead would add ~8.9% MoE weight traffic in
                 a bandwidth-bound phase and trip the K-keyed static_asserts on
                 fleet's linear-load paths.
@@ -245,7 +245,7 @@ def _make_gptoss_class():
                 down_bias=exp.w2_bias.data[:, :hidden],
             )
 
-        def _titan_split_qkv(self, vattn, spec):
+        def _fleet_mk_split_qkv(self, vattn, spec):
             """Split vLLM's fused QKVParallelLinear back into q/k/v weight+bias.
 
             pack_moe_layer re-interleaves Q/K/V by KV group itself, so it wants the
@@ -266,14 +266,14 @@ def _make_gptoss_class():
                     None if b is None else b[q_end:k_end],
                     None if b is None else b[k_end:v_end])
 
-        def _titan_rope_from_vllm(self, spec, dev):
+        def _fleet_mk_rope_from_vllm(self, spec, dev):
             """cos/sin tables from vLLM's own YaRN rotary embedding.
 
             vLLM caches `cat(cos, sin)` along the last dim, both halves rotary_dim/2
-            wide -- GPT-OSS is un-doubled neox, exactly what titan's kernel indexes.
+            wide -- GPT-OSS is un-doubled neox, exactly what fleet_mk's kernel indexes.
             The cache is built in fp32 and is far longer than we need (it spans
             max_position_embeddings x scaling_factor), so slice to the positions this
-            engine can actually reach and cast to titan's bf16.
+            engine can actually reach and cast to fleet_mk's bf16.
             """
             rope = self.model.layers[0].attn.rotary_emb
             cache = rope.cos_sin_cache                     # [N, rotary_dim] fp32
@@ -287,4 +287,4 @@ def _make_gptoss_class():
                 device=dev, dtype=torch.bfloat16).contiguous()
             return cos, sin
 
-    return TitanGptOssForCausalLM
+    return FleetMKGptOssForCausalLM

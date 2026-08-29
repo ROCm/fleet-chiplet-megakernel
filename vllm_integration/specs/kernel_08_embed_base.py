@@ -8,6 +8,6 @@
 # put next in the heap, with no crash.
 
 SUBS = [
-    ("    NUM_LAYERS * titan::COUNTERS_PER_LAYER + NUM_XCDS * 16 + 16;",
+    ("    NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER + NUM_XCDS * 16 + 16;",
      "{emit_embed_barrier_base()}", 1),
 ]

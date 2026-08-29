@@ -1,12 +1,12 @@
 # Step 4, batch 5: pointer-table counts and the EMBED_BARRIER_BASE comment.
 #
 # The three counts here are the kernel's view of MIRAGE_IN / MIRAGE_OUT in
-# titan_generate.py; the demo's table build (step 5) is the other view. Driving
+# fleet_mk_generate.py; the demo's table build (step 5) is the other view. Driving
 # both from len() is the point -- an off-by-one between them does not fail to
 # build, it hands mirage the wrong buffer and the tokens come out garbage.
 #
 # EMBED_BARRIER_BASE itself is already symbolic in the target
-# (NUM_LAYERS * titan::COUNTERS_PER_LAYER + NUM_XCDS * 16 + 16), so only its
+# (NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER + NUM_XCDS * 16 + 16), so only its
 # explanatory comment needs the 103 pulled from the header.
 
 SUBS = [

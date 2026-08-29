@@ -21,7 +21,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from titan_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
+from fleet_megakernel_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
 
 
 def check(name, E, out_dim, nblk_true, nblk_reduce, nblk_stride, opw):

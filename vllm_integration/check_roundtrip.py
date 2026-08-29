@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Round-trip tripwire for titan_generate.py.
+"""Round-trip tripwire for fleet_mk_generate.py.
 
 Asserts that regenerating a model's artifacts from its YAML config reproduces
 the on-disk file byte-for-byte. Sub-second, no GPU, no build. Run this after
-every edit to titan_generate.py.
+every edit to fleet_mk_generate.py.
 
 WHY THIS EXISTS
 ---------------
@@ -149,7 +149,7 @@ def main():
     args = ap.parse_args()
 
     sys.path.insert(0, REPO)
-    import titan_generate as tg
+    import fleet_mk_generate as tg
 
     failures = []
     lines = []

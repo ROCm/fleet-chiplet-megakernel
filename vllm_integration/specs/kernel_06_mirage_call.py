@@ -6,7 +6,7 @@
 #
 # So the whole 48-line block is replaced by one emitter call. Parameter ORDER
 # becomes data (MIRAGE_TEMPLATE_PARAMS / MIRAGE_RUNTIME_ARGS in
-# titan_generate.py, with module-level asserts on the arity mirage declares),
+# fleet_mk_generate.py, with module-level asserts on the arity mirage declares),
 # and the layer_sliding_window initializer above it comes from the config's
 # sliding_window_pattern rather than being hardcoded to GPT-OSS's alternation.
 

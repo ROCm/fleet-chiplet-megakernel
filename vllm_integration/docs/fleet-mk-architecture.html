@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Titan — Architecture, Contrast with Mirage, and vLLM Integration</title>
+<title>Fleet MK — Architecture, Contrast with Mirage, and vLLM Integration</title>
 <style>
   :root {
     --bg: #ffffff;
@@ -132,7 +132,7 @@
 <div class="wrap">
 
 <header class="title">
-  <h1>Titan</h1>
+  <h1>Fleet MK</h1>
   <div class="sub">A code generator for fused persistent decode megakernels — what it is, how it
   differs from Mirage, and how it was integrated into vLLM.</div>
   <div class="meta">
@@ -142,7 +142,7 @@
   <div class="meta">
     This document is the engineering reference: repository shape, reproduction commands,
     process hazards, every measurement. For the argument on its own — 16 slides, no runbook —
-    see <a href="titan-talk.html"><strong>titan-talk.html</strong></a>.
+    see <a href="fleet-mk-talk.html"><strong>fleet-mk-talk.html</strong></a>.
   </div>
 </header>
 
@@ -166,7 +166,7 @@ levels — registers <em>and</em> LDS — takes per-layer intermediate HBM traff
 50 433-line device library is hand-written, and its superoptimizer never mentions those
 kernels. So the assembling layer can be a static generator — and a new model becomes a
 table of shapes, not a search. <a href="#vs-mirage">§8</a>, <a href="#vs-mirage">fig 10</a></li>
-<li><strong>What it costs.</strong> No launch boundary means no free ordering, so Titan builds
+<li><strong>What it costs.</strong> No launch boundary means no free ordering, so Fleet MK builds
 its own: 35 device-wide barriers × 3.56 µs = <strong>124.5 µs/token</strong>, sitting on
 a measured 3.50 µs hardware floor. <a href="#barriers">§6</a>, <a href="#barriers">fig 8</a></li>
 <li><strong>Where the time goes.</strong> MoE is ~40% of a layer. Inside one 13.4 µs tile:
@@ -184,9 +184,9 @@ never got this pipeline. Two architectures on opposite sides of stock is the fin
 <div class="toc">
 <strong>Contents</strong>
 <ol>
-  <li><a href="#what">What Titan is</a></li>
+  <li><a href="#what">What Fleet MK is</a></li>
   <li><a href="#generator">The generator: one YAML, five artifacts</a></li>
-  <li><a href="#newmodel"><strong>End to end: supporting a model Titan has never seen</strong></a></li>
+  <li><a href="#newmodel"><strong>End to end: supporting a model Fleet MK has never seen</strong></a></li>
   <li><a href="#fusion">Two-level fusion — why it is fast</a></li>
   <li><a href="#pipeline">Inside one layer: the 8-phase pipeline</a></li>
   <li><a href="#barriers">Barriers, counters, and why they dominate</a></li>
@@ -215,9 +215,9 @@ never got this pipeline. Two architectures on opposite sides of stock is the fin
 </div>
 
 <!-- ══════════════════════════════════════════════════════════════════════ -->
-<h2 id="what">1. What Titan is</h2>
+<h2 id="what">1. What Fleet MK is</h2>
 
-<p><strong>Titan is a code generator.</strong> Given a YAML description of a transformer, it
+<p><strong>Fleet MK is a code generator.</strong> Given a YAML description of a transformer, it
 emits a self-contained HIP <strong>persistent megakernel</strong> in which <em>one GPU
 launch</em> executes an entire decode step — all layers, the final RMSNorm, the LM head GEMM,
 and the argmax — for one token at batch size 1.</p>
@@ -269,8 +269,8 @@ and the argmax — for one token at batch size 1.</p>
   <path d="M0,120 L92,120" stroke="#5a6472" stroke-width="1.2" marker-end="url(#ar)"/>
   <text x="0" y="112" font-size="10.5" fill="#5a6472" class="m">x</text>
 
-  <!-- ── titan ── -->
-  <text x="0" y="204" font-size="13" font-weight="700" fill="#2e7d4f">TITAN — one persistent megakernel</text>
+  <!-- ── fleet_mk ── -->
+  <text x="0" y="204" font-size="13" font-weight="700" fill="#2e7d4f">FLEET MK — one persistent megakernel</text>
   <text x="0" y="222" font-size="11.5" fill="#5a6472">1 launch per token; the whole box below is inside it</text>
 
   <rect x="96" y="234" width="898" height="46" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
@@ -308,16 +308,16 @@ kernels already handle it well; under vLLM it stays on the stock path.</p>
 <table>
 <thead><tr><th>Path</th><th class="num">Lines</th><th>Role</th></tr></thead>
 <tbody>
-<tr><td><code>titan_generate.py</code></td><td class="num">5379</td><td>The generator. Single source of truth for every emitted artifact and the ABI.</td></tr>
+<tr><td><code>fleet_mk_generate.py</code></td><td class="num">5379</td><td>The generator. Single source of truth for every emitted artifact and the ABI.</td></tr>
 <tr><td><code>configs/*.yaml</code></td><td class="num">—</td><td>Model descriptions: <code>gpt_oss_120b.yaml</code>, <code>qwen3_8b.yaml</code>, <code>llama3_8b.yaml</code>.</td></tr>
 <tr><td><code>kernels/device_functions.cuh</code></td><td class="num">2914</td><td>The composable device-function library: GEMM mainloop, epilogues, RMSNorm, quant, TopK.</td></tr>
 <tr><td><code>kernels/barriers.cuh</code></td><td class="num">229</td><td>Four barrier primitives + the per-layer counter-slot map.</td></tr>
-<tr><td><code>kernels/titan_phases.cuh</code></td><td class="num">746</td><td>Phase-split device functions (A/B/C) for register-pressure scoping.</td></tr>
+<tr><td><code>kernels/fleet_mk_phases.cuh</code></td><td class="num">746</td><td>Phase-split device functions (A/B/C) for register-pressure scoping.</td></tr>
 <tr><td><code>kernels/fused_layer.cuh</code></td><td class="num">107</td><td>Include-order contract + interface documentation for the Mirage sub-kernels.</td></tr>
 <tr><td><code>generated/gpt_oss_120b_kernel.cuh</code></td><td class="num">850</td><td>Emitted: constants, <code>GptConfig</code>, layer loop, tail.</td></tr>
 <tr><td><code>generated/gpt_oss_120b_launch.hip</code></td><td class="num">620</td><td>Emitted: four C entrypoints, hipGraph helpers, decode-loop bridge.</td></tr>
 <tr><td><code>demo_gpt_oss_120b.py</code></td><td class="num">1261</td><td>Emitted: standalone driver — weight packing, pointer table, four decode strategies.</td></tr>
-<tr><td><code>titan_vllm/</code></td><td class="num">~2189</td><td>The vLLM plugin (11 modules). See §9.</td></tr>
+<tr><td><code>fleet_megakernel_vllm/</code></td><td class="num">~2189</td><td>The vLLM plugin (11 modules). See §9.</td></tr>
 </tbody>
 </table>
 
@@ -326,7 +326,7 @@ kernels already handle it well; under vLLM it stays on the stock path.</p>
 <p>Everything under <code>generated/</code> and the standalone driver are <em>outputs</em>.
 The regression gate is a byte-identity round-trip — run the generator in-process, compare
 against disk, all three architectures, sub-second, no GPU. Any kernel change must go through
-<code>titan_generate.py</code> or the round-trip goes red. It is the cheapest gate here and
+<code>fleet_mk_generate.py</code> or the round-trip goes red. It is the cheapest gate here and
 also the one with the sharpest limit — <a href="#gates">§3</a> shows a real bug it let through
 for three weeks, and why no stricter version of it would have helped.</p>
 <pre><code>python3 check_roundtrip.py     # kernel / launch / driver / build × {gptoss, qwen3, llama3}</code></pre>
@@ -334,7 +334,7 @@ for three weeks, and why no stricter version of it would have helped.</p>
 
 <div class="box bad">
 <span class="lbl">Process hazard</span>
-<p>Never run <code>titan_generate.py</code> without <code>--output-dir</code>. Its
+<p>Never run <code>fleet_mk_generate.py</code> without <code>--output-dir</code>. Its
 <code>main()</code> writes the driver and build script to the <em>repo root</em>, overwriting
 the live <code>demo_gpt_oss_120b.py</code>. Also, <code>generated/</code> is gitignored — a
 <code>git clean -xfd</code> deletes every built <code>.so</code> and the dense artifacts.</p>
@@ -392,7 +392,7 @@ the live <code>demo_gpt_oss_120b.py</code>. Also, <code>generated/</code> is git
     <text x="478" y="224" font-size="10.5" fill="#5a6472">hipcc flags — opt level, rdc, extra defines</text>
 
     <rect x="466" y="255" width="574" height="36" fill="#fff" stroke="#e2e6eb" rx="3"/>
-    <text x="478" y="271" class="m" font-weight="700">titan_vllm/spec.py</text>
+    <text x="478" y="271" class="m" font-weight="700">fleet_megakernel_vllm/spec.py</text>
     <text x="478" y="285" font-size="10.5" fill="#5a6472">the plugin reads the same YAML through the same validator</text>
   </g>
 
@@ -508,10 +508,10 @@ in §3.</a></p>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════════════════ -->
-<h2 id="newmodel">3. End to end: supporting a model Titan has never seen</h2>
+<h2 id="newmodel">3. End to end: supporting a model Fleet MK has never seen</h2>
 
 <p>Everything below was executed on this machine, in order, on 2026-08-11, against
-<strong>Mistral-7B</strong> — chosen because Titan had never been pointed at it and there is no
+<strong>Mistral-7B</strong> — chosen because Fleet MK had never been pointed at it and there is no
 Mistral code anywhere in the tree. Outputs are verbatim, <em>including the two places it
 failed</em>, since that is where the real cost of adding a model lives.</p>
 
@@ -608,7 +608,7 @@ quantization:
 
 <h3>Step 2 — Validate before writing anything</h3>
 
-<pre><code>$ python3 titan_generate.py /tmp/mistral_7b.yaml --dry-run
+<pre><code>$ python3 fleet_mk_generate.py /tmp/mistral_7b.yaml --dry-run
 
 Loaded config: mistral-7b (dense)
   Layers=32, Hidden=4096, Intermediate=14336
@@ -648,18 +648,18 @@ AssertionError: QKV WGs 92 not divisible by num_xcds 8</code></pre>
 <p>Note which asserts did <em>not</em> fire. Mistral declares <code>head_dim: 128</code> and
 would fail the hd64 check — but that assert sits inside <code>if cfg.arch == "moe":</code>, and
 Mistral is dense. <strong>Both hard structural constraints bind the fused MoE path only.</strong>
-That is the single most useful fact when sizing "can Titan run model X": a dense model has far
+That is the single most useful fact when sizing "can Fleet MK run model X": a dense model has far
 more freedom than the GPT-OSS numbers suggest.</p>
 </div>
 
 <h3>Step 3 — Generate</h3>
 
-<pre><code>$ python3 titan_generate.py /tmp/mistral_7b.yaml --output-dir /tmp/titan_mistral
+<pre><code>$ python3 fleet_mk_generate.py /tmp/mistral_7b.yaml --output-dir /tmp/fleet_mk_mistral
 
-  Wrote: /tmp/titan_mistral/generated/mistral_7b_kernel.cuh (787 lines)
-  Wrote: /tmp/titan_mistral/generated/mistral_7b_launch.hip (152 lines)
-  Wrote: /tmp/titan_mistral/demo_mistral_7b.py (686 lines)
-  Wrote: /tmp/titan_mistral/build_mistral_7b.sh (49 lines)
+  Wrote: /tmp/fleet_mk_mistral/generated/mistral_7b_kernel.cuh (787 lines)
+  Wrote: /tmp/fleet_mk_mistral/generated/mistral_7b_launch.hip (152 lines)
+  Wrote: /tmp/fleet_mk_mistral/demo_mistral_7b.py (686 lines)
+  Wrote: /tmp/fleet_mk_mistral/build_mistral_7b.sh (49 lines)
 
 Generation complete for mistral-7b.</code></pre>
 
@@ -777,7 +777,7 @@ a person for this model. Three things are worth reading closely:</p>
   <rect x="340" y="26" width="700" height="140" fill="#fff" stroke="#1a1a1a" stroke-width="1.6" rx="4"/>
   <text x="354" y="16" font-size="12" font-weight="700">HAND-WRITTEN, MODEL-INDEPENDENT, SHARED BY EVERY MODEL</text>
   <rect x="354" y="42" width="672" height="52" fill="#fafbfc" stroke="#e2e6eb" rx="3"/>
-  <text x="366" y="60" font-size="11.5" font-weight="700" class="m">titan/kernels/ — 4206 lines</text>
+  <text x="366" y="60" font-size="11.5" font-weight="700" class="m">fleet_mk/kernels/ — 4206 lines</text>
   <text x="366" y="80" font-size="10.5" fill="#5a6472">epilogue structs, the MXFP4 GEMM mainloop, RMSNorm, fp8 quant, TopK router, paged attention, four barrier primitives</text>
   <rect x="354" y="102" width="672" height="52" fill="#fafbfc" stroke="#e2e6eb" rx="3"/>
   <text x="366" y="120" font-size="11.5" font-weight="700" class="m">mirage tasks/mi300/ — 7293 lines</text>
@@ -814,7 +814,7 @@ the YAML <code>measured:</code> block.</p>
         variants, <code>rmsnorm</code>, <code>fp8_quant</code>, <code>topk_router</code>, three
         paged-attention variants, and the per-layer counter-slot map
         (<code>COUNTERS_PER_LAYER = 103 × 16</code>).</td></tr>
-<tr><td><code>titan_phases.cuh</code></td><td class="num">746</td>
+<tr><td><code>fleet_mk_phases.cuh</code></td><td class="num">746</td>
     <td>Phase-split device functions. Splitting a phase into A/B/C scopes its register
         pressure so the whole layer body fits the occupancy target.</td></tr>
 <tr><td><code>barriers.cuh</code></td><td class="num">229</td>
@@ -826,10 +826,10 @@ the YAML <code>measured:</code> block.</p>
 </tbody>
 </table>
 
-<p>The two paths barely overlap: the dense path calls <code>titan::gemm_mxfp4</code> and
+<p>The two paths barely overlap: the dense path calls <code>fleet_mk::gemm_mxfp4</code> and
 friends directly, while the MoE path goes through Mirage's orchestrator to its own copies. So
 2156 of the 2914 lines — <strong>74%</strong> — sit behind four
-<code>#ifdef TITAN_ENABLE_LEGACY</code> guard pairs, opted into per model from the YAML
+<code>#ifdef FLEET_MK_ENABLE_LEGACY</code> guard pairs, opted into per model from the YAML
 <code>build:</code> block. Step 5 below trips over exactly that partition.</p>
 
 <h3>Step 4 — Inspect what came out</h3>
@@ -850,7 +850,7 @@ static constexpr int PTRS_PER_LAYER      = 25;   // 16 in + 9 out</code></pre>
 Llama3-8B. Both are 32×4096×14336 with 32Q/8KV heads; they differ only in vocab
 size:</p>
 
-<pre><code>$ diff generated/llama3_8b_kernel.cuh /tmp/titan_mistral/generated/mistral_7b_kernel.cuh
+<pre><code>$ diff generated/llama3_8b_kernel.cuh /tmp/fleet_mk_mistral/generated/mistral_7b_kernel.cuh
 # 60 lines. Substantively:
 &lt; static constexpr int VOCAB_SIZE = 128256;      &gt; VOCAB_SIZE = 32768;
 &lt; static constexpr int PADDED_VOCAB_SIZE = 128512;  &gt; PADDED_VOCAB_SIZE = 32768;
@@ -863,24 +863,24 @@ the barriers, the epilogues — is shared code, not regenerated per model.</p>
 
 <h3>Step 5 — Build, which failed</h3>
 
-<pre><code>$ bash /tmp/titan_mistral/build_mistral_7b.sh
+<pre><code>$ bash /tmp/fleet_mk_mistral/build_mistral_7b.sh
 ...
-mistral_7b_kernel.cuh:283:24: error: no member named 'gemm_mxfp4' in namespace 'titan'
-mistral_7b_kernel.cuh:313:20: error: no member named 'rope_kv_update' in namespace 'titan'
+mistral_7b_kernel.cuh:283:24: error: no member named 'gemm_mxfp4' in namespace 'fleet_mk'
+mistral_7b_kernel.cuh:313:20: error: no member named 'rope_kv_update' in namespace 'fleet_mk'
 66 warnings and 14 errors generated when compiling for gfx950.</code></pre>
 
 <p>All 14 trace to two device functions. Commit <code>f2354a7</code> — the one that landed
-2.520 ms/token — fenced them behind <code>#ifdef TITAN_ENABLE_LEGACY</code> inside the 116 KB
+2.520 ms/token — fenced them behind <code>#ifdef FLEET_MK_ENABLE_LEGACY</code> inside the 116 KB
 header both architectures include. The MoE path stopped calling them; the dense path still does.
 The fix is one YAML block:</p>
 
 <pre><code>build:
   extra_defines:
-    - TITAN_ENABLE_LEGACY</code></pre>
+    - FLEET_MK_ENABLE_LEGACY</code></pre>
 
 <p>Regenerate, rebuild, and a model that did not exist an hour earlier compiles clean:</p>
 
-<pre><code>$ bash /tmp/titan_mistral/build_mistral_7b.sh      # exit 0, 0 errors
+<pre><code>$ bash /tmp/fleet_mk_mistral/build_mistral_7b.sh      # exit 0, 0 errors
     TotalSGPRs: 106
     VGPRs: 241            AGPRs: 4
     Occupancy [waves/SIMD]: 2
@@ -972,7 +972,7 @@ one you have <em>before</em> you start.</p>
 <p>Both failures in that walkthrough were at step 5, and chasing the first turned up a second.
 <code>build_llama3_8b.sh</code> has not compiled since <code>f2354a7</code> either — the identical
 14 errors.
-<code>qwen3_8b.yaml</code> got the <code>TITAN_ENABLE_LEGACY</code> define when the guards landed;
+<code>qwen3_8b.yaml</code> got the <code>FLEET_MK_ENABLE_LEGACY</code> define when the guards landed;
 <code>llama3_8b.yaml</code> did not, and nobody rebuilt it. <code>generated/llama3_8b.so</code>
 on disk predates the guards by three weeks. Fixed the same way, one YAML block, and it now builds
 at 241 VGPRs / 0 spills / 2 waves per SIMD.</p>
@@ -982,7 +982,7 @@ round-trip, the one that runs in under a second with no GPU — <em>did not catc
 not have</em>. It regenerates each model's artifacts from its YAML and compares them to the files
 on disk. Both sides were missing the same define, so both sides agreed. It printed
 <code>OK build 1409 bytes</code> and passed. After the fix it prints
-<code>OK build 1437 bytes</code> — 28 bytes, one <code>-DTITAN_ENABLE_LEGACY \</code> line — and
+<code>OK build 1437 bytes</code> — 28 bytes, one <code>-DFLEET_MK_ENABLE_LEGACY \</code> line — and
 passes for the same reason it passed before.</p>
 
 <div class="box bad">
@@ -996,7 +996,7 @@ existed at that moment — qwen3, llama3, and the new Mistral. The only one that
 the one somebody had actually compiled.</p>
 </div>
 
-<p>Each gate in Titan is defined by what the one below it cannot see. That is the useful way to
+<p>Each gate in Fleet MK is defined by what the one below it cannot see. That is the useful way to
 read the ladder — not as increasing rigor, but as a sequence of distinct blind spots, each closed
 by paying more:</p>
 
@@ -1035,7 +1035,7 @@ by paying more:</p>
   <text x="12" y="162" font-size="11.5" font-weight="700" class="m">hipcc, actually invoked</text>
   <text x="12" y="180" font-size="10.5" fill="#5a6472">~2 min per model · no weights needed</text>
   <rect x="286" y="142" width="366" height="52" fill="#f4faf5" stroke="#2e7d32" rx="4"/>
-  <text x="298" y="162" font-size="11">the missing <tspan class="m">TITAN_ENABLE_LEGACY</tspan> — and every</text>
+  <text x="298" y="162" font-size="11">the missing <tspan class="m">FLEET_MK_ENABLE_LEGACY</tspan> — and every</text>
   <text x="298" y="180" font-size="11">other drift in the 116 KB shared header</text>
   <rect x="662" y="142" width="378" height="52" fill="#fdf6f6" stroke="#c62828" rx="4"/>
   <text x="674" y="162" font-size="11">everything that compiles. A transposed template</text>
@@ -1199,7 +1199,7 @@ anything the next operator needs must be in HBM. That is why an operator-per-ker
 for round-trips it does not logically need — the traffic is an artifact of the launch model, not
 of the math.</p>
 
-<p>Titan launches once per token. All 240 workgroups stay resident for all 36 layers, so LDS
+<p>Fleet MK launches once per token. All 240 workgroups stay resident for all 36 layers, so LDS
 holds live values across phase and layer boundaries and the residual stream is the only thing
 that has to be written at all. The bill for this arrives in §6: a launch boundary is also a
 free device-wide barrier, and with one launch you have to build your own.</p>
@@ -1226,16 +1226,16 @@ Guo et&nbsp;al., <a href="https://arxiv.org/abs/2605.19269">arXiv:2605.19269</a>
 prior work on Level 1 and the source of the term. It fixes the GEMM mainloop and exposes the
 epilogue as a composable programming surface: elementwise maps, vector broadcasts, tile
 loads/stores, reductions, and stateful running max/sum-exp. CUTLASS CuTeDSL, Hopper, framed around
-training. Titan's epilogue set is the same idea on an AMD MFMA mainloop.</p>
+training. Fleet MK's epilogue set is the same idea on an AMD MFMA mainloop.</p>
 
 <p><strong>The two part company on scope.</strong> A CODA epilogue sees only its own output
 tile, so a global reduction — a full RMSNorm, a softmax denominator — has to become
 tile-local partials plus a separate finishing pass. That is structural: the epilogue ends when
 the kernel does. Level 2 removes the boundary imposing it, which is why RMSNorm and the router
-are phases inside Titan's layer rather than kernels after it.</p>
+are phases inside Fleet MK's layer rather than kernels after it.</p>
 
 <table>
-<thead><tr><th></th><th>CODA</th><th>Mirage / MPK</th><th>Titan</th></tr></thead>
+<thead><tr><th></th><th>CODA</th><th>Mirage / MPK</th><th>Fleet MK</th></tr></thead>
 <tbody>
 <tr><td>Fusion level</td><td>register (Level 1)</td><td>LDS (Level 2)</td><td><strong>both</strong></td></tr>
 <tr><td>Kernel launches</td><td>6–8 per layer</td><td>1 per token</td><td>1 per token</td></tr>
@@ -1349,12 +1349,12 @@ kernel::gang_full_layer_fused_kernel_mi300&lt;..., /*SLIDING_WINDOW=*/0, ...&gt;
 
 <h4>The last-layer ResAdd is parallel, deliberately</h4>
 <p>Mirage runs the final residual add on a single worker. Ported verbatim it cost
-<strong>~1.1 ms/token</strong>, serializing 2944 elements through one workgroup. Titan splits it
+<strong>~1.1 ms/token</strong>, serializing 2944 elements through one workgroup. Fleet MK splits it
 across all 240 workers on <em>disjoint</em> column strides — safe precisely because they are
 disjoint: no worker reads a cache line another is zeroing.</p>
 
 <h3>Register pressure and the phase split</h3>
-<p><code>titan_phases.cuh</code> exists to give the compiler register <em>scopes</em>: three
+<p><code>fleet_mk_phases.cuh</code> exists to give the compiler register <em>scopes</em>: three
 <code>__noinline__</code> functions (A: QKV+attention+merge, B: O-proj+TopK, C: MoE) let it
 reclaim registers between phases instead of holding every live range at once. The build lands
 at 226 VGPRs, 0 VGPR spills, 12 SGPR spills, 512 B LDS, 2 waves/SIMD. Any VGPR spill or a drop
@@ -1363,7 +1363,7 @@ to 1 wave/SIMD is a hard fail regardless of what the clock says.</p>
 <!-- ══════════════════════════════════════════════════════════════════════ -->
 <h2 id="barriers">6. Barriers, counters, and why they dominate</h2>
 
-<p>No launch boundary means no free ordering. Titan has five primitives, and picking the
+<p>No launch boundary means no free ordering. Fleet MK has five primitives, and picking the
 cheapest correct one per site is most of the performance work.</p>
 
 <table>
@@ -1739,8 +1739,8 @@ of the largest wins here were invisible in the source and obvious in the assembl
 <!-- ══════════════════════════════════════════════════════════════════════ -->
 <h2 id="vs-mirage">8. The device-function library: why a static generator can support any model</h2>
 
-<p><a href="#fusion">§4</a> explained why Titan is fast. This section is about why it
-<em>generalizes</em> — and the two answers are unrelated. Titan is not a faster Mirage. It is what
+<p><a href="#fusion">§4</a> explained why Fleet MK is fast. This section is about why it
+<em>generalizes</em> — and the two answers are unrelated. Fleet MK is not a faster Mirage. It is what
 becomes possible once you notice what Mirage's compiler is actually compiling.</p>
 
 <h3>The problem: the compiler does not write the kernels</h3>
@@ -1778,7 +1778,7 @@ MI300) whose arms are those strings. <strong>81 distinct <code>kernel::</code> s
 this way, and the compiler writes the body of none of them.</strong> 8 066 lines of codegen
 produce parameter substitution and a switch; 50 433 lines of kernels are typed by a person.</p>
 
-<p>Titan's generated kernel reaches the same library the same way — emitted from a Python
+<p>Fleet MK's generated kernel reaches the same library the same way — emitted from a Python
 f-string rather than a C++ string-builder, but naming a symbol from the same header set. Its
 whole per-layer body is <a href="#ex-template">the worked example in §3</a>: 23 template
 parameters, 24 runtime arguments, and not one line of algorithm. Two independent generators,
@@ -1793,7 +1793,7 @@ list does not need a superoptimizer to produce it. It needs a table of shapes.</
 </div>
 
 <figure>
-<svg viewBox="0 0 1040 344" role="img" aria-label="Mirage's compiler emits calls into a hand-written device library; Titan emits the same calls from a YAML table">
+<svg viewBox="0 0 1040 344" role="img" aria-label="Mirage's compiler emits calls into a hand-written device library; Fleet MK emits the same calls from a YAML table">
   <text x="0" y="13" font-size="13" font-weight="700" fill="#0b5fa5">MIRAGE (MPK) — dynamic: search the graph, then schedule a DAG at runtime</text>
 
   <g font-size="11" text-anchor="middle">
@@ -1817,7 +1817,7 @@ list does not need a superoptimizer to produce it. It needs a table of shapes.</
   <text x="602" y="45" font-size="11" font-weight="700" fill="#8a6d00">…and what it emits is a CALL STRING, never a body</text>
   <text x="602" y="63" font-size="10" class="m" fill="#5a6472">kernel::gang_moe_pipelined_mxfp4_kernel_mi300&lt;…&gt;(ptrs, tile_idx);</text>
 
-  <text x="0" y="112" font-size="13" font-weight="700" fill="#2e7d4f">TITAN — static: at batch size 1 the shapes are known at generate time, so skip the search</text>
+  <text x="0" y="112" font-size="13" font-weight="700" fill="#2e7d4f">FLEET MK — static: at batch size 1 the shapes are known at generate time, so skip the search</text>
 
   <g font-size="11" text-anchor="middle">
     <rect x="0"   y="125" width="150" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
@@ -1826,7 +1826,7 @@ list does not need a superoptimizer to produce it. It needs a table of shapes.</
 
     <rect x="186" y="125" width="150" height="48" fill="#eef8f0" stroke="#2e7d4f" rx="4"/>
     <text x="261" y="145" font-weight="600">derive + assert</text>
-    <text x="261" y="161" font-size="10" fill="#5a6472">titan_generate.py</text>
+    <text x="261" y="161" font-size="10" fill="#5a6472">fleet_mk_generate.py</text>
 
     <rect x="372" y="125" width="164" height="48" fill="#fff" stroke="#2e7d4f" rx="4"/>
     <text x="454" y="145" font-weight="600">850-line layer loop</text>
@@ -1872,7 +1872,7 @@ list does not need a superoptimizer to produce it. It needs a table of shapes.</
 </svg>
 <figcaption><b>Figure 10.</b> Mirage's superoptimizer searches the operator graph, but its
 compiler's device-level output is a template instantiation naming a hand-written symbol — 81 such
-symbols, zero generated bodies, and <code>src/search</code> mentions none of them. Titan emits the
+symbols, zero generated bodies, and <code>src/search</code> mentions none of them. Fleet MK emits the
 same instantiation from a YAML table instead of from a search. Both bottom out in the same
 library, which is why replacing the top layer costs no kernel performance.</figcaption>
 </figure>
@@ -1893,18 +1893,18 @@ For decode at batch size 1, it is known at <em>generate</em> time:</p>
 </ul>
 
 <p>So the 8 scheduler workgroups and the 301-entry task graph are solving a problem with no
-unknowns in it. Titan deletes them and pays a different bill instead: 35 explicit device-wide
+unknowns in it. Fleet MK deletes them and pays a different bill instead: 35 explicit device-wide
 barriers at 3.56 µs. That is the entire trade, and it is quantified below.</p>
 
-<h3>What Titan replaces, precisely</h3>
+<h3>What Fleet MK replaces, precisely</h3>
 
-<p>Titan calls Mirage's device-level sub-kernels — six headers, reached through
+<p>Fleet MK calls Mirage's device-level sub-kernels — six headers, reached through
 <code>-I&lt;mirage&gt;/include/mirage/persistent_kernel</code> and nothing more elaborate than an
 include path. What it replaces is the layer above: how work is scheduled and synchronized across
 the whole model.</p>
 
 <table>
-<thead><tr><th>Layer</th><th>Mirage</th><th>Titan</th><th>Shared?</th></tr></thead>
+<thead><tr><th>Layer</th><th>Mirage</th><th>Fleet MK</th><th>Shared?</th></tr></thead>
 <tbody>
 <tr><td>Operator search</td><td>Superoptimizer, hours</td><td>None — shapes come from YAML</td><td>no</td></tr>
 <tr><td>Work decomposition</td><td>301-task DAG, built at init</td><td><code>static constexpr</code>, emitted</td><td>no</td></tr>
@@ -1964,7 +1964,7 @@ a file and a line: they mark exactly where the green bar ends.</figcaption>
 
 <div class="box good">
 <span class="lbl">Why this, and not the 1.59×, is the interesting claim</span>
-<p>Mirage demonstrated that a megakernel beats an operator-per-kernel stack. Titan's contribution
+<p>Mirage demonstrated that a megakernel beats an operator-per-kernel stack. Fleet MK's contribution
 is orthogonal: <strong>the megakernel's performance lives in a device-function library, not in the
 compiler that assembles it</strong> — so the assembling layer can be a static generator, and the
 library becomes a reusable asset across models and across frameworks. One library now serves a
@@ -1973,7 +1973,7 @@ dense and an MoE architecture, a standalone driver and a vLLM backend, from four
 
 <h3>The 0.36 ms standalone gap, accounted</h3>
 
-<p>Dropping the scheduler is not free, and the bill arrives as barriers. Titan's standalone driver
+<p>Dropping the scheduler is not free, and the bill arrives as barriers. Fleet MK's standalone driver
 is 0.358 ms/token behind Mirage. That gap has been measured, not estimated:</p>
 
 <table>
@@ -1981,19 +1981,19 @@ is 0.358 ms/token behind Mirage. That gap has been measured, not estimated:</p>
 <tbody>
 <tr><td>Mirage standalone</td><td class="num">2.144</td><td class="num">—</td>
     <td>Scheduler supplies inter-layer ordering for free.</td></tr>
-<tr><td>Titan megakernel GPU time (<code>[TITAN_TIME]</code>)</td><td class="num">~2.39</td><td class="num">+0.25</td>
+<tr><td>Fleet MK megakernel GPU time (<code>[FLEET_MK_TIME]</code>)</td><td class="num">~2.39</td><td class="num">+0.25</td>
     <td><strong>124.5 µs is the inter-layer barrier</strong>, measured. The rest (~0.12 ms) is spread thin across phases.</td></tr>
-<tr><td>Titan standalone end-to-end</td><td class="num">2.502</td><td class="num">+0.11</td>
+<tr><td>Fleet MK standalone end-to-end</td><td class="num">2.502</td><td class="num">+0.11</td>
     <td>Its own Python driver, ~46 µs/token of host work.</td></tr>
 </tbody>
 </table>
 
-<p>Register pressure is explicitly ruled out: Titan has strictly fewer registers and far fewer
+<p>Register pressure is explicitly ruled out: Fleet MK has strictly fewer registers and far fewer
 spills than Mirage — 226 VGPRs and 0 VGPR spills against 261 and 181. The gap is
 synchronization, and it is structural: the price of not having a scheduler.</p>
 
 <table>
-<thead><tr><th>Dimension</th><th>Mirage (MPK)</th><th>Titan</th></tr></thead>
+<thead><tr><th>Dimension</th><th>Mirage (MPK)</th><th>Fleet MK</th></tr></thead>
 <tbody>
 <tr><td><strong>What it is</strong></td>
     <td>A persistent-kernel compiler with a superoptimizer.</td>
@@ -2025,7 +2025,7 @@ synchronization, and it is structural: the price of not having a scheduler.</p>
 <div class="box note">
 <span class="lbl">The trade being made</span>
 <p>Mirage's scheduler is genuinely better at inter-layer ordering, and 124.5 µs/token is what
-that is worth here. In exchange Titan gets a model added by writing YAML instead of running a
+that is worth here. In exchange Fleet MK gets a model added by writing YAML instead of running a
 superoptimizer, one device-function library serving both architectures, a byte-identity regression
 gate, and a real serving backend. Whether that trade is right depends on what you are optimizing
 for — it is a trade, not a win.</p>
@@ -2038,26 +2038,26 @@ cases where the dynamic machinery is the right answer —</p>
 
 <ul>
 <li><strong>Batch &gt; 1 with ragged sequences.</strong> Tile counts become data-dependent and a
-    runtime scheduler earns its keep. Titan's decomposition is frozen at generate time.</li>
+    runtime scheduler earns its keep. Fleet MK's decomposition is frozen at generate time.</li>
 <li><strong>A tile shape nobody has written.</strong> MLA, a new quantization format,
-    <code>head_dim ≠ 64</code> on the MoE path. Titan rejects these at validate time with an
+    <code>head_dim ≠ 64</code> on the MoE path. Fleet MK rejects these at validate time with an
     assert naming a file and a line (§3) — and Mirage would fail too, since the library is
     shared. The constraint is the library's, not the generator's.</li>
 <li><strong>Fusion decisions that depend on a checkpoint's values, not its shape.</strong>
-    Nothing in Titan's pipeline is value-dependent, so this has not arisen — but it is where a
+    Nothing in Fleet MK's pipeline is value-dependent, so this has not arisen — but it is where a
     search would find something a table cannot.</li>
 </ul>
 
 <p>Which points at the research direction this section makes visible. <strong>If the library is
 the asset, the compiler's real job is generating library entries, not scheduling calls to
 them.</strong> Neither system does that today: Mirage's superoptimizer searches a graph whose
-leaves are hand-written, and Titan's generator instantiates those same leaves. Closing the gap —
+leaves are hand-written, and Fleet MK's generator instantiates those same leaves. Closing the gap —
 a compiler that emits the MFMA mainloop, the LDS staging, and the cache-modifier choice rather
 than selecting among human-written ones — is the open problem both systems are standing next
 to.</p>
 
 <h3>An older gap analysis, and what happened to it</h3>
-<p><code>docs/titan_vs_mirage_perf_gap.md</code> recorded Titan at 8.08 ms against Mirage's
+<p><code>docs/fleet_mk_vs_mirage_perf_gap.md</code> recorded Fleet MK at 8.08 ms against Mirage's
 2.19 ms, enumerated 5.09 ms of gap, and predicted ~3.0 ms post-fix. Actual: <strong>2.50
 ms</strong> — beaten, because adopting Mirage's fused layer body wholesale collapsed several
 line items at once rather than fixing each phase separately. Its per-phase reasoning is still
@@ -2066,30 +2066,30 @@ correct and worth reading; its top-line numbers are historical.</p>
 <h2 id="vllm">9. vLLM integration</h2>
 
 <p>A fast kernel that only runs in a benchmark script is not a serving backend. The integration
-makes Titan's megakernel the decode path of a real vLLM engine — continuous batching, paged KV,
+makes Fleet MK's megakernel the decode path of a real vLLM engine — continuous batching, paged KV,
 the full sampler, the OpenAI-compatible API — while prefill stays stock.</p>
 
 <h3>Discovery: a general plugin, not a fork</h3>
 
 <p>vLLM exposes a <code>vllm.general_plugins</code> entry point. At engine startup it calls
-<code>register()</code>, which swaps each stock model class for a Titan subclass:</p>
+<code>register()</code>, which swaps each stock model class for a Fleet MK subclass:</p>
 
 <pre><code>def register():
     from vllm import ModelRegistry
-    from .model import TitanQwen3ForCausalLM, _make_gptoss_class
-    ModelRegistry.register_model("Qwen3ForCausalLM", TitanQwen3ForCausalLM)
+    from .model import FleetMKQwen3ForCausalLM, _make_gptoss_class
+    ModelRegistry.register_model("Qwen3ForCausalLM", FleetMKQwen3ForCausalLM)
     try:   # separate vLLM module; may be absent in older builds
         ModelRegistry.register_model("GptOssForCausalLM", _make_gptoss_class())
     except Exception as e:
-        log.info("titan: GptOssForCausalLM not registered (%s); dense path unaffected.", e)</code></pre>
+        log.info("fleet_mk: GptOssForCausalLM not registered (%s); dense path unaffected.", e)</code></pre>
 
 <p>Registering both is harmless: vLLM instantiates whichever architecture the checkpoint
-declares. Enable with <code>VLLM_PLUGINS=titan</code>; the stock baseline is
+declares. Enable with <code>VLLM_PLUGINS=fleet_mk</code>; the stock baseline is
 <code>VLLM_PLUGINS=</code> (empty). No vLLM source is modified.</p>
 
 <h3>Three seams, and nothing else</h3>
 
-<p>The subclasses are thin. Everything model-agnostic lives in <code>TitanModelMixin</code>,
+<p>The subclasses are thin. Everything model-agnostic lives in <code>FleetMKModelMixin</code>,
 parameterized by a <code>ModelSpec</code>. The mixin overrides exactly three methods:</p>
 
 <table>
@@ -2097,19 +2097,19 @@ parameterized by a <code>ModelSpec</code>. The mixin overrides exactly three met
 <tbody>
 <tr><td><code>load_weights()</code></td>
     <td>Calls <code>super()</code> to load the standard modules, then MXFP4-packs them into
-    Titan's per-XCD layout, builds RoPE tables, <code>dlopen</code>s <code>&lt;model&gt;.so</code>,
+    Fleet MK's per-XCD layout, builds RoPE tables, <code>dlopen</code>s <code>&lt;model&gt;.so</code>,
     and allocates workspace buffers.</td></tr>
 <tr><td><code>forward()</code></td>
     <td>Reads vLLM's attention metadata and branches on query length. Prefill →
-    <code>super().forward()</code>. Decode → <code>titan.decode_step()</code>.</td></tr>
+    <code>super().forward()</code>. Decode → <code>fleet_mk.decode_step()</code>.</td></tr>
 <tr><td><code>compute_logits()</code></td>
-    <td>After a Titan MoE decode, returns the bf16 logit row the megakernel already computed
+    <td>After a Fleet MK MoE decode, returns the bf16 logit row the megakernel already computed
     (§11); otherwise falls through to stock.</td></tr>
 </tbody>
 </table>
 
 <p>MRO matters: the mixin is listed <strong>first</strong>
-(<code>class T(TitanModelMixin, StockModel)</code>) so its overrides win while
+(<code>class T(FleetMKModelMixin, StockModel)</code>) so its overrides win while
 <code>super()</code> still reaches the stock implementation.</p>
 
 <h4>The routing predicate</h4>
@@ -2118,10 +2118,10 @@ parameterized by a <code>ModelSpec</code>. The mixin overrides exactly three met
 if attn_md is None or getattr(attn_md, "max_query_len", 2) != 1:
     return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
 # Decode: exactly one new token.
-self._ensure_titan_kv_bound()
+self._ensure_fleet_mk_kv_bound()
 ...</code></pre>
 <p>The default of <code>2</code> in the <code>getattr</code> is deliberate: a metadata object
-without <code>max_query_len</code> routes to <em>stock</em>, not Titan. Unknown state falls
+without <code>max_query_len</code> routes to <em>stock</em>, not Fleet MK. Unknown state falls
 back to the safe path.</p>
 
 <h3>Module map</h3>
@@ -2132,7 +2132,7 @@ back to the safe path.</p>
 <tr><td><code>model.py</code></td><td class="num">198</td><td>The two subclasses: per-model weight packing and the layer-attention accessor.</td></tr>
 <tr><td><code>mixin.py</code></td><td class="num">292</td><td>All model-agnostic machinery: kernel load, buffers, RoPE, KV binding, routing.</td></tr>
 <tr><td><code>spec.py</code></td><td class="num">398</td><td><code>ModelSpec</code>: every dimension and layout constant, from the same YAML the generator reads.</td></tr>
-<tr><td><code>runtime.py</code></td><td class="num">467</td><td>ctypes ABI loader, <code>TitanBuffers</code>, <code>build_ptr_table</code>, <code>decode_step</code>.</td></tr>
+<tr><td><code>runtime.py</code></td><td class="num">467</td><td>ctypes ABI loader, <code>FleetMKBuffers</code>, <code>build_ptr_table</code>, <code>decode_step</code>.</td></tr>
 <tr><td><code>packing.py</code> / <code>packing_moe.py</code></td><td class="num">161 / 281</td><td>Dense and MoE MXFP4 packing + the 36-slot per-layer pointer table.</td></tr>
 <tr><td><code>harness.py</code> / <code>bench.py</code> / <code>profile_step.py</code></td><td class="num">98 / 103 / 139</td><td>Parity harness, latency benchmark, per-kernel decode attribution.</td></tr>
 </tbody>
@@ -2141,7 +2141,7 @@ back to the safe path.</p>
 <div class="box good">
 <span class="lbl">There is deliberately no constants.py</span>
 <p>Every number in the plugin comes from <code>spec.py</code>, which parses the same YAML the
-generator does and reaches into <code>titan_generate</code> for the two facts the YAML does not
+generator does and reaches into <code>fleet_mk_generate</code> for the two facts the YAML does not
 carry: <code>counter_slots()</code> for the QKV barrier offset, and
 <code>MIRAGE_IN</code>/<code>MIRAGE_OUT</code> for the pointer-table shape. A second
 hand-maintained copy of these constants is how the plugin silently drifted once before; that file
@@ -2150,8 +2150,8 @@ was deleted rather than updated.</p>
 
 <div class="box warn">
 <span class="lbl">Silent-failure trap: the plugin must be pip-installed</span>
-<p><code>titan_vllm</code> is not on <code>sys.path</code> by default. Without
-<code>pip install -e</code>, <code>VLLM_PLUGINS=titan</code> <strong>silently does nothing</strong>
+<p><code>fleet_megakernel_vllm</code> is not on <code>sys.path</code> by default. Without
+<code>pip install -e</code>, <code>VLLM_PLUGINS=fleet_mk</code> <strong>silently does nothing</strong>
 — you get stock vLLM and a plausible-looking result with no warning. Verify the entry point is
 discoverable before trusting any number.</p>
 </div>
@@ -2161,25 +2161,25 @@ discoverable before trusting any number.</p>
 
 <h3>The problem</h3>
 <p>Attention needs every past token's K and V, and vLLM owns a paged KV cache — here roughly
-184 GiB — in its own layout. Titan's kernel originally read and wrote its own K/V buffers, so a
+184 GiB — in its own layout. Fleet MK's kernel originally read and wrote its own K/V buffers, so a
 per-request gather-copy reshuffled vLLM's prefill KV before decode could start: two full KV stores
 plus a per-request copy.</p>
 
 <h3>The trick</h3>
 <p>Rather than converting between layouts, force a vLLM attention backend whose
-<em>physical</em> KV layout is already byte-identical to Titan's, then alias the pointers.</p>
+<em>physical</em> KV layout is already byte-identical to Fleet MK's, then alias the pointers.</p>
 
 <p>The aiter backends allocate KV as <code>(2, num_blocks, block_size, num_kv_heads,
 head_size)</code> — the leading 2 makes K and V each contiguous — and write it through
 <code>reshape_and_cache_flash</code>, the non-reordered layout. Reshaped, that is bit-for-bit
-Titan's flat <code>[entries, num_kv_heads × head_dim]</code> buffer. (vLLM's default Triton/ROCm
+Fleet MK's flat <code>[entries, num_kv_heads × head_dim]</code> buffer. (vLLM's default Triton/ROCm
 backends reorder K or interleave the leading 2 — incompatible with a single flat pointer.)</p>
 
 <pre><code>kvc = attn.kv_cache[0]                          # [2, num_blocks, block_size, n_kv, head]
 k_alias = kvc[0].reshape(entries, n_kv * head)  # a view, not a copy
 v_alias = kvc[1].reshape(entries, n_kv * head)
 assert k_alias.data_ptr() == kvc[0].data_ptr()  # zero-copy invariant guard
-buffers.set_kv_aliases(k_aliases, v_aliases)    # titan's K/V now point at vLLM's pool</code></pre>
+buffers.set_kv_aliases(k_aliases, v_aliases)    # fleet_mk's K/V now point at vLLM's pool</code></pre>
 
 <figure>
 <svg viewBox="0 0 1040 268" role="img" aria-label="Gather-copy between two KV layouts versus pointer aliasing">
@@ -2193,7 +2193,7 @@ buffers.set_kv_aliases(k_aliases, v_aliases)    # titan's K/V now point at vLLM'
   <text x="12" y="92" font-size="10.5" fill="#c0392b">~184 GiB</text>
 
   <rect x="420" y="26" width="300" height="72" fill="#fdf0ef" stroke="#c0392b" rx="4"/>
-  <text x="432" y="45" font-size="11" font-weight="700">Titan's own K/V buffers</text>
+  <text x="432" y="45" font-size="11" font-weight="700">Fleet MK's own K/V buffers</text>
   <text x="432" y="62" font-size="10.5" class="m" fill="#5a6472">[entries, num_kv_heads × head_dim]</text>
   <text x="432" y="92" font-size="10.5" fill="#c0392b">a second copy of the same bytes</text>
 
@@ -2212,7 +2212,7 @@ buffers.set_kv_aliases(k_aliases, v_aliases)    # titan's K/V now point at vLLM'
   <text x="12" y="188" font-size="10.5" class="m" fill="#5a6472">aiter backend: [2, num_blocks, block_size, n_kv, head]</text>
   <text x="12" y="204" font-size="10.5" fill="#5a6472">reshape_and_cache_flash — the non-reordered layout</text>
   <rect x="12" y="212" width="416" height="22" fill="#fff" stroke="#2e7d4f" rx="2"/>
-  <text x="20" y="227" font-size="10" class="m" fill="#2e7d4f">reshaped, this is bit-for-bit Titan's flat [entries, n_kv × head_dim]</text>
+  <text x="20" y="227" font-size="10" class="m" fill="#2e7d4f">reshaped, this is bit-for-bit Fleet MK's flat [entries, n_kv × head_dim]</text>
 
   <g stroke="#2e7d4f" stroke-width="1.4" fill="none" marker-end="url(#ag)">
     <path d="M444,182 L560,182"/>
@@ -2236,11 +2236,11 @@ buffers.set_kv_aliases(k_aliases, v_aliases)    # titan's K/V now point at vLLM'
 <figcaption><b>Figure 12.</b> No layout conversion — a backend is chosen whose physical layout
 already matches, and the pointers are aliased. The whole mechanism rests on one invariant, so
 it is asserted on every bind: <code>k_alias.data_ptr() == kvc[0].data_ptr()</code>. That, plus
-<code>block_size == PAGE_SIZE</code>, is why one vLLM block is exactly one Titan page.</figcaption>
+<code>block_size == PAGE_SIZE</code>, is why one vLLM block is exactly one Fleet MK page.</figcaption>
 </figure>
 
 <p>Binding is lazy, on the first decode, because vLLM allocates the KV cache after
-<code>load_weights()</code>. Titan's page-indirection array <code>kv_indices</code> is then
+<code>load_weights()</code>. Fleet MK's page-indirection array <code>kv_indices</code> is then
 driven straight from vLLM's <code>block_table</code>: during decode the megakernel appends the
 new K/V into vLLM's block and reads all prior KV in place.</p>
 
@@ -2267,9 +2267,9 @@ never exercised.</p>
 <div class="box warn">
 <span class="lbl">Hybrid KV cache must be disabled for GPT-OSS</span>
 <p>vLLM's hybrid KV-cache manager overlays GPT-OSS's two attention types on shared physical
-memory with separate per-group block tables; Titan's decode uses ONE block table for all layers.
+memory with separate per-group block tables; Fleet MK's decode uses ONE block table for all layers.
 <code>disable_hybrid_kv_cache_manager=True</code> unifies every layer to
-<code>FullAttentionSpec</code>. Titan's kernel still applies the sliding-window mask itself, so
+<code>FullAttentionSpec</code>. Fleet MK's kernel still applies the sliding-window mask itself, so
 only the KV-memory saving is lost. No-op for uniform models such as Qwen3.</p>
 </div>
 
@@ -2316,7 +2316,7 @@ if (val &gt; thread_max) { ... }</code></pre>
 <li><strong>A null check, not an <code>#ifdef</code>.</strong> One compiled <code>.so</code>
 serves both drivers; the standalone path pays only a predicated branch.</li>
 <li><strong>The stored value is the same <code>val</code> the argmax compares</strong>, at the
-same absolute vocab index — so the fused row cannot disagree with Titan's own greedy pick.</li>
+same absolute vocab index — so the fused row cannot disagree with Fleet MK's own greedy pick.</li>
 <li><strong><code>compute_logits()</code> consumes its flag rather than just reading it.</strong>
 Prefill, dummy runs, and stock-path fallbacks fall through to vLLM's <code>lm_head</code>.
 Silently returning a stale row on those paths would be wrong output with no error.</li>
@@ -2343,8 +2343,8 @@ lm_head GEMV is gone from the profile entirely.</p>
 <span class="lbl">Read this before quoting any number</span>
 <p><code>enforce_eager</code> disables hipGraph capture, and it is <em>not neutral between the
 two sides</em>. Stock vLLM's decode is a long tail of small kernel launches, so graph capture is
-most of its performance; Titan's decode is ONE launch with almost nothing to gain. Eager mode
-therefore flatters Titan by a large factor.</p>
+most of its performance; Fleet MK's decode is ONE launch with almost nothing to gain. Eager mode
+therefore flatters Fleet MK by a large factor.</p>
 <p>An earlier revision reported GPT-OSS as 8.3× faster than stock. That was an artifact:
 the benchmark hardcoded <code>enforce_eager=True</code>. Stock GPT-OSS with graphs is 4.658
 ms/token, not 26.113 — a 5.6× swing belonging entirely to the baseline. <strong>Always state
@@ -2363,7 +2363,7 @@ double-counts.</p>
 <h3>Through vLLM, batch size 1, gfx950</h3>
 
 <table>
-<thead><tr><th>Model</th><th class="num">stock, graphs ON</th><th class="num">stock, eager</th><th class="num">titan (eager)</th><th></th></tr></thead>
+<thead><tr><th>Model</th><th class="num">stock, graphs ON</th><th class="num">stock, eager</th><th class="num">fleet_mk (eager)</th><th></th></tr></thead>
 <tbody>
 <tr><td><strong>GPT-OSS 120B</strong></td><td class="num">4.658 (215 tok/s)</td><td class="num">26.113</td>
     <td class="num"><strong>2.921 (342 tok/s)</strong></td><td class="add">1.59× faster</td></tr>
@@ -2374,8 +2374,8 @@ double-counts.</p>
 
 <div class="box warn">
 <span class="lbl">What 1.59× does and does not mean</span>
-<p>It is Titan versus stock vLLM, <em>both running under vLLM</em>. It is not a claim that Titan
-beats Mirage. Mirage's standalone driver decodes GPT-OSS 120B at 2.144 ms/token; Titan through
+<p>It is Fleet MK versus stock vLLM, <em>both running under vLLM</em>. It is not a claim that Fleet MK
+beats Mirage. Mirage's standalone driver decodes GPT-OSS 120B at 2.144 ms/token; Fleet MK through
 vLLM is 2.921 — <strong>0.78 ms behind</strong>, and that has to be said in the same breath as the
 1.59×.</p>
 </div>
@@ -2387,11 +2387,11 @@ vLLM is 2.921 — <strong>0.78 ms behind</strong>, and that has to be said in th
 <tbody>
 <tr><td>Mirage, standalone</td><td class="num">2.144</td><td class="num">—</td>
     <td>Reference. Scheduler supplies inter-layer ordering for free.</td></tr>
-<tr><td>Titan megakernel, GPU only</td><td class="num">~2.39</td><td class="num">+0.25</td>
+<tr><td>Fleet MK megakernel, GPU only</td><td class="num">~2.39</td><td class="num">+0.25</td>
     <td>124.5 µs of inter-layer barrier (measured), plus ~0.12 ms spread across phases.</td></tr>
-<tr><td>Titan standalone, end-to-end</td><td class="num">2.502</td><td class="num">+0.11</td>
+<tr><td>Fleet MK standalone, end-to-end</td><td class="num">2.502</td><td class="num">+0.11</td>
     <td>Its own Python driver, ~46 µs/token of host work.</td></tr>
-<tr><td><strong>Titan through vLLM</strong></td><td class="num"><strong>2.921</strong></td><td class="num">+0.42</td>
+<tr><td><strong>Fleet MK through vLLM</strong></td><td class="num"><strong>2.921</strong></td><td class="num">+0.42</td>
     <td>vLLM's scheduler, the sampler, block-table bookkeeping, host round-trip.</td></tr>
 <tr><td>Stock through vLLM</td><td class="num">4.658</td><td class="num">+1.74</td><td>—</td></tr>
 </tbody>
@@ -2417,22 +2417,22 @@ vLLM is 2.921 — <strong>0.78 ms behind</strong>, and that has to be said in th
     <rect x="170" y="40" width="360" height="24" fill="#5a6472" opacity="0.55"/>
     <text x="540" y="57" class="m" font-size="11">2.144</text>
 
-    <!-- Titan GPU 2.39 -->
-    <text x="164" y="92" text-anchor="end">Titan megakernel, GPU only</text>
+    <!-- Fleet MK GPU 2.39 -->
+    <text x="164" y="92" text-anchor="end">Fleet MK, GPU only</text>
     <rect x="170" y="80" width="360" height="24" fill="#0b5fa5" opacity="0.75"/>
     <rect x="530" y="80" width="41" height="24" fill="#c0392b" opacity="0.7"/>
     <text x="581" y="97" class="m" font-size="11">~2.39</text>
     <text x="630" y="97" font-size="10.5" fill="#c0392b">+0.25 — 124.5 µs is the inter-layer barrier, measured</text>
 
-    <!-- Titan standalone 2.502 -->
-    <text x="164" y="132" text-anchor="end">Titan, standalone e2e</text>
+    <!-- Fleet MK standalone 2.502 -->
+    <text x="164" y="132" text-anchor="end">Fleet MK, standalone e2e</text>
     <rect x="170" y="120" width="401" height="24" fill="#0b5fa5" opacity="0.75"/>
     <rect x="571" y="120" width="19" height="24" fill="#e0b400" opacity="0.8"/>
     <text x="600" y="137" class="m" font-size="11">2.502</text>
     <text x="650" y="137" font-size="10.5" fill="#5a6472">+0.11 — its own Python driver, ~46 µs/token of host work</text>
 
-    <!-- Titan vllm 2.921 -->
-    <text x="164" y="172" text-anchor="end" font-weight="700">Titan through vLLM</text>
+    <!-- Fleet MK vllm 2.921 -->
+    <text x="164" y="172" text-anchor="end" font-weight="700">Fleet MK through vLLM</text>
     <rect x="170" y="160" width="420" height="24" fill="#0b5fa5"/>
     <rect x="590" y="160" width="70" height="24" fill="#e0b400" opacity="0.8"/>
     <text x="670" y="177" class="m" font-size="11" font-weight="700">2.921</text>
@@ -2458,7 +2458,7 @@ vLLM is 2.921 — <strong>0.78 ms behind</strong>, and that has to be said in th
   </g>
 </svg>
 <figcaption><b>Figure 13.</b> Every step is measured, not modelled. The two facts that have to
-be said together: Titan is 1.59× faster than stock vLLM, and 0.78 ms behind Mirage's
+be said together: Fleet MK is 1.59× faster than stock vLLM, and 0.78 ms behind Mirage's
 standalone driver. Roughly 0.42 ms of that 0.78 is the price of being a real serving backend;
 the remaining ~0.36 ms is the kernel, and it is the barrier.</figcaption>
 </figure>
@@ -2475,8 +2475,8 @@ is good evidence the overhead belongs to the integration, not to either kernel.<
 <p>GPT-OSS runs the fused single-barrier pipeline and beats stock. Qwen3 still runs the older
 multi-barrier dense kernel — re-converged against the generator, but its body never
 rewritten. Its number barely moved across the rebase (7.33 → 7.28), placing the regression in
-the kernel, not the plugin. "Titan is ~23% slower than stock" still holds for the dense path, but
-is a statement about which kernel, not about Titan.</p>
+the kernel, not the plugin. "Fleet MK is ~23% slower than stock" still holds for the dense path, but
+is a statement about which kernel, not about Fleet MK.</p>
 
 <p>One incidental observation worth keeping: stock vLLM decodes 120B-MoE and 8B-dense at nearly
 the same rate (4.658 vs 4.469 ms/tok). At batch size 1 with graphs, stock's decode is dominated by
@@ -2500,7 +2500,7 @@ branching to a fluent synonym.</li>
 
 <div class="box note">
 <span class="lbl">Divergence position is not a corruption signal</span>
-<p>Titan runs MXFP4 weights and fp8 activations against stock's bf16, so logits differ slightly
+<p>Fleet MK runs MXFP4 weights and fp8 activations against stock's bf16, so logits differ slightly
 and a near-tie eventually resolves the other way. Expected, not a defect — corruption looks
 like a re-emitted prefill token, doubled words, or a degenerate repeat, not a fluent synonym 14
 tokens in. MoE W2 also accumulates 4 experts with float <code>atomicAdd</code>, so
@@ -2510,8 +2510,8 @@ bit-reproducibility is a bonus, not a gate.</p>
 <!-- ══════════════════════════════════════════════════════════════════════ -->
 <h2 id="open">13. Open items and known-dead directions</h2>
 
-<h3>Open: Titan cannot be hipGraph-captured</h3>
-<pre><code>File "titan_vllm/mixin.py", line 180, in forward
+<h3>Open: Fleet MK cannot be hipGraph-captured</h3>
+<pre><code>File "fleet_megakernel_vllm/mixin.py", line 180, in forward
     cur_pos = int(positions[0].item())
 torch.AcceleratorError: HIP error: operation not permitted when stream is capturing</code></pre>
 
@@ -2533,7 +2533,7 @@ the page-count arithmetic moved on-device.</p>
 
 <div class="box note">
 <span class="lbl">Bound the payoff before doing the work</span>
-<p>With <code>TITAN_PROFILE=1</code> the megakernel's own GPU time is ~2.38 ms against 2.921 ms
+<p>With <code>FLEET_MK_PROFILE=1</code> the megakernel's own GPU time is ~2.38 ms against 2.921 ms
 end-to-end, so everything host-side — scheduler, sampler, launch, round-trip — is ~0.54 ms/token.
 That is the ceiling on what capture could recover, and capture would take only part of it. It was
 ~0.83 ms before the fused-logits change took a bite out of it.</p>
@@ -2578,7 +2578,7 @@ corrupts live barriers.</li>
 <li>Dropping the rank-counter modulo breaks on token 2, not token 1.</li>
 <li>A ctypes <code>argtypes</code> list that is short or transposed is stack corruption
 reproducible only under one of four env-selected decode paths.</li>
-<li>Without <code>pip install -e</code>, <code>VLLM_PLUGINS=titan</code> silently runs stock.</li>
+<li>Without <code>pip install -e</code>, <code>VLLM_PLUGINS=fleet_mk</code> silently runs stock.</li>
 </ul>
 
 <!-- ══════════════════════════════════════════════════════════════════════ -->
@@ -2586,10 +2586,10 @@ reproducible only under one of four env-selected decode paths.</li>
 
 <h4>Regenerate and build</h4>
 <pre><code># NEVER omit --output-dir: main() writes the driver to the repo root.
-python3 titan_generate.py configs/gpt_oss_120b.yaml --output-dir /tmp/titan_regen
+python3 fleet_mk_generate.py configs/gpt_oss_120b.yaml --output-dir /tmp/fleet_mk_regen
 
-cmp /tmp/titan_regen/generated/gpt_oss_120b_kernel.cuh generated/gpt_oss_120b_kernel.cuh
-cmp /tmp/titan_regen/demo_gpt_oss_120b.py             demo_gpt_oss_120b.py
+cmp /tmp/fleet_mk_regen/generated/gpt_oss_120b_kernel.cuh generated/gpt_oss_120b_kernel.cuh
+cmp /tmp/fleet_mk_regen/demo_gpt_oss_120b.py             demo_gpt_oss_120b.py
 # cmp, not diff -- it catches CRLF, trailing whitespace, and final-newline drift.
 
 bash build_gpt_oss_120b.sh          # expect: 226 VGPR, 0 VGPR spills, 2 waves/SIMD
@@ -2602,16 +2602,16 @@ nm -D --defined-only generated/gpt_oss_120b.so | grep -c ' T '   # expect 14</co
 # gate: iter 1 next_token=35644 ('analysis'); Non-outlier avg ~2.50 ms/token</code></pre>
 
 <h4>Through vLLM</h4>
-<pre><code># once, or VLLM_PLUGINS=titan silently does nothing
-python3 -m pip install -e titan_vllm --no-deps --no-build-isolation
+<pre><code># once, or VLLM_PLUGINS=fleet_mk silently does nothing
+python3 -m pip install -e fleet_megakernel_vllm --no-deps --no-build-isolation
 python3 -c "import importlib.metadata as m; \
   print([e.value for e in m.entry_points(group='vllm.general_plugins')])"
 
-export TITAN_MODEL=/home/claudeuser/models/gpt-oss-120b
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=      python3 -m titan_vllm.harness   # stock baseline
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan TITAN_TEMP=0 python3 -m titan_vllm.harness
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan python3 -m titan_vllm.bench     # graphs ON for stock
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=titan BENCH_EAGER=1 python3 -m titan_vllm.bench</code></pre>
+export FLEET_MK_MODEL=/home/claudeuser/models/gpt-oss-120b
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=      python3 -m fleet_megakernel_vllm.harness   # stock baseline
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0 python3 -m fleet_megakernel_vllm.harness
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk python3 -m fleet_megakernel_vllm.bench     # graphs ON for stock
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk BENCH_EAGER=1 python3 -m fleet_megakernel_vllm.bench</code></pre>
 
 <p>The harness and bench set the required environment automatically:
 <code>VLLM_ROCM_USE_AITER=1</code>, <code>VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1</code>,
@@ -2630,11 +2630,11 @@ eyeballing the tail. One incremental change at a time, measured, before the next
 </div>
 
 <footer>
-Sources: <code>titan_generate.py</code>, <code>configs/gpt_oss_120b.yaml</code>,
-<code>kernels/{barriers,fused_layer,titan_phases,device_functions}.cuh</code>,
+Sources: <code>fleet_mk_generate.py</code>, <code>configs/gpt_oss_120b.yaml</code>,
+<code>kernels/{barriers,fused_layer,fleet_mk_phases,device_functions}.cuh</code>,
 <code>generated/gpt_oss_120b_{kernel.cuh,launch.hip}</code>,
-<code>titan_vllm/*.py</code>, <code>titan_vllm/INTEGRATION.md</code>,
-<code>docs/two_level_fusion.md</code>, <code>docs/titan_vs_mirage_perf_gap.md</code>,
+<code>fleet_megakernel_vllm/*.py</code>, <code>fleet_megakernel_vllm/INTEGRATION.md</code>,
+<code>docs/two_level_fusion.md</code>, <code>docs/fleet_mk_vs_mirage_perf_gap.md</code>,
 and the mirage wiki (<code>.claude/wiki/articles/</code>).
 All performance figures are batch size 1, greedy, gfx950, prefill-cancelled, best of 3.
 </footer>

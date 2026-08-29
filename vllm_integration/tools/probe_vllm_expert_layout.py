@@ -38,7 +38,7 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch  # noqa: E402
 
-MODEL = os.environ.get("TITAN_MODEL", "/home/claudeuser/models/gpt-oss-120b")
+MODEL = os.environ.get("FLEET_MK_MODEL", "/home/claudeuser/models/gpt-oss-120b")
 
 #: Names probed on the experts module. w13/w2 are the block data; *_scale the
 #: E8M0 exponents; *_bias the bf16 per-output biases.
@@ -228,7 +228,7 @@ def _report_pad(r):
     """Is vLLM's K-axis pad zero, and is the 2880..2944 slice we would newly
     reduce over also zero?
 
-    This is the fact that decides whether titan can alias vLLM's buffer while
+    This is the fact that decides whether fleet_mk can alias vLLM's buffer while
     keeping K=2944. Aliasing means the row stride becomes vLLM's 3072/2 bytes
     but the MFMA still runs 23 iterations = 2944 columns, so columns
     [2880, 2944) -- pad, never part of the real weight -- get folded into every
@@ -261,7 +261,7 @@ def _report_pad(r):
               f"NEWLY-REDUCED[{TRUE_K}:{REDUCE_K}]={int((newly != 0).sum())}  "
               f"beyond[{REDUCE_K}:3072]={int((beyond != 0).sum())}")
     print("\nNEWLY-REDUCED must be 0. It is the only column range that "
-          "changes meaning when titan aliases vLLM's buffer at stride 3072 "
+          "changes meaning when fleet_mk aliases vLLM's buffer at stride 3072 "
           "while keeping a 2944-long reduction.")
 
 
@@ -270,9 +270,9 @@ def main():
     from vllm import LLM, SamplingParams
 
     # Stock path only: the point is to observe what vLLM does to its OWN
-    # weights, so titan's plugin must NOT be loaded. One token is enough --
+    # weights, so fleet_mk's plugin must NOT be loaded. One token is enough --
     # process_weights_after_loading runs during engine init. No CUSTOM
-    # attention backend either: that exists to give titan an aliasable KV
+    # attention backend either: that exists to give fleet_mk an aliasable KV
     # layout, and registering it needs the plugin this probe deliberately
     # disables. The stock backend reaches the same MoE weight-load path.
     os.environ["VLLM_PLUGINS"] = ""
@@ -280,7 +280,7 @@ def main():
               max_model_len=2048, dtype="bfloat16", block_size=16,
               disable_hybrid_kv_cache_manager=True,
               gpu_memory_utilization=float(
-                  os.environ.get("TITAN_GPU_MEM_UTIL", "0.9")))
+                  os.environ.get("FLEET_MK_GPU_MEM_UTIL", "0.9")))
     llm.generate(["hi"], SamplingParams(temperature=0.0, max_tokens=1))
     sys.exit(_report())
 

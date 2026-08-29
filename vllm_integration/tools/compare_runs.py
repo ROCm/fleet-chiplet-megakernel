@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compare titan decode runs: latency, first token, and generated text.
+"""Compare fleet_mk decode runs: latency, first token, and generated text.
 
-Titan's decode is NOT bit-deterministic across runs of the same binary (see
+Fleet MK's decode is NOT bit-deterministic across runs of the same binary (see
 the fleet-header wiki article), so a single run of each arm cannot resolve a
 sub-1% latency delta and a text-hash difference is NOT by itself evidence of a
 correctness change. This script reports the within-arm spread alongside the
@@ -60,7 +60,7 @@ def parse_log(path):
         rest = raw[i:]
         end = min((p for p in (rest.find("\n====="),
                                rest.find("\nDecode avg"),
-                               rest.find("\n[TITAN_TIME]"))
+                               rest.find("\n[FLEET_MK_TIME]"))
                    if p > 0), default=len(rest))
         out["text"] = rest[:end]
     return out
@@ -118,7 +118,7 @@ def main():
         if len(hashes) > 1:
             p = common_prefix([r["text"] for r in runs])
             print(f"{'':10s}   note: {len(hashes)} distinct texts, "
-                  f"common prefix {p} chars (titan is non-deterministic)")
+                  f"common prefix {p} chars (fleet_mk is non-deterministic)")
 
     names = list(summary)
     if len(names) == 2:

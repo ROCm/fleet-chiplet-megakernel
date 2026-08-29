@@ -1,25 +1,25 @@
-"""Which of titan's quantization choices costs the most logit accuracy?
+"""Which of fleet_mk's quantization choices costs the most logit accuracy?
 
 WHY THIS EXISTS
 ---------------
-logit_parity.py measured titan vs stock at 86.0% top-1 agreement, FLAT across
+logit_parity.py measured fleet_mk vs stock at 86.0% top-1 agreement, FLAT across
 context depth -- so the error is not position-dependent (not sliding window, not
 sink, not KV paging). That leaves numerics. But "numerics" is not one knob, and
 the parity test cannot separate them because it only sees the end of the pipeline.
 
 The GPT-OSS checkpoint is ALREADY MXFP4: config.json carries
-`"quant_method": "mxfp4"`, so stock vLLM and titan run the same 4-bit MoE weights.
+`"quant_method": "mxfp4"`, so stock vLLM and fleet_mk run the same 4-bit MoE weights.
 The two sides differ in exactly two other places:
 
   1. modules_to_not_convert -- the checkpoint explicitly excludes
      `self_attn`, `mlp.router`, `embed_tokens`, and `lm_head` from quantization.
-     titan re-quantizes qkv (demo:394), oproj (:418), and lm_head (:531) anyway.
+     fleet_mk re-quantizes qkv (demo:394), oproj (:418), and lm_head (:531) anyway.
      (The router is NOT affected: slot [6] packs an MXFP4 copy but the pointer
      table feeds mirage_in[13] = router_bf16_xcd, so the bf16 copy is what runs.
      Slot [6] is dead weight -- ~30 MB of packing nothing reads.)
   2. Activations -- stock's MXFP4 path on ROCm is w4a16 (bf16 activations;
      mxfp4_w4a16_moe_quant_config in vllm/model_executor/layers/quantization/
-     mxfp4.py:741). titan quantizes activations to fp8 per GEMM.
+     mxfp4.py:741). fleet_mk quantizes activations to fp8 per GEMM.
 
 This script measures (1) directly, one weight class at a time, WITHOUT touching
 the kernel. Each is a pure numerical question -- what does round-tripping this
@@ -46,12 +46,12 @@ and, for lm_head only, the metric that actually matters: how often argmax over
 the 201k-row logit vector CHANGES. A weight can carry visible relative error and
 still never flip an argmax; lm_head is the one place where the flip IS the token.
 
-Uses titan's OWN quantize_bf16_to_mxfp4 from the compiled .so, not a
-reimplementation -- otherwise this measures a model of titan rather than titan.
+Uses fleet_mk's OWN quantize_bf16_to_mxfp4 from the compiled .so, not a
+reimplementation -- otherwise this measures a model of fleet_mk rather than fleet_mk.
 
 USAGE
 -----
-  HIP_VISIBLE_DEVICES=0 python3 -m titan_vllm.quant_ablation \\
+  HIP_VISIBLE_DEVICES=0 python3 -m fleet_megakernel_vllm.quant_ablation \\
       --model-path /home/claudeuser/models/gpt-oss-120b
 """
 
@@ -63,8 +63,8 @@ import sys
 import torch
 
 
-def _load_titan_so():
-    """titan's own MXFP4 quantizer, so we measure titan and not a model of it."""
+def _load_fleet_mk_so():
+    """fleet_mk's own MXFP4 quantizer, so we measure fleet_mk and not a model of it."""
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     so = os.path.join(here, "generated", "gpt_oss_120b.so")
     if not os.path.exists(so):
@@ -76,7 +76,7 @@ def _load_titan_so():
 def quant_dequant_mxfp4(w: torch.Tensor) -> torch.Tensor:
     """Round-trip a bf16 weight through MXFP4 (e2m1, block 32, e8m0 scale).
 
-    Mirrors titan's quantize_bf16_to_mxfp4: per-32-element blocks along the
+    Mirrors fleet_mk's quantize_bf16_to_mxfp4: per-32-element blocks along the
     reduction axis, one power-of-two scale per block, values snapped to the 16
     representable e2m1 levels. Done in torch so we get the dequantized result
     back -- the .so entry point returns packed blocks+scales, which we would
@@ -179,8 +179,8 @@ def main():
     # ---------------------------------------------------------------- lm_head
     # The one weight where the error IS the token: argmax over its output is
     # literally what the kernel emits. The checkpoint excludes it from
-    # quantization; titan quantizes it anyway (demo_gpt_oss_120b.py:531).
-    print("\n=== lm_head (checkpoint says DO NOT quantize; titan does) ===")
+    # quantization; fleet_mk quantizes it anyway (demo_gpt_oss_120b.py:531).
+    print("\n=== lm_head (checkpoint says DO NOT quantize; fleet_mk does) ===")
     lm = get("lm_head.weight")
     print(f"  shape {tuple(lm.shape)}  dtype {lm.dtype}")
     lm_q = quant_dequant_mxfp4(lm)
@@ -220,7 +220,7 @@ def main():
     torch.cuda.empty_cache()
 
     # -------------------------------------------------------------- attention
-    # Checkpoint excludes self_attn; titan quantizes qkv (demo:394) and
+    # Checkpoint excludes self_attn; fleet_mk quantizes qkv (demo:394) and
     # oproj (:418). Attention error does not directly flip a token but it
     # propagates through all 36 layers.
     print(f"\n=== attention layer {args.layer} (checkpoint says DO NOT quantize) ===")
@@ -241,11 +241,11 @@ def main():
         torch.cuda.empty_cache()
 
     # ----------------------------------------------------------------- router
-    # Included as a CONTROL. titan feeds mirage_in[13] = router_bf16_xcd, so the
-    # live path is already bf16 and this number should NOT be read as a titan
+    # Included as a CONTROL. fleet_mk feeds mirage_in[13] = router_bf16_xcd, so the
+    # live path is already bf16 and this number should NOT be read as a fleet_mk
     # defect. It shows what quantizing the router WOULD have cost -- i.e. what
     # the existing bf16 choice is buying.
-    print(f"\n=== router layer {li} (CONTROL -- titan already runs this bf16) ===")
+    print(f"\n=== router layer {li} (CONTROL -- fleet_mk already runs this bf16) ===")
     rk = f"model.layers.{li}.mlp.router.weight"
     if rk in index:
         rw = get(rk)
@@ -270,7 +270,7 @@ def main():
     print("    (near-tied logits flip under any perturbation) -- ignore it.")
     print("  * attention rel_err compounds over 36 layers; it is not directly")
     print("    comparable to a flip rate, only useful as a relative ranking.")
-    print("  * router is a CONTROL: titan already runs it bf16, so its number is")
+    print("  * router is a CONTROL: fleet_mk already runs it bf16, so its number is")
     print("    the cost AVOIDED, not a cost paid. The top-4 SET change rate is why.")
     print("  * fp8 activations are NOT measured here. If every weight class above")
     print("    is small, activations are the remaining suspect by elimination.")

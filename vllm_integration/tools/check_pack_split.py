@@ -25,7 +25,7 @@ is obvious:
      plausible values and fluent garbage rather than a fault.
 
 The knob is checked with and without a wider row stride, since split scales and
-strided data rows are independent and will be combined when titan aliases
+strided data rows are independent and will be combined when fleet_mk aliases
 vLLM's allocation.
 
 Run:
@@ -37,7 +37,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from titan_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
+from fleet_megakernel_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
 
 
 def check(name, E, out_dim, nblk_true, nblk_reduce, nblk_stride, opw):

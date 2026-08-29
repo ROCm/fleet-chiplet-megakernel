@@ -1,4 +1,4 @@
-"""MXFP4 weight packing + pointer-table build for the titan GPT-OSS (MoE) kernel.
+"""MXFP4 weight packing + pointer-table build for the fleet_mk GPT-OSS (MoE) kernel.
 
 Ported verbatim (parameterized by a ModelSpec) from the known-good standalone
 demo.py so the vLLM plugin packs MoE weights byte-identically to the 2.13 ms/token
@@ -50,7 +50,7 @@ def _moe_data(pack, layout, which, blocks, scales, foreign=None):
     already hold exactly these bytes at exactly these offsets, so packing them
     would materialize a byte-for-byte 60 GiB duplicate of the thing being
     aliased. The tensor itself is returned rather than its address so the caller
-    keeps a reference in the same list it keeps titan's own tensors in -- vLLM
+    keeps a reference in the same list it keeps fleet_mk's own tensors in -- vLLM
     will not free it, but a slot whose lifetime rule differs from its
     neighbours' is exactly what breaks when someone later reorders the list.
 
@@ -67,7 +67,7 @@ def _moe_data(pack, layout, which, blocks, scales, foreign=None):
 def _moe_scales(pack, layout, which, blocks, scales):
     """The expert SCALE slot for "w13" or "w2", or None when interleaved.
 
-    Always titan's own bytes, aliased or not: vLLM's TRITON backend deletes
+    Always fleet_mk's own bytes, aliased or not: vLLM's TRITON backend deletes
     w13_weight_scale / w2_weight_scale in process_weights_after_loading (the
     swizzled scales move inside the precision configs), so there is nothing on
     that side to point at.
@@ -86,7 +86,7 @@ def pack_moe_layer(*, w_q, w_k, w_v, q_bias, k_bias, v_bias, w_o, o_bias,
                    down_blocks, down_scales, down_bias, sinks,
                    spec, packers, layout,
                    foreign_w13=None, foreign_w2=None):
-    """Pack one GPT-OSS decoder layer into the 13-slot titan weight list.
+    """Pack one GPT-OSS decoder layer into the 13-slot fleet_mk weight list.
 
     Attention weights (w_q/w_k/w_v/w_o + biases), norms, router, sinks are raw HF
     bf16 [out,in] CUDA tensors. Expert weights come as raw MXFP4 blocks/scales
@@ -94,7 +94,7 @@ def pack_moe_layer(*, w_q, w_k, w_v, q_bias, k_bias, v_bias, w_o, o_bias,
     biases.
 
     `layout` is the MoeLayout describing the expert buffer's pitches and section
-    split (titan_vllm/moe_layout.py). `foreign_w13` / `foreign_w2` are vLLM's own
+    split (fleet_megakernel_vllm/moe_layout.py). `foreign_w13` / `foreign_w2` are vLLM's own
     expert data tensors, passed only when aliasing them instead of packing a
     second copy.
 
@@ -179,9 +179,9 @@ def pack_moe_layer(*, w_q, w_k, w_v, q_bias, k_bias, v_bias, w_o, o_bias,
     # ── [8] W13 (gate_up) MXFP4 + [9] W2 (down) MXFP4 ────────────────────────
     # Data sections; pitches and section split come from `layout`, and under
     # aliasing the data is vLLM's tensor rather than a packed copy. See
-    # titan_vllm/moe_layout.py for why each knob exists, and
+    # fleet_megakernel_vllm/moe_layout.py for why each knob exists, and
     # tools/check_alias_equivalence.py for the proof that the aliased bytes are
-    # the bytes titan would have packed.
+    # the bytes fleet_mk would have packed.
     out.append(_moe_data(pack, layout, "w13", gate_up_blocks, gate_up_scales,
                          foreign=foreign_w13))                  # [8]
     out.append(_moe_data(pack, layout, "w2", down_blocks, down_scales,
@@ -347,7 +347,7 @@ def build_ptr_table_moe(spec, weight_ptrs_host, buffers, moe_scale_ptrs=None):
                 # it would leave two slots holding whatever the previous layer
                 # wrote, which faults confusingly the day someone flips the knob.
                 #
-                # Split: titan's own scale-only slab, in its own allocation.
+                # Split: fleet_mk's own scale-only slab, in its own allocation.
                 # These are NOT vLLM's w13_weight_scale / w2_weight_scale -- the
                 # TRITON backend deletes those in process_weights_after_loading
                 # (the swizzled scales move into the precision configs), so

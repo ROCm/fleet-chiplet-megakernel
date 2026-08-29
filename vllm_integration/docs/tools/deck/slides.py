@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Slide bodies. Each entry: (tag, html). Figures are spliced in by build.py
-# via the {FIGn} placeholder, taken verbatim from titan-architecture.html.
+# via the {FIGn} placeholder, taken verbatim from fleet-mk-architecture.html.
 #
 # Deliberate content constraints (from review):
 #   - SHORT titles.
@@ -9,7 +9,7 @@
 #     Structural constants (8 XCDs, 36 layers, 8 phases) are architecture, not
 #     measurements, and stay.
 #   - Spine: problem with dynamic dispatch -> static approach and its goal ->
-#     how Titan achieves it -> vLLM + zero-copy KV -> results.
+#     how Fleet MK achieves it -> vLLM + zero-copy KV -> results.
 
 SLIDES = []
 def S(tag, html): SLIDES.append((tag, html))
@@ -38,7 +38,7 @@ every task boundary, per layer, per token.</p>
 # ─────────────────────────────────────────────────────────────────── 2. title
 S("", '''
 <div style="margin:auto 0">
-<h1 style="font-size:46px">Titan</h1>
+<h1 style="font-size:46px">Fleet MK</h1>
 <p class="sub" style="font-size:20px;max-width:870px">A <b>static generator</b> for fused
 decode kernels. One launch runs the whole model, and what each worker does is
 decided when the kernel is generated — not while it executes.</p>
@@ -113,7 +113,7 @@ S("How", '''
 </div>
 </div>
 <p class="muted" style="font-size:14.5px;margin:10px 0 0">Upstream reaches this library through a
-superoptimizer; Titan reaches it through a table. <b>Neither generates a kernel body.</b></p>
+superoptimizer; Fleet MK reaches it through a table. <b>Neither generates a kernel body.</b></p>
 ''')
 
 # ─────────────────────────────────────────────────────────── 5. the example
@@ -277,7 +277,7 @@ quantization:
   output_per_wg: 64</code></pre>
 
 <p class="muted" style="margin:9px 0 6px;font-size:13.5px"><b>2.</b> Run the generator:</p>
-<pre style="margin:0;padding:8px 12px"><code style="font-size:10.9px;line-height:1.4">$ python3 titan_generate.py \\
+<pre style="margin:0;padding:8px 12px"><code style="font-size:10.9px;line-height:1.4">$ python3 fleet_mk_generate.py \\
       configs/mistral_7b.yaml</code></pre>
 </div>
 
@@ -320,10 +320,10 @@ S("Serving", '''
 and calls <code>register()</code>, which swaps the stock architecture for a subclass.
 <b>No fork, no patch:</b></p>
 <pre style="margin:8px 0 0;padding:9px 13px"><code style="font-size:11.5px;line-height:1.5">ModelRegistry.<b>register_model</b>(
-    "Qwen3ForCausalLM", TitanQwen3ForCausalLM)
+    "Qwen3ForCausalLM", FleetMKQwen3ForCausalLM)
 
-class TitanQwen3ForCausalLM(
-        <b>TitanModelMixin</b>, Qwen3ForCausalLM): …</code></pre>
+class FleetMKQwen3ForCausalLM(
+        <b>FleetMKModelMixin</b>, Qwen3ForCausalLM): …</code></pre>
 <p style="margin:9px 0 0">Mixin first in the MRO, so its <code>forward()</code> shadows the stock
 model's and <code>super().forward()</code> still reaches it. One predicate decides everything:</p>
 <pre style="margin:8px 0 0;padding:9px 13px"><code style="font-size:11.5px;line-height:1.5">def forward(self, input_ids, positions, …):
@@ -334,19 +334,19 @@ model's and <code>super().forward()</code> still reaches it. One predicate decid
       return <b>super().forward</b>(…)   <span class="muted"># stock vLLM</span>
 
   <span class="muted"># decode: one token, batch 1</span>
-  self._ensure_titan_kv_bound()   <span class="muted"># once → next slide</span>
-  self.titan.<b>decode_step</b>(embed, cur_pos,
+  self._ensure_fleet_mk_kv_bound()   <span class="muted"># once → next slide</span>
+  self.fleet_mk.<b>decode_step</b>(embed, cur_pos,
         block_table=md.block_table[0])</code></pre>
 <p class="muted" style="margin:8px 0 0;font-size:13.5px">Prefill is compute-bound and already well
 served. The megakernel claims only the memory-bound case it was built for.</p>
 </div>
 <div>
-<p style="margin-top:0">Titan inherits everything it deliberately left out: continuous batching,
+<p style="margin-top:0">Fleet MK inherits everything it deliberately left out: continuous batching,
 the scheduler, preemption, sampling, the OpenAI API, paged KV, prefix caching.</p>
 <div class="box warn" style="margin:12px 0 0;padding:11px 15px">
 <span class="lbl">The handoff is a pointer, not a copy</span>
 <p>Decode reads the KV prefill just wrote, in place — which works only because one vLLM block is
-exactly one Titan page, so vLLM's block table drives the kernel's page indirection directly.</p>
+exactly one Fleet MK page, so vLLM's block table drives the kernel's page indirection directly.</p>
 </div>
 <p class="muted" style="font-size:14.5px;margin-top:10px">The scheduler, sampler and host
 round-trip sit between kernel time and end-to-end latency; the results slide separates them rather
@@ -365,7 +365,7 @@ two full KV stores and a reshuffle on the decode path, every token.</p>
 
 {FIG12}
 
-<pre style="margin:6px 0 4px;padding:8px 13px"><code style="font-size:11.3px;line-height:1.45"><span class="muted">def <b>_ensure_titan_kv_bound</b>(self):   # first decode only — vLLM allocates KV after load_weights</span>
+<pre style="margin:6px 0 4px;padding:8px 13px"><code style="font-size:11.3px;line-height:1.45"><span class="muted">def <b>_ensure_fleet_mk_kv_bound</b>(self):   # first decode only — vLLM allocates KV after load_weights</span>
 k_alias = attn.kv_cache[0][0].reshape(entries, KV_STRIDE)   <span class="muted"># contiguous reshape = <b>view</b></span>
 assert k_alias.data_ptr() == kvc[0].data_ptr()   <span class="muted"># or it silently copied</span>
 ptr_table[… + <b>K_CACHE</b>] = k_alias.data_ptr()   <span class="muted"># same slot the demo fills</span></code></pre>
@@ -373,7 +373,7 @@ ptr_table[… + <b>K_CACHE</b>] = k_alias.data_ptr()   <span class="muted"># sam
 <div class="two" style="gap:20px;margin-top:11px">
 <div>
 <div class="box warn" style="margin:0">
-<span class="lbl">The price: one vLLM block = one Titan page</span>
+<span class="lbl">The price: one vLLM block = one Fleet MK page</span>
 <p>The engine is launched at <code>block_size = PAGE_SIZE</code>, which also picks the backend: aiter's
 MHA path static_asserts <code>BLOCK_SIZE &lt;= 32</code> — why the ROCm default is 16 — so decode runs
 on the unified path, which stages a page-sized tile in LDS and tops out at 160.</p>
@@ -395,7 +395,7 @@ S("Results", '''
 {FIG13}
 <div class="two">
 <div>
-<p>Titan is substantially faster than stock vLLM on the MoE model, and still behind the dynamic
+<p>Fleet MK is substantially faster than stock vLLM on the MoE model, and still behind the dynamic
 system it is built on — half that gap the price of being a real serving backend, half the kernel's
 barriers.</p>
 <p>The dense model runs the <em>older</em> multi-barrier kernel — the fused pipeline was never
@@ -406,7 +406,7 @@ rebase, placing the regression in the kernel, not the integration.</p>
 <div class="box bad" style="margin:0">
 <span class="lbl">Read this before quoting any of it</span>
 <p><code>enforce_eager</code> is <b>not neutral between the two sides</b>. Stock vLLM's decode is a
-long tail of small launches, so graph capture is most of its performance; Titan's is one launch with
+long tail of small launches, so graph capture is most of its performance; Fleet MK's is one launch with
 nothing to gain. An earlier revision reported a far larger speedup that belonged entirely to a
 handicapped baseline.</p>
 </div>
@@ -481,7 +481,7 @@ boundary — that, not the assembling layer, is the open problem.</p>
 <span class="lbl">Where dynamic is the right answer</span>
 <p>Ragged batches, and <b>sparse attention</b> — which breaks the static argument even at batch size 1,
 because the block count per step is genuinely data-dependent. Also any tile shape nobody has
-written: Titan rejects those at validate time rather than running them slowly, which is correct
+written: Fleet MK rejects those at validate time rather than running them slowly, which is correct
 behaviour and also the honest limit of a static system.</p>
 </div>
 </div>
@@ -563,7 +563,7 @@ S("Related work", '''
 <span class="lbl">The axis, stated carefully</span>
 <p>All four call a hand-written device library — <b>that is not the distinction</b>. The axis is
 <b>who decides the work assignment, and when</b>. Hazy and MPK decide at runtime; Kog at compile
-time by hand, per model. Titan decides at compile time and <b>generates that decision from a model
+time by hand, per model. Fleet MK decides at compile time and <b>generates that decision from a model
 description</b> — which makes the static choice reusable instead of bespoke.</p>
 </div>
 ''')
@@ -589,13 +589,13 @@ file instead of a search, at no cost in performance.</p>
 <div class="box warn" style="margin:12px 0;padding:11px 17px">
 <span class="lbl">3 — Static is a trade, and the price is legible</span>
 <p style="margin:0;font-size:17px">Deleting the launches deletes the free ordering they provided,
-and the barriers that replace it are the largest thing Titan adds. We report that next to the
+and the barriers that replace it are the largest thing Fleet MK adds. We report that next to the
 speedup, with the negative results that produced the design.</p>
 </div>
 
 <hr class="rule" style="margin:12px 0 6px">
 <p class="cite" style="margin:0">Engineering reference — repository shape, reproduction commands,
-every measurement: <a href="titan-architecture.html"><code>titan-architecture.html</code></a>.
+every measurement: <a href="fleet-mk-architecture.html"><code>fleet-mk-architecture.html</code></a>.
 &nbsp;·&nbsp; Sources —
 <a href="https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles">Hazy Research megakernel</a> ·
 <a href="https://arxiv.org/abs/2512.22219">MPK, arXiv:2512.22219</a> ·

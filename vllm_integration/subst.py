@@ -7,7 +7,7 @@ time. Each substitution must leave the emitter byte-identical to its target.
 
 This driver makes that loop safe:
   * edits are confined to ONE function's body, so a literal like `64` cannot
-    accidentally be rewritten somewhere else in titan_generate.py;
+    accidentally be rewritten somewhere else in fleet_mk_generate.py;
   * every `old` must occur an exact expected number of times -- a count that
     drifted means the substitution is hitting something it should not;
   * the round-trip gate runs after the write, and the file is restored if it
@@ -29,7 +29,7 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-GEN = os.path.join(REPO, "titan_generate.py")
+GEN = os.path.join(REPO, "fleet_mk_generate.py")
 
 
 def function_span(text, name):
@@ -103,7 +103,7 @@ def main():
     if after == before:
         raise SystemExit("REFUSED: substitution changed nothing.")
 
-    backup = tempfile.mktemp(suffix=".titan_generate.py")
+    backup = tempfile.mktemp(suffix=".fleet_mk_generate.py")
     shutil.copy2(GEN, backup)
     with open(GEN, "w", encoding="utf-8") as f:
         f.write(after)

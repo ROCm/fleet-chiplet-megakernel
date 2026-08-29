@@ -4,7 +4,7 @@
 The N stride is the last of the three "somebody else wrote this buffer" knobs,
 after row_stride_blocks (K pitch) and split_scales (section layout). It makes
 one expert occupy MORE rows in the data section than the kernel computes, so
-titan can step experts by vLLM's 6144/3072 pitch while its tiles still cover
+fleet_mk can step experts by vLLM's 6144/3072 pitch while its tiles still cover
 5888/2944.
 
 Four properties, in increasing strength:
@@ -14,7 +14,7 @@ Four properties, in increasing strength:
      check_pack_stride.py and check_pack_split.py enforce for their knobs.
   2. The DATA section grows by exactly the pad rows and the SCALE section does
      not grow at all. This is the asymmetry that makes the knob safe: scales
-     keep titan's own row count because in split mode the two sections have
+     keep fleet_mk's own row count because in split mode the two sections have
      different writers by construction. If the scale section grew, the kernel's
      W13_EXPERT_SCALE_BYTES (which deliberately keeps WGS, not N_STRIDE) would
      be reading the wrong expert.
@@ -42,7 +42,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from titan_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
+from fleet_megakernel_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
 
 
 def _say(label, cond):
@@ -127,7 +127,7 @@ def check_rejects():
     ok = True
 
     # A foreign expert pitch implies a foreign buffer, which cannot carry
-    # titan's interleaved scales.
+    # fleet_mk's interleaved scales.
     try:
         pack_mxfp4_workgroup(blocks, scales, output_per_wg=64,
                              out_stride_rows=384)
@@ -148,7 +148,7 @@ def check_rejects():
 
 def main():
     # Real GPT-OSS 120B geometry, E cut to 2 experts (packing is per-expert, so
-    # the count does not change what is tested). Titan computes 5888/2944 rows;
+    # the count does not change what is tested). Fleet MK computes 5888/2944 rows;
     # vLLM stores 6144/3072. 90 true blocks -> 92 reduced (2944) -> 96 strided
     # (3072, vLLM's K pitch).
     ok = True

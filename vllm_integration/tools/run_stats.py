@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a titan_vllm harness/bench log: per-token timing, footprint, output.
+"""Summarize a fleet_megakernel_vllm harness/bench log: per-token timing, footprint, output.
 
 Every step of the single-copy weight-sourcing work has to be compared against a
 baseline on three axes -- latency, memory footprint, and generated text -- so
@@ -21,9 +21,9 @@ import statistics
 import sys
 
 TIME_RE = re.compile(
-    r"\[TITAN_TIME\]\s+embed=([\d.]+)us\s+layers=([\d.]+)us\s+"
+    r"\[FLEET_MK_TIME\]\s+embed=([\d.]+)us\s+layers=([\d.]+)us\s+"
     r"tail=([\d.]+)us\s+total=([\d.]+)us")
-MEM_RE = re.compile(r"\[TITAN_MEM\] (.+?):\s+(.*)")
+MEM_RE = re.compile(r"\[FLEET_MK_MEM\] (.+?):\s+(.*)")
 IDS_RE = re.compile(r"generated token ids =====\n\[(.*?)\]", re.S)
 TEXT_RE = re.compile(r"===== \[\w+\] text =====\n(.*?)(?:\nINFO |\Z)", re.S)
 
@@ -58,7 +58,7 @@ def parse(path):
 def report(r):
     print(f"=== {r['path']} ===")
     if not r["rows"]:
-        print("  no [TITAN_TIME] lines -- kernel timing not enabled or run died")
+        print("  no [FLEET_MK_TIME] lines -- kernel timing not enabled or run died")
     else:
         totals = [x[3] for x in r["rows"]]
         kept, dropped = _trim_outliers(totals)

@@ -1,20 +1,20 @@
-"""Attribute titan's per-decode-token time under vLLM to specific GPU kernels.
+"""Attribute fleet_mk's per-decode-token time under vLLM to specific GPU kernels.
 
 `bench.py` says *how much* a decode token costs end-to-end; this says *where* it
 goes. The gap it exists to explain: the megakernel's own GPU time is ~2.38 ms
-(TITAN_PROFILE=1) against ~3.21 ms end-to-end, so ~0.83 ms/token is everything
+(FLEET_MK_PROFILE=1) against ~3.21 ms end-to-end, so ~0.83 ms/token is everything
 else -- vLLM's bf16 lm_head, the sampler, the scheduler, and host round-trips.
 Guessing which of those dominates is exactly the mistake this repo keeps paying
 for, so: profile it.
 
-  VLLM_PLUGINS=titan TITAN_MODEL=... python -m titan_vllm.profile_step
+  VLLM_PLUGINS=fleet_mk FLEET_MK_MODEL=... python -m fleet_megakernel_vllm.profile_step
 
 Reports, per decode token:
   * top GPU kernels by total device time, with the megakernel identified
   * the non-megakernel GPU total -- the part a fused-logits ABI could remove
   * wall time minus GPU time -- host overhead that fusing logits would NOT remove
 
-Writes the raw chrome trace to /tmp/titan_vllm_trace.json for Perfetto.
+Writes the raw chrome trace to /tmp/fleet_megakernel_vllm_trace.json for Perfetto.
 """
 
 import os
@@ -27,7 +27,7 @@ from vllm import LLM, SamplingParams
 
 # The megakernel launches under this name; everything else on the decode stream
 # is vLLM's own work (lm_head GEMV, sampler elementwise, KV bookkeeping).
-_MEGAKERNEL_HINTS = ("gpt_oss", "qwen3", "llama3", "titan", "megakernel")
+_MEGAKERNEL_HINTS = ("gpt_oss", "qwen3", "llama3", "fleet_mk", "megakernel")
 
 
 def _is_megakernel(name):
@@ -35,8 +35,8 @@ def _is_megakernel(name):
     return any(h in low for h in _MEGAKERNEL_HINTS)
 
 
-def _titan_page_size(model):
-    from titan_vllm.spec import load_spec
+def _fleet_mk_page_size(model):
+    from fleet_megakernel_vllm.spec import load_spec
     name = model.lower()
     arch = ("GptOssForCausalLM" if "gpt-oss" in name or "gpt_oss" in name
             else "Qwen3ForCausalLM")
@@ -44,20 +44,20 @@ def _titan_page_size(model):
 
 
 def main():
-    model = os.environ.get("TITAN_MODEL", "Qwen/Qwen3-8B")
-    prompt = os.environ.get("TITAN_PROMPT", "Tell me the history of America.")
+    model = os.environ.get("FLEET_MK_MODEL", "Qwen/Qwen3-8B")
+    prompt = os.environ.get("FLEET_MK_PROMPT", "Tell me the history of America.")
     n_tokens = int(os.environ.get("PROFILE_TOKENS", "64"))
-    titan_on = bool(os.environ.get("VLLM_PLUGINS"))
-    # Graph capture must be OFF: titan cannot be captured today (the .item()
+    fleet_mk_on = bool(os.environ.get("VLLM_PLUGINS"))
+    # Graph capture must be OFF: fleet_mk cannot be captured today (the .item()
     # host syncs in mixin.forward), and a captured graph would also collapse the
     # per-kernel attribution this script exists to produce.
     llm_kwargs = dict(model=model, max_num_seqs=1, enforce_eager=True,
                       max_model_len=2048, dtype="bfloat16")
-    if titan_on:
+    if fleet_mk_on:
         os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
         os.environ.setdefault("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "1")
         llm_kwargs["block_size"] = int(
-            os.environ.get("TITAN_BLOCK_SIZE", str(_titan_page_size(model))))
+            os.environ.get("FLEET_MK_BLOCK_SIZE", str(_fleet_mk_page_size(model))))
         llm_kwargs["disable_hybrid_kv_cache_manager"] = True
 
     llm = LLM(**llm_kwargs)
@@ -99,7 +99,7 @@ def main():
     n_short = int(os.environ.get("PROFILE_SHORT", "8"))
     w_short, k_short, _ = run(n_short)
     w_long, k_long, prof = run(n_tokens)
-    prof.export_chrome_trace("/tmp/titan_vllm_trace.json")
+    prof.export_chrome_trace("/tmp/fleet_megakernel_vllm_trace.json")
 
     steps = n_tokens - n_short
     by_kernel = {}
@@ -113,7 +113,7 @@ def main():
     mega = sum(v for k, v in by_kernel.items() if _is_megakernel(k))
     other = total_gpu - mega
 
-    label = "titan" if titan_on else "stock"
+    label = "fleet_mk" if fleet_mk_on else "stock"
     print(f"\n===== [{label}] per-decode-token GPU attribution =====")
     print(f"prefill-cancelled     : {n_short} vs {n_tokens} tokens ({steps} steps)")
     print(f"wall (PROFILED, high) : {wall_pt:8.3f} ms/token")
@@ -132,7 +132,7 @@ def main():
         tag = "  [MEGAKERNEL]" if _is_megakernel(k) else ""
         print(f"{v:8.3f}  {k[:88]}{tag}")
 
-    print("\ntrace: /tmp/titan_vllm_trace.json (open in Perfetto)")
+    print("\ntrace: /tmp/fleet_megakernel_vllm_trace.json (open in Perfetto)")
 
 
 if __name__ == "__main__":

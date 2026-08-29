@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Assemble docs/titan-talk.html from head.py + slides.py + the doc's figures.
+"""Assemble docs/fleet-mk-talk.html from head.py + slides.py + the doc's figures.
 
     python3 build.py && python3 check_fit.py && \
-      python3 ../validate_doc.py ../../titan-talk.html
+      python3 ../validate_doc.py ../../fleet-mk-talk.html
 
 Reusable: edit slides.py and re-run. Figures are spliced verbatim out of
-titan-architecture.html by figures.py, so the deck and the document can never
+fleet-mk-architecture.html by figures.py, so the deck and the document can never
 drift; their captions lose the doc's "Figure N." prefix, since a slide has one
 figure and does not need a number.
 """
@@ -17,7 +17,7 @@ from head import HEAD                    # noqa: E402
 from slides import SLIDES                # noqa: E402
 from figures import load as load_figures  # noqa: E402
 
-OUT = os.path.normpath(os.path.join(HERE, "..", "..", "titan-talk.html"))
+OUT = os.path.normpath(os.path.join(HERE, "..", "..", "fleet-mk-talk.html"))
 FIGS = load_figures()
 
 # The doc's captions open with "<b>Figure N.</b> ". On a slide the figure is
@@ -71,12 +71,12 @@ def title_of(body: str) -> str:
     return re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else "Title"
 
 
-idx = ['<div class="index"><h2 style="margin-top:0">Titan — deck contents</h2>\n<ol>']
+idx = ['<div class="index"><h2 style="margin-top:0">Fleet MK — deck contents</h2>\n<ol>']
 idx += ['<li><a href="#s%d">%s</a></li>' % (i, title_of(b))
         for i, (_, b) in enumerate(SLIDES, 1)]
 idx += ['</ol>\n<p class="cite">%d slides, 16:9. Print to PDF at 1120×630. '
-        'Full architecture document: <a href="titan-architecture.html">'
-        'titan-architecture.html</a>.</p></div>\n' % len(SLIDES)]
+        'Full architecture document: <a href="fleet-mk-architecture.html">'
+        'fleet-mk-architecture.html</a>.</p></div>\n' % len(SLIDES)]
 
 html = out[0] + "".join(idx) + "".join(out[1:]) + "</body>\n</html>\n"
 open(OUT, "w").write(html)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check MoeLayout against the standalone driver's arithmetic, knob by knob.
 
-`titan_vllm/moe_layout.py` re-derives, for the vLLM plugin, geometry that
+`fleet_megakernel_vllm/moe_layout.py` re-derives, for the vLLM plugin, geometry that
 `demo_gpt_oss_120b.py` already derives for the standalone driver: K row pitch, N
 expert pitch, section split, workgroup and expert byte strides. Two derivations
 of one layout is exactly the drift pattern that has bitten this tree before --
@@ -59,9 +59,9 @@ def _driver_constants(env):
     ns = {"__name__": "_driver_prologue", "__file__": DRIVER, "os": os}
     old = dict(os.environ)
     try:
-        for k in ("TITAN_MOE_K_STRIDE", "TITAN_MOE_SPLIT_SCALES",
-                  "TITAN_MOE_N_STRIDE", "TITAN_MOE_SPLIT_BUFFERS",
-                  "TITAN_MOE_ALIAS_VLLM"):
+        for k in ("FLEET_MK_MOE_K_STRIDE", "FLEET_MK_MOE_SPLIT_SCALES",
+                  "FLEET_MK_MOE_N_STRIDE", "FLEET_MK_MOE_SPLIT_BUFFERS",
+                  "FLEET_MK_MOE_ALIAS_VLLM"):
             os.environ.pop(k, None)
         os.environ.update(env)
         exec(compile(src[:cut], DRIVER, "exec"), ns)
@@ -79,11 +79,11 @@ class _FakeSpec:
 
 def _layout(env):
     """A MoeLayout built under `env`, importing fresh so module state cannot leak."""
-    from titan_vllm.moe_layout import MoeLayout
+    from fleet_megakernel_vllm.moe_layout import MoeLayout
     old = dict(os.environ)
     try:
-        for k in ("TITAN_MOE_K_STRIDE", "TITAN_MOE_SPLIT_SCALES",
-                  "TITAN_MOE_N_STRIDE", "TITAN_MOE_ALIAS_VLLM"):
+        for k in ("FLEET_MK_MOE_K_STRIDE", "FLEET_MK_MOE_SPLIT_SCALES",
+                  "FLEET_MK_MOE_N_STRIDE", "FLEET_MK_MOE_ALIAS_VLLM"):
             os.environ.pop(k, None)
         os.environ.update(env)
         return MoeLayout(_FakeSpec())
@@ -172,7 +172,7 @@ def check(tag, env):
 #: The shapes read transposed and the strides are why: the middle axis has
 #: stride 1 and the last has stride 1536, so these are transposed *views* over
 #: `[E, rows, 1536]` row-major storage -- 6144 rows for w13, 3072 for w2. A
-#: linear reader sees titan's own order. Recorded as literals rather than
+#: linear reader sees fleet_mk's own order. Recorded as literals rather than
 #: re-derived so this stays a comparison against a measurement.
 VLLM_EXPERT_BYTES = {"w13": 9437184, "w2": 4718592}
 
@@ -180,18 +180,18 @@ VLLM_EXPERT_BYTES = {"w13": 9437184, "w2": 4718592}
 def check_against_vllm():
     """The aliased layout's expert pitch must equal vLLM's actual allocation stride.
 
-    Every other check in this file compares titan against titan: the plugin's
+    Every other check in this file compares fleet_mk against fleet_mk: the plugin's
     layout against the driver's arithmetic. Both could agree and both be wrong
     about the buffer they are aliasing, and the symptom would be reading real
     weight bytes at a drifting expert offset -- fluent output from the wrong
     expert, worse for later experts than earlier ones.
 
-    This is the one check with an external referent. If it passes, titan's
+    This is the one check with an external referent. If it passes, fleet_mk's
     addressing walks vLLM's buffer expert-for-expert.
     """
     print("--- vs vLLM's measured storage")
-    lay = _layout({"TITAN_MOE_K_STRIDE": "3072", "TITAN_MOE_SPLIT_SCALES": "1",
-                   "TITAN_MOE_N_STRIDE": "3072", "TITAN_MOE_ALIAS_VLLM": "1"})
+    lay = _layout({"FLEET_MK_MOE_K_STRIDE": "3072", "FLEET_MK_MOE_SPLIT_SCALES": "1",
+                   "FLEET_MK_MOE_N_STRIDE": "3072", "FLEET_MK_MOE_ALIAS_VLLM": "1"})
     ok = True
     for which, want in VLLM_EXPERT_BYTES.items():
         got = _expert_bytes(lay, which)
@@ -213,23 +213,23 @@ def check_rejects():
     """The layout must refuse combinations the kernel cannot honour.
 
     Each of these is silent if it gets through: a foreign pitch without the
-    split reads titan's interleaved scales at vLLM's row spacing, and aliasing
+    split reads fleet_mk's interleaved scales at vLLM's row spacing, and aliasing
     without the pitches points the kernel at vLLM's memory while addressing it
-    as titan's.
+    as fleet_mk's.
     """
     print("--- rejects")
     cases = [
-        ("N stride without split", dict(TITAN_MOE_N_STRIDE="3072")),
-        ("alias without any knobs", dict(TITAN_MOE_ALIAS_VLLM="1")),
-        ("alias without N stride", dict(TITAN_MOE_ALIAS_VLLM="1",
-                                        TITAN_MOE_SPLIT_SCALES="1",
-                                        TITAN_MOE_K_STRIDE="3072")),
-        ("alias without K stride", dict(TITAN_MOE_ALIAS_VLLM="1",
-                                        TITAN_MOE_SPLIT_SCALES="1",
-                                        TITAN_MOE_N_STRIDE="3072")),
+        ("N stride without split", dict(FLEET_MK_MOE_N_STRIDE="3072")),
+        ("alias without any knobs", dict(FLEET_MK_MOE_ALIAS_VLLM="1")),
+        ("alias without N stride", dict(FLEET_MK_MOE_ALIAS_VLLM="1",
+                                        FLEET_MK_MOE_SPLIT_SCALES="1",
+                                        FLEET_MK_MOE_K_STRIDE="3072")),
+        ("alias without K stride", dict(FLEET_MK_MOE_ALIAS_VLLM="1",
+                                        FLEET_MK_MOE_SPLIT_SCALES="1",
+                                        FLEET_MK_MOE_N_STRIDE="3072")),
         ("N stride below the computed rows",
-         dict(TITAN_MOE_SPLIT_SCALES="1", TITAN_MOE_N_STRIDE="2048")),
-        ("K stride not a multiple of 32", dict(TITAN_MOE_K_STRIDE="3000")),
+         dict(FLEET_MK_MOE_SPLIT_SCALES="1", FLEET_MK_MOE_N_STRIDE="2048")),
+        ("K stride not a multiple of 32", dict(FLEET_MK_MOE_K_STRIDE="3000")),
     ]
     ok = True
     for label, env in cases:
@@ -242,7 +242,7 @@ def check_rejects():
 
 
 def main():
-    K, S, N = "TITAN_MOE_K_STRIDE", "TITAN_MOE_SPLIT_SCALES", "TITAN_MOE_N_STRIDE"
+    K, S, N = "FLEET_MK_MOE_K_STRIDE", "FLEET_MK_MOE_SPLIT_SCALES", "FLEET_MK_MOE_N_STRIDE"
     ok = True
     ok &= check("default", {})
     ok &= check("kstride", {K: "3072"})
@@ -250,7 +250,7 @@ def main():
     ok &= check("kstride+split", {K: "3072", S: "1"})
     ok &= check("all", {K: "3072", S: "1", N: "3072"})
     ok &= check("alias", {K: "3072", S: "1", N: "3072",
-                          "TITAN_MOE_ALIAS_VLLM": "1"})
+                          "FLEET_MK_MOE_ALIAS_VLLM": "1"})
     ok &= check_against_vllm()
     ok &= check_rejects()
     print("PASS" if ok else "FAIL")

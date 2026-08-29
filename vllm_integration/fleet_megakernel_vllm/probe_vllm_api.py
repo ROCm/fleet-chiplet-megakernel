@@ -1,16 +1,16 @@
-"""Probe the installed vLLM for every API seam titan_vllm depends on.
+"""Probe the installed vLLM for every API seam fleet_megakernel_vllm depends on.
 
 The plugin touches vLLM in about a dozen places -- a model registry, a plugin
 entry point, three model methods it overrides, the forward-context attention
 metadata, and the KV cache layout. Each of those is an independent way a version
 bump can break, and the failure mode for most of them is *not* an import error:
 a renamed `compute_logits` parameter or a moved `block_table` silently falls
-through to the stock path and you measure vLLM, not titan.
+through to the stock path and you measure vLLM, not fleet_mk.
 
 So enumerate them explicitly and print a table, rather than discovering them one
 traceback at a time. Run this against any candidate vLLM before porting:
 
-    python -m titan_vllm.probe_vllm_api
+    python -m fleet_megakernel_vllm.probe_vllm_api
 
 Prints one line per seam: OK / MISSING / CHANGED, with the observed signature.
 Exit code is the number of non-OK seams, so it works as a CI gate.
@@ -177,7 +177,7 @@ def main():
            "vllm.v1.attention.backends.rocm_aiter_unified_attn",
            "RocmAiterUnifiedAttentionBackend", "get_kv_cache_shape")
 
-    # -- Attention module: where titan reads the KV tensor from ---------------
+    # -- Attention module: where fleet_mk reads the KV tensor from ---------------
     # Moved vllm.attention -> vllm.model_executor.layers.attention in 0.27.x.
     p.any_of("Attention",
              [("vllm.attention", "Attention"),
@@ -186,7 +186,7 @@ def main():
     # -- attention metadata fields the mixin reads ----------------------------
     # forward() gates on max_query_len and indexes block_table. If either is
     # renamed the gate silently sends every decode down the stock path -- you
-    # get correct output and titan never runs, which benchmarks as a
+    # get correct output and fleet_mk never runs, which benchmarks as a
     # "regression" with no error anywhere.
     p.metadata_fields("RocmAttentionMetadata",
                       "vllm.v1.attention.backends.rocm_attn",

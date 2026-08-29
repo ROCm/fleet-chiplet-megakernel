@@ -1,4 +1,4 @@
-/* Titan: Barrier primitives for 8-phase fused transformer layer
+/* Fleet MK: Barrier primitives for 8-phase fused transformer layer
  *
  * Extracted from mirage's gang_full_layer_fused_mi300.cuh and adapted
  * as standalone reusable barrier functions.
@@ -18,7 +18,7 @@
 #pragma once
 #include "common.cuh"
 
-namespace titan {
+namespace fleet_mk {
 
 // Counter buffer slot offsets (matching mirage's gang_full_layer_fused_mi300.cuh)
 // Slots 0..17: oproj HierBarrier (xcd_arrive[0..7], global_arrive, xcd_release[0..7], topk_counter)
@@ -226,4 +226,4 @@ inter_layer_fence(int tid) {
   asm volatile("buffer_inv" ::: "memory");
 }
 
-} // namespace titan
+} // namespace fleet_mk

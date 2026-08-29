@@ -1,7 +1,7 @@
-"""MXFP4 quantize/pad/pack primitives -- titan's own copy.
+"""MXFP4 quantize/pad/pack primitives -- fleet_mk's own copy.
 
 Vendored verbatim from mirage's `demo/gpt_oss/demo.py` (functions `pad_weight_1d`,
-`pad_weight_2d`, `quantize_bf16_to_mxfp4`, `pack_mxfp4_workgroup`) so titan_vllm
+`pad_weight_2d`, `quantize_bf16_to_mxfp4`, `pack_mxfp4_workgroup`) so fleet_megakernel_vllm
 has no Python import dependency on the mirage checkout. Previously these were
 pulled at runtime through `_load_gptoss_demo_module`, which executed mirage's demo
 module -- dragging in its model code and its `sys.path` insert -- purely to reach
@@ -15,7 +15,7 @@ re-verify with `tools/hash_packed.py`, which hashes every packed slot.
 
 Layout note for `pack_mxfp4_workgroup`: per workgroup the slab holds
 `OPW x K_half` data bytes immediately followed by `OPW x num_blocks` scale bytes,
-so `wg_bytes = OPW*K_half + OPW*num_blocks`. That interleaving is why titan cannot
+so `wg_bytes = OPW*K_half + OPW*num_blocks`. That interleaving is why fleet_mk cannot
 simply point at vLLM's two separate plain tensors -- see the wiki article on
 single-copy weight sourcing. `split_scales=True` removes the interleave (all data,
 then all scales) and is the step that makes aliasing possible; it must be matched
@@ -170,9 +170,9 @@ def pack_mxfp4_workgroup(blocks: torch.Tensor, scales: torch.Tensor,
             to target_out_dim, i.e. experts packed exactly as tall as the kernel
             computes. Set it taller to reproduce a buffer someone else padded on
             the OUTPUT axis (vLLM stores GPT-OSS experts 6144/3072 rows apart
-            while titan computes 5888/2944) -- see MPK_MOE_N_STRIDE. Requires
+            while fleet_mk computes 5888/2944) -- see MPK_MOE_N_STRIDE. Requires
             split_scales, and like row_stride_blocks it moves ONLY the data
-            section: the scale section keeps titan's own row count, because in
+            section: the scale section keeps fleet_mk's own row count, because in
             split mode the two sections have different writers by construction.
         split_scales: emit ALL data followed by ALL scales, instead of
             interleaving them per workgroup. Must match the MoE kernel's
@@ -183,7 +183,7 @@ def pack_mxfp4_workgroup(blocks: torch.Tensor, scales: torch.Tensor,
             "data", or "scales". Requires split_scales, since the sections are
             only separable once the interleave is gone.
 
-            "scales" exists so titan can build a scale-only slab for a data
+            "scales" exists so fleet_mk can build a scale-only slab for a data
             section it does NOT own: when the data pointer aliases vLLM's
             w13_weight/w2_weight, packing the data bytes would materialize a
             second 60 GiB copy of the very thing being aliased, defeating the
@@ -263,7 +263,7 @@ def pack_mxfp4_workgroup(blocks: torch.Tensor, scales: torch.Tensor,
     if out_stride_rows is not None:
         assert split_scales, (
             "out_stride_rows describes a foreign expert pitch, which implies a "
-            "foreign buffer; that buffer cannot also carry titan's per-workgroup "
+            "foreign buffer; that buffer cannot also carry fleet_mk's per-workgroup "
             "interleaved scales. Pass split_scales=True.")
         assert out_stride_rows >= out_dim, (
             f"expert pitch {out_stride_rows} rows is shorter than the {out_dim} "

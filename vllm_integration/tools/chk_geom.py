@@ -1,9 +1,9 @@
 import torch, sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from titan_vllm.mxfp4_pack import pack_mxfp4_workgroup
+from fleet_megakernel_vllm.mxfp4_pack import pack_mxfp4_workgroup
 
 E, OUT, NB, OPW = 4, 5760, 90, 128        # w13: 2*2880 rows, 2880/32 blocks
-TGT_OUT, TGT_NB = 5888, 92                # titan pads to 2944
+TGT_OUT, TGT_NB = 5888, 92                # fleet_mk pads to 2944
 K_STRIDE_BLK, N_STRIDE_ROWS = 96, 6144    # the K+N config
 
 blocks = torch.zeros(E, OUT, NB, 16, dtype=torch.uint8)

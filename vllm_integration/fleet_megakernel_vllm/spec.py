@@ -1,4 +1,4 @@
-"""ModelSpec: the single per-model source of truth for the titan vLLM adapter.
+"""ModelSpec: the single per-model source of truth for the fleet_mk vLLM adapter.
 
 `load_spec(vllm_arch)` returns a `ModelSpec` carrying everything the
 model-agnostic machinery (buffers, pointer table, decode ABI) needs to vary per
@@ -21,7 +21,7 @@ generator work already fixed twice: a constant maintained in two places drifts,
 and the drift surfaces as garbage output rather than an error. A *schema*
 maintained in two places drifts the same way.
 
-So the spec is now built from `titan_generate.load_and_validate()` -- the exact
+So the spec is now built from `fleet_mk_generate.load_and_validate()` -- the exact
 function that emits the kernel. Whatever the YAML says, whatever derivation
 rules apply, the plugin sees precisely what the compiled `.cuh` was generated
 from, because it is the same object. Renaming a YAML key can no longer break
@@ -49,23 +49,23 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-_TITAN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CONFIG_DIR = os.path.join(_TITAN_ROOT, "configs")
-_GENERATED_DIR = os.path.join(_TITAN_ROOT, "generated")
+_FLEET_MK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CONFIG_DIR = os.path.join(_FLEET_MK_ROOT, "configs")
+_GENERATED_DIR = os.path.join(_FLEET_MK_ROOT, "generated")
 
 
 def _load_cfg(config_stem):
     """Parse configs/<stem>.yaml through the generator's own loader.
 
-    Imported lazily and with the titan root on sys.path: titan_generate.py lives
+    Imported lazily and with the fleet_mk root on sys.path: fleet_mk_generate.py lives
     at the repo root, not in this package, and importing it at module scope would
-    make `import titan_vllm` depend on cwd.
+    make `import fleet_megakernel_vllm` depend on cwd.
     """
-    if _TITAN_ROOT not in sys.path:
-        sys.path.insert(0, _TITAN_ROOT)
-    import titan_generate
+    if _FLEET_MK_ROOT not in sys.path:
+        sys.path.insert(0, _FLEET_MK_ROOT)
+    import fleet_mk_generate
 
-    return titan_generate.load_and_validate(
+    return fleet_mk_generate.load_and_validate(
         os.path.join(_CONFIG_DIR, f"{config_stem}.yaml"))
 
 
@@ -73,14 +73,14 @@ def _qkv_barrier_slot():
     """SLOT_QKV_BARRIER as an int offset, from the generator's region list.
 
     Same reason as `_load_cfg`: this offset is a running sum over
-    `titan_generate.COUNTER_REGIONS`, and re-declaring it here would let it drift
+    `fleet_mk_generate.COUNTER_REGIONS`, and re-declaring it here would let it drift
     silently -- a wrong value does not crash, it corrupts a live barrier.
     """
-    if _TITAN_ROOT not in sys.path:
-        sys.path.insert(0, _TITAN_ROOT)
-    import titan_generate
+    if _FLEET_MK_ROOT not in sys.path:
+        sys.path.insert(0, _FLEET_MK_ROOT)
+    import fleet_mk_generate
 
-    return titan_generate.counter_slots()["SLOT_QKV_BARRIER_NEW"][0] * 16
+    return fleet_mk_generate.counter_slots()["SLOT_QKV_BARRIER_NEW"][0] * 16
 
 
 def _mirage_ptr_counts():
@@ -92,11 +92,11 @@ def _mirage_ptr_counts():
     too large shifts every subsequent layer's base. Neither faults -- both produce
     wrong output from a table that looks well-formed.
     """
-    if _TITAN_ROOT not in sys.path:
-        sys.path.insert(0, _TITAN_ROOT)
-    import titan_generate
+    if _FLEET_MK_ROOT not in sys.path:
+        sys.path.insert(0, _FLEET_MK_ROOT)
+    import fleet_mk_generate
 
-    return len(titan_generate.MIRAGE_IN), len(titan_generate.MIRAGE_OUT)
+    return len(fleet_mk_generate.MIRAGE_IN), len(fleet_mk_generate.MIRAGE_OUT)
 
 
 @dataclass
@@ -157,7 +157,7 @@ class ModelSpec:
     # Cache-line ints the kernel addresses PAST the per-layer blocks and the
     # rank-counter block, with absolute offsets. Dense needs none; the MoE kernel
     # needs a decode-iter line, the embed barrier (1 global + num_xcds per-XCD),
-    # and slack for the TITAN_ILB_TIMING probe. See TitanBuffers for the map.
+    # and slack for the FLEET_MK_ILB_TIMING probe. See FleetMKBuffers for the map.
     counter_tail_ints: int
     # Int offset of the per-XCD QKV barrier WITHIN a layer's counter block. The
     # MoE pointer table passes it as input_ptrs[7], derived from the layer's
@@ -335,7 +335,7 @@ def _moe_spec(cfg, config_stem, so_path):
         # [6]router_w_bf16 [7]router_b [8]gate_up_w [9]down_w [10]w13_bias
         # [11]w2_bias [12]attn_sinks. K/V are aliased zero-copy from vLLM.
         weights_per_layer=13,
-        # 24 in + 11 out + 1 trailing layer_output, read from titan_generate's
+        # 24 in + 11 out + 1 trailing layer_output, read from fleet_mk_generate's
         # MIRAGE_IN / MIRAGE_OUT tables -- the same lists that emit the kernel's
         # MIRAGE_IN_COUNT / MIRAGE_OUT_COUNT. NOT cfg.ptrs_in/ptrs_out (19/12):
         # those are the dense counts and are vestigial for MoE.
@@ -345,7 +345,7 @@ def _moe_spec(cfg, config_stem, so_path):
         counters_per_layer=cfg.counters_per_layer,
         # 16 decode-iter + (1 + num_xcds)*16 embed barrier + 20*16 ILB slack,
         # matching demo_gpt_oss_120b.py. The ILB slack is always allocated so a
-        # TITAN_ILB_TIMING build needs no Python change; it costs 1.3 KB.
+        # FLEET_MK_ILB_TIMING build needs no Python change; it costs 1.3 KB.
         counter_tail_ints=16 + (1 + cfg.num_xcds) * 16 + 20 * 16,
         slot_qkv_barrier=_qkv_barrier_slot(),
         timing_slots_per_layer=14,
@@ -385,14 +385,14 @@ def supported_arches():
 def load_spec(vllm_arch):
     """Build the ModelSpec for a vLLM architecture name.
 
-    TITAN_SO overrides the .so path; otherwise generated/<default>.so.
+    FLEET_MK_SO overrides the .so path; otherwise generated/<default>.so.
     """
     if vllm_arch not in _REGISTRY:
         raise KeyError(
-            f"no titan spec for vLLM arch {vllm_arch!r}; "
+            f"no fleet_mk spec for vLLM arch {vllm_arch!r}; "
             f"known: {sorted(_REGISTRY)}")
     config_stem, builder = _REGISTRY[vllm_arch]
     cfg = _load_cfg(config_stem)
     so_path = os.environ.get(
-        "TITAN_SO", os.path.join(_GENERATED_DIR, f"{cfg.name_clean}.so"))
+        "FLEET_MK_SO", os.path.join(_GENERATED_DIR, f"{cfg.name_clean}.so"))
     return builder(cfg, config_stem, so_path)

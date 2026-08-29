@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Anchor-based paragraph editor for titan-architecture.html.
+"""Anchor-based paragraph editor for fleet-mk-architecture.html.
 
 The doc is hand-wrapped at ~95 columns and mixes literal glyphs (x, ->) with
 inline <em>/<strong>/<code>, so exact-string matching against a remembered
@@ -7,7 +7,7 @@ paragraph almost never works. Instead: locate the unique <p> that contains an
 anchor substring, and replace that whole element.
 
     from edit_para import Doc
-    d = Doc('titan-architecture.html')
+    d = Doc('fleet-mk-architecture.html')
     d.replace_p('anchor text inside the paragraph', '<p>new html</p>')
     d.drop_p('anchor text')          # delete the paragraph entirely
     d.save()                          # prints the byte delta

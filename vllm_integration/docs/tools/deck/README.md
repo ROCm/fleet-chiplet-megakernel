@@ -1,13 +1,13 @@
-# Building `titan-talk.html`
+# Building `fleet-mk-talk.html`
 
 The 16-slide researcher deck is **generated**. Do not hand-edit
-`docs/titan-talk.html` — the next build overwrites it. Edit `slides.py`.
+`docs/fleet-mk-talk.html` — the next build overwrites it. Edit `slides.py`.
 
 ```bash
 cd docs/tools/deck
-python3 build.py                          # slides.py + head.py + doc figures -> titan-talk.html
+python3 build.py                          # slides.py + head.py + doc figures -> fleet-mk-talk.html
 python3 check_fit.py                      # does every slide fit on one 1120x630 page?
-python3 ../validate_doc.py ../../titan-talk.html
+python3 ../validate_doc.py ../../fleet-mk-talk.html
 python3 deck_text.py | less               # read the whole deck as plain text
 ```
 
@@ -19,15 +19,15 @@ chainable with `&&`.
 |---|---|
 | `slides.py` | `SLIDES`: 16 `(tag, html)` pairs. `{FIGn}` splices in figure *n* of the architecture doc. **This is the only file with content in it.** |
 | `head.py` | `HEAD`: the standalone `<style>` and the shared SVG `<defs>`. |
-| `figures.py` | Extracts the figures out of `titan-architecture.html`. Run it alone to list them. |
-| `build.py` | Assembles the three into `docs/titan-talk.html`. |
+| `figures.py` | Extracts the figures out of `fleet-mk-architecture.html`. Run it alone to list them. |
+| `build.py` | Assembles the three into `docs/fleet-mk-talk.html`. |
 | `check_fit.py` | Estimates rendered slide height. There is no headless renderer on this box. |
 | `deck_text.py` | Tag-stripped dump for proof-reading. |
 
 ## Things that will bite you
 
 - **Figures are shared with the document, not copied.** `figures.py` reads them
-  out of `titan-architecture.html` at build time, so the two can never drift —
+  out of `fleet-mk-architecture.html` at build time, so the two can never drift —
   but a figure edit in the doc silently changes the deck, and figures are
   numbered **positionally**, so inserting one in the doc repoints every
   `{FIGn}` above it. `build.py` prints which figures it used; check that list.

@@ -1,19 +1,19 @@
-"""Decode-latency benchmark: titan vs stock vLLM (Qwen3-8B, greedy).
+"""Decode-latency benchmark: fleet_mk vs stock vLLM (Qwen3-8B, greedy).
 
 Measures per-decode-token latency with a prefill-cancelling method: time
 generate() for a short and a long output of the SAME prompt, then
   ms/token = 1000 * (T_long - T_short) / (N_long - N_short)
 so the (identical) prefill + fixed call overhead cancels out.
 
-  VLLM_PLUGINS=       python -m titan_vllm.bench   # stock baseline
-  VLLM_PLUGINS=titan  python -m titan_vllm.bench   # titan decode
+  VLLM_PLUGINS=       python -m fleet_megakernel_vllm.bench   # stock baseline
+  VLLM_PLUGINS=fleet_mk  python -m fleet_megakernel_vllm.bench   # fleet_mk decode
 """
 
 import os
 
 # MUST precede `from vllm import ...` -- vLLM resolves the ROCm attention backend at
 # import time. See harness.py for the full rationale. Unconditional so the stock
-# baseline runs the SAME attention backend as titan; otherwise the A/B silently
+# baseline runs the SAME attention backend as fleet_mk; otherwise the A/B silently
 # compares two different attention implementations, not two decode paths.
 os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
 os.environ.setdefault("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "1")
@@ -23,9 +23,9 @@ import time  # noqa: E402
 from vllm import LLM, SamplingParams  # noqa: E402
 
 
-def _titan_page_size(model):
-    """titan PAGE_SIZE (== required vLLM block_size) for the selected model."""
-    from titan_vllm.spec import load_spec
+def _fleet_mk_page_size(model):
+    """fleet_mk PAGE_SIZE (== required vLLM block_size) for the selected model."""
+    from fleet_megakernel_vllm.spec import load_spec
     name = model.lower()
     arch = ("GptOssForCausalLM" if "gpt-oss" in name or "gpt_oss" in name
             else "Qwen3ForCausalLM")
@@ -35,9 +35,9 @@ def _titan_page_size(model):
 def _custom_attention_backend():
     """AttentionBackendEnum.CUSTOM, or None on a vLLM without the registry.
 
-    Mirrors harness.py. Without this, a 0.27.x titan run silently falls back to
+    Mirrors harness.py. Without this, a 0.27.x fleet_mk run silently falls back to
     whatever backend the platform picks (TRITON_ATTN here, since aiter does not
-    import under this venv's torch) and binds titan's KV against that backend's
+    import under this venv's torch) and binds fleet_mk's KV against that backend's
     layout -- so the measurement would be of a configuration that never ran
     correctly. 0.11.x has no registry and needs no override; passing the kwarg
     there is a TypeError.
@@ -60,17 +60,17 @@ def _time_generate(llm, text, n_tokens):
 
 
 def main():
-    prompt = os.environ.get("TITAN_PROMPT", "Tell me the history of America.")
-    model = os.environ.get("TITAN_MODEL", "Qwen/Qwen3-8B")
+    prompt = os.environ.get("FLEET_MK_PROMPT", "Tell me the history of America.")
+    model = os.environ.get("FLEET_MK_MODEL", "Qwen/Qwen3-8B")
     n_short = int(os.environ.get("BENCH_SHORT", "8"))
     n_long = int(os.environ.get("BENCH_LONG", "128"))
     reps = int(os.environ.get("BENCH_REPS", "3"))
-    titan_on = bool(os.environ.get("VLLM_PLUGINS"))
+    fleet_mk_on = bool(os.environ.get("VLLM_PLUGINS"))
     # enforce_eager=1 disables hipGraph capture. It used to be hardcoded on, which
     # silently handicapped the stock baseline: stock vLLM's decode is a long tail of
-    # small kernel launches and graph capture is most of its performance. titan's
+    # small kernel launches and graph capture is most of its performance. fleet_mk's
     # decode is ONE megakernel launch, so it has almost nothing to gain -- meaning
-    # eager mode flatters titan by a large factor. Default off; set BENCH_EAGER=1 to
+    # eager mode flatters fleet_mk by a large factor. Default off; set BENCH_EAGER=1 to
     # reproduce the old numbers. Always state which mode a number came from.
     eager = os.environ.get("BENCH_EAGER", "0") == "1"
 
@@ -83,17 +83,17 @@ def main():
         # Same knob harness.py exposes. Without it the default utilization
         # leaves too little room after a 131 GiB 120B load and KV-cache init
         # fails during engine startup -- which looks like a kernel fault in the
-        # log but is a configuration error before any titan code runs.
+        # log but is a configuration error before any fleet_mk code runs.
         gpu_memory_utilization=float(
-            os.environ.get("TITAN_GPU_MEM_UTIL", "0.9")),
+            os.environ.get("FLEET_MK_GPU_MEM_UTIL", "0.9")),
     )
-    if titan_on:
+    if fleet_mk_on:
         # The two AITER env vars are set at module import (vLLM reads them before
         # this runs). Only the vLLM-constructor settings belong here.
         llm_kwargs["block_size"] = int(
-            os.environ.get("TITAN_BLOCK_SIZE", str(_titan_page_size(model))))
+            os.environ.get("FLEET_MK_BLOCK_SIZE", str(_fleet_mk_page_size(model))))
         # Unify hybrid (GPT-OSS sliding+full) layers into one uniform KV-cache group
-        # so titan's single-block-table zero-copy decode reads the right per-layer
+        # so fleet_mk's single-block-table zero-copy decode reads the right per-layer
         # KV. No-op for uniform models (Qwen3). See harness.py for the full rationale.
         llm_kwargs["disable_hybrid_kv_cache_manager"] = True
         # Registration (in plugin.py) is not selection -- the engine must also be
@@ -123,7 +123,7 @@ def main():
     tl = min(long_times)
     steps = n_long - n_short
     ms_per_tok = 1000.0 * (tl - ts) / steps
-    label = "titan" if titan_on else "stock"
+    label = "fleet_mk" if fleet_mk_on else "stock"
 
     print(f"\n===== [{label}] decode latency =====")
     print(f"graph capture         : {'OFF (enforce_eager)' if eager else 'ON'}")

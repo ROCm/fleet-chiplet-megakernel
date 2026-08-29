@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Hash titan's packed weight slots, and diff two such hash dumps.
+"""Hash fleet_mk's packed weight slots, and diff two such hash dumps.
 
-The single-copy weight-sourcing work rewrites *where* titan's weights come from
+The single-copy weight-sourcing work rewrites *where* fleet_mk's weights come from
 (mirage's reference model -> vLLM's live modules) while claiming the packed bytes
 are unchanged. That claim is only worth anything if it is checked mechanically:
 a slot that silently changes produces fluent-but-wrong text, which no amount of
@@ -9,7 +9,7 @@ reading the output catches.
 
 Two modes:
 
-  Dump   -- set TITAN_HASH_PACKED=<path> on a normal harness/bench run. The mixin
+  Dump   -- set FLEET_MK_HASH_PACKED=<path> on a normal harness/bench run. The mixin
             writes one `slot_index<TAB>sha256<TAB>shape<TAB>dtype` line per packed
             tensor, in pointer-table order.
 
@@ -33,7 +33,7 @@ MOE_SLOT_NAMES = [
 def hash_tensors(named_tensors, path):
     """Write `name<TAB>sha256<TAB>shape<TAB>dtype` for each (name, tensor).
 
-    Called from the mixin under TITAN_HASH_PACKED; kept here so the hashing rule
+    Called from the mixin under FLEET_MK_HASH_PACKED; kept here so the hashing rule
     lives next to the diff that consumes it.
     """
     import hashlib
@@ -45,7 +45,7 @@ def hash_tensors(named_tensors, path):
                 f.write(f"{name}\t<none>\t-\t-\n")
                 continue
             c = t.detach().contiguous().cpu()
-            # .numpy() rejects bfloat16 (no numpy dtype), and most titan slots
+            # .numpy() rejects bfloat16 (no numpy dtype), and most fleet_mk slots
             # are bf16 norms/biases. view(uint8) hashes the raw storage bytes,
             # which is what we actually want to compare anyway.
             digest = hashlib.sha256(

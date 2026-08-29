@@ -3,7 +3,7 @@
 Why this exists: after a change like a PAGE_SIZE switch, the question is always
 "did the output change, and does the change mean anything?" -- and eyeballing two
 lists of token ids answers neither. Divergence *position* is not by itself a
-signal, because titan's MoE W2 accumulates 4 experts into workspace_f32 with a
+signal, because fleet_mk's MoE W2 accumulates 4 experts into workspace_f32 with a
 float atomicAdd, whose summation order varies run to run. Two runs of the SAME
 build can therefore diverge, and routinely do.
 
@@ -18,7 +18,7 @@ that is consistently EARLIER than the within-config spread is evidence the
 change altered the computation.
 
 Usage:
-    python -m titan_vllm.compare_runs \\
+    python -m fleet_megakernel_vllm.compare_runs \\
         --group ps128 /tmp/a1.txt /tmp/a2.txt \\
         --group ps16  /tmp/b1.txt /tmp/b2.txt
 
@@ -104,7 +104,7 @@ def main():
     n_tok = min((len(s) for st in groups.values() for _, s in st), default=0)
 
     print("\n=== within-config spread (same build, run to run) ===")
-    print("    This is the noise floor. titan's MoE W2 sums 4 experts with a")
+    print("    This is the noise floor. fleet_mk's MoE W2 sums 4 experts with a")
     print("    float atomicAdd, so summation order -- and thus the last bits of")
     print("    every logit -- varies between runs of one build.")
     for name, streams in groups.items():

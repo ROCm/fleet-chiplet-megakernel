@@ -1,7 +1,7 @@
-## GPT-OSS 120B MoE model configuration for Titan code generator
+## GPT-OSS 120B MoE model configuration for Fleet MK code generator
 ## Source: /home/claudeuser/models/gpt-oss-120b/config.json
 ##
-## Usage: python3 titan_generate.py configs/gpt_oss_120b.yaml
+## Usage: python3 fleet_mk_generate.py configs/gpt_oss_120b.yaml
 
 model:
   name: gpt-oss-120b
@@ -37,11 +37,11 @@ gpu:
   ## page_size and the kernel's PAGE_SIZE must be generated together or KV
   ## addressing is silently wrong.
   ##
-  ## 16 rather than 4096 because titan_vllm aliases vLLM's KV pool zero-copy,
+  ## 16 rather than 4096 because fleet_megakernel_vllm aliases vLLM's KV pool zero-copy,
   ## which requires block_size == PAGE_SIZE, and 16 is vLLM's *default* ROCm
-  ## block size. Running at the default is the point: it means titan binds to a
+  ## block size. Running at the default is the point: it means fleet_mk binds to a
   ## stock-configured engine with no block_size override, rather than requiring
-  ## every caller to know titan's page size.
+  ## every caller to know fleet_mk's page size.
   ##
   ## History: 4096 -> 128 was the first step (vLLM caps block_size at 256,
   ## BlockSize = Literal[1, 8, 16, 32, 64, 128, 256] in vllm/config/cache.py),
@@ -81,7 +81,7 @@ build:
 
   ## GPT-OSS is the only config ported to fleet's calling convention, so it is
   ## the only one that may flip the header tree. Setting this also emits
-  ## -DTITAN_FLEET_HEADERS, -DMPK_MAX_NUM_BATCHED_REQUESTS=1 and
+  ## -DFLEET_MK_FLEET_HEADERS, -DMPK_MAX_NUM_BATCHED_REQUESTS=1 and
   ## -DMPK_PREFETCH_NEXT_QKV: those are the convention, not tuning, and two of
   ## the three miscompile SILENTLY if dropped, so they are derived from this key
   ## rather than listed by hand in extra_defines.
@@ -100,7 +100,7 @@ build:
   header_dir: /home/claudeuser/fleet-chiplet-megakernel
 
   ## MPK_W13_LDS_PREFETCH is NOT in extra_defines: it needs to be switchable off
-  ## from the environment (TITAN_NO_W13_PREFETCH=1) so an A/B pair can differ in
+  ## from the environment (FLEET_MK_NO_W13_PREFETCH=1) so an A/B pair can differ in
   ## the prefetch and nothing else.
   w13_prefetch_toggle: true
 

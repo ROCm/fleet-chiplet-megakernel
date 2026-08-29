@@ -1,9 +1,9 @@
-"""How titan's MoE expert weights are laid out in memory, for the vLLM plugin.
+"""How fleet_mk's MoE expert weights are laid out in memory, for the vLLM plugin.
 
 The standalone driver (`demo_gpt_oss_120b.py`) grew four knobs describing an
-expert buffer that titan did not necessarily write: a K row pitch, an N expert
+expert buffer that fleet_mk did not necessarily write: a K row pitch, an N expert
 pitch, a data/scale section split, and whether the two sections share one
-allocation. Each was landed and measured there on titan's OWN slab, so that when
+allocation. Each was landed and measured there on fleet_mk's OWN slab, so that when
 the buffer finally belongs to someone else, "someone else's bytes" is the only
 variable left.
 
@@ -20,26 +20,26 @@ vLLM keeps GPT-OSS's experts as two plain tensors per layer, `w13_weight` and
 `w2_weight`, 1728 MiB/layer, 60.75 GiB across 36 layers. They survive
 `process_weights_after_loading` at the same address with the same bytes (ROCm's
 `StridedLayout` swizzle is identity; the shape change is a transposed *view*, so
-a linear reader still sees `[E, rows, K/2]` row-major). Titan packs its own copy
+a linear reader still sees `[E, rows, K/2]` row-major). Fleet MK packs its own copy
 of exactly those bytes. Aliasing means pointing the kernel at vLLM's and not
-packing ours -- but only if titan's addressing can be made to match a layout it
+packing ours -- but only if fleet_mk's addressing can be made to match a layout it
 did not choose:
 
   * `k_stride`      -- vLLM rounds K to 3072, so its rows sit 1536 B apart while
                        the MFMA still reduces 2944. Pitch and reduction are
                        independent (`MPK_MOE_K_STRIDE`).
-  * `n_stride`      -- vLLM rounds the output axis to 3072 rows too, while titan
+  * `n_stride`      -- vLLM rounds the output axis to 3072 rows too, while fleet_mk
                        computes 2944 (`MPK_MOE_N_STRIDE`).
-  * `split_scales`  -- vLLM's data tensor obviously does not carry titan's scales
+  * `split_scales`  -- vLLM's data tensor obviously does not carry fleet_mk's scales
                        interleaved inside it (`MPK_MOE_SPLIT_SCALES`).
   * separate allocations -- and the scale slab cannot be at a fixed offset from a
                        buffer vLLM allocated.
 
-## Why the scales stay titan's own
+## Why the scales stay fleet_mk's own
 
 vLLM's TRITON MXFP4 backend **deletes** `w13_weight_scale` / `w2_weight_scale`
 in `process_weights_after_loading`; the swizzled scales move inside the precision
-configs. So there is nothing to alias on the scale side. Titan keeps packing
+configs. So there is nothing to alias on the scale side. Fleet MK keeps packing
 scales -- but *only* scales, via `section="scales"`, because packing the data
 section too would materialize the very 60 GiB copy the aliasing exists to
 remove.
@@ -49,7 +49,7 @@ remove.
 The driver has a `MOE_SPLIT_BUFFERS` knob because it could put the two sections
 adjacent in one allocation and derive the scale base by arithmetic. That
 arrangement cannot survive aliasing -- there is no offset from vLLM's tensor that
-reaches titan's scales -- so the plugin does not implement it. Split here always
+reaches fleet_mk's scales -- so the plugin does not implement it. Split here always
 means two independent bases, which is also the only arrangement the aliased path
 can use. The kernel is indifferent: it takes both bases as arguments and never
 assumes a relationship between them, which is why none of this needs a flag
@@ -94,26 +94,26 @@ class MoeLayout:
         self.w2_opw = S.gemm["w2_output_per_wg"]
 
         # ── K row pitch ──────────────────────────────────────────────────────
-        self.k_stride = _env_int("TITAN_MOE_K_STRIDE") or ph
+        self.k_stride = _env_int("FLEET_MK_MOE_K_STRIDE") or ph
         assert self.k_stride >= ph and self.k_stride % 32 == 0, (
-            f"TITAN_MOE_K_STRIDE={self.k_stride} must be a multiple of 32 and at "
+            f"FLEET_MK_MOE_K_STRIDE={self.k_stride} must be a multiple of 32 and at "
             f"least the {ph}-wide reduction")
         self.k_stride_blocks = self.k_stride // 32
 
         # ── data/scale section split ─────────────────────────────────────────
-        self.split_scales = os.environ.get("TITAN_MOE_SPLIT_SCALES") == "1"
+        self.split_scales = os.environ.get("FLEET_MK_MOE_SPLIT_SCALES") == "1"
 
         # ── N expert pitch ───────────────────────────────────────────────────
         # In units of the intermediate/hidden row count (3072 for vLLM), not of
         # W13's doubled axis: W13 is gate+up interleaved, so its axis holds two
         # of them. The kernel's W13_N_STRIDE is the identical expression.
-        self.n_stride = _env_int("TITAN_MOE_N_STRIDE")
+        self.n_stride = _env_int("FLEET_MK_MOE_N_STRIDE")
         assert not self.n_stride or self.split_scales, (
-            "TITAN_MOE_N_STRIDE requires TITAN_MOE_SPLIT_SCALES=1 -- a foreign "
+            "FLEET_MK_MOE_N_STRIDE requires FLEET_MK_MOE_SPLIT_SCALES=1 -- a foreign "
             "expert pitch implies a foreign buffer, which cannot also carry "
-            "titan's per-workgroup interleaved scales")
+            "fleet_mk's per-workgroup interleaved scales")
         assert not self.n_stride or self.n_stride >= ph, (
-            f"TITAN_MOE_N_STRIDE={self.n_stride} is shorter than the {ph} rows "
+            f"FLEET_MK_MOE_N_STRIDE={self.n_stride} is shorter than the {ph} rows "
             f"W2 computes -- experts would overlap")
         self.w13_out_stride = 2 * self.n_stride if self.n_stride else self.w13_out
         self.w2_out_stride = self.n_stride if self.n_stride else self.w2_out
@@ -126,14 +126,14 @@ class MoeLayout:
         # Requires all three of the above to describe vLLM's buffer, since that
         # is the buffer the kernel would then be reading. The check is structural
         # (the knobs must be SET, and set consistently), not a comparison against
-        # literal 3072s -- the padding rule belongs to vLLM, not to titan.
-        self.alias = os.environ.get("TITAN_MOE_ALIAS_VLLM") == "1"
+        # literal 3072s -- the padding rule belongs to vLLM, not to fleet_mk.
+        self.alias = os.environ.get("FLEET_MK_MOE_ALIAS_VLLM") == "1"
         if self.alias:
             assert self.split_scales and self.n_stride and self.k_stride > ph, (
-                "TITAN_MOE_ALIAS_VLLM needs TITAN_MOE_SPLIT_SCALES=1 plus "
-                "TITAN_MOE_K_STRIDE and TITAN_MOE_N_STRIDE describing vLLM's "
+                "FLEET_MK_MOE_ALIAS_VLLM needs FLEET_MK_MOE_SPLIT_SCALES=1 plus "
+                "FLEET_MK_MOE_K_STRIDE and FLEET_MK_MOE_N_STRIDE describing vLLM's "
                 "padding (3072/3072 for GPT-OSS). Aliasing without them points "
-                "the kernel at vLLM's memory while addressing it as titan's.")
+                "the kernel at vLLM's memory while addressing it as fleet_mk's.")
 
     # ── packer arguments ─────────────────────────────────────────────────────
     def pack_kwargs(self, which):
@@ -183,6 +183,6 @@ class MoeLayout:
                f"  <-- .so MUST be built -DMPK_MOE_N_STRIDE={self.n_stride}"),
             "MoE expert data: "
             + ("ALIASED from vLLM's w13_weight/w2_weight (not packed)"
-               if self.alias else "packed by titan"),
+               if self.alias else "packed by fleet_mk"),
         ]
         return "\n".join(lines)

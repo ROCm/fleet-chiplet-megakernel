@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the inline SVG figures from titan-architecture.html.
+"""Extract the inline SVG figures from fleet-mk-architecture.html.
 
 The deck reuses the document's figures verbatim rather than keeping a second
 copy of them, so that editing a figure in the doc updates the deck on the next
@@ -16,7 +16,7 @@ import os
 import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DOC = os.path.normpath(os.path.join(HERE, "..", "..", "titan-architecture.html"))
+DOC = os.path.normpath(os.path.join(HERE, "..", "..", "fleet-mk-architecture.html"))
 
 FIGURE = re.compile(r"<figure>(.*?)</figure>", re.S)
 PARTS = re.compile(r"(<svg\b.*?</svg>)\s*<figcaption>(.*?)</figcaption>", re.S)

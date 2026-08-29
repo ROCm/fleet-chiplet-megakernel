@@ -1,7 +1,7 @@
-## Qwen3-8B model configuration for Titan code generator
+## Qwen3-8B model configuration for Fleet MK code generator
 ## Source: Qwen/Qwen3-8B HuggingFace config.json
 ##
-## Usage: python3 titan_generate.py configs/qwen3_8b.yaml
+## Usage: python3 fleet_mk_generate.py configs/qwen3_8b.yaml
 
 model:
   name: qwen3-8b
@@ -31,7 +31,7 @@ gpu:
   ##
   ## 128 rather than 4096 for the same reason as gpt_oss_120b.yaml: vLLM caps
   ## block_size at 256 (BlockSize = Literal[1, 8, 16, 32, 64, 128, 256],
-  ## vllm/config/cache.py), and titan_vllm aliases vLLM's KV pool zero-copy,
+  ## vllm/config/cache.py), and fleet_megakernel_vllm aliases vLLM's KV pool zero-copy,
   ## which requires block_size == PAGE_SIZE. At 4096 the dense path registers
   ## but cannot bind the alias.
   ##
@@ -50,8 +50,8 @@ quantization:
 
 build:
   ## The dense kernel calls exactly two device functions that commit f2354a7
-  ## fenced behind TITAN_ENABLE_LEGACY: titan::gemm_mxfp4 and
-  ## titan::rope_kv_update. Without this define hipcc reports 14 errors, all
+  ## fenced behind FLEET_MK_ENABLE_LEGACY: fleet_mk::gemm_mxfp4 and
+  ## fleet_mk::rope_kv_update. Without this define hipcc reports 14 errors, all
   ## tracing to those two; with it, zero.
   ##
   ## Defining it here rather than moving the #ifdefs is deliberate. The guards
@@ -64,4 +64,4 @@ build:
   ## version on disk before this change. That is the fix, not a regression:
   ## the old script did not build.
   extra_defines:
-    - TITAN_ENABLE_LEGACY
+    - FLEET_MK_ENABLE_LEGACY

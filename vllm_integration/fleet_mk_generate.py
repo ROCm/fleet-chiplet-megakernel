@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Titan code generator: reads a YAML model config and generates 4 files
+"""Fleet MK code generator: reads a YAML model config and generates 4 files
 for a working persistent kernel on MI350.
 
 Generated files:
@@ -9,7 +9,7 @@ Generated files:
   4. build_{name}.sh              -- Build script
 
 Usage:
-    python3 titan_generate.py configs/qwen3_8b.yaml
+    python3 fleet_mk_generate.py configs/qwen3_8b.yaml
 """
 
 import argparse
@@ -93,7 +93,7 @@ class ModelConfig:
     # contract, so the default must not move.
     headers: str = "mirage"
     header_dir: str = "/home/claudeuser/mirage"
-    # Emit the TITAN_NO_W13_PREFETCH shell escape hatch (fleet arm only). This
+    # Emit the FLEET_MK_NO_W13_PREFETCH shell escape hatch (fleet arm only). This
     # is not just extra_defines with a flag: the point is an A/B pair that
     # differs in NOTHING but the prefetch, which a plain define cannot give.
     w13_prefetch_toggle: bool = False
@@ -185,7 +185,7 @@ def _pad_up(val, align):
 #
 # Each entry is (slot_name, cache_lines, map_text, range_override).
 #   slot_name       -- None means mirage addresses the region internally and
-#                      there is no named Titan constant; it still consumes
+#                      there is no named Fleet MK constant; it still consumes
 #                      cache lines, so it still moves everything after it.
 #   map_text        -- prose for the comment map. May contain {p0}, {p1}, ...
 #                      placeholders, where {pN} is this region's own first cache
@@ -204,7 +204,7 @@ COUNTER_REGIONS = [
     (None,                      8, "chunk_barrier, mirage's site (8 per-XCD)", None),
     (None,                      8, "attn_release (8 per-XCD)", None),
     # Everything from here to the end of the layer barrier is owned by FLEET's
-    # layer body, which titan compiles against. Fleet moved the chunk barrier
+    # layer body, which fleet_mk compiles against. Fleet moved the chunk barrier
     # from 28 to 48 (it needs 8*NUM_REQS lines and at NUM_REQS>=3 the old site
     # grew through the fused-tail literals) and added a layer barrier above it
     # at FULL_LAYER_LAYER_BARRIER_SLOT(NUM_REQS) = 48*16 + 128*NUM_REQS for 272
@@ -279,22 +279,22 @@ def _region_bounds(marker: str) -> tuple:
     raise KeyError(marker)
 
 
-def _titan_owned_first() -> int:
-    """First cache line Titan owns: everything below belongs to the layer body."""
+def _fleet_mk_owned_first() -> int:
+    """First cache line Fleet MK owns: everything below belongs to the layer body."""
     off = 0
     for name, lines, _, _ in COUNTER_REGIONS:
         if name is not None:
             return off
         off += lines
-    raise AssertionError("no Titan-owned counter region")
+    raise AssertionError("no Fleet MK-owned counter region")
 
 
 def emit_counter_ownership() -> str:
-    """The one-sentence split between the layer body's half and Titan's."""
-    first = _titan_owned_first()
-    return (f"lines 0..{first - 1} belong to the layer body and Titan must not "
+    """The one-sentence split between the layer body's half and Fleet MK's."""
+    first = _fleet_mk_owned_first()
+    return (f"lines 0..{first - 1} belong to the layer body and Fleet MK must not "
             f"touch them, and\n"
-            f"// lines {first}..{counter_lines_used() - 1} are Titan's own.")
+            f"// lines {first}..{counter_lines_used() - 1} are Fleet MK's own.")
 
 
 def emit_counter_reserved_note(cfg: ModelConfig) -> str:
@@ -337,7 +337,7 @@ def emit_driver_qkv_slot_note(cfg: ModelConfig) -> str:
     """
     if cfg.headers != "fleet":
         return ""
-    body_last = _titan_owned_first() - 1
+    body_last = _fleet_mk_owned_first() - 1
     op0, op1 = _region_bounds("OProj Mechanism C")
     rr0, rr1 = _region_bounds("routing_ready")
     ag0, _ = _region_bounds("attn_global_counter")
@@ -365,11 +365,11 @@ def emit_counter_total_note(cfg: ModelConfig) -> str:
     """Tie the map's line count back to COUNTERS_PER_LAYER, and flag the
     slots that outlive their use.
 
-    Titan's own layer-barrier slots stay ALLOCATED under fleet even though the
+    Fleet MK's own layer-barrier slots stay ALLOCATED under fleet even though the
     barrier itself is compiled out -- deallocating them would renumber
     everything above and buy 18 cache lines nobody is short of.
     """
-    return f'''// Total {counter_lines_used()} cache lines = COUNTERS_PER_LAYER. Titan's own layer barrier
+    return f'''// Total {counter_lines_used()} cache lines = COUNTERS_PER_LAYER. Fleet MK's own layer barrier
 // (layer_done / layer_local / layer_release / layer_done_global) is still live
 // here because mirage's layer body has no layer barrier of its own; it is
 // deleted when the -I paths move to fleet, whose body ends with one.
@@ -425,12 +425,12 @@ def emit_touch_lds_pad(cfg: ModelConfig) -> str:
         // Hold the window slot's padding live so static LDS stays 736 (a
         // multiple of 16). This is the +1.09 ms fix -- see the note at the
         // LayerWindowSlot declaration. One-time, not per layer.
-        titan::touch_lds_pad(tid, cur_token);
+        fleet_mk::touch_lds_pad(tid, cur_token);
 '''
 
 
 def emit_full_window(cfg: ModelConfig) -> str:
-    """TITAN_FULL_WINDOW, the finite stand-in for the unlimited window.
+    """FLEET_MK_FULL_WINDOW, the finite stand-in for the unlimited window.
 
     Only emitted on the fleet arm, where the window is a template parameter and
     the odd (full-attention) layers need a value that keeps them on the same
@@ -443,7 +443,7 @@ def emit_full_window(cfg: ModelConfig) -> str:
 // every guard in fleet's attention path tests `seqlen_k > sliding_window` and
 // seqlen_k tops out at MAX_SEQ_LEN - 1. Passing a finite window instead of 0
 // keeps all {cfg.num_layers} layers on one code path -- that is worth ~0.8 ms/token.
-static constexpr int TITAN_FULL_WINDOW = MAX_SEQ_LEN;
+static constexpr int FLEET_MK_FULL_WINDOW = MAX_SEQ_LEN;
 '''
 
 
@@ -544,12 +544,12 @@ MIRAGE_IN = [
     # Appending kept all of those correct for free -- which is also why the
     # fleet flip could repurpose these two without touching anything else.
     #
-    # What they carry now depends on TITAN_QKV_PF, and the emitted note below
+    # What they carry now depends on FLEET_MK_QKV_PF, and the emitted note below
     # is the full account of why. It is emitted, not left here as generator
     # source, because the reader who needs it is looking at the pointer table
     # in the driver, not at this list.
-    ("(next_qkv_weight_xcd if TITAN_QKV_PF else w13_scale_base),", ""),
-    ("(prefetched_qkv_weight_xcd if TITAN_QKV_PF else w2_scale_base),", ""),
+    ("(next_qkv_weight_xcd if FLEET_MK_QKV_PF else w13_scale_base),", ""),
+    ("(prefetched_qkv_weight_xcd if FLEET_MK_QKV_PF else w2_scale_base),", ""),
 ]
 
 # Emitted verbatim above the pointer-table entry it annotates. Kept as a module
@@ -561,7 +561,7 @@ MIRAGE_IN = [
 PTR_PRE_NOTES = {
     ("in", 24): """# [24]/[25] -- FLEET'S QKV-PREFETCH HAND-OFF.
 #
-# These used to carry titan's MoE scale bases, which was a real
+# These used to carry fleet_mk's MoE scale bases, which was a real
 # collision and the root cause of the "+1.09 ms dual-body
 # penalty". Fleet reads these two slots at exactly five sites
 # (gang_full_layer_fused_mi300.cuh :458, :1693, :1719, :1912,
@@ -573,7 +573,7 @@ PTR_PRE_NOTES = {
 # and gang_moe_fused_mxfp4_kernel_mi300 takes 12 parameters
 # with no scale pointers at all -- it reads MXFP4 scales inline
 # from the packed slab. MPK_MOE_SPLIT_SCALES has ZERO
-# occurrences in fleet's tree, so titan's -D for it was already
+# occurrences in fleet's tree, so fleet_mk's -D for it was already
 # being silently ignored. The scale bases are still computed
 # above because the non-fleet build path passes them; under
 # fleet's header they simply have no consumer.
@@ -609,7 +609,7 @@ PTR_PRE_NOTES = {
 #
 # NEGATIVE RESULT, superseded but recorded: nulling both slots
 # appeared to fail 3 runs of 3. That verdict was invalid. Those
-# runs carried TITAN_MOE_SPLIT_SCALES/K_STRIDE/N_STRIDE env
+# runs carried FLEET_MK_MOE_SPLIT_SCALES/K_STRIDE/N_STRIDE env
 # values against a .so built WITHOUT the matching -D flags, and
 # that mismatch faults deterministically at iter 1 (next_token
 # =-1, HIP error 700) on the shipping .so too. The knobs and the
@@ -667,7 +667,7 @@ MIRAGE_TEMPLATE_PARAMS = [
     # sliding_window_override runtime argument; on the fleet arm there is no
     # such argument, so the window must be a template value -- either two
     # compile-time instantiations, or one instantiation plus the shim that
-    # forwards titan::g_layer_sliding_window. Baking a literal in here would
+    # forwards fleet_mk::g_layer_sliding_window. Baking a literal in here would
     # foreclose all three.
     ("SLIDING_WINDOW",        "(SW_)"),
     ("HAS_SINKS",             "1"),
@@ -788,7 +788,7 @@ TRAILING_COUNTERS = [
         "Must match SLOT_EMBED_DONE / SLOT_EMBED_LOCAL in the kernel.",
     ]),
     ("ILB_PROBE_INTS", "20 * 16", None, [
-        "Slack for the TITAN_ILB_TIMING diagnostic probe barrier (compiled out in",
+        "Slack for the FLEET_MK_ILB_TIMING diagnostic probe barrier (compiled out in",
         "production). Always allocated so a timing build needs no Python change.",
     ]),
 ]
@@ -831,7 +831,7 @@ def _wrap_sum(head: str, terms: list) -> str:
 
 def emit_embed_barrier_base(indent: str = " " * 4) -> str:
     """The kernel's EMBED_BARRIER_BASE expression, from the same list."""
-    terms = ["NUM_LAYERS * titan::COUNTERS_PER_LAYER"]
+    terms = ["NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER"]
     for name, expr, _, _ in TRAILING_COUNTERS:
         if name == _EMBED_REGION:
             break
@@ -909,7 +909,7 @@ MACRO_WIDTH = 80
 def emit_mirage_call(cfg: ModelConfig, indent: str = " " * 16) -> str:
     """The full templated call, template args commented, runtime args bare.
 
-    Emitted as a `#define TITAN_LAYER_BODY(SW_)` rather than as a bare call,
+    Emitted as a `#define FLEET_MK_LAYER_BODY(SW_)` rather than as a bare call,
     because the fleet arm needs the SAME 47-argument list at up to four call
     sites (two compile-time windows, the one-body shim path, the legacy
     two-instantiation ladder). Writing it once and letting the preprocessor
@@ -917,7 +917,7 @@ def emit_mirage_call(cfg: ModelConfig, indent: str = " " * 16) -> str:
     argument -- and a transposed argument here compiles clean and produces
     garbage tokens.
     """
-    lines = ["#define TITAN_LAYER_BODY(SW_)",
+    lines = ["#define FLEET_MK_LAYER_BODY(SW_)",
              f"{indent[:-4]}kernel::gang_full_layer_fused_kernel_mi300<"]
     for i, (name, val) in enumerate(MIRAGE_TEMPLATE_PARAMS):
         tail = ">(" if i == len(MIRAGE_TEMPLATE_PARAMS) - 1 else ","
@@ -926,7 +926,7 @@ def emit_mirage_call(cfg: ModelConfig, indent: str = " " * 16) -> str:
         lines.append(f"{indent}{val}" + ("," if i < len(MIRAGE_RUNTIME_ARGS) - 1
                                          else ")"))
     # The terminator carries no backslash and no semicolon: the macro is
-    # invoked as `TITAN_LAYER_BODY(0);`, so the semicolon belongs to the call.
+    # invoked as `FLEET_MK_LAYER_BODY(0);`, so the semicolon belongs to the call.
     body, last = lines[:-1], lines[-1]
     widest = max(len(s) for s in body)
     assert widest < MACRO_WIDTH, f"macro line {widest} >= {MACRO_WIDTH} cols"
@@ -950,7 +950,7 @@ def emit_layer_dispatch(cfg: ModelConfig) -> str:
     """The whole per-layer dispatch: trailing-arg choice, macro, ladder.
 
     The fleet arm's #ifdef ladder is emitted UNCONDITIONALLY, not gated on
-    cfg.headers. That is deliberate: the arms select on TITAN_FLEET_HEADERS,
+    cfg.headers. That is deliberate: the arms select on FLEET_MK_FLEET_HEADERS,
     which is a compile-time define, and the mirage configs must keep compiling
     the mirage arm out of the same source. Making the generator pick would put
     the choice in two places -- YAML and -D -- that could disagree, and the
@@ -1415,7 +1415,7 @@ def emit_extra_defines(cfg: ModelConfig) -> str:
 
     Empty by default. These are correctness- or performance-load-bearing:
     MPK_W13_LDS_PREFETCH is one of the three flags commit f2354a7 records as
-    affecting the 2.520 ms/tok result, and TITAN_ENABLE_LEGACY is what the
+    affecting the 2.520 ms/tok result, and FLEET_MK_ENABLE_LEGACY is what the
     dense kernel needs for gemm_mxfp4 and rope_kv_update to be visible.
     """
     return "".join(f"    -D{d} \\\n" for d in cfg.extra_defines)
@@ -1431,9 +1431,9 @@ def emit_header_root(cfg: ModelConfig) -> str:
     """
     if cfg.headers == "fleet":
         return f'''\
-# Titan compiles against fleet's header tree ONLY -- ROCm/fleet-chiplet-megakernel,
+# Fleet MK compiles against fleet's header tree ONLY -- ROCm/fleet-chiplet-megakernel,
 # branch amd_mi355_gpt_oss120b. Nothing here may point at mirage
-# (github.com/sangeeta0201/mirage): that is a personal fork, and titan carrying a
+# (github.com/sangeeta0201/mirage): that is a personal fork, and fleet_mk carrying a
 # build-time dependency on it is exactly what this flip removes. Fleet is public
 # and is the single source of truth.
 #
@@ -1468,29 +1468,29 @@ def emit_fleet_define_note(cfg: ModelConfig) -> str:
         return ""
     return '''
 # Three defines fleet's Python driver (persistent_kernel.py) normally supplies and
-# titan must now supply itself. Verified against fleet @ f3c40ed: NEITHER of the
+# fleet_mk must now supply itself. Verified against fleet @ f3c40ed: NEITHER of the
 # first two has an in-header default -- the only #define of
 # MPK_MAX_NUM_BATCHED_REQUESTS in the tree is commented out
 # (persistent_kernel.cuh:556), and MPK_PREFETCH_NEXT_QKV is a bare #ifdef at
 # three sites. Omitting either is a SILENT miscompile, not a build error:
 #
-#   TITAN_FLEET_HEADERS         selects fleet's calling convention in the
+#   FLEET_MK_FLEET_HEADERS         selects fleet's calling convention in the
 #                               generated kernel -- the trailing runtime arg is
 #                               task_layer_idx in fleet, sliding_window_override
 #                               in mirage, and neither header diagnoses receiving
 #                               the other's. Also selects the two-instantiation
 #                               form, since fleet takes the window as a template
 #                               parameter only.
-#   MPK_MAX_NUM_BATCHED_REQUESTS=1   titan is bs=1 decode.
+#   MPK_MAX_NUM_BATCHED_REQUESTS=1   fleet_mk is bs=1 decode.
 #   MPK_PREFETCH_NEXT_QKV       default ON in fleet; the reason for the migration.
 #
 # MPK_NO_LAYER_BARRIER is deliberately NOT passed: fleet's cross-XCD layer
-# barrier is the one that survives, and titan's own has been removed.
+# barrier is the one that survives, and fleet_mk's own has been removed.
 '''
 
 
 def emit_w13_prefetch_toggle(cfg: ModelConfig) -> str:
-    """The TITAN_NO_W13_PREFETCH escape hatch, as a shell if/else.
+    """The FLEET_MK_NO_W13_PREFETCH escape hatch, as a shell if/else.
 
     A plain entry in build.extra_defines cannot be turned OFF without editing
     the generated script, and an A/B that also has to edit the script is an A/B
@@ -1500,13 +1500,13 @@ def emit_w13_prefetch_toggle(cfg: ModelConfig) -> str:
     if not cfg.w13_prefetch_toggle:
         return ""
     return '''
-# W13 direct-to-LDS weight prefetch is ON by default. Set TITAN_NO_W13_PREFETCH=1
+# W13 direct-to-LDS weight prefetch is ON by default. Set FLEET_MK_NO_W13_PREFETCH=1
 # to build the HBM-direct path instead -- the only supported way to get an A/B
 # pair that differs ONLY in the prefetch, which matters because the MoE fault
 # under investigation reproduces about one run in three. Comparing a prefetch-ON
 # build against a prefetch-OFF build that also differs in K stride or scale
 # split cannot attribute anything.
-if [ -n "$TITAN_NO_W13_PREFETCH" ]; then
+if [ -n "$FLEET_MK_NO_W13_PREFETCH" ]; then
   W13_PREFETCH_FLAG=""
 else
   W13_PREFETCH_FLAG="-DMPK_W13_LDS_PREFETCH"
@@ -1535,7 +1535,7 @@ def emit_fleet_defines(cfg: ModelConfig) -> str:
     if cfg.headers != "fleet":
         return ""
     return (
-        "    -DTITAN_FLEET_HEADERS \\\n"
+        "    -DFLEET_MK_FLEET_HEADERS \\\n"
         "    -DMPK_MAX_NUM_BATCHED_REQUESTS=1 \\\n"
         "    -DMPK_PREFETCH_NEXT_QKV \\\n"
     )
@@ -1550,12 +1550,12 @@ def generate_build(cfg: ModelConfig) -> str:
     nc = cfg.name_clean
     return f'''\
 #!/bin/bash
-# Auto-generated by titan_generate.py
-# Titan build script for {cfg.name} on {cfg.target}
+# Auto-generated by fleet_mk_generate.py
+# Fleet MK build script for {cfg.name} on {cfg.target}
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TITAN_DIR="$SCRIPT_DIR"
+FLEET_MK_DIR="$SCRIPT_DIR"
 GEN_DIR="${{1:-$SCRIPT_DIR/generated}}"
 
 ROCM_PATH="${{ROCM_PATH:-/opt/rocm}}"
@@ -1568,7 +1568,7 @@ CK_DIR="${{CK_DIR:-/home/claudeuser/composable_kernel_mirage}}"
 {emit_fleet_define_note(cfg)}\
 {emit_w13_prefetch_toggle(cfg)}\
 
-echo "=== Titan {cfg.name} Build ==="
+echo "=== Fleet MK {cfg.name} Build ==="
 echo "  Source: $GEN_DIR/{nc}_launch.hip"
 echo "  Target: {cfg.target}"
 echo "  Output: $GEN_DIR/{nc}.so"
@@ -1579,8 +1579,8 @@ $HIPCC -x hip "$GEN_DIR/{nc}_launch.hip" \\
     -fPIC \\
 {emit_build_flag(cfg.rdc, "-fgpu-rdc")}\
     --offload-arch={cfg.target} \\
-    -I"$TITAN_DIR/kernels" \\
-    -I"$TITAN_DIR/generated" \\
+    -I"$FLEET_MK_DIR/kernels" \\
+    -I"$FLEET_MK_DIR/generated" \\
     -I"$MPK_INCLUDE" \\
 {emit_include_paths(cfg)}\
     -I"$ROCM_PATH/include" \\
@@ -1589,14 +1589,14 @@ $HIPCC -x hip "$GEN_DIR/{nc}_launch.hip" \\
     -DMIRAGE_AMD_MI300 \\
     -DMIRAGE_BACKEND_USE_ROCM \\
     -DMPK_USE_CK_FMHA \\
-    -DTITAN_TARGET_GFX950 \\
+    -DFLEET_MK_TARGET_GFX950 \\
     -DMPK_TARGET_CC=95 \\
 {emit_extra_defines(cfg)}\
 {emit_fleet_defines(cfg)}\
 {emit_w13_prefetch_flag(cfg)}\
     -DCK_TILE_FMHA_FWD_FAST_EXP2=1 \\
-    ${{TITAN_SUBPHASE_TIMING:+-DTITAN_SUBPHASE_TIMING}} \\
-    ${{TITAN_EXTRA_DEFINES:+$TITAN_EXTRA_DEFINES}} \\
+    ${{FLEET_MK_SUBPHASE_TIMING:+-DFLEET_MK_SUBPHASE_TIMING}} \\
+    ${{FLEET_MK_EXTRA_DEFINES:+$FLEET_MK_EXTRA_DEFINES}} \\
     -Rpass-analysis=kernel-resource-usage \\
     -shared \\
     -o "$GEN_DIR/{nc}.so"
@@ -1628,8 +1628,8 @@ def generate_launch_fused_moe(cfg: ModelConfig) -> str:
     The verbatim seed reached byte-identity for free, so check_roundtrip.py
     gates it on bytes as well -- see the note there before loosening that.
     """
-    return f"""/* Auto-generated by titan_generate.py
- * Titan: Launch wrapper for {cfg.name}
+    return f"""/* Auto-generated by fleet_mk_generate.py
+ * Fleet MK: Launch wrapper for {cfg.name}
  *
  * Build: hipcc -x hip {cfg.name_clean}_launch.hip [flags] -shared -o {cfg.name_clean}.so
  */
@@ -1645,7 +1645,7 @@ def generate_launch_fused_moe(cfg: ModelConfig) -> str:
 // Initialization (no-op: counter buffer managed by Python)
 // ============================================================================
 extern "C" void {cfg.name_clean}_init() {{
-    printf("[Titan/Gpt] Initialized (counter buffer managed externally)\\n");
+    printf("[Fleet MK/Gpt] Initialized (counter buffer managed externally)\\n");
 }}
 
 // ============================================================================
@@ -1807,7 +1807,7 @@ extern "C" void {cfg.name_clean}_graph_capture(
     // Instantiate
     HIP_CHECK(hipGraphInstantiate(&s_graph_exec, s_graph, nullptr, nullptr, 0));
 
-    printf("[Titan/Gpt] hipGraph created: %d nodes (%d memset + 1 kernel), kernel node=%p\\n",
+    printf("[Fleet MK/Gpt] hipGraph created: %d nodes (%d memset + 1 kernel), kernel node=%p\\n",
            num_memset_nodes + 1, num_memset_nodes, s_kernel_node);
 }}
 
@@ -1848,7 +1848,7 @@ extern "C" void {cfg.name_clean}_graph_destroy() {{
         s_graph = nullptr;
     }}
     s_kernel_node = nullptr;
-    printf("[Titan/Gpt] hipGraph destroyed\\n");
+    printf("[Fleet MK/Gpt] hipGraph destroyed\\n");
 }}
 
 #undef HIP_CHECK
@@ -2029,7 +2029,7 @@ extern "C" void {cfg.name_clean}_pipe_capture(
                                      &bridge_node, 1, &kparams_pipe));
     HIP_CHECK(hipGraphInstantiate(&s_pipe_graph_exec, s_pipe_graph, nullptr, nullptr, 0));
 
-    printf("[Titan/Gpt] Pipelined graph captured: first_graph(1 memset + kernel), pipe_graph(bridge + kernel)\\n");
+    printf("[Fleet MK/Gpt] Pipelined graph captured: first_graph(1 memset + kernel), pipe_graph(bridge + kernel)\\n");
 }}
 
 extern "C" void {cfg.name_clean}_pipe_launch_first(hipStream_t stream) {{
@@ -2064,7 +2064,7 @@ extern "C" void {cfg.name_clean}_pipe_destroy() {{
     if (s_pipe_graph)      {{ hipGraphDestroy(s_pipe_graph); s_pipe_graph = nullptr; }}
     if (s_first_graph_exec){{ hipGraphExecDestroy(s_first_graph_exec); s_first_graph_exec = nullptr; }}
     if (s_first_graph)     {{ hipGraphDestroy(s_first_graph); s_first_graph = nullptr; }}
-    printf("[Titan/Gpt] Pipelined graph destroyed\\n");
+    printf("[Fleet MK/Gpt] Pipelined graph destroyed\\n");
 }}
 
 #undef HIP_CHECK
@@ -2143,7 +2143,7 @@ extern "C" void {cfg.name_clean}_decode_loop(
 // Finalization (no-op)
 // ============================================================================
 extern "C" void {cfg.name_clean}_finalize() {{
-    printf("[Titan/Gpt] Finalized\\n");
+    printf("[Fleet MK/Gpt] Finalized\\n");
 }}
 """
 
@@ -2156,8 +2156,8 @@ def generate_launch_dense(cfg: ModelConfig) -> str:
     ns = nc  # namespace name (same as name_clean)
 
     return f'''\
-/* Auto-generated by titan_generate.py
- * Titan: Launch wrapper for {cfg.name}
+/* Auto-generated by fleet_mk_generate.py
+ * Fleet MK: Launch wrapper for {cfg.name}
  *
  * Build: hipcc -x hip {nc}_launch.hip [flags] -shared -o {nc}.so
  */
@@ -2173,7 +2173,7 @@ def generate_launch_dense(cfg: ModelConfig) -> str:
 // Initialization (no-op: counter buffer managed by Python)
 // ============================================================================
 extern "C" void {nc}_init() {{
-    printf("[Titan/{nt}] Initialized (counter buffer managed externally)\\n");
+    printf("[Fleet MK/{nt}] Initialized (counter buffer managed externally)\\n");
 }}
 
 // ============================================================================
@@ -2242,13 +2242,13 @@ extern "C" void {nc}_launch(
 // Finalization (no-op)
 // ============================================================================
 extern "C" void {nc}_finalize() {{
-    printf("[Titan/{nt}] Finalized\\n");
+    printf("[Fleet MK/{nt}] Finalized\\n");
 }}
 
 // ============================================================================
 // Python module
 // ============================================================================
-#ifdef TITAN_PYTHON_MODULE
+#ifdef FLEET_MK_PYTHON_MODULE
 #include <Python.h>
 
 static PyObject* py_{nc}_init(PyObject *self, PyObject *args) {{
@@ -2294,20 +2294,20 @@ static PyObject* py_{nc}_finalize(PyObject *self, PyObject *args) {{
 }}
 
 static PyMethodDef {nt}Methods[] = {{
-    {{"init", py_{nc}_init, METH_NOARGS, "Initialize {nt} Titan"}},
-    {{"launch", py_{nc}_launch, METH_VARARGS, "Launch {nt} Titan kernel"}},
-    {{"finalize", py_{nc}_finalize, METH_NOARGS, "Finalize {nt} Titan"}},
+    {{"init", py_{nc}_init, METH_NOARGS, "Initialize {nt} Fleet MK"}},
+    {{"launch", py_{nc}_launch, METH_VARARGS, "Launch {nt} Fleet MK kernel"}},
+    {{"finalize", py_{nc}_finalize, METH_NOARGS, "Finalize {nt} Fleet MK"}},
     {{NULL, NULL, 0, NULL}}
 }};
 
 static struct PyModuleDef {nc}module = {{
-    PyModuleDef_HEAD_INIT, "{nc}_titan", NULL, -1, {nt}Methods
+    PyModuleDef_HEAD_INIT, "{nc}_fleet_mk", NULL, -1, {nt}Methods
 }};
 
-PyMODINIT_FUNC PyInit_{nc}_titan(void) {{
+PyMODINIT_FUNC PyInit_{nc}_fleet_mk(void) {{
     return PyModule_Create(&{nc}module);
 }}
-#endif // TITAN_PYTHON_MODULE
+#endif // FLEET_MK_PYTHON_MODULE
 '''
 
 
@@ -2360,7 +2360,7 @@ FLEET_DISPATCH_PRE = r'''            // GPT-OSS alternates attention types per l
             //
             // decode_iter comes from the dedicated counter line past the
             // per-layer blocks; it is bumped once per token by worker (0,0).
-#ifdef TITAN_FLEET_HEADERS
+#ifdef FLEET_MK_FLEET_HEADERS
             int const layer_trailing_arg = decode_iter * NUM_LAYERS + layer;
 #else
             int const layer_trailing_arg = {sw};
@@ -2373,7 +2373,7 @@ FLEET_DISPATCH_PRE = r'''            // GPT-OSS alternates attention types per l
             // register counts and occupancy matched, and the never-executed
             // two-body arm was fast. Every one of those arms was confounded:
             // the fast ones were arms where LLVM dead-stripped
-            // titan::g_layer_sliding_window (static LDS 720) and the slow ones
+            // fleet_mk::g_layer_sliding_window (static LDS 720) and the slow ones
             // were arms that kept it (728). See the LayerWindowSlot note at the
             // top of this file for the controlled experiment that separates
             // them; the cause is static LDS size mod 16, not the body count.
@@ -2385,7 +2385,7 @@ FLEET_DISPATCH_POST = r'''
             // at the top of this file. Kept here because two findings from the
             // hunt stand on their own:
             //
-            //   * A REAL BUG, fixed: titan was writing MoE scale pointers into
+            //   * A REAL BUG, fixed: fleet_mk was writing MoE scale pointers into
             //     input_ptrs[24]/[25], which under fleet's header are the
             //     QKV-prefetch slots (see the note at those entries in
             //     demo_gpt_oss_120b.py). Worth qkv_gemm 15.40 -> 13.50 us,
@@ -2401,10 +2401,10 @@ FLEET_DISPATCH_POST = r'''
             //     itself sits. The 8-byte shift was the entire effect. When an
             //     ablation says a structural cause is ruled out, check that the
             //     evidence could have detected it.
-#if defined(TITAN_FLEET_HEADERS) && !defined(TITAN_TWO_BODY_LEGACY)
+#if defined(FLEET_MK_FLEET_HEADERS) && !defined(FLEET_MK_TWO_BODY_LEGACY)
             // ONE BODY, CORRECT WINDOWS. The template argument below is a
             // sentinel: the shim installed at the top of this file discards
-            // it and forwards titan::g_layer_sliding_window instead, so a
+            // it and forwards fleet_mk::g_layer_sliding_window instead, so a
             // single instantiation serves both layer types.
             //
             // GPT-OSS alternates: even layers use a 128-token sliding window,
@@ -2412,18 +2412,18 @@ FLEET_DISPATCH_POST = r'''
             // every thread of every worker -- it is __shared__, so each
             // workgroup needs its own copy, and the value is a pure function
             // of `layer`, identical on all of them.
-#ifdef TITAN_TWO_CONST_WINDOWS
+#ifdef FLEET_MK_TWO_CONST_WINDOWS
             // THE FIX. Two COMPILE-TIME instantiations, 128 and
-            // TITAN_FULL_WINDOW(=MAX_SEQ_LEN=512). Both are > 0, so in BOTH
+            // FLEET_MK_FULL_WINDOW(=MAX_SEQ_LEN=512). Both are > 0, so in BOTH
             // bodies the compiler can prove `sliding_window == 0` false and
             // dead-strip the 21 KB __attn_wave_local_scan_hd64 path
             // (decode_minimal_hd64:754). 512 is arithmetically identical to
             // the unlimited window 0 at this MAX_SEQ_LEN -- see the note on
-            // TITAN_FULL_WINDOW -- so semantics are exact.
+            // FLEET_MK_FULL_WINDOW -- so semantics are exact.
             if ((layer & 1) == 0) {
-                TITAN_LAYER_BODY(SLIDING_WINDOW);
+                FLEET_MK_LAYER_BODY(SLIDING_WINDOW);
             } else {
-                TITAN_LAYER_BODY(TITAN_FULL_WINDOW);
+                FLEET_MK_LAYER_BODY(FLEET_MK_FULL_WINDOW);
             }
 #else
             // Single writer plus a barrier. This IS needed, despite the
@@ -2436,7 +2436,7 @@ FLEET_DISPATCH_POST = r'''
             // at all, because the cause was static LDS size. Reverted; the
             // cost of being right here is one workgroup barrier per layer.
             if (tid == 0) {
-#ifdef TITAN_PIN_RUNTIME_WINDOW
+#ifdef FLEET_MK_PIN_RUNTIME_WINDOW
                 // Diagnostic: still a RUNTIME value through the same shared
                 // channel, but the same value on every layer. Separates
                 // "runtime vs compile-time constant" from "value varies
@@ -2444,18 +2444,18 @@ FLEET_DISPATCH_POST = r'''
                 // cannot fold, so `& 0` keeps the store unfoldable while
                 // pinning the value.
                 // NOTE: the original form here was
-                //   TITAN_PIN_RUNTIME_WINDOW + (cur_token & 0)
+                //   FLEET_MK_PIN_RUNTIME_WINDOW + (cur_token & 0)
                 // which LLVM folds to a literal (x & 0 == 0), so it did NOT
                 // test runtime-ness at all -- the build reported LDS 720, i.e.
                 // the shared store was dead-stripped entirely. Launder the
                 // value through an asm barrier instead: the compiler must
                 // materialise it in a register and cannot constant-fold it,
                 // while the value is still 128 on EVERY layer.
-                int titan_w = TITAN_PIN_RUNTIME_WINDOW;
-                asm volatile("" : "+v"(titan_w));
-                titan::g_layer_sliding_window = titan_w;
+                int fleet_mk_w = FLEET_MK_PIN_RUNTIME_WINDOW;
+                asm volatile("" : "+v"(fleet_mk_w));
+                fleet_mk::g_layer_sliding_window = fleet_mk_w;
 #else
-                // Odd (full-attention) layers publish TITAN_FULL_WINDOW rather
+                // Odd (full-attention) layers publish FLEET_MK_FULL_WINDOW rather
                 // than 0. Any window >= MAX_SEQ_LEN is arithmetically identical
                 // to full attention here, because every consumer guards on
                 // `seqlen_k > sliding_window` and seqlen_k never reaches
@@ -2474,23 +2474,23 @@ FLEET_DISPATCH_POST = r'''
                 // confound described at the LayerWindowSlot declaration. A
                 // pinned runtime 128 on every layer measured 3.612 ms, i.e. no
                 // better than alternating -- the cost tracked static LDS mod
-                // 16, never the value. TITAN_ODD_WINDOW survives as a knob for
+                // 16, never the value. FLEET_MK_ODD_WINDOW survives as a knob for
                 // re-testing that separation, default 0.
 // Default 0 = fleet's true unlimited window, which is also what enables its
-// wave-local scan fast path (decode_minimal_hd64:754). TITAN_FULL_WINDOW(512)
+// wave-local scan fast path (decode_minimal_hd64:754). FLEET_MK_FULL_WINDOW(512)
 // is arithmetically equivalent but disables that path, so it is a diagnostic
 // only.
-#ifndef TITAN_ODD_WINDOW
-#define TITAN_ODD_WINDOW 0
+#ifndef FLEET_MK_ODD_WINDOW
+#define FLEET_MK_ODD_WINDOW 0
 #endif
-                titan::g_layer_sliding_window =
-                    ((layer & 1) == 0) ? SLIDING_WINDOW : TITAN_ODD_WINDOW;
+                fleet_mk::g_layer_sliding_window =
+                    ((layer & 1) == 0) ? SLIDING_WINDOW : FLEET_MK_ODD_WINDOW;
 #endif
             }
             __syncthreads();
-            TITAN_LAYER_BODY(0);
-#endif // TITAN_TWO_CONST_WINDOWS
-#elif defined(TITAN_FLEET_HEADERS) && defined(TITAN_MEASURE_ONE_BODY)
+            FLEET_MK_LAYER_BODY(0);
+#endif // FLEET_MK_TWO_CONST_WINDOWS
+#elif defined(FLEET_MK_FLEET_HEADERS) && defined(FLEET_MK_MEASURE_ONE_BODY)
             // MEASUREMENT ONLY -- THIS BUILD PRODUCES WRONG OUTPUT.
             //
             // One instantiation under fleet's header, which means full
@@ -2506,8 +2506,8 @@ FLEET_DISPATCH_POST = r'''
             // body. It served its purpose and the answer was that the body
             // count is not the term at all: the LDS figure in that very list
             // (728, not a multiple of 16) was. Retained as an A/B harness.
-            TITAN_LAYER_BODY(0);
-#elif defined(TITAN_FLEET_HEADERS)
+            FLEET_MK_LAYER_BODY(0);
+#elif defined(FLEET_MK_FLEET_HEADERS)
             // Fleet's header takes the window ONLY as a template parameter
             // (declared :118, used once at :610, where it is handed to
             // paged_attention_ck_fmha_split_kv_impl as a runtime argument --
@@ -2516,16 +2516,16 @@ FLEET_DISPATCH_POST = r'''
             // instantiations are forced. LEGACY PATH -- the shim above
             // avoids this; kept only for A/B against it.
             if ((layer & 1) == 0) {
-                TITAN_LAYER_BODY(SLIDING_WINDOW);
+                FLEET_MK_LAYER_BODY(SLIDING_WINDOW);
             } else {
-                TITAN_LAYER_BODY(0);
+                FLEET_MK_LAYER_BODY(0);
             }
 #else
             // Mirage's header exposes sliding_window_override, so ONE body
             // serves both layer types without any shim.
-            TITAN_LAYER_BODY(0);
+            FLEET_MK_LAYER_BODY(0);
 #endif
-#undef TITAN_LAYER_BODY
+#undef FLEET_MK_LAYER_BODY
 '''
 
 
@@ -2539,7 +2539,7 @@ FLEET_SHIM_PREAMBLE = r'''
 // ONE LAYER BODY UNDER FLEET'S HEADER
 // ============================================================================
 // Fleet takes the sliding window as a TEMPLATE parameter
-// (gang_full_layer_fused_mi300.cuh:118), which is what forced titan to
+// (gang_full_layer_fused_mi300.cuh:118), which is what forced fleet_mk to
 // instantiate the whole 26 KB layer body twice -- SW=128 for even layers,
 // SW=0 for odd. (The second body was long believed to cost +1.05 ms/token;
 // it does not -- that A/B was confounded by static LDS size, see the
@@ -2556,15 +2556,15 @@ FLEET_SHIM_PREAMBLE = r'''
 // immediate differing, and there is no semantic reason to emit both.
 //
 // Fleet's tree must not be edited, and the template parameter is the only
-// channel it exposes -- so titan interposes on the call instead. The real
+// channel it exposes -- so fleet_mk interposes on the call instead. The real
 // definition is parsed FIRST under its real name (the include just below;
 // `#pragma once` then makes fleet's own include of it at :40 a no-op), then
 // the name is macro-redirected to a shim for the duration of the fused
 // header. Fleet's :610 expands to the shim, which discards the template-
-// derived window and forwards titan's per-layer runtime one.
+// derived window and forwards fleet_mk's per-layer runtime one.
 //
 // The redirect is scoped to a single include and is #undef'd immediately.
-// Only gang_full_layer_fused_mi300.cuh calls this name in titan's include
+// Only gang_full_layer_fused_mi300.cuh calls this name in fleet_mk's include
 // chain -- gang_qkv_attn_fused_mi300.cuh and gang_attention_mi300.cuh also
 // call it, but neither is reachable from here.
 //
@@ -2577,11 +2577,11 @@ FLEET_SHIM_PREAMBLE = r'''
 #include "tasks/mi300/gang_rmsnorm_linear_mxfp4_bias_mi300.cuh"
 #include "tasks/mi300/paged_attention_ck_fmha_split_kv_mi300.cuh"
 
-namespace titan {
+namespace fleet_mk {
 // Per-layer sliding window, published by the layer loop before the body runs
 // and read inside it by the attention phase. Workgroup-scoped: every worker
 // sets it for itself under a __syncthreads(), so no cross-worker ordering is
-// involved. TITAN_SHIM_CONST_WINDOW ablates it to a constant to isolate the
+// involved. FLEET_MK_SHIM_CONST_WINDOW ablates it to a constant to isolate the
 // shim + include reorder from the shared-variable channel.
 //
 // STATIC LDS SIZE MOD 16 IS LOAD-BEARING, and it is the whole +1.09 ms story.
@@ -2647,7 +2647,7 @@ __device__ __forceinline__ void touch_lds_pad(int tid, int seed) {
   }
 }
 
-} // namespace titan
+} // namespace fleet_mk
 
 namespace kernel {
 // Signature mirrors paged_attention_ck_fmha_split_kv_impl exactly (10 template
@@ -2664,7 +2664,7 @@ template <typename T,
           int NUM_KV_HEADS_T,
           bool DECODE_ONLY = false>
 __device__ __forceinline__ void
-    titan_split_kv_runtime_window(void const *q_workspace_ptr,
+    fleet_mk_split_kv_runtime_window(void const *q_workspace_ptr,
                                   void *paged_k_cache_ptr,
                                   void *paged_v_cache_ptr,
                                   void *o_acc_ptr,
@@ -2702,26 +2702,26 @@ __device__ __forceinline__ void
       kv_head_idx,
       kv_chunk_idx,
       scale_s,
-#ifdef TITAN_SHIM_CONST_WINDOW
-      TITAN_SHIM_CONST_WINDOW,
-#elif defined(TITAN_CLAMP_WINDOW)
+#ifdef FLEET_MK_SHIM_CONST_WINDOW
+      FLEET_MK_SHIM_CONST_WINDOW,
+#elif defined(FLEET_MK_CLAMP_WINDOW)
       // Forward the per-layer window through a CLAMP the compiler can see:
-      // the result provably lies in [SLIDING_WINDOW, TITAN_FULL_WINDOW], so it
+      // the result provably lies in [SLIDING_WINDOW, FLEET_MK_FULL_WINDOW], so it
       // is provably > 0. That lets LLVM fold `sliding_window == 0` to false and
       // dead-strip the 21 KB __attn_wave_local_scan_hd64 path
       // (decode_minimal_hd64:754) even though the VALUE is a runtime load.
       // Both legal values (128 and 512) survive the clamp unchanged, so this
       // is semantically a no-op -- 512 is identical to the unlimited window at
-      // MAX_SEQ_LEN=512 (see TITAN_FULL_WINDOW).
-      // (Literals, not SLIDING_WINDOW / TITAN_FULL_WINDOW: those constants are
+      // MAX_SEQ_LEN=512 (see FLEET_MK_FULL_WINDOW).
+      // (Literals, not SLIDING_WINDOW / FLEET_MK_FULL_WINDOW: those constants are
       // declared below this shim. They are asserted equal at their definition.)
-      (titan::g_layer_sliding_window < 128
+      (fleet_mk::g_layer_sliding_window < 128
            ? 128
-           : (titan::g_layer_sliding_window > 512
+           : (fleet_mk::g_layer_sliding_window > 512
                   ? 512
-                  : titan::g_layer_sliding_window)),
+                  : fleet_mk::g_layer_sliding_window)),
 #else
-      titan::g_layer_sliding_window,
+      fleet_mk::g_layer_sliding_window,
 #endif
       sinks_ptr);
 }
@@ -2748,7 +2748,7 @@ template <typename T,
           int NUM_KV_HEADS_T,
           bool DECODE_ONLY = false>
 __device__ __forceinline__ void
-    titan_split_kv_specialized_window(void const *q_workspace_ptr,
+    fleet_mk_split_kv_specialized_window(void const *q_workspace_ptr,
                                       void *paged_k_cache_ptr,
                                       void *paged_v_cache_ptr,
                                       void *o_acc_ptr,
@@ -2763,31 +2763,31 @@ __device__ __forceinline__ void
                                       float scale_s,
                                       int /*template window -- ignored*/,
                                       void const *sinks_ptr = nullptr) {
-#define TITAN_CALL_ATTN(WIN_)                                                    paged_attention_ck_fmha_split_kv_impl<T,                                                                             NUM_QO_PER_KV,                                                                 HEAD_DIM,                                                                      PAGE_SIZE,                                                                     MAX_SEQ_LEN,                                                                   NUM_KV_CHUNKS,                                                                 Q_WORKSPACE_STRIDE,                                                            KV_CACHE_STRIDE_T,                                                             NUM_KV_HEADS_T,                                                                DECODE_ONLY>(q_workspace_ptr,                                                               paged_k_cache_ptr,                                                             paged_v_cache_ptr,                                                             o_acc_ptr,                                                                     lse_acc_ptr,                                                                   qo_indptr_buffer_ptr,                                                          paged_kv_indptr_buffer_ptr,                                                      paged_kv_indices_buffer_ptr,                                                      paged_kv_last_page_len_ptr,                                                      request_id,                                                                    kv_head_idx,                                                                   kv_chunk_idx,                                                                  scale_s,                                                                       (WIN_),                                                                        sinks_ptr)
-  if (titan::g_layer_sliding_window == 0) {
-    TITAN_CALL_ATTN(0);
+#define FLEET_MK_CALL_ATTN(WIN_)                                                    paged_attention_ck_fmha_split_kv_impl<T,                                                                             NUM_QO_PER_KV,                                                                 HEAD_DIM,                                                                      PAGE_SIZE,                                                                     MAX_SEQ_LEN,                                                                   NUM_KV_CHUNKS,                                                                 Q_WORKSPACE_STRIDE,                                                            KV_CACHE_STRIDE_T,                                                             NUM_KV_HEADS_T,                                                                DECODE_ONLY>(q_workspace_ptr,                                                               paged_k_cache_ptr,                                                             paged_v_cache_ptr,                                                             o_acc_ptr,                                                                     lse_acc_ptr,                                                                   qo_indptr_buffer_ptr,                                                          paged_kv_indptr_buffer_ptr,                                                      paged_kv_indices_buffer_ptr,                                                      paged_kv_last_page_len_ptr,                                                      request_id,                                                                    kv_head_idx,                                                                   kv_chunk_idx,                                                                  scale_s,                                                                       (WIN_),                                                                        sinks_ptr)
+  if (fleet_mk::g_layer_sliding_window == 0) {
+    FLEET_MK_CALL_ATTN(0);
   } else {
-    TITAN_CALL_ATTN(128);
+    FLEET_MK_CALL_ATTN(128);
   }
-#undef TITAN_CALL_ATTN
+#undef FLEET_MK_CALL_ATTN
 }
 } // namespace kernel
 
-// TITAN_NO_SHIM keeps the early split-KV include but does NOT redirect the
+// FLEET_MK_NO_SHIM keeps the early split-KV include but does NOT redirect the
 // name, so fleet's body compiles exactly as it does in the shipping build.
 // Bisects "include reorder" against "shim".
-#if defined(TITAN_FLEET_HEADERS) && !defined(TITAN_NO_SHIM)
-#ifdef TITAN_SPECIALIZE_WINDOW
+#if defined(FLEET_MK_FLEET_HEADERS) && !defined(FLEET_MK_NO_SHIM)
+#ifdef FLEET_MK_SPECIALIZE_WINDOW
 #define paged_attention_ck_fmha_split_kv_impl                                  \
-  kernel::titan_split_kv_specialized_window
+  kernel::fleet_mk_split_kv_specialized_window
 #else
 #define paged_attention_ck_fmha_split_kv_impl                                  \
-  kernel::titan_split_kv_runtime_window
+  kernel::fleet_mk_split_kv_runtime_window
 #endif
 #endif
 '''
 
-FLEET_SHIM_UNDEF = r'''#if defined(TITAN_FLEET_HEADERS) && !defined(TITAN_NO_SHIM)
+FLEET_SHIM_UNDEF = r'''#if defined(FLEET_MK_FLEET_HEADERS) && !defined(FLEET_MK_NO_SHIM)
 #undef paged_attention_ck_fmha_split_kv_impl
 #endif
 '''
@@ -2798,13 +2798,13 @@ def emit_fleet_shim(cfg: ModelConfig) -> str:
 
     Fleet exposes the sliding window as a template parameter only, and names the
     attention callee UNQUALIFIED at gang_full_layer_fused_mi300.cuh:610. Since
-    fleet's tree is used out of the box and must not be edited, titan parses the
+    fleet's tree is used out of the box and must not be edited, fleet_mk parses the
     real definition first, redirects the name to a shim for the duration of one
     include, and #undef's it immediately after. One instantiation then serves
     both layer parities.
 
     UNPROTECTED COUPLING: if fleet ever qualifies or renames that call, the
-    redirect stops applying and titan silently runs full attention on the 18
+    redirect stops applying and fleet_mk silently runs full attention on the 18
     sliding-window layers. That is fluent wrong output with no compile error.
     """
     return FLEET_SHIM_PREAMBLE if cfg.headers == "fleet" else ""
@@ -2846,12 +2846,12 @@ def generate_kernel_fused_moe(cfg: ModelConfig) -> str:
     "preserve verbatim" notes at the substitution sites.
     """
     return f'''\
-/* Auto-generated by titan_generate.py
- * Titan: Persistent kernel for gpt-oss-120b (MoE) on MI350X
+/* Auto-generated by fleet_mk_generate.py
+ * Fleet MK: Persistent kernel for gpt-oss-120b (MoE) on MI350X
  *
  * Calls mirage's gang_full_layer_fused_kernel_mi300 directly for each layer,
  * eliminating any pointer/barrier mapping bugs. The layer loop + end-of-layer
- * barrier + tail (LM head) are Titan's own code.
+ * barrier + tail (LM head) are Fleet MK's own code.
  */
 #pragma once
 
@@ -3231,7 +3231,7 @@ gpt_oss_120b_lmhead_gemm_argmax(
 // ============================================================================
 // The gpt-oss-120b persistent kernel
 // Calls mirage's gang_full_layer_fused_kernel_mi300 for each layer,
-// with a Titan-specific end-of-layer barrier and tail (LM head).
+// with a Fleet MK-specific end-of-layer barrier and tail (LM head).
 // ============================================================================
 __global__ void __launch_bounds__(256)
 gpt_oss_120b_kernel(
@@ -3246,7 +3246,7 @@ gpt_oss_120b_kernel(
     int tid = threadIdx.x;
 
     // XCD-local rank via atomic counter
-    int *rank_counters = counter_buf + NUM_LAYERS * titan::COUNTERS_PER_LAYER;
+    int *rank_counters = counter_buf + NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER;
 
 {emit_decode_iter_note(cfg)}\
     __shared__ int s_xcd_rank;
@@ -3270,7 +3270,7 @@ gpt_oss_120b_kernel(
     int xcd_table_base = xcd_id * NUM_LAYERS * PTRS_PER_LAYER;
 
     // Tail counter pointers
-    int *tail_counters = counter_buf + (NUM_LAYERS - 1) * titan::COUNTERS_PER_LAYER;
+    int *tail_counters = counter_buf + (NUM_LAYERS - 1) * fleet_mk::COUNTERS_PER_LAYER;
     int *lmhead_done   = tail_counters + SLOT_TAIL_LMHEAD_NEW;
     float *argmax_packed_base = reinterpret_cast<float *>(
         tail_counters + SLOT_TAIL_ARGMAX_NEW);
@@ -3321,7 +3321,7 @@ gpt_oss_120b_kernel(
         __syncthreads();
         asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
         // Ends with buffer_inv, so the embedding is visible to every worker.
-        titan::barrier_global(embed_done, s_embed_expected, TOTAL_WORKERS,
+        fleet_mk::barrier_global(embed_done, s_embed_expected, TOTAL_WORKERS,
                               embed_local, xcd_id, WORKERS_PER_XCD);
 
         unsigned long long _embed_t1 = __builtin_amdgcn_s_memrealtime();
@@ -3330,7 +3330,7 @@ gpt_oss_120b_kernel(
         // Layer loop (36 layers)
         // ================================================================
         unsigned long long _layer_t0 = __builtin_amdgcn_s_memrealtime();
-#ifdef TITAN_ILB_TIMING
+#ifdef FLEET_MK_ILB_TIMING
         unsigned long long _ilb_accum = 0;
 #endif
 {emit_touch_lds_pad(cfg)}
@@ -3361,7 +3361,7 @@ gpt_oss_120b_kernel(
                     s_layer_expected = ((cur / NUM_XCDS) + 1) * NUM_XCDS;
                 }}
                 __syncthreads();
-                titan::barrier_global(layer_done, s_layer_expected, TOTAL_WORKERS,
+                fleet_mk::barrier_global(layer_done, s_layer_expected, TOTAL_WORKERS,
                                       layer_local, xcd_id, WORKERS_PER_XCD);
 
                 // ResAdd: workspace_f32 + oproj_out → layer_output, and zero
@@ -3384,7 +3384,7 @@ gpt_oss_120b_kernel(
                     for (int tok = 0; tok < config.num_active_tokens; tok++) {{
                         for (int col = global_rank * 256 + tid; col < HIDDEN_SIZE;
                              col += TOTAL_WORKERS * 256) {{
-#ifdef TITAN_FLEET_HEADERS
+#ifdef FLEET_MK_FLEET_HEADERS
                             // Fleet's MoE workspace is per-(token, topk slot), not
                             // per-token: W2's epilogue writes plain st_wt stores to
                             // (b * MOE_WS_SLOTS + slot) * HIDDEN_SIZE instead of
@@ -3422,7 +3422,7 @@ gpt_oss_120b_kernel(
                                 float sum = f + rv;
                                 layer_out[tok * HIDDEN_SIZE + col] = kernel::_gang_float_to_bf16(sum);
                             }}
-#ifndef TITAN_FLEET_HEADERS
+#ifndef FLEET_MK_FLEET_HEADERS
                             ws_f32[tok * HIDDEN_SIZE + col] = 0.0f;
 #endif
                         }}
@@ -3436,27 +3436,27 @@ gpt_oss_120b_kernel(
             // (gang_full_layer_fused_mi300.cuh:1318, active because we do not pass
             // MPK_NO_LAYER_BARRIER). Running both is a double rendezvous per layer
             // -- 36 extra barriers per token, and every worker waiting twice.
-            // Decision on record: fleet's barrier survives, titan's is deleted.
+            // Decision on record: fleet's barrier survives, fleet_mk's is deleted.
             //
             // The LAST-layer global barrier above is NOT redundant and stays: it
-            // guards titan's own parallel ResAdd, which fleet has no equivalent of.
-#ifndef TITAN_FLEET_HEADERS
+            // guards fleet_mk's own parallel ResAdd, which fleet has no equivalent of.
+#ifndef FLEET_MK_FLEET_HEADERS
             if (layer < NUM_LAYERS - 1) {{
                 int *layer_done = layer_counters + SLOT_LAYER_DONE_NEW;
                 int *layer_local = layer_counters + SLOT_LAYER_LOCAL_NEW;
                 int *layer_release = layer_counters + SLOT_LAYER_RELEASE_NEW;
-#ifdef TITAN_ILB_TIMING
+#ifdef FLEET_MK_ILB_TIMING
                 unsigned long long _ilb0 = __builtin_amdgcn_s_memrealtime();
 #endif
-                titan::barrier_wt_release_no_wbl2(layer_done, layer_local,
+                fleet_mk::barrier_wt_release_no_wbl2(layer_done, layer_local,
                                                   layer_release, xcd_id, WORKERS_PER_XCD);
-#ifdef TITAN_ILB_TIMING
+#ifdef FLEET_MK_ILB_TIMING
                 // Accumulate instead of printing per layer: 36 layers x 8 XCDs
                 // of printf would perturb the very thing being measured.
                 _ilb_accum += __builtin_amdgcn_s_memrealtime() - _ilb0;
 #endif
             }}
-#endif  // !TITAN_FLEET_HEADERS
+#endif  // !FLEET_MK_FLEET_HEADERS
         }} // end layer loop
 
         unsigned long long _layer_t1 = __builtin_amdgcn_s_memrealtime();
@@ -3492,7 +3492,7 @@ gpt_oss_120b_kernel(
                 s_lyr_out = ptr_table[last_layer_base + SLOT_LAYER_OUTPUT];
             }}
             __syncthreads();
-            titan::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
+            fleet_mk::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
                 s_lyr_out,
                 config.lm_norm_weight,
                 config.lm_norm_scratch);
@@ -3506,7 +3506,7 @@ gpt_oss_120b_kernel(
             (unsigned short *)config.logits_output);
 
         // LM head global barrier
-        titan::barrier_global_local(lmhead_done, s_lmhead_expected, TOTAL_WORKERS);
+        fleet_mk::barrier_global_local(lmhead_done, s_lmhead_expected, TOTAL_WORKERS);
 
         // Cross-XCD argmax reduce (worker 0 on XCD 0)
         if (xcd_id == 0 && xcd_rank == 0 && tid == 0) {{
@@ -3535,68 +3535,68 @@ gpt_oss_120b_kernel(
             double layers_us = (double)(_layer_t1 - _layer_t0) * 10.0 / 1000.0;
             double tail_us   = (double)(_tail_t1 - _layer_t1) * 10.0 / 1000.0;
             double total_us  = (double)(_tail_t1 - _embed_t0) * 10.0 / 1000.0;
-#ifdef TITAN_ILB_TIMING
+#ifdef FLEET_MK_ILB_TIMING
             double ilb_us = (double)_ilb_accum * 10.0 / 1000.0;
-            printf("[TITAN_TIME] embed=%.1fus layers=%.1fus tail=%.1fus total=%.1fus ilb=%.1fus\\n",
+            printf("[FLEET_MK_TIME] embed=%.1fus layers=%.1fus tail=%.1fus total=%.1fus ilb=%.1fus\\n",
                    embed_us, layers_us, tail_us, total_us, ilb_us);
 #else
-            printf("[TITAN_TIME] embed=%.1fus layers=%.1fus tail=%.1fus total=%.1fus\\n",
+            printf("[FLEET_MK_TIME] embed=%.1fus layers=%.1fus tail=%.1fus total=%.1fus\\n",
                    embed_us, layers_us, tail_us, total_us);
 #endif
-#ifdef TITAN_QKV_DRAIN_TIMING
+#ifdef FLEET_MK_QKV_DRAIN_TIMING
             // Sum over every QKV worker/layer, so report the per-call mean and
             // the per-token total for XCD 0 alone (drains overlap across XCDs).
-            unsigned long long dsum = kernel::g_titan_qkv_drain;
-            unsigned long long dcnt = kernel::g_titan_qkv_drain_cnt;
+            unsigned long long dsum = kernel::g_fleet_mk_qkv_drain;
+            unsigned long long dcnt = kernel::g_fleet_mk_qkv_drain_cnt;
             if (dcnt) {{
-                printf("[TITAN_QKV_DRAIN] calls=%llu mean=%.3fus total_all=%.1fus\\n",
+                printf("[FLEET_MK_QKV_DRAIN] calls=%llu mean=%.3fus total_all=%.1fus\\n",
                        dcnt, (double)dsum * 10.0 / 1000.0 / (double)dcnt,
                        (double)dsum * 10.0 / 1000.0);
             }}
-            kernel::g_titan_qkv_drain = 0;
-            kernel::g_titan_qkv_drain_cnt = 0;
+            kernel::g_fleet_mk_qkv_drain = 0;
+            kernel::g_fleet_mk_qkv_drain_cnt = 0;
 #endif
-#ifdef TITAN_MOE_W2WAIT_TIMING
+#ifdef FLEET_MK_MOE_W2WAIT_TIMING
             {{
-                unsigned long long ws = kernel::g_titan_w2_wait;
-                unsigned long long wc = kernel::g_titan_w2_wait_cnt;
+                unsigned long long ws = kernel::g_fleet_mk_w2_wait;
+                unsigned long long wc = kernel::g_fleet_mk_w2_wait_cnt;
                 if (wc) {{
                     // 184 W2 tiles/layer x 36 layers = 6624 calls/token expected.
                     // mean = time one W2 tile sits blocked on the W13 barrier.
-                    printf("[TITAN_W2WAIT] calls=%llu mean=%.3fus\\n",
+                    printf("[FLEET_MK_W2WAIT] calls=%llu mean=%.3fus\\n",
                            wc, (double)ws * 10.0 / 1000.0 / (double)wc);
                 }}
-                kernel::g_titan_w2_wait = 0;
-                kernel::g_titan_w2_wait_cnt = 0;
+                kernel::g_fleet_mk_w2_wait = 0;
+                kernel::g_fleet_mk_w2_wait_cnt = 0;
             }}
 #endif
-#ifdef TITAN_MOE_SPLIT_TIMING
+#ifdef FLEET_MK_MOE_SPLIT_TIMING
             {{
                 // Per-tile wall time for each MoE phase. Expected counts per
                 // token: W13 = 180 real tiles x 36, W2 = 184 x 36. The means
                 // are per-tile, so they overlap across the 240 workers — they
                 // bound, not sum to, the 21.6us/layer MoE phase.
-                unsigned long long a = kernel::g_titan_moe_w13;
-                unsigned long long ac = kernel::g_titan_moe_w13_cnt;
-                unsigned long long b = kernel::g_titan_moe_w2;
-                unsigned long long bc = kernel::g_titan_moe_w2_cnt;
-                unsigned long long d = kernel::g_titan_moe_w13drain;
-                unsigned long long e = kernel::g_titan_moe_w13drain1;
-                unsigned long long q = kernel::g_titan_moe_w13quant;
-                unsigned long long qc = kernel::g_titan_moe_w13quant_cnt;
-                unsigned long long m = kernel::g_titan_moe_w13mfma;
-                unsigned long long pr = kernel::g_titan_moe_w13pro;
-                unsigned long long ep = kernel::g_titan_moe_w13epi;
-                unsigned long long f0 = kernel::g_titan_moe_w13mf0;
-                unsigned long long f1 = kernel::g_titan_moe_w13mf1;
-                unsigned long long md = kernel::g_titan_moe_w13mid;
-                unsigned long long en = kernel::g_titan_moe_w13ent;
-                unsigned long long i0 = kernel::g_titan_moe_w13iss0;
-                unsigned long long i1 = kernel::g_titan_moe_w13iss1;
-                unsigned long long sw = kernel::g_titan_moe_w13swi0;
+                unsigned long long a = kernel::g_fleet_mk_moe_w13;
+                unsigned long long ac = kernel::g_fleet_mk_moe_w13_cnt;
+                unsigned long long b = kernel::g_fleet_mk_moe_w2;
+                unsigned long long bc = kernel::g_fleet_mk_moe_w2_cnt;
+                unsigned long long d = kernel::g_fleet_mk_moe_w13drain;
+                unsigned long long e = kernel::g_fleet_mk_moe_w13drain1;
+                unsigned long long q = kernel::g_fleet_mk_moe_w13quant;
+                unsigned long long qc = kernel::g_fleet_mk_moe_w13quant_cnt;
+                unsigned long long m = kernel::g_fleet_mk_moe_w13mfma;
+                unsigned long long pr = kernel::g_fleet_mk_moe_w13pro;
+                unsigned long long ep = kernel::g_fleet_mk_moe_w13epi;
+                unsigned long long f0 = kernel::g_fleet_mk_moe_w13mf0;
+                unsigned long long f1 = kernel::g_fleet_mk_moe_w13mf1;
+                unsigned long long md = kernel::g_fleet_mk_moe_w13mid;
+                unsigned long long en = kernel::g_fleet_mk_moe_w13ent;
+                unsigned long long i0 = kernel::g_fleet_mk_moe_w13iss0;
+                unsigned long long i1 = kernel::g_fleet_mk_moe_w13iss1;
+                unsigned long long sw = kernel::g_fleet_mk_moe_w13swi0;
                 double s = qc ? 10.0 / 1000.0 / (double)qc : 0.0;
                 if (ac && bc) {{
-                    printf("[TITAN_MOESPLIT] w13 %.3fus = pro %.3f + quant %.3f + drain0 %.3f + mfma %.3f + epi %.3f | mfma = mf0 %.3f + mid %.3f + drain1 %.3f + mf1 %.3f | pro = ent %.3f + iss0 %.3f | mid = iss1 %.3f + swi0 %.3f | w2 %.3fus\\n",
+                    printf("[FLEET_MK_MOESPLIT] w13 %.3fus = pro %.3f + quant %.3f + drain0 %.3f + mfma %.3f + epi %.3f | mfma = mf0 %.3f + mid %.3f + drain1 %.3f + mf1 %.3f | pro = ent %.3f + iss0 %.3f | mid = iss1 %.3f + swi0 %.3f | w2 %.3fus\\n",
                            (double)a * 10.0 / 1000.0 / (double)ac,
                            (double)pr * s, (double)q * s, (double)d * s,
                            (double)m * s, (double)ep * s,
@@ -3605,45 +3605,45 @@ gpt_oss_120b_kernel(
                            (double)i1 * s, (double)sw * s,
                            (double)b * 10.0 / 1000.0 / (double)bc);
                 }}
-                kernel::g_titan_moe_w13ent = 0;
-                kernel::g_titan_moe_w13iss0 = 0;
-                kernel::g_titan_moe_w13iss1 = 0;
-                kernel::g_titan_moe_w13swi0 = 0;
-                kernel::g_titan_moe_w13drain = 0;
-                kernel::g_titan_moe_w13drain1 = 0;
-                kernel::g_titan_moe_w13pro = 0;
-                kernel::g_titan_moe_w13epi = 0;
-                kernel::g_titan_moe_w13mf0 = 0;
-                kernel::g_titan_moe_w13mf1 = 0;
-                kernel::g_titan_moe_w13mid = 0;
-                kernel::g_titan_moe_w13quant = 0;
-                kernel::g_titan_moe_w13quant_cnt = 0;
-                kernel::g_titan_moe_w13mfma = 0;
-                kernel::g_titan_moe_w13 = 0;
-                kernel::g_titan_moe_w13_cnt = 0;
-                kernel::g_titan_moe_w2 = 0;
-                kernel::g_titan_moe_w2_cnt = 0;
+                kernel::g_fleet_mk_moe_w13ent = 0;
+                kernel::g_fleet_mk_moe_w13iss0 = 0;
+                kernel::g_fleet_mk_moe_w13iss1 = 0;
+                kernel::g_fleet_mk_moe_w13swi0 = 0;
+                kernel::g_fleet_mk_moe_w13drain = 0;
+                kernel::g_fleet_mk_moe_w13drain1 = 0;
+                kernel::g_fleet_mk_moe_w13pro = 0;
+                kernel::g_fleet_mk_moe_w13epi = 0;
+                kernel::g_fleet_mk_moe_w13mf0 = 0;
+                kernel::g_fleet_mk_moe_w13mf1 = 0;
+                kernel::g_fleet_mk_moe_w13mid = 0;
+                kernel::g_fleet_mk_moe_w13quant = 0;
+                kernel::g_fleet_mk_moe_w13quant_cnt = 0;
+                kernel::g_fleet_mk_moe_w13mfma = 0;
+                kernel::g_fleet_mk_moe_w13 = 0;
+                kernel::g_fleet_mk_moe_w13_cnt = 0;
+                kernel::g_fleet_mk_moe_w2 = 0;
+                kernel::g_fleet_mk_moe_w2_cnt = 0;
             }}
 #endif
-#ifdef TITAN_OPROJ_SPLIT_TIMING
+#ifdef FLEET_MK_OPROJ_SPLIT_TIMING
             {{
                 // Sub-phase split of the fused OProj+RMSNorm+Router+TopK task.
                 // Expected count: OPROJ_TOTAL_TILES x 36 layers. gemm and rtopk
                 // are real work; bar is the Mechanism C wait, i.e. pure loss.
-                unsigned long long g = kernel::g_titan_op_gemm;
-                unsigned long long gc = kernel::g_titan_op_gemm_cnt;
-                unsigned long long b = kernel::g_titan_op_bar;
-                unsigned long long bc = kernel::g_titan_op_bar_cnt;
-                unsigned long long r = kernel::g_titan_op_rtopk;
-                unsigned long long rc = kernel::g_titan_op_rtopk_cnt;
-                unsigned long long l = kernel::g_titan_op_barlast;
-                unsigned long long lc = kernel::g_titan_op_barlast_cnt;
-                unsigned long long rr = kernel::g_titan_op_rr;
-                unsigned long long rrc = kernel::g_titan_op_rr_cnt;
-                unsigned long long ri = kernel::g_titan_op_rridle;
-                unsigned long long ric = kernel::g_titan_op_rridle_cnt;
+                unsigned long long g = kernel::g_fleet_mk_op_gemm;
+                unsigned long long gc = kernel::g_fleet_mk_op_gemm_cnt;
+                unsigned long long b = kernel::g_fleet_mk_op_bar;
+                unsigned long long bc = kernel::g_fleet_mk_op_bar_cnt;
+                unsigned long long r = kernel::g_fleet_mk_op_rtopk;
+                unsigned long long rc = kernel::g_fleet_mk_op_rtopk_cnt;
+                unsigned long long l = kernel::g_fleet_mk_op_barlast;
+                unsigned long long lc = kernel::g_fleet_mk_op_barlast_cnt;
+                unsigned long long rr = kernel::g_fleet_mk_op_rr;
+                unsigned long long rrc = kernel::g_fleet_mk_op_rr_cnt;
+                unsigned long long ri = kernel::g_fleet_mk_op_rridle;
+                unsigned long long ric = kernel::g_fleet_mk_op_rridle_cnt;
                 if (gc) {{
-                    printf("[TITAN_OPSPLIT] calls=%llu | gemm=%.3fus bar=%.3fus rtopk=%.3fus | barlast=%.3fus | rr=%.3fus(n=%llu) rridle=%.3fus(n=%llu)\\n",
+                    printf("[FLEET_MK_OPSPLIT] calls=%llu | gemm=%.3fus bar=%.3fus rtopk=%.3fus | barlast=%.3fus | rr=%.3fus(n=%llu) rridle=%.3fus(n=%llu)\\n",
                            gc, (double)g * 10.0 / 1000.0 / (double)gc,
                            bc ? (double)b * 10.0 / 1000.0 / (double)bc : 0.0,
                            rc ? (double)r * 10.0 / 1000.0 / (double)rc : 0.0,
@@ -3651,18 +3651,18 @@ gpt_oss_120b_kernel(
                            rrc ? (double)rr * 10.0 / 1000.0 / (double)rrc : 0.0, rrc,
                            ric ? (double)ri * 10.0 / 1000.0 / (double)ric : 0.0, ric);
                 }}
-                kernel::g_titan_op_barlast = 0;
-                kernel::g_titan_op_barlast_cnt = 0;
-                kernel::g_titan_op_rr = 0;
-                kernel::g_titan_op_rr_cnt = 0;
-                kernel::g_titan_op_rridle = 0;
-                kernel::g_titan_op_rridle_cnt = 0;
-                kernel::g_titan_op_gemm = 0;
-                kernel::g_titan_op_gemm_cnt = 0;
-                kernel::g_titan_op_bar = 0;
-                kernel::g_titan_op_bar_cnt = 0;
-                kernel::g_titan_op_rtopk = 0;
-                kernel::g_titan_op_rtopk_cnt = 0;
+                kernel::g_fleet_mk_op_barlast = 0;
+                kernel::g_fleet_mk_op_barlast_cnt = 0;
+                kernel::g_fleet_mk_op_rr = 0;
+                kernel::g_fleet_mk_op_rr_cnt = 0;
+                kernel::g_fleet_mk_op_rridle = 0;
+                kernel::g_fleet_mk_op_rridle_cnt = 0;
+                kernel::g_fleet_mk_op_gemm = 0;
+                kernel::g_fleet_mk_op_gemm_cnt = 0;
+                kernel::g_fleet_mk_op_bar = 0;
+                kernel::g_fleet_mk_op_bar_cnt = 0;
+                kernel::g_fleet_mk_op_rtopk = 0;
+                kernel::g_fleet_mk_op_rtopk_cnt = 0;
             }}
 #endif
         }}
@@ -3695,8 +3695,8 @@ def generate_kernel_dense(cfg: ModelConfig) -> str:
 
     # ── Header ──
     parts.append(f'''\
-/* Auto-generated by titan_generate.py
- * Titan: Persistent kernel for {cfg.name} (Dense) using device function library
+/* Auto-generated by fleet_mk_generate.py
+ * Fleet MK: Persistent kernel for {cfg.name} (Dense) using device function library
  *
  * Built ENTIRELY from device_functions.cuh -- no mirage fused kernel calls.
  * Demonstrates two-level fusion with composable device functions:
@@ -3875,7 +3875,7 @@ struct {nt}Config {{
     void const *lm_bias;
     void       *argmax_output;
 
-    // Subphase timing (optional, enabled via TITAN_SUBPHASE_TIMING)
+    // Subphase timing (optional, enabled via FLEET_MK_SUBPHASE_TIMING)
     unsigned long long *timing_buf;  // [NUM_LAYERS * TIMING_SLOTS_PER_LAYER] u64
 }};
 
@@ -3887,14 +3887,14 @@ struct {nt}Config {{
 static constexpr int TIMING_SLOTS_PER_LAYER = 12;
 static constexpr int TIMING_TAIL_SLOTS = 4;  // tail rmsnorm, lmhead, argmax, end
 
-#ifdef TITAN_SUBPHASE_TIMING
-#define TITAN_TIMESTAMP(buf, slot) \\
+#ifdef FLEET_MK_SUBPHASE_TIMING
+#define FLEET_MK_TIMESTAMP(buf, slot) \\
     if (xcd_id == 0 && xcd_rank == 0 && tid == 0) {{ \\
         asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory"); \\
         (buf)[(slot)] = get_gpu_time(); \\
     }}
 #else
-#define TITAN_TIMESTAMP(buf, slot) ((void)0)
+#define FLEET_MK_TIMESTAMP(buf, slot) ((void)0)
 #endif
 ''')
 
@@ -3902,7 +3902,7 @@ static constexpr int TIMING_TAIL_SLOTS = 4;  // tail rmsnorm, lmhead, argmax, en
     # RoPE call depends on has_qk_norm
     if cfg.has_qk_norm:
         rope_call = f"""\
-            titan::rope_kv_update<HEAD_DIM, NUM_Q_PER_KV, NUM_KV_HEADS, PAGE_SIZE, true>(
+            fleet_mk::rope_kv_update<HEAD_DIM, NUM_Q_PER_KV, NUM_KV_HEADS, PAGE_SIZE, true>(
                 (const unsigned short *)s_output_ptrs[ptr::QKV_OUTPUT],
                 (const unsigned short *)config.cos_ptr,
                 (const unsigned short *)config.sin_ptr,
@@ -3918,7 +3918,7 @@ static constexpr int TIMING_TAIL_SLOTS = 4;  // tail rmsnorm, lmhead, argmax, en
                 (const unsigned short *)s_input_ptrs[ptr::K_NORM_WEIGHT]);"""
     else:
         rope_call = f"""\
-            titan::rope_kv_update<HEAD_DIM, NUM_Q_PER_KV, NUM_KV_HEADS, PAGE_SIZE, false>(
+            fleet_mk::rope_kv_update<HEAD_DIM, NUM_Q_PER_KV, NUM_KV_HEADS, PAGE_SIZE, false>(
                 (const unsigned short *)s_output_ptrs[ptr::QKV_OUTPUT],
                 (const unsigned short *)config.cos_ptr,
                 (const unsigned short *)config.sin_ptr,
@@ -3952,7 +3952,7 @@ __global__ void __launch_bounds__(256)
     int tid = threadIdx.x;
 
     // XCD-local rank via atomic counter
-    int *rank_counters = counter_buf + NUM_LAYERS * titan::COUNTERS_PER_LAYER;
+    int *rank_counters = counter_buf + NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER;
 
     __shared__ int s_xcd_rank;
     if (tid == 0) {{
@@ -3975,8 +3975,8 @@ __global__ void __launch_bounds__(256)
     // ================================================================
     // Layer loop
     // ================================================================
-#ifdef TITAN_SINGLE_LAYER_DEBUG
-    for (int layer = 0; layer < TITAN_SINGLE_LAYER_DEBUG; layer++) {{
+#ifdef FLEET_MK_SINGLE_LAYER_DEBUG
+    for (int layer = 0; layer < FLEET_MK_SINGLE_LAYER_DEBUG; layer++) {{
 #else
     for (int layer = 0; layer < NUM_LAYERS; layer++) {{
 #endif
@@ -3995,22 +3995,22 @@ __global__ void __launch_bounds__(256)
         // Counter buffer for this layer
         int *layer_counters = static_cast<int *>(s_input_ptrs[ptr::COUNTER_BUF]);
 
-#ifdef TITAN_SUBPHASE_TIMING
+#ifdef FLEET_MK_SUBPHASE_TIMING
         unsigned long long *layer_timing = config.timing_buf + layer * TIMING_SLOTS_PER_LAYER;
 #endif
-        TITAN_TIMESTAMP(layer_timing, 0);  // layer_start
+        FLEET_MK_TIMESTAMP(layer_timing, 0);  // layer_start
 
         // ────────────────────────────────────────────────────────────────
         // Phase 1: RMSNorm -> QKV GEMM -> RoPE + KV update
         // ────────────────────────────────────────────────────────────────
 
         // Phase 1a: RMSNorm (all workers redundantly compute)
-        titan::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
+        fleet_mk::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
             s_input_ptrs[ptr::RESIDUAL],
             s_input_ptrs[ptr::NORM_W1],
             s_input_ptrs[ptr::NORM_SCRATCH1]);
 
-        TITAN_TIMESTAMP(layer_timing, 1);  // after_rmsnorm1
+        FLEET_MK_TIMESTAMP(layer_timing, 1);  // after_rmsnorm1
 
         // Phase 1b: QKV GEMM with EpilogueStore (OPW={cfg.output_per_wg})
         {{
@@ -4024,12 +4024,12 @@ __global__ void __launch_bounds__(256)
             for (int t = xcd_rank; t < qkv_total_tiles; t += WORKERS_PER_XCD) {{
                 int wg_idx = t % QKV_N_WGS_PER_XCD;
 
-                titan::EpilogueStore store_ep;
+                fleet_mk::EpilogueStore store_ep;
                 store_ep.output = qkv_out_base;
                 store_ep.output_stride = QKV_OUTPUT_SIZE;
                 store_ep.output_size = QKV_N_WGS_PER_XCD * OUTPUT_PER_WG;  // local size
 
-                titan::gemm_mxfp4<titan::EpilogueStore, 1, HIDDEN_SIZE, OUTPUT_PER_WG>(
+                fleet_mk::gemm_mxfp4<fleet_mk::EpilogueStore, 1, HIDDEN_SIZE, OUTPUT_PER_WG>(
                     s_input_ptrs[ptr::NORM_SCRATCH1],  // input: norm output
                     s_input_ptrs[ptr::QKV_WEIGHT],
                     s_output_ptrs[ptr::QKV_OUTPUT],
@@ -4045,24 +4045,24 @@ __global__ void __launch_bounds__(256)
 
         // QKV barrier (local)
         {{
-            int *qkv_done = layer_counters + titan::SLOT_QKV_DONE;
+            int *qkv_done = layer_counters + fleet_mk::SLOT_QKV_DONE;
             __shared__ int s_qkv_expected;
             if (tid == 0) {{
                 int cur = __atomic_load_n(qkv_done, __ATOMIC_RELAXED);
                 s_qkv_expected = ((cur / TOTAL_WORKERS) + 1) * TOTAL_WORKERS;
             }}
             __syncthreads();
-            titan::barrier_global_local(qkv_done, s_qkv_expected, TOTAL_WORKERS);
+            fleet_mk::barrier_global_local(qkv_done, s_qkv_expected, TOTAL_WORKERS);
         }}
 
-        TITAN_TIMESTAMP(layer_timing, 2);  // after_qkv_barrier
+        FLEET_MK_TIMESTAMP(layer_timing, 2);  // after_qkv_barrier
 
         // Phase 1c: RoPE + KV cache update (one worker per KV head)
         if (xcd_rank == 0) {{
 {rope_call}
         }}
 
-        TITAN_TIMESTAMP(layer_timing, 3);  // after_rope (no barrier)
+        FLEET_MK_TIMESTAMP(layer_timing, 3);  // after_rope (no barrier)
 
         // ────────────────────────────────────────────────────────────────
         // Phase 2: Attention (scalar decode, no split-KV merge needed)
@@ -4097,24 +4097,24 @@ __global__ void __launch_bounds__(256)
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             }}
 
-            TITAN_TIMESTAMP(layer_timing, 4);  // after_attn_compute (only xcd_rank==0)
+            FLEET_MK_TIMESTAMP(layer_timing, 4);  // after_attn_compute (only xcd_rank==0)
 
             // Attention barrier (selective wbl2)
             {{
-                int *oproj_done = layer_counters + titan::SLOT_OPROJ_DONE;
+                int *oproj_done = layer_counters + fleet_mk::SLOT_OPROJ_DONE;
                 __shared__ int s_oproj_expected;
                 if (tid == 0) {{
                     int cur = __atomic_load_n(oproj_done, __ATOMIC_RELAXED);
                     s_oproj_expected = ((cur / TOTAL_WORKERS) + 1) * TOTAL_WORKERS;
                 }}
                 __syncthreads();
-                titan::barrier_global_selective_wbl2(
+                fleet_mk::barrier_global_selective_wbl2(
                     oproj_done, s_oproj_expected, TOTAL_WORKERS,
                     /*is_writer=*/xcd_rank == 0);
             }}
         }}
 
-        TITAN_TIMESTAMP(layer_timing, 5);  // after_oproj_barrier
+        FLEET_MK_TIMESTAMP(layer_timing, 5);  // after_oproj_barrier
 
         // ────────────────────────────────────────────────────────────────
         // Phase 3: O-proj GEMM + ResAdd + RMSNorm
@@ -4126,7 +4126,7 @@ __global__ void __launch_bounds__(256)
             for (int t = xcd_rank; t < oproj_total_tiles; t += WORKERS_PER_XCD) {{
                 int wg_idx = t % OPROJ_N_WGS_PER_XCD;
 
-                titan::EpilogueResAdd resadd_ep;
+                fleet_mk::EpilogueResAdd resadd_ep;
                 resadd_ep.output = (unsigned short *)s_output_ptrs[ptr::OPROJ_OUT]
                     + oproj_col_offset;
                 resadd_ep.residual = (const unsigned short *)s_input_ptrs[ptr::RESIDUAL]
@@ -4134,7 +4134,7 @@ __global__ void __launch_bounds__(256)
                 resadd_ep.output_stride = HIDDEN_SIZE;
                 resadd_ep.output_size = OPROJ_N_WGS_PER_XCD * OPROJ_OPW;
 
-                titan::gemm_mxfp4<titan::EpilogueResAdd, 1, OPROJ_REDUCTION, OPROJ_OPW>(
+                fleet_mk::gemm_mxfp4<fleet_mk::EpilogueResAdd, 1, OPROJ_REDUCTION, OPROJ_OPW>(
                     s_output_ptrs[ptr::ATTN_OUT],    // input: attention output
                     s_input_ptrs[ptr::OPROJ_WEIGHT],
                     s_output_ptrs[ptr::OPROJ_OUT],
@@ -4148,26 +4148,26 @@ __global__ void __launch_bounds__(256)
                     resadd_ep);
             }}
 
-            TITAN_TIMESTAMP(layer_timing, 6);  // after_oproj_gemm
+            FLEET_MK_TIMESTAMP(layer_timing, 6);  // after_oproj_gemm
 
             // O-proj hierarchical barrier
             {{
-                int *ffn_mid_done = layer_counters + titan::SLOT_FFN_MID_DONE;
-                int *ffn_local = layer_counters + titan::SLOT_FFN_LOCAL;
+                int *ffn_mid_done = layer_counters + fleet_mk::SLOT_FFN_MID_DONE;
+                int *ffn_local = layer_counters + fleet_mk::SLOT_FFN_LOCAL;
                 __shared__ int s_ffn_mid_expected;
                 if (tid == 0) {{
                     int cur = __atomic_load_n(ffn_mid_done, __ATOMIC_RELAXED);
                     s_ffn_mid_expected = ((cur / NUM_XCDS) + 1) * NUM_XCDS;
                 }}
                 __syncthreads();
-                titan::barrier_global(ffn_mid_done, s_ffn_mid_expected, TOTAL_WORKERS,
+                fleet_mk::barrier_global(ffn_mid_done, s_ffn_mid_expected, TOTAL_WORKERS,
                                       ffn_local, xcd_id, WORKERS_PER_XCD);
             }}
 
-            TITAN_TIMESTAMP(layer_timing, 7);  // after_ffn_mid_barrier
+            FLEET_MK_TIMESTAMP(layer_timing, 7);  // after_ffn_mid_barrier
 
             // RMSNorm on O-proj output (all workers redundantly)
-            titan::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
+            fleet_mk::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
                 s_output_ptrs[ptr::OPROJ_OUT],
                 s_input_ptrs[ptr::NORM_W2],
                 s_input_ptrs[ptr::NORM_SCRATCH2]);
@@ -4183,13 +4183,13 @@ __global__ void __launch_bounds__(256)
                 for (int t = xcd_rank; t < gateup_total_tiles; t += WORKERS_PER_XCD) {{
                     int wg_idx = t % GATEUP_N_WGS_PER_XCD;
 
-                    titan::EpilogueSwiGLU swiglu_ep;
+                    fleet_mk::EpilogueSwiGLU swiglu_ep;
                     swiglu_ep.output = (unsigned short *)s_output_ptrs[ptr::SWIGLU_OUT]
                         + swiglu_col_offset;
                     swiglu_ep.output_stride = INTERMEDIATE_SIZE;
                     swiglu_ep.output_size = GATEUP_N_WGS_PER_XCD * (GATEUP_OPW / 2);
 
-                    titan::gemm_mxfp4<titan::EpilogueSwiGLU, 1, HIDDEN_SIZE, GATEUP_OPW>(
+                    fleet_mk::gemm_mxfp4<fleet_mk::EpilogueSwiGLU, 1, HIDDEN_SIZE, GATEUP_OPW>(
                         s_input_ptrs[ptr::NORM_SCRATCH2],  // input: pre-FFN norm output
                         s_input_ptrs[ptr::GATEUP_WEIGHT],
                         s_output_ptrs[ptr::SWIGLU_OUT],    // output buffer
@@ -4204,23 +4204,23 @@ __global__ void __launch_bounds__(256)
                 }}
             }}
 
-            TITAN_TIMESTAMP(layer_timing, 8);  // after_gateup_gemm
+            FLEET_MK_TIMESTAMP(layer_timing, 8);  // after_gateup_gemm
 
             // GateUp->Down hierarchical barrier
             {{
-                int *down_done = layer_counters + titan::SLOT_DOWN_DONE;
-                int *down_local = layer_counters + titan::SLOT_DOWN_LOCAL;
+                int *down_done = layer_counters + fleet_mk::SLOT_DOWN_DONE;
+                int *down_local = layer_counters + fleet_mk::SLOT_DOWN_LOCAL;
                 __shared__ int s_down_expected;
                 if (tid == 0) {{
                     int cur = __atomic_load_n(down_done, __ATOMIC_RELAXED);
                     s_down_expected = ((cur / NUM_XCDS) + 1) * NUM_XCDS;
                 }}
                 __syncthreads();
-                titan::barrier_global(down_done, s_down_expected, TOTAL_WORKERS,
+                fleet_mk::barrier_global(down_done, s_down_expected, TOTAL_WORKERS,
                                       down_local, xcd_id, WORKERS_PER_XCD);
             }}
 
-            TITAN_TIMESTAMP(layer_timing, 9);  // after_gateup_barrier
+            FLEET_MK_TIMESTAMP(layer_timing, 9);  // after_gateup_barrier
 
             // Step 4b: Down GEMM with ResAdd
             {{
@@ -4230,7 +4230,7 @@ __global__ void __launch_bounds__(256)
                 for (int t = xcd_rank; t < down_total_tiles; t += WORKERS_PER_XCD) {{
                     int wg_idx = t % DOWN_N_WGS_PER_XCD;
 
-                    titan::EpilogueResAdd resadd_ep;
+                    fleet_mk::EpilogueResAdd resadd_ep;
                     resadd_ep.output = (unsigned short *)s_output_ptrs[ptr::LAYER_OUTPUT]
                         + down_col_offset;
                     resadd_ep.residual = (const unsigned short *)s_output_ptrs[ptr::OPROJ_OUT]
@@ -4238,7 +4238,7 @@ __global__ void __launch_bounds__(256)
                     resadd_ep.output_stride = HIDDEN_SIZE;
                     resadd_ep.output_size = DOWN_N_WGS_PER_XCD * OUTPUT_PER_WG;
 
-                    titan::gemm_mxfp4<titan::EpilogueResAdd, 1, INTERMEDIATE_SIZE, OUTPUT_PER_WG>(
+                    fleet_mk::gemm_mxfp4<fleet_mk::EpilogueResAdd, 1, INTERMEDIATE_SIZE, OUTPUT_PER_WG>(
                         s_output_ptrs[ptr::SWIGLU_OUT],
                         s_input_ptrs[ptr::DOWN_WEIGHT],
                         s_output_ptrs[ptr::LAYER_OUTPUT],
@@ -4254,22 +4254,22 @@ __global__ void __launch_bounds__(256)
             }}
         }}
 
-        TITAN_TIMESTAMP(layer_timing, 10);  // after_down_gemm""".format(gateup_opw=cfg.gateup_opw)}
+        FLEET_MK_TIMESTAMP(layer_timing, 10);  // after_down_gemm""".format(gateup_opw=cfg.gateup_opw)}
 
         // -- End-of-layer hierarchical barrier --
         {{
-            int *layer_done = layer_counters + titan::SLOT_LAYER_DONE;
-            int *layer_local = layer_counters + titan::SLOT_LAYER_LOCAL;
+            int *layer_done = layer_counters + fleet_mk::SLOT_LAYER_DONE;
+            int *layer_local = layer_counters + fleet_mk::SLOT_LAYER_LOCAL;
             __shared__ int s_layer_expected;
             if (tid == 0) {{
                 int cur = __atomic_load_n(layer_done, __ATOMIC_RELAXED);
                 s_layer_expected = ((cur / NUM_XCDS) + 1) * NUM_XCDS;
             }}
             __syncthreads();
-            titan::barrier_global(layer_done, s_layer_expected, TOTAL_WORKERS,
+            fleet_mk::barrier_global(layer_done, s_layer_expected, TOTAL_WORKERS,
                                   layer_local, xcd_id, WORKERS_PER_XCD);
         }}
-        TITAN_TIMESTAMP(layer_timing, 11);  // after_layer_barrier
+        FLEET_MK_TIMESTAMP(layer_timing, 11);  // after_layer_barrier
     }} // end layer loop
 
     // ================================================================
@@ -4277,10 +4277,10 @@ __global__ void __launch_bounds__(256)
     // ================================================================
 
     // Use tail counter slots (after last layer)
-    int *tail_counters = counter_buf + (NUM_LAYERS - 1) * titan::COUNTERS_PER_LAYER;
-    int *lmhead_done   = tail_counters + titan::SLOT_TAIL_LMHEAD;
+    int *tail_counters = counter_buf + (NUM_LAYERS - 1) * fleet_mk::COUNTERS_PER_LAYER;
+    int *lmhead_done   = tail_counters + fleet_mk::SLOT_TAIL_LMHEAD;
     float *argmax_packed_base = reinterpret_cast<float *>(
-        tail_counters + titan::SLOT_TAIL_ARGMAX);
+        tail_counters + fleet_mk::SLOT_TAIL_ARGMAX);
 
     __shared__ int s_lmhead_expected;
     if (tid == 0) {{
@@ -4291,7 +4291,7 @@ __global__ void __launch_bounds__(256)
 
     // Wait for last layer to complete
     {{
-        int *tail_sync = tail_counters + titan::SLOT_QKV_DONE;
+        int *tail_sync = tail_counters + fleet_mk::SLOT_QKV_DONE;
         __shared__ int s_tail_expected;
         if (tid == 0) {{
             int cur = __atomic_load_n(tail_sync, __ATOMIC_RELAXED);
@@ -4299,7 +4299,7 @@ __global__ void __launch_bounds__(256)
         }}
         __syncthreads();
         // LAYER_DONE barrier already flushed L2 for last layer output
-        titan::barrier_global_local(tail_sync, s_tail_expected, TOTAL_WORKERS);
+        fleet_mk::barrier_global_local(tail_sync, s_tail_expected, TOTAL_WORKERS);
     }}
 
     // Initialize per-XCD argmax slots
@@ -4314,7 +4314,7 @@ __global__ void __launch_bounds__(256)
     }}
 
     // RMSNorm on last layer output
-    titan::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
+    fleet_mk::rmsnorm<HIDDEN_SIZE, ACTUAL_HIDDEN_DIM>(
         s_output_ptrs[ptr::LAYER_OUTPUT],
         config.lm_norm_weight,
         config.lm_norm_scratch);
@@ -4494,7 +4494,7 @@ __global__ void __launch_bounds__(256)
     }}
 
     // LM head global barrier
-    titan::barrier_global_local(lmhead_done, s_lmhead_expected, TOTAL_WORKERS);
+    fleet_mk::barrier_global_local(lmhead_done, s_lmhead_expected, TOTAL_WORKERS);
 
     // Cross-XCD argmax reduce (worker 0 on XCD 0)
     if (xcd_id == 0 && xcd_rank == 0 && tid == 0) {{
@@ -4516,7 +4516,7 @@ __global__ void __launch_bounds__(256)
     }}
 
     // Final L2 writeback
-    titan::final_writeback();
+    fleet_mk::final_writeback();
 }}
 ''')
 
@@ -4555,12 +4555,12 @@ def generate_driver_fused_moe(cfg: ModelConfig) -> str:
     """
     return f'''\
 #!/usr/bin/env python3
-"""Auto-generated by titan_generate.py
-Titan demo for {cfg.name} inference using two-level fusion.
+"""Auto-generated by fleet_mk_generate.py
+Fleet MK demo for {cfg.name} inference using two-level fusion.
 
 Loads {cfg.name} weights from HuggingFace, quantizes to MXFP4, builds the
 pointer table for the {cfg.name} persistent kernel, runs prefill via PyTorch,
-then decode via the titan kernel.
+then decode via the fleet_mk kernel.
 
 Usage:
     HIP_VISIBLE_DEVICES=0 python3 demo_{cfg.name_clean}.py \\
@@ -4581,13 +4581,13 @@ import torch
 import yaml
 from safetensors import safe_open
 
-# Weight packing primitives. These live in titan now (titan_vllm/mxfp4_pack.py,
+# Weight packing primitives. These live in fleet_mk now (fleet_megakernel_vllm/mxfp4_pack.py,
 # a verified copy of mirage's demo.py originals) rather than being imported out
 # of the mirage checkout at runtime -- the vLLM plugin already depends on the
 # local copy, and the two packers must agree byte-for-byte or the two entry
 # points build different slabs for the same kernel.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from titan_vllm.mxfp4_pack import (  # noqa: E402
+from fleet_megakernel_vllm.mxfp4_pack import (  # noqa: E402
     pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup)
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -4630,17 +4630,17 @@ MOE_INTERMEDIATE_SIZE = {cfg.padded_moe_intermediate_size}
 # the row pitch belongs to whoever wrote the buffer, and the reduction belongs to
 # the MFMA -- see MPK_MOE_K_STRIDE in gang_moe_fused_mxfp4_mi300.cuh.
 #
-# It is only ever non-default when titan reads expert weights out of an
+# It is only ever non-default when fleet_mk reads expert weights out of an
 # allocation someone else padded. vLLM rounds GPT-OSS's K to 3072, so its rows
-# sit 1536 B apart; to alias that memory rather than copy it, titan has to walk
-# rows at ITS pitch while still reducing {cfg.padded_hidden_size}. Setting this here packs titan's
+# sit 1536 B apart; to alias that memory rather than copy it, fleet_mk has to walk
+# rows at ITS pitch while still reducing {cfg.padded_hidden_size}. Setting this here packs fleet_mk's
 # own slab the same way, which exercises the kernel's stride path without vLLM
 # in the picture.
 #
 # MUST equal the -DMPK_MOE_K_STRIDE the .so was built with (0/unset means "same
 # as the reduction"). A mismatch does not fail the build -- it reads every
 # expert row at the wrong offset and produces fluent-looking garbage.
-MOE_K_STRIDE = int(os.environ.get("TITAN_MOE_K_STRIDE", "0")) or HIDDEN_SIZE
+MOE_K_STRIDE = int(os.environ.get("FLEET_MK_MOE_K_STRIDE", "0")) or HIDDEN_SIZE
 assert MOE_K_STRIDE >= HIDDEN_SIZE and MOE_K_STRIDE % 32 == 0, (
     f"MOE_K_STRIDE={{MOE_K_STRIDE}} must be a multiple of 32 and at least the "
     f"{{HIDDEN_SIZE}}-wide reduction")
@@ -4648,7 +4648,7 @@ MOE_K_STRIDE_BLOCKS = MOE_K_STRIDE // 32
 
 # ── MoE scale placement ──────────────────────────────────────────────────────
 # 0: scales interleaved per workgroup -- [data][scales][data][scales]... This is
-#    what titan has always packed, and the kernel finds a workgroup's scales by
+#    what fleet_mk has always packed, and the kernel finds a workgroup's scales by
 #    walking WG_DATA bytes past its own data.
 # 1: split -- [all data][all scales], two contiguous sections addressed with
 #    independent bases and pitches.
@@ -4662,7 +4662,7 @@ MOE_K_STRIDE_BLOCKS = MOE_K_STRIDE // 32
 #
 # MUST equal the -DMPK_MOE_SPLIT_SCALES the .so was built with. Like the stride
 # knob, a mismatch is silent: it reads real scale bytes for the wrong rows.
-MOE_SPLIT_SCALES = os.environ.get("TITAN_MOE_SPLIT_SCALES", "0") == "1"
+MOE_SPLIT_SCALES = os.environ.get("FLEET_MK_MOE_SPLIT_SCALES", "0") == "1"
 
 # ── MoE data/scale allocation split ──────────────────────────────────────────
 # Split mode puts the two sections in ONE allocation, adjacent, so the scale base
@@ -4672,18 +4672,18 @@ MOE_SPLIT_SCALES = os.environ.get("TITAN_MOE_SPLIT_SCALES", "0") == "1"
 #
 # This knob makes them so. It buys nothing on its own -- same bytes, same
 # addresses modulo the allocator -- and that is exactly the point: it is the last
-# structural difference between titan's slab and the arrangement where the DATA
-# pointer belongs to vLLM and only the SCALE pointer is titan's. Exercising it on
-# titan's own bytes first isolates "two allocations" from "someone else's bytes",
+# structural difference between fleet_mk's slab and the arrangement where the DATA
+# pointer belongs to vLLM and only the SCALE pointer is fleet_mk's. Exercising it on
+# fleet_mk's own bytes first isolates "two allocations" from "someone else's bytes",
 # so that if the aliased run misbehaves, this is already ruled out.
 #
 # Costs no .so flag: the kernel takes both bases as arguments and never assumes a
 # relationship between them.
-MOE_SPLIT_BUFFERS = os.environ.get("TITAN_MOE_SPLIT_BUFFERS", "0") == "1"
+MOE_SPLIT_BUFFERS = os.environ.get("FLEET_MK_MOE_SPLIT_BUFFERS", "0") == "1"
 
 # ── Fleet QKV weight prefetch hand-off (input_ptrs[24]/[25]) ─────────────────
 # ON (the default) puts the QKV weight pointers fleet actually reads in those
-# slots. OFF restores titan's MoE scale bases, which is what shipped before and
+# slots. OFF restores fleet_mk's MoE scale bases, which is what shipped before and
 # what every -DMPK_PREFETCH_NEXT_QKV build ran with. See the long note at the
 # [24]/[25] entries in the pointer table for the mechanism.
 #
@@ -4691,7 +4691,7 @@ MOE_SPLIT_BUFFERS = os.environ.get("TITAN_MOE_SPLIT_BUFFERS", "0") == "1"
 # exactly two host-side integers -- same .so, same defines, same everything --
 # which makes it the cleanest A/B available and the only way to get a control
 # run without a rebuild. Both arms are correct; they differ in cost.
-TITAN_QKV_PF = os.environ.get("TITAN_QKV_PF", "1") == "1"
+FLEET_MK_QKV_PF = os.environ.get("FLEET_MK_QKV_PF", "1") == "1"
 
 # ── MoE slab tail pad (DIAGNOSTIC) ───────────────────────────────────────────
 # Bytes of dead space appended to the END of each packed expert slab. Purely a
@@ -4707,16 +4707,16 @@ TITAN_QKV_PF = os.environ.get("TITAN_QKV_PF", "1") == "1"
 # a different address -- and only the first is evidence of an overrun. If -1
 # also survives, the pad proved nothing about reads running off the end and the
 # fault is address- or allocator-dependent instead.
-MOE_TAIL_PAD = int(os.environ.get("TITAN_MOE_TAIL_PAD", "0"))
+MOE_TAIL_PAD = int(os.environ.get("FLEET_MK_MOE_TAIL_PAD", "0"))
 
 # Which expert slabs the pad applies to: "both" (default), "w13", or "w2".
 # Padding one at a time says WHICH tensor is overrun, which the combined run
 # cannot: both slabs are rebuilt together otherwise.
-MOE_TAIL_PAD_SLOT = os.environ.get("TITAN_MOE_TAIL_PAD_SLOT", "both")
+MOE_TAIL_PAD_SLOT = os.environ.get("FLEET_MK_MOE_TAIL_PAD_SLOT", "both")
 assert MOE_TAIL_PAD_SLOT in ("both", "w13", "w2")
 
 assert not MOE_SPLIT_BUFFERS or MOE_SPLIT_SCALES, (
-    "TITAN_MOE_SPLIT_BUFFERS requires TITAN_MOE_SPLIT_SCALES=1 -- there are no "
+    "FLEET_MK_MOE_SPLIT_BUFFERS requires FLEET_MK_MOE_SPLIT_SCALES=1 -- there are no "
     "separable sections to allocate apart while they are interleaved per "
     "workgroup")
 
@@ -4727,7 +4727,7 @@ assert not MOE_SPLIT_BUFFERS or MOE_SPLIT_SCALES, (
 # the tiles.
 #
 # vLLM pads BOTH axes to a multiple of 256, so its experts sit 6144/3072 rows
-# apart while titan computes 5888/2944. Unlike the K pad, these extra rows are
+# apart while fleet_mk computes 5888/2944. Unlike the K pad, these extra rows are
 # never addressed by any tile -- no MFMA sums them -- so their content is
 # irrelevant rather than required-zero.
 #
@@ -4737,15 +4737,15 @@ assert not MOE_SPLIT_BUFFERS or MOE_SPLIT_SCALES, (
 #
 # MUST equal the -DMPK_MOE_N_STRIDE the .so was built with. Requires split mode
 # on both sides: a foreign expert pitch implies a foreign buffer, which cannot
-# also carry titan's per-workgroup interleaved scales.
-MOE_N_STRIDE = int(os.environ.get("TITAN_MOE_N_STRIDE", "0"))
+# also carry fleet_mk's per-workgroup interleaved scales.
+MOE_N_STRIDE = int(os.environ.get("FLEET_MK_MOE_N_STRIDE", "0"))
 assert not MOE_N_STRIDE or MOE_SPLIT_SCALES, (
-    "TITAN_MOE_N_STRIDE requires TITAN_MOE_SPLIT_SCALES=1")
+    "FLEET_MK_MOE_N_STRIDE requires FLEET_MK_MOE_SPLIT_SCALES=1")
 assert not MOE_N_STRIDE or MOE_N_STRIDE >= HIDDEN_SIZE, (
     f"MOE_N_STRIDE={{MOE_N_STRIDE}} is shorter than the {{HIDDEN_SIZE}} rows W2 "
     f"computes -- experts would overlap")
 # One knob covers both axes only because GPT-OSS pads hidden and intermediate
-# alike (titan 2944/2944, vLLM 3072/3072). The kernel static_asserts this too.
+# alike (fleet_mk 2944/2944, vLLM 3072/3072). The kernel static_asserts this too.
 assert not MOE_N_STRIDE or HIDDEN_SIZE == MOE_INTERMEDIATE_SIZE, (
     "one N-stride knob assumes hidden and intermediate pad alike")
 
@@ -4816,7 +4816,7 @@ COUNTERS_PER_LAYER = {cfg.counters_per_layer // 16} * 16  # 84 base + 10 fused o
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Titan {cfg.name} demo")
+    parser = argparse.ArgumentParser(description="Fleet MK {cfg.name} demo")
     parser.add_argument("--model", default="Gpt/GPT-OSS-120B",
                         help="HuggingFace model name or path")
     parser.add_argument("--model-path", default=None,
@@ -4826,15 +4826,15 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--titan-so", default=None,
+    parser.add_argument("--fleet-mk-so", default=None,
                         help="Path to compiled {cfg.name_clean}.so")
     parser.add_argument("--pytorch-only", action="store_true",
-                        help="Use PyTorch for decode (skip titan kernel)")
+                        help="Use PyTorch for decode (skip fleet_mk kernel)")
     return parser.parse_args()
 
 
 def load_{cfg.name_clean}_kernel(so_path: str):
-    """Load the compiled Gpt titan .so."""
+    """Load the compiled Gpt fleet_mk .so."""
     lib = ctypes.CDLL(so_path)
 
     lib.{cfg.name_clean}_init.restype = None
@@ -4936,7 +4936,7 @@ def main():
              else "one allocation"))
 
     bs = 1  # decode batch size
-    page_size = {cfg.page_size}  # == titan PAGE_SIZE (vLLM's ROCm default block size)
+    page_size = {cfg.page_size}  # == fleet_mk PAGE_SIZE (vLLM's ROCm default block size)
     # Enough pages to hold the whole sequence. This used to be a bare 16, which
     # only worked because page_size was 128 (16 x 128 = 2048 entries, far past
     # any --max-seq-length). At page_size 16 a fixed 16 pages is 256 entries and
@@ -5161,7 +5161,7 @@ def main():
 
     weight_ptrs_host = [t.data_ptr() for t in weight_tensors]
 
-    # Diagnostic tail pad: see TITAN_MOE_TAIL_PAD. Appended AFTER data_ptr() is
+    # Diagnostic tail pad: see FLEET_MK_MOE_TAIL_PAD. Appended AFTER data_ptr() is
     # taken, so every base and every section offset is byte-for-byte what it was
     # -- the pad exists only to make the addresses past the last scale byte
     # legal. Held in weight_tensors' shadow by this list so it is not collected.
@@ -5404,14 +5404,14 @@ def main():
             # Giving each layer its own zeroed block breaks exactly that. Layer
             # 2's counter starts at 0, one arrival takes it to 1, and every
             # worker waits forever for 2. That is not a hypothesis: with
-            # -DTITAN_WORKER_STATE the mid-hang dump reads
+            # -DFLEET_MK_WORKER_STATE the mid-hang dump reads
             #   xcd=* phase=20 layer=2 barrier=20 observed=1 expected=2 -> 10 workers
             #   xcd=* phase=60 layer=2 barrier=60 observed=0 expected=2 -> 20 workers
             # on all 8 XCDs -- fleet's Phase 2 QKV epoch and Phase 6 attn
             # release, short by precisely the arrivals the previous layer would
             # have contributed had it shared the block.
             #
-            # The per-layer stride was correct for titan's OWN barriers, which
+            # The per-layer stride was correct for fleet_mk's OWN barriers, which
             # zero and reuse their slots; it is incompatible with fleet's
             # monotonic-counter contract. Sharing one block is what fleet does.
             counter_ptr = buf_counter.data_ptr()
@@ -5457,12 +5457,12 @@ def main():
     kv_indices = torch.arange(max_num_pages, dtype=torch.int32, device="cuda")
     kv_last_page_len = torch.zeros(1, dtype=torch.int32, device="cuda")
 
-    # -- Load titan kernel --
-    titan_so = args.titan_so or os.path.join(
+    # -- Load fleet_mk kernel --
+    fleet_mk_so = args.fleet_mk_so or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "generated", "{cfg.name_clean}.so")
-    print(f"Loading titan kernel from: {{titan_so}}")
-    titan = load_{cfg.name_clean}_kernel(titan_so)
-    titan.{cfg.name_clean}_init()
+    print(f"Loading fleet_mk kernel from: {{fleet_mk_so}}")
+    fleet_mk = load_{cfg.name_clean}_kernel(fleet_mk_so)
+    fleet_mk.{cfg.name_clean}_init()
 
     # -- Inference loop --
     stream = torch.cuda.current_stream()
@@ -5558,7 +5558,7 @@ def main():
             print(f"Decode min: {{min(decode_times):.3f}} ms/token")
             print(f"Decode max: {{max(decode_times):.3f}} ms/token")
     else:
-        # Titan kernel path: per-token launch loop with hipGraph
+        # Fleet MK kernel path: per-token launch loop with hipGraph
         import struct as st
 
         import time as _time
@@ -5566,7 +5566,7 @@ def main():
         cur_token = tokens[prompt_len].item()
         cur_pos = prompt_len
 
-        use_decode_loop = os.environ.get("TITAN_DECODE_LOOP", "0") == "1"
+        use_decode_loop = os.environ.get("FLEET_MK_DECODE_LOOP", "0") == "1"
 
         if use_decode_loop:
             # ============================================================
@@ -5583,7 +5583,7 @@ def main():
                 num_pages_used = (cur_pos + page_size) // page_size
                 kv_indptr[1] = num_pages_used
                 kv_last_page_len[0] = (cur_pos % page_size) + 1
-                titan.{cfg.name_clean}_launch(
+                fleet_mk.{cfg.name_clean}_launch(
                     1, attn_scale,
                     cos_padded.data_ptr(), sin_padded.data_ptr(),
                     qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -5611,7 +5611,7 @@ def main():
             wall_t0 = _time.perf_counter()
 
             # C-side decode loop: launches kernel repeatedly from C
-            titan.{cfg.name_clean}_decode_loop(
+            fleet_mk.{cfg.name_clean}_decode_loop(
                 1, attn_scale,
                 cos_padded.data_ptr(), sin_padded.data_ptr(),
                 qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -5658,7 +5658,7 @@ def main():
             print(f"Wall total: {{wall_elapsed:.3f}} ms")
             print(f"Wall avg: {{wall_avg:.3f}} ms/token")
 
-        elif os.environ.get("TITAN_PIPE", "0") == "1":
+        elif os.environ.get("FLEET_MK_PIPE", "0") == "1":
             # ============================================================
             # PIPELINED GRAPH: queue ALL decode steps, no host sync between
             # Bridge kernel handles argmax→token + KV metadata between steps
@@ -5678,7 +5678,7 @@ def main():
                 num_pages_used = (cur_pos + page_size) // page_size
                 kv_indptr[1] = num_pages_used
                 kv_last_page_len[0] = (cur_pos % page_size) + 1
-                titan.{cfg.name_clean}_launch(
+                fleet_mk.{cfg.name_clean}_launch(
                     1, attn_scale,
                     cos_padded.data_ptr(), sin_padded.data_ptr(),
                     qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -5712,7 +5712,7 @@ def main():
             torch.cuda.synchronize()
 
             # Capture pipelined graph
-            titan.{cfg.name_clean}_pipe_capture(
+            fleet_mk.{cfg.name_clean}_pipe_capture(
                 1, attn_scale,
                 cos_padded.data_ptr(), sin_padded.data_ptr(),
                 qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -5744,7 +5744,7 @@ def main():
 
             # Queue ALL decode steps at once — no host sync between!
             starter.record()
-            titan.{cfg.name_clean}_pipe_launch_all(
+            fleet_mk.{cfg.name_clean}_pipe_launch_all(
                 stream.cuda_stream,
                 remaining,
             )
@@ -5774,7 +5774,7 @@ def main():
             print(f"GPU total: {{gpu_elapsed:.3f}} ms")
             print(f"GPU avg: {{gpu_avg:.3f}} ms/token (zero host overhead)")
 
-            titan.{cfg.name_clean}_pipe_destroy()
+            fleet_mk.{cfg.name_clean}_pipe_destroy()
 
         else:
             # ============================================================
@@ -5793,7 +5793,7 @@ def main():
 
             # Helper to launch one decode step
             def launch_one_step(cur_tok_id):
-                titan.{cfg.name_clean}_launch(
+                fleet_mk.{cfg.name_clean}_launch(
                     1, attn_scale,
                     cos_padded.data_ptr(), sin_padded.data_ptr(),
                     qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -5809,7 +5809,7 @@ def main():
                     stream.cuda_stream,
                 )
 
-            use_graph = os.environ.get("TITAN_GRAPH", "0") == "1"
+            use_graph = os.environ.get("FLEET_MK_GRAPH", "0") == "1"
             graph_captured = False
 
             # Buffer sizes for graph capture
@@ -5832,13 +5832,13 @@ def main():
                     # Graph replay: zero + kernel in one submission
                     if di >= args.warmup:
                         starter.record()
-                    titan.{cfg.name_clean}_graph_launch(
+                    fleet_mk.{cfg.name_clean}_graph_launch(
                         cur_token,
                         stream.cuda_stream,
                     )
                 elif use_graph and di == args.warmup - 1:
                     # Last warmup: capture graph
-                    titan.{cfg.name_clean}_graph_capture(
+                    fleet_mk.{cfg.name_clean}_graph_capture(
                         1, attn_scale,
                         cos_padded.data_ptr(), sin_padded.data_ptr(),
                         qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -5859,7 +5859,7 @@ def main():
                     graph_captured = True
                     print(f"  [hipGraph captured at warmup iter {{di + 1}}]")
                     # Now replay the captured graph for this iteration
-                    titan.{cfg.name_clean}_graph_launch(
+                    fleet_mk.{cfg.name_clean}_graph_launch(
                         cur_token,
                         stream.cuda_stream,
                     )
@@ -5924,7 +5924,7 @@ def main():
                             print(f"Python overhead: {{overhead*1000:.0f}} us/token")
 
     # -- Subphase timing readback --
-    if os.environ.get("TITAN_SUBPHASE_TIMING"):
+    if os.environ.get("FLEET_MK_SUBPHASE_TIMING"):
         timing_data = buf_timing.cpu().numpy()
         # GPU clock is 100MHz on MI350 (10ns ticks)
         GPU_CLOCK_NS = 10.0
@@ -5976,7 +5976,7 @@ def main():
             print(f"    {{'TOTAL':62s}}: {{total_avg:8.1f}} us")
             print(f"    {{'TOTAL x {cfg.num_layers} layers':62s}}: {{total_avg * {cfg.num_layers} / 1000.0:8.3f}} ms")
 
-    titan.{cfg.name_clean}_finalize()
+    fleet_mk.{cfg.name_clean}_finalize()
     print("\\nDone.")
 
 
@@ -6033,12 +6033,12 @@ def generate_driver_dense(cfg: ModelConfig) -> str:
 
     return f'''\
 #!/usr/bin/env python3
-"""Auto-generated by titan_generate.py
-Titan demo for {cfg.name} inference using two-level fusion.
+"""Auto-generated by fleet_mk_generate.py
+Fleet MK demo for {cfg.name} inference using two-level fusion.
 
 Loads {cfg.name} weights from HuggingFace, quantizes to MXFP4, builds the
 pointer table for the {cfg.name} persistent kernel, runs prefill via PyTorch,
-then decode via the titan kernel.
+then decode via the fleet_mk kernel.
 
 Usage:
     HIP_VISIBLE_DEVICES=0 python3 demo_{nc}.py \\
@@ -6126,7 +6126,7 @@ COUNTERS_PER_LAYER = {cfg.counters_per_layer // 16} * 16
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Titan {cfg.name} demo")
+    parser = argparse.ArgumentParser(description="Fleet MK {cfg.name} demo")
     parser.add_argument("--model", default="{nt}/{cfg.name.upper().replace('-', '-')}",
                         help="HuggingFace model name or path")
     parser.add_argument("--model-path", default=None,
@@ -6136,15 +6136,15 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--titan-so", default=None,
+    parser.add_argument("--fleet-mk-so", default=None,
                         help="Path to compiled {nc}.so")
     parser.add_argument("--pytorch-only", action="store_true",
-                        help="Use PyTorch for decode (skip titan kernel)")
+                        help="Use PyTorch for decode (skip fleet_mk kernel)")
     return parser.parse_args()
 
 
 def load_{nc}_kernel(so_path: str):
-    """Load the compiled {nt} titan .so."""
+    """Load the compiled {nt} fleet_mk .so."""
     lib = ctypes.CDLL(so_path)
 
     lib.{nc}_init.restype = None
@@ -6204,7 +6204,7 @@ def main():
           f"heads={{NUM_Q_HEADS}}Q/{{NUM_KV_HEADS}}KV, head_dim={{HEAD_DIM}}")
 
     bs = 1  # decode batch size
-    page_size = {cfg.page_size}  # == titan PAGE_SIZE (vLLM's ROCm default block size)
+    page_size = {cfg.page_size}  # == fleet_mk PAGE_SIZE (vLLM's ROCm default block size)
     # Enough pages to hold the whole sequence. This used to be a bare 16, which
     # only worked because page_size was 128 (16 x 128 = 2048 entries, far past
     # any --max-seq-length). At page_size 16 a fixed 16 pages is 256 entries and
@@ -6518,12 +6518,12 @@ def main():
     kv_indices = torch.zeros(max_num_pages, dtype=torch.int32, device="cuda")
     kv_last_page_len = torch.zeros(1, dtype=torch.int32, device="cuda")
 
-    # -- Load titan kernel --
-    titan_so = args.titan_so or os.path.join(
+    # -- Load fleet_mk kernel --
+    fleet_mk_so = args.fleet_mk_so or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "generated", "{nc}.so")
-    print(f"Loading titan kernel from: {{titan_so}}")
-    titan = load_{nc}_kernel(titan_so)
-    titan.{nc}_init()
+    print(f"Loading fleet_mk kernel from: {{fleet_mk_so}}")
+    fleet_mk = load_{nc}_kernel(fleet_mk_so)
+    fleet_mk.{nc}_init()
 
     # -- Inference loop --
     stream = torch.cuda.current_stream()
@@ -6589,7 +6589,7 @@ def main():
                 logits = outputs.logits
             next_token = logits[:, -1, :VOCAB_SIZE].argmax(dim=-1).item()
         else:
-            # Titan kernel path
+            # Fleet MK kernel path
             embed_out = model.model.embed_tokens(
                 torch.tensor([[cur_token]], device=_model_device)).to("cuda")
             # Layer 0 reads from buf_residual_a (even layer -> RESIDUAL = A)
@@ -6605,7 +6605,7 @@ def main():
                 kv_indices[p] = p
             kv_last_page_len[0] = (cur_pos % page_size) + 1
 
-            titan.{nc}_launch(
+            fleet_mk.{nc}_launch(
                 1, attn_scale,
                 cos_padded.data_ptr(), sin_padded.data_ptr(),
                 qo_indptr.data_ptr(), kv_indptr.data_ptr(),
@@ -6654,7 +6654,7 @@ def main():
         print("\\nNo decode tokens generated (warmup >= output_len?)")
 
     # -- Subphase timing readback --
-    if os.environ.get("TITAN_SUBPHASE_TIMING"):
+    if os.environ.get("FLEET_MK_SUBPHASE_TIMING"):
         timing_data = buf_timing.cpu().numpy()
         # GPU clock is 100MHz on MI350 (10ns ticks)
         GPU_CLOCK_NS = 10.0
@@ -6705,7 +6705,7 @@ def main():
             print(f"    {{'TOTAL':62s}}: {{total_avg:8.1f}} us")
             print(f"    {{'TOTAL x {cfg.num_layers} layers':62s}}: {{total_avg * {cfg.num_layers} / 1000.0:8.3f}} ms")
 
-    titan.{nc}_finalize()
+    fleet_mk.{nc}_finalize()
     print("\\nDone.")
 
 
@@ -6720,7 +6720,7 @@ if __name__ == "__main__":
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Titan code generator: YAML config -> kernel + launch + driver + build")
+        description="Fleet MK code generator: YAML config -> kernel + launch + driver + build")
     parser.add_argument("config", help="Path to YAML model config file")
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: same as config parent)")

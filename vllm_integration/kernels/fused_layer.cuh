@@ -1,13 +1,13 @@
-/* Titan: Fused transformer layer kernel
+/* Fleet MK: Fused transformer layer kernel
  *
- * This file re-exports mirage's sub-kernel functions with Titan-compatible
+ * This file re-exports mirage's sub-kernel functions with Fleet MK-compatible
  * names and documents the interface. The actual implementations live in
  * mirage's include/ tree and are accessed via include path.
  *
  * Dependency chain:
  *   fused_layer.cuh
- *     -> common.cuh (Titan's own atomic/barrier primitives)
- *     -> barriers.cuh (Titan's barrier functions)
+ *     -> common.cuh (Fleet MK's own atomic/barrier primitives)
+ *     -> barriers.cuh (Fleet MK's barrier functions)
  *     -> mirage/persistent_kernel/tasks/mi300/gang_full_layer_fused_mi300.cuh
  *          -> gang_rmsnorm_linear_mxfp4_bias_mi300.cuh (QKV)
  *          -> paged_attention_ck_fmha_split_kv_mi300.cuh (Attention)
@@ -37,7 +37,7 @@
 #include "tasks/ampere/merge_splitkv.cuh"
 #include "tasks/mi300/gang_full_layer_fused_mi300.cuh"
 
-namespace titan {
+namespace fleet_mk {
 
 // ============================================================================
 // Sub-kernel interface documentation
@@ -99,9 +99,9 @@ namespace titan {
 // These are byte offsets into the counter buffer (oproj_counters_base).
 // Each slot is 16 bytes apart (cache-line aligned for atomics).
 
-using titan::ATTN_GLOBAL_COUNTER_SLOT;
-using titan::QKV_EPOCH_SLOT;
-using titan::CHUNK_BARRIER_SLOT;
-using titan::ROUTING_READY_SLOT;
+using fleet_mk::ATTN_GLOBAL_COUNTER_SLOT;
+using fleet_mk::QKV_EPOCH_SLOT;
+using fleet_mk::CHUNK_BARRIER_SLOT;
+using fleet_mk::ROUTING_READY_SLOT;
 
-} // namespace titan
+} // namespace fleet_mk

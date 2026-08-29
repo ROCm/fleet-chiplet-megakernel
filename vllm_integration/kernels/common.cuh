@@ -1,7 +1,7 @@
-/* Titan: Common utilities and type definitions for MI350 (gfx950)
+/* Fleet MK: Common utilities and type definitions for MI350 (gfx950)
  *
  * The memory atoms used to be TRANSCRIBED here from mirage's
- * mpk_atoms.cuh. That copy has been deleted: titan now includes fleet's own
+ * mpk_atoms.cuh. That copy has been deleted: fleet_mk now includes fleet's own
  * header (ROCm/fleet-chiplet-megakernel, branch amd_mi355_gpt_oss120b), which
  * arrives on the include path as <mirage/persistent_kernel/mpk_atoms.cuh>.
  *
@@ -13,7 +13,7 @@
  *      redefinition errors on ld_local_u64 / fence_local / atom_add_local_u64.
  *   2. It DRIFTED. A hand copy of someone else's memory-ordering primitives is
  *      a silent-corruption hazard: fleet can change an sc0/sc1 bit or a
- *      waitcnt and titan would keep the old semantics with no build error.
+ *      waitcnt and fleet_mk would keep the old semantics with no build error.
  *
  * Only the three atoms with NO fleet counterpart are kept below -- verified
  * 0 occurrences each in fleet's tree: get_xcd_id, kernel::_gang_moe_get_xcd_id,
@@ -27,7 +27,7 @@
 #include <hip/hip_bf16.h>       // provides __hip_bfloat16 struct (different from hip_bfloat16)
 #include <cstdint>
 
-// Force AMD platform for all titan code.
+// Force AMD platform for all fleet_mk code.
 // Must precede mpk_atoms.cuh: every atom there selects its AMD inline-asm body
 // with `defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)`, and the
 // #else branch is a plain volatile access with NO cache-bypass bits. Getting
@@ -43,15 +43,15 @@
 #include <mirage/persistent_kernel/mpk_atoms.cuh>
 
 // No-op stubs for fleet's worker-state tracing macros (MPK_WS_MARK et al).
-// Fleet defines these in persistent_kernel.cuh, which titan does not compile;
+// Fleet defines these in persistent_kernel.cuh, which fleet_mk does not compile;
 // without the stubs, fleet's MoE header fails on undeclared MPK_WS_MARK at
 // gang_moe_fused_mxfp4_mi300.cuh:289. Each stub is #ifndef-guarded, so if
 // persistent_kernel.cuh ever does enter the build its definitions win.
 #include "mpk_ws_stubs.cuh"
 
 // Use relaxed atomics + non-temporal memory (matches fleet's tuned config)
-#define TITAN_USE_RELAXED_ATOMICS
-#define TITAN_USE_NT_MEMORY
+#define FLEET_MK_USE_RELAXED_ATOMICS
+#define FLEET_MK_USE_NT_MEMORY
 
 // =============================================================================
 // XCD identification

@@ -2,8 +2,8 @@
 """Verify pack_mxfp4_workgroup's `section` argument against the full packed buffer.
 
 `section` is what makes aliasing possible in practice. The three stride/layout
-knobs (row_stride_blocks, split_scales, out_stride_rows) let titan DESCRIBE a
-buffer vLLM wrote; `section` lets titan avoid REBUILDING it. Without it, packing
+knobs (row_stride_blocks, split_scales, out_stride_rows) let fleet_mk DESCRIBE a
+buffer vLLM wrote; `section` lets fleet_mk avoid REBUILDING it. Without it, packing
 a scale slab for aliased data would still materialize the 60 GiB data section
 that is being aliased -- which is the entire cost this change exists to remove.
 
@@ -24,7 +24,7 @@ Five properties:
      on the right bytes for every (expert, workgroup) pair.
   5. Both stride knobs are inert on a scales-only pack. A foreign K pitch and a
      foreign N pitch describe the DATA section; if either moved the scale
-     section, titan's scales and vLLM's data would disagree about which expert
+     section, fleet_mk's scales and vLLM's data would disagree about which expert
      is which.
 
 Run:
@@ -37,7 +37,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from titan_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
+from fleet_megakernel_vllm.mxfp4_pack import pack_mxfp4_workgroup  # noqa: E402
 
 
 def _say(label, cond):
@@ -143,7 +143,7 @@ def check_rejects():
 
 
 def main():
-    # Real GPT-OSS 120B geometry, E cut to 2 experts. Titan computes 5888/2944
+    # Real GPT-OSS 120B geometry, E cut to 2 experts. Fleet MK computes 5888/2944
     # rows and reduces 2944 (92 blocks); vLLM stores 6144/3072 rows at a 3072
     # (96-block) K pitch.
     ok = True

@@ -1,8 +1,8 @@
-/* Titan: no-op stubs for the megakernel's worker-state / phase tracing macros.
+/* Fleet MK: no-op stubs for the megakernel's worker-state / phase tracing macros.
  *
  * Fleet's task headers call a family of debug-instrumentation macros
  * (MPK_WS_*, MPK_TW_SUB, MPK_PHASE_MARK) that are defined in
- * persistent_kernel.cuh. Titan does not compile persistent_kernel.cuh -- it
+ * persistent_kernel.cuh. Fleet MK does not compile persistent_kernel.cuh -- it
  * drives the task headers from its own generated kernel -- so those macros
  * arrive undefined and every call site is a hard error.
  *
@@ -20,7 +20,7 @@
  *   MPK_WS_MARK       :461
  *   MPK_WS_WAIT_BEGIN :474
  *   MPK_WS_WAIT_TICK  :475
- * all under #ifdef MPK_WORKER_STATE, which titan never defines.
+ * all under #ifdef MPK_WORKER_STATE, which fleet_mk never defines.
  *
  * Stubbing rather than enabling is the correct call on performance grounds,
  * not just convenience: fleet's own comment records the four-store tracing

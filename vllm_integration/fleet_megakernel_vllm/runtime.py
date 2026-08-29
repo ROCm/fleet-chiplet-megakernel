@@ -1,8 +1,8 @@
-"""Spec-driven runtime glue for the titan megakernel: ctypes loader, buffer pool,
+"""Spec-driven runtime glue for the fleet_mk megakernel: ctypes loader, buffer pool,
 pointer-table builders, and a decode driver.
 
 Everything here is parameterized by a `ModelSpec` (spec.py) so one launch path
-serves every titan model. The decode hot path (a single prebuilt-ptr-table kernel
+serves every fleet_mk model. The decode hot path (a single prebuilt-ptr-table kernel
 launch) is identical across models; all per-model variation lives in setup:
 which .so/launch symbol to load, buffer sizing, and how the pointer table is laid
 out (dense gate/up/down vs MoE experts). Weight packing is the caller's job
@@ -18,7 +18,7 @@ import torch
 
 # ── kernel loader ────────────────────────────────────────────────────────────
 def load_kernel(spec):
-    """Load the compiled titan .so and declare the ctypes ABI for `spec`.
+    """Load the compiled fleet_mk .so and declare the ctypes ABI for `spec`.
 
     The launch ABI is identical across models up to `argmax_output`; past it each
     family appends its own trailing args, carried on the spec as a tuple of
@@ -74,7 +74,7 @@ def load_qwen3_kernel(so_path):
 
 
 # ── workspace + paged-KV buffers ─────────────────────────────────────────────
-class TitanBuffers:
+class FleetMKBuffers:
     """All workspace + paged-KV buffers the megakernel reads/writes, sized from
     `spec`. Per-layer K/V caches are separate bf16 tensors of shape
     [max_num_pages*page_size, kv_cache_stride]; with alloc_kv=False they are left
@@ -324,7 +324,7 @@ def build_ptr_table(spec, weight_ptrs_host, buffers, moe_scale_ptrs=None):
 
 
 # ── decode driver ────────────────────────────────────────────────────────────
-class TitanDecoder:
+class FleetMKDecoder:
     """Drives a single decode step through the megakernel.
 
     Holds the loaded lib, buffer pool, pointer table, RoPE cos/sin tables (indexed
@@ -376,7 +376,7 @@ class TitanDecoder:
         self.kv_indices = torch.zeros(buffers.max_num_pages, dtype=torch.int32, device=dev)
         self.kv_last_page_len = torch.zeros(1, dtype=torch.int32, device=dev)
 
-        # Optional per-step megakernel timing (TITAN_PROFILE=1).
+        # Optional per-step megakernel timing (FLEET_MK_PROFILE=1).
         self._prof_start = torch.cuda.Event(enable_timing=True)
         self._prof_end = torch.cuda.Event(enable_timing=True)
         self._prof_ms = 0.0
@@ -390,9 +390,9 @@ class TitanDecoder:
         (embedding of the token being decoded, zero-padded past hidden_size), or
         None on the MoE path, where the kernel embeds itself and `token_id` is
         required instead. cur_pos: cached positions. block_table: optional int
-        tensor of physical page ids (vLLM's block_table, 1 block == 1 titan page
+        tensor of physical page ids (vLLM's block_table, 1 block == 1 fleet_mk page
         when block_size == page_size); None -> identity map (standalone/demo path).
-        sync=False enqueues without a host sync (vLLM path, which ignores titan's
+        sync=False enqueues without a host sync (vLLM path, which ignores fleet_mk's
         fused argmax and reads buf_lm_norm_scratch).
         """
         b = self.b
@@ -452,7 +452,7 @@ class TitanDecoder:
             len(args), len(S.extra_launch_args))
         args.append(stream.cuda_stream)
 
-        profile = os.environ.get("TITAN_PROFILE")
+        profile = os.environ.get("FLEET_MK_PROFILE")
         if profile:
             self._prof_start.record(stream)
         self.launch(*args)
@@ -464,7 +464,7 @@ class TitanDecoder:
             self._prof_ms += self._prof_start.elapsed_time(self._prof_end)
             self._prof_n += 1
             if self._prof_n % 32 == 0:
-                print(f"[titan] megakernel GPU avg: "
+                print(f"[fleet_mk] megakernel GPU avg: "
                       f"{self._prof_ms / self._prof_n:.3f} ms/token "
                       f"over {self._prof_n} steps", flush=True)
             return None

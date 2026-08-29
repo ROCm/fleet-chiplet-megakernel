@@ -6,7 +6,7 @@
 # barrier and produces garbage tokens.
 #
 # So neither block below is substituted line-by-line. Both are replaced by a
-# call into COUNTER_REGIONS, the single running-sum table in titan_generate.py,
+# call into COUNTER_REGIONS, the single running-sum table in fleet_mk_generate.py,
 # which is the only place a cache-line count is written down. The comment map
 # and the SLOT_* declarations are in DIFFERENT orders in the target file, and
 # the emitters preserve that -- the map is layout order, the declarations lead

@@ -14,7 +14,7 @@ SUBS = [
      "    # Kept outside the per-layer blocks, whose 103 cache lines are fully used.\n"
      "    # Must match SLOT_EMBED_DONE / SLOT_EMBED_LOCAL in the kernel.\n"
      "    EMBED_BARRIER_INTS = (1 + NUM_XCDS) * 16\n"
-     "    # Slack for the TITAN_ILB_TIMING diagnostic probe barrier (compiled out in\n"
+     "    # Slack for the FLEET_MK_ILB_TIMING diagnostic probe barrier (compiled out in\n"
      "    # production). Always allocated so a timing build needs no Python change.\n"
      "    ILB_PROBE_INTS = 20 * 16\n"
      "    counter_total_ints = (NUM_LAYERS * COUNTERS_PER_LAYER + RANK_COUNTER_INTS\n"

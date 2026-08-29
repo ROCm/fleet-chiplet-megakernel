@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Identify which MoE knob combination a built .so was compiled with.
 
-The three MPK_MOE_* knobs are invisible from the outside -- the banner titan
+The three MPK_MOE_* knobs are invisible from the outside -- the banner fleet_mk
 prints comes from the *env*, not the binary, so a .so and its env knobs can
 disagree silently (that mismatch is the whole reason moe_layout.py prints the
 "<-- .so MUST be built" line). This reads the answer out of the device code
@@ -48,7 +48,7 @@ def extents(k_stride, n_stride_w13, n_stride_w2, split):
 
 
 def combos():
-    """Every knob combination titan can currently be built with."""
+    """Every knob combination fleet_mk can currently be built with."""
     out = {}
     for k in (2944, 3072):
         for n in (0, 3072):

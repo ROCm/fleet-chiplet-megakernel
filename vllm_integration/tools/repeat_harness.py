@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the titan/vLLM harness N times and classify each run's failure mode.
+"""Run the fleet_mk/vLLM harness N times and classify each run's failure mode.
 
 Why this exists
 ---------------
@@ -26,8 +26,8 @@ log CONTENT, not by exit code.
 Usage
 -----
   python3 tools/repeat_harness.py --runs 6 --so /tmp/gpt_oss_120b.so.split_k \\
-      --env TITAN_MOE_SPLIT_SCALES=1 TITAN_MOE_SPLIT_BUFFERS=1 \\
-            TITAN_MOE_K_STRIDE=3072
+      --env FLEET_MK_MOE_SPLIT_SCALES=1 FLEET_MK_MOE_SPLIT_BUFFERS=1 \\
+            FLEET_MK_MOE_K_STRIDE=3072
 
 Runs are sequential by construction: never run two MPK arms concurrently.
 """
@@ -40,9 +40,9 @@ import subprocess
 import sys
 import time
 
-TITAN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FLEET_MK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON = "/home/claudeuser/venv-vllm027/bin/python3"
-LIVE_SO = os.path.join(TITAN_DIR, "generated", "gpt_oss_120b.so")
+LIVE_SO = os.path.join(FLEET_MK_DIR, "generated", "gpt_oss_120b.so")
 
 # Ordered most-specific first: the aperture violation and the node fault are
 # both real GPU memory faults; a bare timeout with neither is a hang.
@@ -90,10 +90,10 @@ def main() -> int:
 
     env = dict(os.environ)
     env.update({
-        "VLLM_PLUGINS": "titan",
-        "TITAN_MODEL": "/home/claudeuser/models/gpt-oss-120b",
+        "VLLM_PLUGINS": "fleet_mk",
+        "FLEET_MK_MODEL": "/home/claudeuser/models/gpt-oss-120b",
         "HIP_VISIBLE_DEVICES": "0",
-        "TITAN_MAX_TOKENS": str(args.tokens),
+        "FLEET_MK_MAX_TOKENS": str(args.tokens),
     })
     for kv in args.env:
         k, _, v = kv.partition("=")
@@ -108,8 +108,8 @@ def main() -> int:
             proc = subprocess.run(
                 ["bash", "-c",
                  f"ulimit -c 0; exec timeout {args.timeout} {PYTHON} "
-                 f"-m titan_vllm.harness"],
-                cwd=TITAN_DIR, env=env, stdout=fh, stderr=subprocess.STDOUT)
+                 f"-m fleet_megakernel_vllm.harness"],
+                cwd=FLEET_MK_DIR, env=env, stdout=fh, stderr=subprocess.STDOUT)
         text = open(log_path, errors="replace").read()
         verdict, detail = classify(text, proc.returncode)
         tally[verdict] = tally.get(verdict, 0) + 1
@@ -118,7 +118,7 @@ def main() -> int:
         if detail:
             print(f"           {detail}")
         # Cores are disabled above, but a prior arm may have left some behind.
-        for pat in ("/tmp/gpucore*", f"{TITAN_DIR}/gpucore*"):
+        for pat in ("/tmp/gpucore*", f"{FLEET_MK_DIR}/gpucore*"):
             subprocess.run(["bash", "-c", f"rm -f {pat}"], check=False)
 
     print(f"\n[repeat_harness] {args.runs} runs: " +

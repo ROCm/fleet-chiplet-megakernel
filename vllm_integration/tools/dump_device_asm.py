@@ -1,8 +1,8 @@
-"""Disassemble the GPU code inside a titan .so.
+"""Disassemble the GPU code inside a fleet_mk .so.
 
 `llvm-objdump` on the .so itself yields only x86 host code -- the device image
 is a clang offload bundle in the `.hip_fatbin` section, and under `-fgpu-rdc`
-(which titan uses) that bundle holds a linked ELF at a 4096-byte alignment
+(which fleet_mk uses) that bundle holds a linked ELF at a 4096-byte alignment
 offset rather than at byte 0. Disassembling the bundle directly reports zero
 instructions, which reads as "the kernel vanished" rather than "wrong input".
 
