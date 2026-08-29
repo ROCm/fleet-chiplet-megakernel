@@ -59,6 +59,8 @@ _BS1_ONLY_OPTS = (
     "MPK_W13_T0_COUNTED_HANDOFF",
     # Canonical K128 recycle is batch-1 / OPW=128 only (kernel static_asserts).
     "MPK_W13_KMAJOR_RECYCLE",
+    # Rides on the batch-1-only recycle schedule.
+    "MPK_W13_T1_BIAS_EARLY",
 )
 
 

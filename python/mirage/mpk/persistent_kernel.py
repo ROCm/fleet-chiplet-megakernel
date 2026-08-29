@@ -913,6 +913,14 @@ def get_compile_command(
             # can cost more in occupancy than the flat_load wait it removes;
             # this is the control that isolates the two halves.
             flags = flags + ["-DMPK_W13_BIAS_PF_T0_ONLY"]
+        if _opt("MPK_W13_T1_BIAS_EARLY"):
+            # Recycle-only: issue tile-1 bias after the counted T1-scale wait
+            # so T0 SwiGLU and T1 fragment waits hide its HBM latency.
+            # Three alternating pairs were 1.783/1.768, 1.767/1.776 and
+            # 1.783/1.766 ms (control/variant), all text bit-identical; direct
+            # W13 timing moved compute 7.52 -> 7.32 us. The kernel enforces
+            # the required recycle/bias flags.
+            flags = flags + ["-DMPK_W13_T1_BIAS_EARLY"]
         if _opt("MPK_ROUTER_FUSED_DP"):
             # Fold the router dot product into the RMSNorm's ssq pass. irms is
             # a scalar uniform over the row, so it can be applied once to the

@@ -104,6 +104,15 @@ namespace kernel {
 #endif
 #endif
 
+#ifdef MPK_W13_T1_BIAS_EARLY
+#ifndef MPK_W13_KMAJOR_RECYCLE
+#error "MPK_W13_T1_BIAS_EARLY requires MPK_W13_KMAJOR_RECYCLE"
+#endif
+#if !defined(MPK_W13_BIAS_PREFETCH) || defined(MPK_W13_BIAS_PF_T0_ONLY)
+#error "MPK_W13_T1_BIAS_EARLY requires tile-1 bias prefetch"
+#endif
+#endif
+
 // Per-expert MoE barrier geometry. One 64-byte line per slot (see the layout
 // note at the top of this file): 8 per-XCD release flags then the arrival
 // counter, so 9 lines used out of 10 reserved per expert.
@@ -1367,6 +1376,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       constexpr int W13_T1_SC_LPT_WAVE = (W13_T1_SC_DW4_PER_TILE + 63) / 64;
       i32x4_t w13_t1_sc_wave[W13_T1_SC_LPT_WAVE];
 #endif
+#ifdef MPK_W13_T1_BIAS_EARLY
+      uint2 w13_t1_bias_pf = {0u, 0u};
+      int const t1_out_n_pf =
+          wg_idx * W13_OUTPUT_PER_WG + (warp_id + NUM_WAVES) * 16 + g * 4;
+#endif
       // ── Phase C: MFMA from LDS ───────────────────────────────────────
       {
 #ifdef MPK_W13_T1_SPLIT_LDS_STAGE
@@ -2124,6 +2138,25 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             }
           }
         }
+#ifdef MPK_W13_T1_BIAS_EARLY
+        // vmcnt(23) above retired the older T0 bias and T1 scales. Launch the
+        // tile-1 bias now so T0 SwiGLU and the progressive fragment waits hide
+        // its HBM latency.
+        if (tok_active && t1_out_n_pf + 3 < W13_OUTPUT_SIZE) {
+          typedef unsigned int u32x2_t __attribute__((ext_vector_type(2)));
+          auto const *bias_address =
+              (u32x2_t const __attribute__((address_space(1))) *)&d_w13_bias
+                  [expert_id * W13_OUTPUT_SIZE + t1_out_n_pf];
+          u32x2_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(bias_address)
+                       : "memory");
+          w13_t1_bias_pf.x = value.x;
+          w13_t1_bias_pf.y = value.y;
+        }
+        asm volatile("" ::: "memory");
+#endif
 #endif
 
         // ── Issue tile_iter=1 per-wave HBM→LDS loads BEFORE SwiGLU ──
@@ -2640,6 +2673,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           // Tile-1's bias, hoisted above its MFMA block for the same reason as
           // tile-0's; see there for why this goes through the compiler rather
           // than inline asm.
+#ifndef MPK_W13_T1_BIAS_EARLY
           uint2 w13_t1_bias_pf = {0u, 0u};
           int const t1_out_n_pf =
               wg_idx * W13_OUTPUT_PER_WG + wave_tile_1 * 16 + g * 4;
@@ -2660,6 +2694,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             w13_t1_bias_pf.x = v.x;
             w13_t1_bias_pf.y = v.y;
           }
+#endif
 #endif
 
           // Depth-2 pipelined FP8 MFMA loop (tile_iter=1, full asm)
