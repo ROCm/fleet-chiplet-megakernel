@@ -218,9 +218,23 @@ script finds **0 of 92** and **0 of 46** workgroups keep a single AID across the
 4 possible positions. Not one weight page has a stable home, so no static
 placement can help.
 
-Making the map expert-invariant (`xcd = wg_idx % 8`) fixes that and is what
-takes remote traffic to 1.7%. It costs some balance: 92 workgroups over 8 XCDs
-is 11 or 12 each rather than an even split.
+Making the map expert-invariant is what takes remote traffic to 1.7%. The
+obvious `xcd = wg_idx % 8` works but costs load balance, because neither 92 nor
+46 divides by 8. The better map uses the fact that **only the AID has to be
+invariant, not the XCD** — there are 2 memory domains, not 8, so which of the
+4 XCDs inside an AID takes a tile is still free to rotate:
+
+    aid = (w < TILES/2) ? 0 : 1                  // fixed per workgroup
+    xcd = aid * 4 + ((p * (TILES/2) + w) % 4)    // rotates within the AID
+
+| map | AID-invariant wgs | XCD load imbalance |
+|---|---|---|
+| current `(p*TILES + w) % 8` | 0/92, 0/46 | 1.00x |
+| naive `w % 8` | 92/92, 46/46 | 1.09x (W13), 1.20x (W2) |
+| AID-split + rotate within AID | 92/92, 46/46 | **1.00x** |
+
+The halves divide evenly (92 -> 46 per AID, 46 -> 23) and 4 expert positions
+over 4 XCDs lands exactly, so this buys full pinnability at no balance cost.
 
 The residual 1.7% is the 85 MiB/token of genuinely shared tensors. Removing it
 would mean replicating them per AID, which is cheap in bytes but only worth it

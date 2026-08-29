@@ -151,16 +151,29 @@ def moe_tile_map(w13_wgs=92, w2_wgs=46):
     print("\n" + "=" * 60)
     print("MoE tile map: is the reading AID fixed per weight page?")
     print("=" * 60)
+    # Only the AID must be invariant, not the XCD: there are 2 memory domains,
+    # so which of the 4 XCDs inside an AID takes a tile can still rotate, which
+    # is what keeps the load even.
+    maps = {
+        "current  (p*TILES + w) % 8": lambda p, w, t: (p * t + w) % NUM_XCDS,
+        "naive    w % 8": lambda p, w, t: w % NUM_XCDS,
+        "AID-split + rotate in AID":
+            lambda p, w, t: (0 if w < t // 2 else 1) * XCDS_PER_AID
+                            + (p * (t // 2) + w) % XCDS_PER_AID,
+    }
     for phase, tiles in (("W13", w13_wgs), ("W2", w2_wgs)):
-        stable = sum(
-            len({((p * tiles + w) % NUM_XCDS) // XCDS_PER_AID
-                 for p in range(TOP_K)}) == 1
-            for w in range(tiles))
-        print(f"  {phase}: TILES={tiles}, TILES%8={tiles % NUM_XCDS} -> "
-              f"{stable}/{tiles} workgroups keep one AID across the {TOP_K} "
-              f"expert positions ({100 * stable / tiles:.0f}%)")
-    print("  Fix: make the tile map expert-invariant (xcd = wg_idx % 8) so a\n"
-          "  workgroup is always read by the same XCD regardless of routing.")
+        print(f"  {phase}: TILES={tiles}, TILES%8={tiles % NUM_XCDS}")
+        for label, fn in maps.items():
+            stable = sum(
+                len({fn(p, w, tiles) // XCDS_PER_AID
+                     for p in range(TOP_K)}) == 1
+                for w in range(tiles))
+            load = collections.Counter(fn(p, w, tiles)
+                                       for p in range(TOP_K)
+                                       for w in range(tiles))
+            imb = max(load.values()) / min(load.values())
+            print(f"    {label:28s} AID-invariant {stable:3d}/{tiles}  "
+                  f"load imbalance {imb:.2f}x")
 
 
 if __name__ == "__main__":
