@@ -406,3 +406,56 @@ ceiling should be read as provisional.
 For scale, the same breakdown puts **38% of every layer in barriers and
 inter-layer wait** (13.6 + 14.0 + 10.2), and Phase 7 alone is as expensive as
 the entire MoE. Those are far larger targets than AID locality.
+
+## The gap at fleet's real operating point (`aid_moe_bw.hip`)
+
+Every local/remote figure above -- 1.14x on NT streaming, 1.10x and 1.23x on
+`aid_gemv` -- was measured with the memory system nearly idle. `aid_gemv`'s
+shipped phase runs at **296.9 GB/s**; fleet's MoE phase runs at **4270 GB/s**.
+That is a 14x different operating point, so the gap was re-measured on a stream
+shaped like the MoE itself: 200192-byte MXFP4 slabs read exactly once, the
+invariant map's `w < 23 -> AID0` assignment, and a 509 MiB working set so the
+224 MiB L3 cannot absorb it.
+
+The arms matter. Comparing a pinned VMM buffer against `hipMalloc` confounds
+*homing* with *page size*, because VMM forces 4 KiB mappings while `hipMalloc`
+gets 2 MiB pages. So there is a fourth arm: `VMM-mixed`, the same VMM machinery
+with pages dealt alternately instead of by AID.
+
+| grid | hipMalloc | VMM-mixed | VMM-local | VMM-remote | loc/mix | loc/rem |
+|---|---|---|---|---|---|---|
+| 240 | 1422 | 1415 | 1970 | 1610 | 1.392x | 1.224x |
+| 960 | 5404 | 4814 | 4921 | 2881 | **1.022x** | 1.708x |
+| 1920 | 5480 | 4462 | 4525 | 2811 | **1.014x** | 1.610x |
+| 3840 | 5981 | 4518 | 4832 | 2916 | **1.070x** | 1.657x |
+
+Two results, and they point the same way.
+
+**The remote penalty grows under load, but the achievable gain shrinks.**
+AID-local beats AID-remote by 1.61-1.71x here, far worse than the 1.23x seen at
+297 GB/s -- so a loaded inter-AID link really does hurt more. But it beats a
+50/50 mix by only **1.02-1.07x**, and 50/50 is what `hipMalloc` already gives.
+Spreading traffic balances it across both AIDs' HBM stacks and both directions
+of the link; at saturation the bottleneck is aggregate HBM bandwidth, not the
+interconnect, so removing crossings buys almost nothing. The all-remote column
+is a pathology no allocator produces.
+
+**The mechanism costs 32%.** VMM-mixed (4518) against `hipMalloc` (5981) is the
+price of 130K separate 4 KiB mappings on the TLB -- an order of magnitude more
+than the 2-7% locality is worth. Folding both into the MoE phase's 23.8% share
+of the layer:
+
+| | end to end |
+|---|---|
+| locality alone, if 4 KiB pages were free | 1.825 -> 1.80 ms (+0.5% to +1.6%) |
+| locality as actually implementable | 1.825 -> ~1.93 ms (**5% slower**) |
+
+So AID-pinning the MoE weights through the VMM path would make fleet slower,
+independently of the 3.7 hours of startup it would cost. The grid-240 row does
+invert (1.392x), but it only reaches 1970 GB/s; fleet's 4270 GB/s sits in the
+saturated regime, so the 1.02x rows are the ones that apply.
+
+This retires the pinning line. What survives is the tile map, which is free and
+is a prerequisite for anything that later wants a stable AID per workgroup --
+partition modes included, since NPS2 gives AID-local memory in hardware with no
+4 KiB page penalty and no startup cost.
