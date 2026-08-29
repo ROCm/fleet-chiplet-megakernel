@@ -1063,7 +1063,7 @@ def get_compile_command(
             # wide load. The merge is serial on the last chunk worker and the
             # per-XCD barrier waits on it.
             flags = flags + ["-DMPK_MERGE_KV_OUTER"]
-        if int(os.environ.get("MPK_ROUTING_DERIVED_EPOCH", "0")) == 1:
+        if _opt("MPK_ROUTING_DERIVED_EPOCH"):
             # Derive the Phase 7b release epoch from layer_epoch instead of
             # reading the flag back from HBM. The read-back is a dependent,
             # cache-bypassing load in front of the nine stores that release all
@@ -1071,6 +1071,11 @@ def get_compile_command(
             # the consumers already compute the same value locally
             # (`layer_counter + 1`). Same fix the O-proj hierarchical barrier
             # took for its own release target.
+            #
+            # Six alternating pairs at batch 1 were +2/-20/-15 and
+            # -23/+7/-10 us/token (variant-control), all text bit-identical.
+            # The two losses are within noise; aggregate median improved
+            # 1.773 -> 1.760 ms/token.
             flags = flags + ["-DMPK_ROUTING_DERIVED_EPOCH"]
         if int(os.environ.get("MPK_ROUTING_LANE_RELEASE", "0")) == 1:
             # TESTED AND NOT ADOPTED (correct, but neutral: 2.022 vs 2.025
