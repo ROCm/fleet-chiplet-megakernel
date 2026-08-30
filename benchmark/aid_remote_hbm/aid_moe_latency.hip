@@ -210,6 +210,68 @@ __global__ __launch_bounds__(256) void latency_kernel(
   }
 }
 
+// Link the given pages into a random ring, one hop per page, so a chase
+// through it is a chain of dependent loads with no parallelism to hide
+// anything. This is the quantity NPS2 reported as 400 -> 341 ns; the tile-load
+// number above is not comparable to it, since a 23 KiB tile includes transfer
+// time on top of the round trip.
+__global__ void build_chain(char *base, const int *pages, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    *(uint64_t *)(base + (size_t)pages[i] * kPage) =
+        (uint64_t)pages[(i + 1) % n] * kPage;
+}
+
+// One lane per measuring block walks the ring; the rest generate background
+// traffic exactly as in latency_kernel, so the chase can be sampled at a
+// realistic level of memory pressure.
+__global__ __launch_bounds__(256) void chase_kernel(
+    char *__restrict base, const uint64_t *__restrict starts,
+    const int *__restrict table, const int *__restrict sl0, int n0,
+    const int *__restrict sl1, int n1, int n_measure, int hops,
+    uint64_t *__restrict out, int *__restrict done_flag,
+    uint64_t *__restrict sink) {
+  const int xcc = (int)get_xcc_id();
+  const int aid = xcc >> 2;
+  const int *mine = aid ? sl1 : sl0;
+  const int nmine = aid ? n1 : n0;
+  if (nmine == 0)
+    return;
+
+  if (blockIdx.x < n_measure) {
+    if (threadIdx.x == 0) {
+      uint64_t off = starts[aid];
+      const uint64_t t0 = wall_clock64();
+      for (int h = 0; h < hops; h++)
+        off = __builtin_nontemporal_load((const uint64_t *)(base + off));
+      const uint64_t t1 = wall_clock64();
+      out[blockIdx.x] = (t1 - t0);
+      sink[blockIdx.x] = off;
+      __hip_atomic_fetch_add(done_flag, 1, __ATOMIC_RELEASE,
+                             __HIP_MEMORY_SCOPE_AGENT);
+    }
+  } else {
+    uint64_t acc = 0;
+    int s = (blockIdx.x * 31) % nmine;
+    while (__hip_atomic_load(done_flag, __ATOMIC_ACQUIRE,
+                             __HIP_MEMORY_SCOPE_AGENT) < n_measure) {
+      const int slab = mine[s];
+      for (int p = 0; p < kSlabPages; p++) {
+        const int off = p * (int)kPage + (int)threadIdx.x * 16;
+        if (off >= kSlabBytes)
+          break;
+        const int pg = table[(size_t)slab * kSlabPages + p];
+        acc += __builtin_nontemporal_load(
+                   (const v4u *)(base + (size_t)pg * kPage +
+                                 (size_t)threadIdx.x * 16))
+                   .x;
+      }
+      s = (s + 131) % nmine;
+    }
+    sink[blockIdx.x * 256 + threadIdx.x] = acc;
+  }
+}
+
 int main() {
   CHECK(hipSetDevice(0));
   hipDeviceProp_t prop;
