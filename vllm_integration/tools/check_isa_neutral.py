@@ -95,6 +95,28 @@ def opcodes(lines):
     return out
 
 
+def variants(name):
+    """A rename carries several casings; a caller should not have to name each.
+
+    Passing --old TITAN --new FLEET_MK once reported 10 UNEXPLAINED lines that
+    were all the C++ namespace, which is mangled lowercase (_ZN5titan ->
+    _ZN8fleet_mk). Classifying only the casing the caller happened to type
+    turns a clean rename into a spurious FAIL, and a spurious FAIL on a gate
+    like this one trains you to skim it.
+    """
+    return {v for v in (name, name.lower(), name.upper()) if v}
+
+
+def code_part(line):
+    """The line with objdump's // annotation stripped.
+
+    Everything after // is symbol TEXT that objdump resolves for readability --
+    it is not machine code. Two lines whose code parts match byte for byte
+    encode the same instruction no matter how the annotation reads.
+    """
+    return line.split("//")[0].rstrip()
+
+
 def classify(a, b, old, new):
     if "file format" in a:
         return "objdump filename line"
@@ -102,8 +124,15 @@ def classify(a, b, old, new):
         return "internal-linkage symbol hash"
     # Itanium mangling spells a namespace as <length><name>, so the renamed
     # symbol is matched by the name alone appearing in either side.
-    if re.search(r"_ZN\d+(%s|%s)" % (re.escape(old), re.escape(new)), a + b):
-        return "mangled symbol / branch annotation"
+    pat = "|".join(re.escape(v) for v in variants(old) | variants(new))
+    named = re.search(r"_ZN\d+(%s)" % pat, a + b)
+    if named:
+        # Either a symbol header line, or a branch whose annotation cites one.
+        # In the branch case require the instruction itself to be untouched --
+        # a renamed symbol must never move a branch target.
+        if code_part(a) == code_part(b) or "<" in a.split("//")[0]:
+            return "mangled symbol / branch annotation"
+        return "UNEXPLAINED"
     ia = re.findall(r"0x[0-9a-f]+", a)
     ib = re.findall(r"0x[0-9a-f]+", b)
     if len(ia) == len(ib):
