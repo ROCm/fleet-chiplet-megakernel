@@ -98,11 +98,12 @@ def opcodes(lines):
 def variants(name):
     """A rename carries several casings; a caller should not have to name each.
 
-    Passing --old TITAN --new FLEET_MK once reported 10 UNEXPLAINED lines that
-    were all the C++ namespace, which is mangled lowercase (_ZN5titan ->
-    _ZN8fleet_mk). Classifying only the casing the caller happened to type
-    turns a clean rename into a spurious FAIL, and a spurious FAIL on a gate
-    like this one trains you to skim it.
+    Passing the macro casing (--old OLD --new NEW_NAME) for a rename that also
+    moves a C++ namespace once reported 10 UNEXPLAINED lines that were all the
+    namespace, which Itanium mangles LOWERCASE (_ZN3old -> _ZN8new_name).
+    Classifying only the casing the caller happened to type turns a clean
+    rename into a spurious FAIL, and a spurious FAIL on a gate like this one
+    trains you to skim it.
     """
     return {v for v in (name, name.lower(), name.upper()) if v}
 
