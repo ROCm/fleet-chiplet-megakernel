@@ -85,6 +85,112 @@ constexpr int oproj_lds_w_off(int batch_size, int reduction_size) {
          16;
 }
 
+#ifdef MPK_OPROJ_AMAX_DPP
+// 8-lane amax butterfly (xor 1/2/4) via DPP, matching
+// gang_moe_linear_mxfp4_mi300.cuh. __shfl_xor here is ds_bpermute.
+__device__ __forceinline__ float _oproj_amax8_dpp(float amax) {
+  float peer;
+  asm volatile("s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 quad_perm:[1,0,3,2] row_mask:0xf "
+               "bank_mask:0xf\n"
+               "v_max_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 quad_perm:[2,3,0,1] row_mask:0xf "
+               "bank_mask:0xf\n"
+               "v_max_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_half_mirror row_mask:0xf "
+               "bank_mask:0xf\n"
+               "v_max_f32 %0, %0, %1"
+               : "+v"(amax), "=&v"(peer));
+  return amax;
+}
+#endif
+
+#ifdef MPK_OPROJ_PIPE_SLICE_MFMA
+#ifndef MPK_ATTN_SLICE_RELEASE
+#error "MPK_OPROJ_PIPE_SLICE_MFMA requires MPK_ATTN_SLICE_RELEASE"
+#endif
+#if defined(MPK_OPROJ_SPLIT_SLICE_WAIT) || defined(MPK_SLICE_DUAL_POLL) ||      \
+    defined(MPK_OPROJ_POLL_BEFORE_DRAIN) || defined(MPK_OPROJ_PTR_WALK) ||      \
+    defined(MPK_OPROJ_NEXT_WT)
+#error "MPK_OPROJ_PIPE_SLICE_MFMA is the default two-slice K-parallel path only"
+#endif
+// Wait for one XCD's attn_release, acquire, and quantize that 512-element
+// slice into LDS. pair_idx 0 uses lanes 0-31 of the wave, 1 uses 32-63, so
+// the 8-lane amax xor stays inside a half-wave. sl is the XCD / slice index.
+__device__ __forceinline__ void
+    oproj_wait_convert_one_slice(unsigned short const *A,
+                                   uint8_t *s_tok_fp8,
+                                   uint8_t *s_tok_scales,
+                                   int *rel,
+                                   int sl,
+                                   int pair_idx,
+                                   int tid,
+                                   int layer_epoch) {
+  constexpr int kElem = 16;
+  constexpr int kScale = 128;
+  constexpr int kSlice = 512;
+  constexpr int kTps = kScale / kElem;
+  while (ld_sys_s32(rel) < layer_epoch) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+  asm volatile("buffer_inv" ::: "memory");
+  int const lane = tid & 63;
+  if ((pair_idx == 0 && lane < 32) || (pair_idx == 1 && lane >= 32)) {
+    int const sl_lane = lane & 31;
+    int const scale_block = sl * (kSlice / kScale) + sl_lane / kTps;
+    int const lane_in_scale = sl_lane & (kTps - 1);
+    int const base = scale_block * kScale + lane_in_scale * kElem;
+    typedef int __attribute__((ext_vector_type(4))) i32x4_t;
+    i32x4_t const *src = (i32x4_t const *)(A + base);
+    i32x4_t v0 = src[0];
+    i32x4_t v1 = src[1];
+    float vals[kElem];
+    float amax = 0.0f;
+    unsigned short const *vs0 = (unsigned short const *)&v0;
+    unsigned short const *vs1 = (unsigned short const *)&v1;
+#pragma unroll
+    for (int j = 0; j < kElem / 2; j++) {
+      vals[j] = _gang_bf16_to_float(vs0[j]);
+      vals[j + kElem / 2] = _gang_bf16_to_float(vs1[j]);
+      amax = fmaxf(amax,
+                   fmaxf(fabsf(vals[j]), fabsf(vals[j + kElem / 2])));
+    }
+    amax = fmaxf(amax, __shfl_xor(amax, 1));
+    amax = fmaxf(amax, __shfl_xor(amax, 2));
+    amax = fmaxf(amax, __shfl_xor(amax, 4));
+    uint8_t const se = _gang_compute_e8m0_fp8(amax);
+    float scale_f;
+    if (se == 0) {
+      scale_f = 1.0f;
+    } else {
+      union {
+        float f;
+        uint32_t u;
+      } sv;
+      sv.u = (uint32_t)se << 23;
+      scale_f = sv.f;
+    }
+#pragma unroll
+    for (int j = 0; j < kElem; j += 4) {
+      fp8x4_t pk = {};
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j], vals[j + 1], scale_f, false);
+      pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+          pk, vals[j + 2], vals[j + 3], scale_f, true);
+      *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
+    }
+    if (lane_in_scale == 0) {
+      s_tok_scales[scale_block] = se;
+    }
+  }
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_wave_barrier();
+}
+#endif
+
 #ifdef MPK_ROUTER_DUAL_REDUCE
 #ifndef MPK_ROUTER_FUSED_DP
 #error                                                                         \
@@ -301,6 +407,18 @@ __device__ __attribute__((noinline)) void
   // caller pins are at 44..47. The buffer is sized well past 36 lines by
   // demo.py's counter_size, so this needs no allocation change.
   int *hier_local = hier_barrier + 28 * HIER_STRIDE;
+#ifdef MPK_ROUTER_XCD_FOLD
+#ifndef MPK_OPROJ_TREE_BARRIER
+#error "MPK_ROUTER_XCD_FOLD publishes from the tree-barrier local-last"
+#endif
+#ifndef MPK_ROUTER_FUSED_DP
+#error "MPK_ROUTER_XCD_FOLD reuses the fused-dp ssq/raw reduction"
+#endif
+  // 8 lines after the fused layer-barrier region. Matches
+  // FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh and
+  // demo.py counter_size (+128).
+  int *oproj_xcd_ready = hier_barrier + (48 * 16 + 128 * MPK_MAX_NUM_BATCHED_REQUESTS + 272);
+#endif
 
   extern __shared__ char _lm_smem[];
   uint8_t *s_tok_fp8 = (uint8_t *)_lm_smem;
@@ -418,14 +536,114 @@ __device__ __attribute__((noinline)) void
       // block: the caller's buffer_load_lds slices are issued per wave and
       // interleave across the region every wave then reads. Drain and
       // rendezvous once, before any wave goes off on its own.
+#ifndef MPK_OPROJ_POLL_BEFORE_DRAIN
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
+#endif
 
+#ifdef MPK_OPROJ_PIPE_SLICE_MFMA
+      // Default wave→slice map (XCD 2w, 2w+1). Convert slice 0, then the
+      // K-parallel loop MFMAs those 4 iters before waiting for slice 1.
+      // Rotating by xcd_id so wave 0 was local-first was +39 / +36 / +42 µs
+      // and changed the text hash (fp32 K order); do not combine them.
+      int const pipe_sl0 = warp_id * 2;
+      int *pipe_rel0 =
+          const_cast<int *>(attn_slice_release) + pipe_sl0 * 16;
+      oproj_wait_convert_one_slice(A,
+                                   s_tok_fp8,
+                                   s_tok_scales,
+                                   pipe_rel0,
+                                   pipe_sl0,
+                                   /*pair_idx=*/0,
+                                   tid,
+                                   layer_epoch);
+#else
       int const first_xcd = warp_id * 2;
       // ld_sys_s32 takes a mutable pointer only because every other caller
       // hands it one; the load itself is read-only.
       int *rel0 = const_cast<int *>(attn_slice_release) + first_xcd * 16;
       int *rel1 = const_cast<int *>(attn_slice_release) + (first_xcd + 1) * 16;
+      constexpr int THREADS_PER_SCALE =
+          ELEMENTS_PER_SCALE / ELEMENTS_PER_THREAD;
+      int const scale_block = tid / THREADS_PER_SCALE;
+      int const lane_in_scale = tid & (THREADS_PER_SCALE - 1);
+      int const base = scale_block * ELEMENTS_PER_SCALE +
+                       lane_in_scale * ELEMENTS_PER_THREAD;
+#if defined(MPK_OPROJ_SPLIT_SLICE_WAIT) && defined(MPK_SLICE_DUAL_POLL)
+#error "MPK_OPROJ_SPLIT_SLICE_WAIT cannot combine with MPK_SLICE_DUAL_POLL"
+#endif
+#if defined(MPK_OPROJ_POLL_BEFORE_DRAIN) && defined(MPK_OPROJ_SPLIT_SLICE_WAIT)
+#error "MPK_OPROJ_POLL_BEFORE_DRAIN is the default two-slice path only"
+#endif
+#ifdef MPK_OPROJ_SPLIT_SLICE_WAIT
+      // Overlap first-slice quantize with the second XCD's merge. Wave w's
+      // 1024 K elements are two 512-element XCD slices; 32 lanes x 16 elems
+      // each. Wait, acquire, and convert one slice at a time.
+      static_assert(ELEMENTS_PER_THREAD == 16,
+                    "split-slice wait assumes 32 lanes cover one 512-elem XCD");
+      for (int sl = 0; sl < 2; sl++) {
+        int *rel = sl == 0 ? rel0 : rel1;
+        while (ld_sys_s32(rel) < layer_epoch) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        asm volatile("buffer_inv" ::: "memory");
+        if (((tid & 63) < 32) == (sl == 0)) {
+          i32x4_t const *src = (i32x4_t const *)(A + base);
+          i32x4_t v0 = src[0];
+          i32x4_t v1 = src[1];
+
+          float vals[ELEMENTS_PER_THREAD];
+          float amax = 0.0f;
+          unsigned short const *vs0 = (unsigned short const *)&v0;
+          unsigned short const *vs1 = (unsigned short const *)&v1;
+#pragma unroll
+          for (int j = 0; j < ELEMENTS_PER_THREAD / 2; j++) {
+            vals[j] = _gang_bf16_to_float(vs0[j]);
+            vals[j + ELEMENTS_PER_THREAD / 2] = _gang_bf16_to_float(vs1[j]);
+            amax = fmaxf(
+                amax,
+                fmaxf(fabsf(vals[j]),
+                      fabsf(vals[j + ELEMENTS_PER_THREAD / 2])));
+          }
+#ifdef MPK_OPROJ_AMAX_DPP
+          amax = _oproj_amax8_dpp(amax);
+#else
+          amax = fmaxf(amax, __shfl_xor(amax, 1));
+          amax = fmaxf(amax, __shfl_xor(amax, 2));
+          amax = fmaxf(amax, __shfl_xor(amax, 4));
+#endif
+
+          uint8_t const se = _gang_compute_e8m0_fp8(amax);
+          float scale_f;
+          if (se == 0) {
+            scale_f = 1.0f;
+          } else {
+            union {
+              float f;
+              uint32_t u;
+            } sv;
+            sv.u = (uint32_t)se << 23;
+            scale_f = sv.f;
+          }
+
+#pragma unroll
+          for (int j = 0; j < ELEMENTS_PER_THREAD; j += 4) {
+            fp8x4_t pk = {};
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+                pk, vals[j], vals[j + 1], scale_f, false);
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(
+                pk, vals[j + 2], vals[j + 3], scale_f, true);
+            *(int *)(s_tok_fp8 + base + j) = *(int const *)&pk;
+          }
+          if (lane_in_scale == 0) {
+            s_tok_scales[scale_block] = se;
+          }
+        }
+      }
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      __builtin_amdgcn_wave_barrier();
+#else
 #ifdef MPK_SLICE_DUAL_POLL
       // Wave w waits on XCDs 2w and 2w+1. The serial form issues load-wait
       // twice, so a miss always pays two coherency round trips even though
@@ -440,7 +658,9 @@ __device__ __attribute__((noinline)) void
       } while (true);
 #else
       while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
+#ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
+#endif
       }
 #endif
       // Cross-XCD acquire, per wave, placed at this wave's observation. The
@@ -451,13 +671,9 @@ __device__ __attribute__((noinline)) void
       // shape, not a redundancy -- each wave invalidates for itself.
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       asm volatile("buffer_inv" ::: "memory");
-
-      constexpr int THREADS_PER_SCALE =
-          ELEMENTS_PER_SCALE / ELEMENTS_PER_THREAD;
-      int const scale_block = tid / THREADS_PER_SCALE;
-      int const lane_in_scale = tid & (THREADS_PER_SCALE - 1);
-      int const base = scale_block * ELEMENTS_PER_SCALE +
-                       lane_in_scale * ELEMENTS_PER_THREAD;
+#ifdef MPK_OPROJ_POLL_BEFORE_DRAIN
+      __syncthreads();
+#endif
 
       i32x4_t const *src = (i32x4_t const *)(A + base);
       i32x4_t v0 = src[0];
@@ -480,9 +696,13 @@ __device__ __attribute__((noinline)) void
       // wave (lane_in_scale is the low 3 bits of tid), so an xor butterfly
       // over 1/2/4 stays inside the wave and leaves every lane holding the
       // block max -- no leader broadcast needed.
+#ifdef MPK_OPROJ_AMAX_DPP
+      amax = _oproj_amax8_dpp(amax);
+#else
       amax = fmaxf(amax, __shfl_xor(amax, 1));
       amax = fmaxf(amax, __shfl_xor(amax, 2));
       amax = fmaxf(amax, __shfl_xor(amax, 4));
+#endif
 
       uint8_t const se = _gang_compute_e8m0_fp8(amax);
       float scale_f;
@@ -516,6 +736,8 @@ __device__ __attribute__((noinline)) void
       // XCDs 6 and 7.
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
       __builtin_amdgcn_wave_barrier();
+#endif
+#endif
     } else {
       // Stage up to 16 token rows. The bespoke inline quantizer that used to
       // live here was a second copy of the E8M0 logic that only ever handled
@@ -876,6 +1098,69 @@ __device__ __attribute__((noinline)) void
   (lds_w_data + lds_row_data_base + (KI) * (K_PER_MFMA / 2) + g * 16)
 #endif
 
+#ifdef MPK_OPROJ_A_PAD_HOIST
+#if defined(MPK_OPROJ_PTR_WALK) || defined(MPK_OPROJ_NEXT_WT)
+#error "MPK_OPROJ_A_PAD_HOIST is the live address-form K-parallel loop only"
+#endif
+      i32x8_t a;
+      a[4] = 0;
+      a[5] = 0;
+      a[6] = 0;
+      a[7] = 0;
+#endif
+#ifdef MPK_OPROJ_PTR_WALK
+      // The eight K-parallel iterations are consecutive. Keep one cursor per
+      // operand stream instead of rebuilding four thread-varying LDS
+      // addresses from kp_ki_start before every MFMA.
+      uint8_t const *op_w_data = MPK_OPROJ_W_ADDR(kp_ki_start);
+      uint8_t const *op_w_scale =
+          lds_w_scales + lds_row_scale_base + kp_ki_start * 4 + g;
+      uint8_t const *op_b_data =
+          b_tok + kp_ki_start * K_PER_MFMA;
+      uint8_t const *op_b_scale = b_scl + kp_ki_start;
+#ifdef MPK_OPROJ_KMAJOR
+      constexpr int OP_W_DATA_STEP = LDS_DATA_K_STRIDE;
+#else
+      constexpr int OP_W_DATA_STEP = K_PER_MFMA / 2;
+#endif
+#define DO_MFMA_LDS_FP8(KI)                                                    \
+  do {                                                                         \
+    i32x4_t _wt;                                                               \
+    __builtin_memcpy(&_wt, op_w_data, 16);                                     \
+    int sa = (int)*op_w_scale;                                                 \
+    i32x8_t a;                                                                 \
+    a[0] = _wt[0];                                                             \
+    a[1] = _wt[1];                                                             \
+    a[2] = _wt[2];                                                             \
+    a[3] = _wt[3];                                                             \
+    a[4] = 0;                                                                  \
+    a[5] = 0;                                                                  \
+    a[6] = 0;                                                                  \
+    a[7] = 0;                                                                  \
+    i32x8_t b = _gang_load_fp8_mfma_b(op_b_data, 0, g);                        \
+    int sb = (int)*op_b_scale;                                                 \
+    acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
+    op_w_data += OP_W_DATA_STEP;                                               \
+    op_w_scale += 4;                                                           \
+    op_b_data += K_PER_MFMA;                                                   \
+    op_b_scale += 1;                                                           \
+  } while (0)
+#else
+#ifdef MPK_OPROJ_A_PAD_HOIST
+#define DO_MFMA_LDS_FP8(KI)                                                    \
+  do {                                                                         \
+    i32x4_t _wt;                                                               \
+    __builtin_memcpy(&_wt, MPK_OPROJ_W_ADDR(KI), 16);                          \
+    int sa = (int)lds_w_scales[lds_row_scale_base + (KI)*4 + g];               \
+    a[0] = _wt[0];                                                             \
+    a[1] = _wt[1];                                                             \
+    a[2] = _wt[2];                                                             \
+    a[3] = _wt[3];                                                             \
+    i32x8_t b = _gang_load_fp8_mfma_b(b_tok, (KI)*K_PER_MFMA, g);              \
+    int sb = (int)b_scl[KI];                                                   \
+    acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
+  } while (0)
+#else
 #define DO_MFMA_LDS_FP8(KI)                                                    \
   do {                                                                         \
     i32x4_t _wt;                                                               \
@@ -894,6 +1179,36 @@ __device__ __attribute__((noinline)) void
     int sb = (int)b_scl[KI];                                                   \
     acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
   } while (0)
+#endif
+#endif
+#ifdef MPK_OPROJ_NEXT_WT
+#if defined(MPK_OPROJ_PTR_WALK)
+#error "MPK_OPROJ_NEXT_WT is the address-form pipeline; not combined with PTR_WALK"
+#endif
+#undef DO_MFMA_LDS_FP8
+      i32x4_t _wt_pipe;
+      __builtin_memcpy(&_wt_pipe, MPK_OPROJ_W_ADDR(kp_ki_start), 16);
+#define DO_MFMA_LDS_FP8(KI)                                                    \
+  do {                                                                         \
+    i32x4_t _wt = _wt_pipe;                                                    \
+    if ((KI) + 1 < kp_ki_end) {                                                \
+      __builtin_memcpy(&_wt_pipe, MPK_OPROJ_W_ADDR((KI) + 1), 16);             \
+    }                                                                          \
+    int sa = (int)lds_w_scales[lds_row_scale_base + (KI)*4 + g];               \
+    i32x8_t a;                                                                 \
+    a[0] = _wt[0];                                                             \
+    a[1] = _wt[1];                                                             \
+    a[2] = _wt[2];                                                             \
+    a[3] = _wt[3];                                                             \
+    a[4] = 0;                                                                  \
+    a[5] = 0;                                                                  \
+    a[6] = 0;                                                                  \
+    a[7] = 0;                                                                  \
+    i32x8_t b = _gang_load_fp8_mfma_b(b_tok, (KI)*K_PER_MFMA, g);              \
+    int sb = (int)b_scl[KI];                                                   \
+    acc = _gang_mfma_f4xf8(a, b, acc, sa, sb);                                 \
+  } while (0)
+#endif
 #define DO_MFMA_LDS_FP4(KI)                                                    \
   do {                                                                         \
     i32x4_t _wt;                                                               \
@@ -913,6 +1228,32 @@ __device__ __attribute__((noinline)) void
     acc = _gang_mfma_f4xf4(a, b, acc, sa, sb);                                 \
   } while (0)
 
+#ifdef MPK_OPROJ_PIPE_SLICE_MFMA
+      {
+        int const pipe_sl0 = warp_id * 2;
+        int const pipe_sl1 = pipe_sl0 + 1;
+        int const ki0 = pipe_sl0 * 4;
+        int const ki1 = pipe_sl1 * 4;
+        DO_MFMA_LDS_FP8(ki0 + 0);
+        DO_MFMA_LDS_FP8(ki0 + 1);
+        DO_MFMA_LDS_FP8(ki0 + 2);
+        DO_MFMA_LDS_FP8(ki0 + 3);
+        int *pipe_rel1 =
+            const_cast<int *>(attn_slice_release) + pipe_sl1 * 16;
+        oproj_wait_convert_one_slice(A,
+                                     s_tok_fp8,
+                                     s_tok_scales,
+                                     pipe_rel1,
+                                     pipe_sl1,
+                                     /*pair_idx=*/1,
+                                     tid,
+                                     layer_epoch);
+        DO_MFMA_LDS_FP8(ki1 + 0);
+        DO_MFMA_LDS_FP8(ki1 + 1);
+        DO_MFMA_LDS_FP8(ki1 + 2);
+        DO_MFMA_LDS_FP8(ki1 + 3);
+      }
+#else
       DO_MFMA_LDS_FP8(kp_ki_start + 0);
       DO_MFMA_LDS_FP8(kp_ki_start + 1);
       DO_MFMA_LDS_FP8(kp_ki_start + 2);
@@ -927,6 +1268,7 @@ __device__ __attribute__((noinline)) void
       if (kp_ki_start + 7 < kp_ki_end) {
         DO_MFMA_LDS_FP8(kp_ki_start + 7);
       }
+#endif
 #undef DO_MFMA_LDS_FP8
 #undef DO_MFMA_LDS_FP4
 #undef MPK_OPROJ_W_ADDR
@@ -955,9 +1297,17 @@ __device__ __attribute__((noinline)) void
       float *lds_reduce =
           (float *)((uint8_t *)_lm_smem +
                     oproj_lds_red_off(BATCH_SIZE, REDUCTION_SIZE));
+#ifdef MPK_OPROJ_RED_VEC
+      {
+        f32x4_t packed = acc;
+        __builtin_memcpy(&lds_reduce[(warp_id * 64 + lane_id) * 4], &packed,
+                         sizeof(packed));
+      }
+#else
       for (int i = 0; i < 4; i++) {
         lds_reduce[(warp_id * 64 + lane_id) * 4 + i] = acc[i];
       }
+#endif
       __syncthreads();
 
       if (warp_id == 0 && tok_active) {
@@ -968,10 +1318,20 @@ __device__ __attribute__((noinline)) void
         // costs scratch even though the two are equal under tok_active.
         int const src_lane = TOK_ROWS == 1 ? g * 16 : lane_id;
         for (int w = 0; w < NUM_WAVES; w++) {
+#ifdef MPK_OPROJ_RED_VEC
+          f32x4_t t;
+          __builtin_memcpy(&t, &lds_reduce[(w * 64 + src_lane) * 4],
+                           sizeof(t));
+          v0 += t[0];
+          v1 += t[1];
+          v2 += t[2];
+          v3 += t[3];
+#else
           v0 += lds_reduce[(w * 64 + src_lane) * 4 + 0];
           v1 += lds_reduce[(w * 64 + src_lane) * 4 + 1];
           v2 += lds_reduce[(w * 64 + src_lane) * 4 + 2];
           v3 += lds_reduce[(w * 64 + src_lane) * 4 + 3];
+#endif
         }
 
         // bias/residual are XCD-partitioned -> use local offset
@@ -985,11 +1345,21 @@ __device__ __attribute__((noinline)) void
         // an output register with a not-yet-read input register.
         uint2 bias_packed, res_packed;
         asm volatile(
+#ifdef MPK_OPROJ_BIAS_NO_WAIT
+            // __syncthreads above already drained vmcnt for this wave on
+            // gfx950 (s_waitcnt vmcnt(0) lgkmcnt(0); s_barrier). The extra
+            // wait here was for bias+residual issued before the MFMA loop.
+            "v_mov_b32_e32 %0, %4\n"
+            "v_mov_b32_e32 %1, %5\n"
+            "v_mov_b32_e32 %2, %6\n"
+            "v_mov_b32_e32 %3, %7"
+#else
             "s_waitcnt vmcnt(0)\n"
             "v_mov_b32_e32 %0, %4\n"
             "v_mov_b32_e32 %1, %5\n"
             "v_mov_b32_e32 %2, %6\n"
             "v_mov_b32_e32 %3, %7"
+#endif
             : "=&v"(bias_packed.x),
               "=&v"(bias_packed.y),
               "=&v"(res_packed.x),
@@ -1230,6 +1600,14 @@ oproj_barrier :
         // are every other arriving worker's on this XCD -- each drained
         // before its own arrival, and all of those arrivals precede this one
         // on the same line. Publish one arrival for the whole die.
+#ifdef MPK_ROUTER_XCD_FOLD
+        // This XCD's 368-col attn_proj_out slice is in HBM. Router workers
+        // on every die poll this flag and FMA the slice without waiting
+        // for the other seven XCDs.
+        st_wt_u32((void *)&oproj_xcd_ready[xcd_id * HIER_STRIDE],
+                  (unsigned)oproj_release_expected);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
         int const prev_global =
             atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
         if ((prev_global % 8) == 7) {
@@ -1337,6 +1715,13 @@ oproj_barrier :
     // done`; both are a few cycles against the ~2.5 us poll, and leaving them
     // in keeps the acquire argument below untouched.
     if (local_tile < router_tile_n)
+#endif
+#ifdef MPK_ROUTER_XCD_FOLD
+#if defined(MPK_OPROJ_ARRIVE_ONLY)
+#error "MPK_ROUTER_XCD_FOLD skips the hier poll on router tiles; incompatible with ARRIVE_ONLY"
+#endif
+    // Router workers wait per-XCD in pass 1 instead of for the global last.
+    if (local_tile >= router_tile_n)
 #endif
 #ifdef MPK_NARROW_OPROJ_HIER
 #ifdef MPK_OPROJ_LEAN_ACQUIRE
@@ -1585,6 +1970,74 @@ oproj_barrier :
                     "pass-1 hidden prefetch: the s_waitcnt vmcnt switch below "
                     "only covers up to 3 in-flight loads; add arms before "
                     "raising ACTUAL_HIDDEN_DIM past 3*256*4");
+#ifdef MPK_ROUTER_XCD_FOLD
+      // FMA each XCD's 368-col slice as that die's O-proj local-last
+      // publishes. Per-thread iter order is unchanged (1024-dim stride >
+      // 368-col slice ⇒ at most one iter per XCD), so ssq/dp association
+      // matches the unfolder.
+      int const cols_per_xcd = OUTPUT_PER_WG * n_wgs_per_xcd;
+      int const slice_epoch = layer_epoch > 0 ? layer_epoch : 1;
+      for (int x = 0; x < 8; x++) {
+        // Adjacent XCDs' 368-col slices share a 128 B line (736 % 128 != 0).
+        // Waiting for x+1 before reading x keeps that line from tearing.
+        // All 256 threads poll so there is no per-slice syncthreads.
+        while (MPK_LD_GATE(&oproj_xcd_ready[x * 16]) < slice_epoch) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        if (x < 7) {
+          while (MPK_LD_GATE(&oproj_xcd_ready[(x + 1) * 16]) < slice_epoch) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+        }
+        asm volatile("buffer_inv" ::: "memory");
+        int const d0 = x * cols_per_xcd;
+        int const d1 = d0 + cols_per_xcd;
+#pragma unroll
+        for (int iter = 0; iter < MAX_ITERS; iter++) {
+          int i_cur = tid + iter * 256;
+          if (i_cur >= H4) {
+            break;
+          }
+          int const dim = i_cur * 4;
+          if (dim < d0 || dim >= d1 || dim >= ACTUAL_HIDDEN_DIM) {
+            continue;
+          }
+          i32x2_t h_v;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(h_v)
+                       : "v"(h_base + i_cur * 8)
+                       : "memory");
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          h_cache[iter] = h_v;
+          __builtin_memcpy(&g_cache[iter], &g_pf_buf[iter], 8);
+          n_cached = iter + 1;
+          float v0, v1, v2, v3;
+          asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                       "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                       "v_cvt_f32_bf16 %2, %5\n"
+                       "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                       : "=&v"(v0), "=&v"(v1), "=&v"(v2), "=&v"(v3)
+                       : "v"(h_v[0]), "v"(h_v[1]));
+          ssq += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+          float gg0, gg1, gg2, gg3;
+          asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                       "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                       "v_cvt_f32_bf16 %2, %5\n"
+                       "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                       : "=&v"(gg0), "=&v"(gg1), "=&v"(gg2), "=&v"(gg3)
+                       : "v"(g_pf_buf[iter][0]), "v"(g_pf_buf[iter][1]));
+          float ww0, ww1, ww2, ww3;
+          asm volatile("v_cvt_f32_bf16 %0, %4\n"
+                       "v_cvt_f32_bf16 %1, %4 src0_sel:WORD_1\n"
+                       "v_cvt_f32_bf16 %2, %5\n"
+                       "v_cvt_f32_bf16 %3, %5 src0_sel:WORD_1"
+                       : "=&v"(ww0), "=&v"(ww1), "=&v"(ww2), "=&v"(ww3)
+                       : "v"(w_pf_buf[iter][0]), "v"(w_pf_buf[iter][1]));
+          dp += ww0 * (v0 * gg0) + ww1 * (v1 * gg1) + ww2 * (v2 * gg2) +
+                ww3 * (v3 * gg3);
+        }
+      }
+#else
       i32x2_t h_pf[MAX_ITERS];
       int n_issued = 0;
 #pragma unroll
@@ -1691,6 +2144,7 @@ oproj_barrier :
               ww3 * (v3 * gg3);
 #endif
       }
+#endif
 
 #if defined(MPK_ROUTER_FUSED_DP) && defined(MPK_ROUTER_DUAL_REDUCE)
       // Both partials are complete here, so they reduce together through one
@@ -2147,7 +2601,13 @@ topk_barrier :
         routing_indices_ptr,
         active_expert_ids_ptr,
         topk_counter,
-        num_active_tokens);
+        num_active_tokens
+#ifdef MPK_EARLY_ROUTING
+        ,
+        routing_ready_ptr,
+        (unsigned)layer_epoch
+#endif
+    );
     // topk_noinline resets topk_counter internally.
     //
     // Drain then rendezvous. __syncthreads alone is NOT enough here: it makes

@@ -82,7 +82,65 @@ __global__ void compile_check_moe_fused(void const *input,
                                                     swiglu_out,
                                                     workspace_f32,
                                                     barrier,
-                                                    tile_idx);
+                                                    tile_idx
+#ifdef MPK_MOE_XCD_STRIPE_LAYER
+                                                    ,
+                                                    /*layer_idx=*/0
+#endif
+    );
+}
+
+// Instantiate the QKV kvupd kernel so K-split / MFMA-loop edits are codegen
+// gated. The MoE body above does not pull this template in.
+__global__ void compile_check_qkv_kvupd(void *workspace_f32,
+                                        void const *residual,
+                                        void const *norm_weight,
+                                        void *norm_scratch,
+                                        void const *weight,
+                                        void const *bias,
+                                        void *x_output,
+                                        void *k_cache,
+                                        void *v_cache,
+                                        void *q_workspace,
+                                        void const *cos,
+                                        void const *sin,
+                                        int const *qo_indptr,
+                                        int const *kv_indptr,
+                                        int const *kv_indices,
+                                        int const *kv_last_page_len) {
+  kernel::gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<1,
+                                                                64,
+                                                                2944,
+                                                                2880,
+                                                                64,
+                                                                8,
+                                                                64>(workspace_f32,
+                                                                    residual,
+                                                                    norm_weight,
+                                                                    norm_scratch,
+                                                                    weight,
+                                                                    bias,
+                                                                    x_output,
+                                                                    k_cache,
+                                                                    v_cache,
+                                                                    q_workspace,
+                                                                    cos,
+                                                                    sin,
+                                                                    qo_indptr,
+                                                                    kv_indptr,
+                                                                    kv_indices,
+                                                                    kv_last_page_len,
+                                                                    /*num_active_tokens=*/1,
+                                                                    /*n_wgs_per_xcd=*/10,
+                                                                    /*kv_stride=*/64,
+                                                                    /*q_ws_stride=*/64,
+                                                                    /*tile_idx=*/0,
+                                                                    /*weights_preloaded=*/false
+#ifdef MPK_QKV_KSPLIT
+                                                                    ,
+                                                                    /*k_part=*/1
+#endif
+  );
 }
 
 // Keep the LM-head specialization in the same codegen gate. It has the same
@@ -113,4 +171,65 @@ __global__ void compile_check_lm_head(void const *norm_input,
                                                              31,
                                                              201216,
                                                              tile_idx);
+}
+
+// Instantiate the fused full-layer dispatch so O-proj rank remaps (and any
+// other fused-only control flow) are codegen-gated. The kernels above do
+// not pull this template in.
+__global__ void compile_check_fused_layer(void *const *input_ptrs,
+                                           void *const *output_ptrs,
+                                           void const *cos,
+                                           void const *sin,
+                                           int const *qo,
+                                           int const *kvi,
+                                           int const *kvix,
+                                           int const *kvlp) {
+  kernel::gang_full_layer_fused_kernel_mi300<1,
+                                             64,
+                                             2944,
+                                             2880,
+                                             64,
+                                             8,
+                                             4096,
+                                             136,
+                                             8,
+                                             4096,
+                                             512,
+                                             8,
+                                             128,
+                                             1,
+                                             16,
+                                             4096,
+                                             128,
+                                             4,
+                                             2944,
+                                             2944,
+                                             128,
+                                             64,
+                                             true,
+                                             MPK_MAX_NUM_BATCHED_REQUESTS>(
+      input_ptrs,
+      output_ptrs,
+      cos,
+      sin,
+      qo,
+      kvi,
+      kvix,
+      kvlp,
+      /*num_active_tokens=*/1,
+      /*qkv_n_wgs_per_xcd=*/10,
+      /*kv_stride=*/512,
+      /*q_ws_stride=*/4096,
+      /*attn_scale=*/0.180337f,
+      /*total_qkv_tiles_per_xcd=*/10,
+      /*oproj_n_wgs_per_xcd=*/23,
+      /*oproj_output_stride=*/2944,
+      /*router_tile_n=*/16,
+      /*total_oproj_tiles=*/184,
+      /*total_topk_tiles=*/128,
+      /*oproj_tiles_per_xcd=*/23,
+      /*moe_total_tiles_per_xcd=*/53,
+      /*workers_per_xcd=*/31,
+      /*tile_idx=*/0,
+      /*task_layer_idx=*/0);
 }

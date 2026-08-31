@@ -14,10 +14,107 @@
 
 #include <hip/hip_bf16.h>
 
+#ifdef MPK_ATTN_PERM_NO_NOP
+#define MPK_HD64_PERM_PREFIX ""
+#else
+#define MPK_HD64_PERM_PREFIX "s_nop 1\n\t"
+#endif
+
 // Default ON. See prefetch_tile in __attn_wave_local_scan_hd64 for what this
 // gates and why it is bit-exact; MPK_ATTN_SCALAR_PAGE=0 ablates.
 #ifndef MPK_ATTN_SCALAR_PAGE
 #define MPK_ATTN_SCALAR_PAGE 1
+#endif
+
+#ifdef MPK_ATTN_K_VEC_LOAD
+// Eight consecutive fp16 K elements are 16-byte aligned (midx*64 + kc*32 +
+// kgrp*8). Two dword loads replace eight scalar ds_reads; same bytes.
+__device__ __forceinline__ void mpk_hd64_load_k8(_Float16 *dst,
+                                                 _Float16 const *src) {
+  *reinterpret_cast<uint64_t *>(dst) =
+      *reinterpret_cast<uint64_t const *>(src);
+  *reinterpret_cast<uint64_t *>(dst + 4) =
+      *reinterpret_cast<uint64_t const *>(src + 4);
+}
+#endif
+
+using _mpk_kv_u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ _mpk_kv_u32x2 mpk_hd64_load_kv_as1(char const *p) {
+  auto const *gp =
+      (__attribute__((address_space(1))) _mpk_kv_u32x2 const *)p;
+#ifdef MPK_ATTN_KV_NT_GL
+  return __builtin_nontemporal_load(gp);
+#else
+  return *gp;
+#endif
+}
+
+#ifdef MPK_ATTN_KV_PREFETCH
+// Fire-and-forget K/V loads that allocate this XCD's L2. Idle ranks issue
+// these during QKV so the attention workers' later AS(1) loads hit L2 after
+// MoE/QKV weight traffic. Same addressing as the HD64 decode scan.
+//
+// Skip the last global tile: QKV writes the current token with st_wt, and a
+// prefetch of that slot would install the previous-step value in L2.
+template <int PAGE_SIZE, int HEAD_DIM, int NUM_KV_CHUNKS, int KV_CACHE_STRIDE>
+__device__ __forceinline__ void
+    mpk_prefetch_kv_chunk_l2(char const *k_base,
+                             char const *v_base,
+                             int const *kv_indptr,
+                             int const *kv_indices,
+                             int const *kv_last_page_len,
+                             int request_id,
+                             int kv_chunk_idx,
+                             int sliding_window) {
+  constexpr int KV_TILE = 16;
+  int const first_page = kv_indptr[request_id];
+  int const last_page = kv_indptr[request_id + 1];
+  int const num_pages = last_page - first_page;
+  if (num_pages <= 0) {
+    return;
+  }
+  int const seqlen_k =
+      (num_pages - 1) * PAGE_SIZE + kv_last_page_len[request_id];
+  int kv_start = 0;
+  if (sliding_window > 0 && seqlen_k > sliding_window) {
+    kv_start = ((seqlen_k - sliding_window) / KV_TILE) * KV_TILE;
+  }
+  int const effective_len = seqlen_k - kv_start;
+  int const ntiles = (effective_len + KV_TILE - 1) / KV_TILE;
+  int const tiles_per_chunk = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+  int chunk_first = kv_chunk_idx * tiles_per_chunk;
+  int chunk_last = chunk_first + tiles_per_chunk;
+  if (chunk_last > ntiles) {
+    chunk_last = ntiles;
+  }
+  int const last_safe_tile = ntiles - 1;
+  if (chunk_last > last_safe_tile) {
+    chunk_last = last_safe_tile;
+  }
+  if (chunk_first >= chunk_last) {
+    return;
+  }
+
+  int const tid = threadIdx.x;
+  int const my_tok = tid / 16;
+  int const my_dim = (tid % 16) * 4;
+  long const lane_kv_off = static_cast<long>(my_tok) * KV_CACHE_STRIDE * 2 +
+                           static_cast<long>(my_dim) * 2;
+
+  for (int t = chunk_first; t < chunk_last; t++) {
+    int const tile_tok0 = kv_start + t * KV_TILE;
+    int const pid = __builtin_amdgcn_readfirstlane(
+        kv_indices[first_page + tile_tok0 / PAGE_SIZE]);
+    long const off =
+        (static_cast<long>(pid) * PAGE_SIZE * KV_CACHE_STRIDE +
+         static_cast<long>(tile_tok0 % PAGE_SIZE) * KV_CACHE_STRIDE) *
+            2 +
+        lane_kv_off;
+    _mpk_kv_u32x2 const k = mpk_hd64_load_kv_as1(k_base + off);
+    _mpk_kv_u32x2 const v = mpk_hd64_load_kv_as1(v_base + off);
+    asm volatile("" ::"v"(k), "v"(v) : "memory");
+  }
+}
 #endif
 
 // Minimum tiles per chunk for the wave-local scan, i.e. >= 2 tiles per wave.
@@ -41,6 +138,97 @@
 // and 2.206 for T=16.
 #ifndef MPK_ATTN_WAVE_LOCAL_MIN_TILES
 #define MPK_ATTN_WAVE_LOCAL_MIN_TILES 8
+#endif
+
+#ifdef MPK_ATTN_SPLIT_CHUNK
+// Helper ranks write a second copy of (O, LSE) at +LSE_S / +O_S. demo.py
+// always allocates 2x so the flag can toggle without a host/kernel mismatch.
+#define MPK_ATTN_SPLIT_PART_OFF(LSE_S, split_part)                             \
+  (static_cast<long>(split_part) * (LSE_S))
+#else
+#define MPK_ATTN_SPLIT_PART_OFF(LSE_S, split_part) (0L)
+#endif
+
+// Double-buffer shared K/V so tile t+1 writes do not alias tile t reads.
+// Removes the mid-iteration WAR __syncthreads() on the ntiles=4 decode path.
+// Opt-in; default off until A/B. Wave-local scan is unchanged.
+#ifndef MPK_ATTN_LDS_PINGPONG
+#define MPK_ATTN_LDS_PINGPONG 0
+#endif
+#ifndef MPK_ATTN_SKIP_LAST_WAR_BAR
+#define MPK_ATTN_SKIP_LAST_WAR_BAR 0
+#endif
+// Issue tile t+2's K/V HBM prefetch before the PV MFMA so those loads fly
+// under PV instead of after it. Tile t+1 must be committed to LDS first
+// (it occupies k_pre/v_pre). Bit-identical addresses; issue order only.
+#ifndef MPK_ATTN_PF_BEFORE_PV
+#define MPK_ATTN_PF_BEFORE_PV 0
+#endif
+#if defined(MPK_ATTN_PF2) && MPK_ATTN_PF_BEFORE_PV
+#error "MPK_ATTN_PF2 is depth-2 prologue prefetch; not with PF_BEFORE_PV"
+#endif
+#if defined(MPK_ATTN_PF_DURING_QK) &&                                          \
+    (defined(MPK_ATTN_PF2) || defined(MPK_ATTN_PF_AT_BAR) ||                 \
+     MPK_ATTN_PF_BEFORE_PV)
+#error "MPK_ATTN_PF_DURING_QK keeps t+1 in k_pre; not with PF2 or PF_BEFORE_PV"
+#endif
+#if defined(MPK_ATTN_PF_DURING_SOFTMAX) &&                                      \
+    (defined(MPK_ATTN_PF_DURING_QK) || defined(MPK_ATTN_PF2) ||                 \
+     defined(MPK_ATTN_PF_AT_BAR) || MPK_ATTN_PF_BEFORE_PV)
+#error "MPK_ATTN_PF_DURING_SOFTMAX is t+2 HBM under softmax; not with other t+2 issue sites"
+#endif
+#if defined(MPK_ATTN_PF_AT_BAR) &&                                              \
+    (defined(MPK_ATTN_PF_DURING_QK) || defined(MPK_ATTN_PF_DURING_SOFTMAX) ||   \
+     defined(MPK_ATTN_PF2) || MPK_ATTN_PF_BEFORE_PV)
+#error "MPK_ATTN_PF_AT_BAR is t+2 after the top barrier; not with other t+2 issue sites"
+#endif
+#if defined(MPK_ATTN_COMMIT_BEFORE_PV) && MPK_ATTN_PF_BEFORE_PV
+#error "MPK_ATTN_COMMIT_BEFORE_PV is K+V commit before PV; PF_BEFORE_PV already does that"
+#endif
+#if defined(MPK_ATTN_V_COMMIT_AFTER_PV) &&                                      \
+    (defined(MPK_ATTN_COMMIT_BEFORE_PV) || MPK_ATTN_PF_BEFORE_PV ||           \
+     defined(MPK_ATTN_COMMIT_DURING_SOFTMAX) ||                               \
+     defined(MPK_ATTN_COMMIT_DURING_QK))
+#error "MPK_ATTN_V_COMMIT_AFTER_PV is the default V-before-PV split; not with other commit sites"
+#endif
+#if defined(MPK_ATTN_COMMIT_DURING_SOFTMAX) &&                                  \
+    (defined(MPK_ATTN_COMMIT_BEFORE_PV) || MPK_ATTN_PF_BEFORE_PV ||             \
+     defined(MPK_ATTN_V_AFTER_QK))
+#error "MPK_ATTN_COMMIT_DURING_SOFTMAX writes t+1 after QK; not with commit-before-PV, PF_BEFORE_PV, or V_AFTER_QK"
+#endif
+#if defined(MPK_ATTN_COMMIT_DURING_QK) &&                                       \
+    (defined(MPK_ATTN_COMMIT_DURING_SOFTMAX) ||                                 \
+     defined(MPK_ATTN_COMMIT_BEFORE_PV) || MPK_ATTN_PF_BEFORE_PV ||             \
+     defined(MPK_ATTN_V_AFTER_QK) || defined(MPK_ATTN_PF_DURING_QK))
+#error "MPK_ATTN_COMMIT_DURING_QK writes t+1 under QK; not with other commit/PF-during-QK knobs"
+#endif
+#if defined(MPK_ATTN_PROLOGUE_PF_OVERLAP) && defined(MPK_ATTN_PF2)
+#error "MPK_ATTN_PROLOGUE_PF_OVERLAP is tile-1 under tile-0 commit; not with PF2"
+#endif
+#if defined(MPK_ATTN_V_AFTER_QK) && MPK_ATTN_LDS_PINGPONG
+#error "MPK_ATTN_V_AFTER_QK moves the WAR bar with the V reads; not with pingpong"
+#endif
+#if defined(MPK_ATTN_QK_PIPE_K) &&                                             \
+    (defined(MPK_ATTN_V_AFTER_QK) || defined(MPK_ATTN_COMMIT_DURING_QK) ||    \
+     defined(MPK_ATTN_PF_DURING_QK) || defined(MPK_ATTN_QK_BEFORE_WAR))
+#error "MPK_ATTN_QK_PIPE_K issues QK0 before remaining K/V LDS; not with V_AFTER_QK or during-QK knobs"
+#endif
+#if defined(MPK_ATTN_QK_BEFORE_WAR) &&                                          \
+    (defined(MPK_ATTN_QK_PIPE_K) || defined(MPK_ATTN_V_AFTER_QK) ||           \
+     defined(MPK_ATTN_COMMIT_DURING_QK) || defined(MPK_ATTN_PF_DURING_QK) || \
+     MPK_ATTN_LDS_PINGPONG)
+#error "MPK_ATTN_QK_BEFORE_WAR runs both QK MFMAs before the WAR bar; not with pipe/V-after/during-QK/pingpong"
+#endif
+// Pad each V LDS token row by 8 fp16 so the 4 PV reads (stride HEAD_DIM)
+// are 36 dwords apart (bank+4) instead of 32 (same banks, 4-way conflict).
+#ifndef MPK_ATTN_V_PAD8
+#define MPK_ATTN_V_PAD8 0
+#endif
+#ifndef MPK_ATTN_O_VEC_STORE
+#define MPK_ATTN_O_VEC_STORE 0
+#endif
+#ifndef MPK_ATTN_UNROLL_TILES
+#define MPK_ATTN_UNROLL_TILES 0
 #endif
 
 namespace kernel {
@@ -174,7 +362,8 @@ __device__ __noinline__ void
                                 float scale_s,
                                 int kv_start,
                                 int effective_len,
-                                int ntiles) {
+                                int ntiles,
+                                int split_part = 0) {
   constexpr int KV_TILE = 16;
   constexpr int NUM_K32 = HEAD_DIM / 32; // 2
   constexpr int WAVES = 4;
@@ -185,6 +374,9 @@ __device__ __noinline__ void
   int const lane = tid & 63;
   int const midx = lane & 15; // MFMA column: q head
   int const kgrp = lane >> 4; // MFMA row group: token / dim quad
+#ifndef MPK_ATTN_SPLIT_CHUNK
+  (void)split_part;
+#endif
 
   // Wave-private staging at 4 KB stride, then merge scratch. Disjoint by
   // construction: no wave ever addresses another's K/V.
@@ -222,8 +414,16 @@ __device__ __noinline__ void
   }
 
   // Tile range for this wave, relative to the chunk frame the caller rebased.
-  int const tpw = (ntiles + WAVES - 1) / WAVES;
-  int const w_first = wave_id * tpw;
+#ifdef MPK_ATTN_WL_PAIR
+  // ntiles=4: two waves × two sequential tiles (T=8's per-wave shape).
+  // Waves 2-3 stay empty (m=-inf) so the existing 4-way merge is an identity
+  // on them. ntiles>=8 keeps the 4-wave split.
+  int const n_assign = (ntiles <= 4) ? 2 : WAVES;
+#else
+  int const n_assign = WAVES;
+#endif
+  int const tpw = (ntiles + n_assign - 1) / n_assign;
+  int const w_first = (wave_id < n_assign) ? wave_id * tpw : ntiles;
   int w_last = w_first + tpw;
   if (w_last > ntiles) {
     w_last = ntiles;
@@ -321,12 +521,8 @@ __device__ __noinline__ void
         // over flat_load_dwordx2, and a reinterpret through a generic
         // reference throws that away. Same note as
         // gang_rmsnorm_linear_mxfp4_bias_mi300.cuh:2458.
-        _kv_u32x2 const kv =
-            *(__attribute__((address_space(1))) _kv_u32x2 const *)(k_base +
-                                                                   off);
-        _kv_u32x2 const vv =
-            *(__attribute__((address_space(1))) _kv_u32x2 const *)(v_base +
-                                                                   off);
+        _kv_u32x2 const kv = mpk_hd64_load_kv_as1(k_base + off);
+        _kv_u32x2 const vv = mpk_hd64_load_kv_as1(v_base + off);
         k_pre[i] = make_uint2(kv[0], kv[1]);
         v_pre[i] = make_uint2(vv[0], vv[1]);
       } else {
@@ -400,10 +596,14 @@ __device__ __noinline__ void
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       _Float16 const *k_ptr = &wk[midx * HEAD_DIM + kc * 32 + kgrp * 8];
+#ifdef MPK_ATTN_K_VEC_LOAD
+      mpk_hd64_load_k8(kr[kc], k_ptr);
+#else
 #pragma unroll
       for (int i = 0; i < 8; i++) {
         kr[kc][i] = k_ptr[i];
       }
+#endif
     }
 
     __mfma_hd64_fp16x4 va[DBLK];
@@ -439,16 +639,24 @@ __device__ __noinline__ void
     // Online softmax. Identical arithmetic and identical reduction order to
     // the baseline loop, so a wave's partial is bit-comparable to the same
     // token range scanned there.
+#ifdef MPK_ATTN_SCORE_MAX3
+    float tile_max;
+    asm volatile("v_max3_f32 %0, %1, %2, %3"
+                 : "=v"(tile_max)
+                 : "v"(scores[0]), "v"(scores[1]), "v"(scores[2]));
+    tile_max = fmaxf(tile_max, scores[3]);
+#else
     float tile_max =
         fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[2], scores[3]));
+#endif
     {
       float a = tile_max, b = tile_max;
-      asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
                    : "+v"(a), "+v"(b));
       tile_max = fmaxf(a, b);
       a = tile_max;
       b = tile_max;
-      asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
                    : "+v"(a), "+v"(b));
       tile_max = fmaxf(a, b);
     }
@@ -470,11 +678,13 @@ __device__ __noinline__ void
     float w2 = __fast_exp2_hd64(scores[2] - new_max);
     float w3 = __fast_exp2_hd64(scores[3] - new_max);
 
+#ifndef MPK_ATTN_PV_BEFORE_LHEAD
     l_head[0] = l_head[0] * rescale + w0;
     l_head[1] = l_head[1] * rescale + w1;
     l_head[2] = l_head[2] * rescale + w2;
     l_head[3] = l_head[3] * rescale + w3;
     m_running = new_max;
+#endif
 
     // Tile t is fully register-resident now, so staging t+1 is free to run
     // ahead of the PV MFMAs below.
@@ -494,6 +704,14 @@ __device__ __noinline__ void
           o_acc[d], (_Float16 const *)&va[d], (_Float16 const *)&pb);
     }
 
+#ifdef MPK_ATTN_PV_BEFORE_LHEAD
+    l_head[0] = l_head[0] * rescale + w0;
+    l_head[1] = l_head[1] * rescale + w1;
+    l_head[2] = l_head[2] * rescale + w2;
+    l_head[3] = l_head[3] * rescale + w3;
+    m_running = new_max;
+#endif
+
     if (t + 2 < w_ntiles) {
       prefetch_tile(t + 2);
     }
@@ -501,8 +719,24 @@ __device__ __noinline__ void
 
   // ===== Cross-wave merge: once per chunk, not once per tile =====
   float l_sum = l_head[0] + l_head[1] + l_head[2] + l_head[3];
+#ifdef MPK_ATTN_LSE_DPP
+  // Same xor-16 then xor-32 association as __shfl_xor, via VALU permlane
+  // instead of LDS ds_bpermute.
+  {
+    float a = l_sum, b = l_sum;
+    asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    l_sum = a + b;
+    a = l_sum;
+    b = l_sum;
+    asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    l_sum = a + b;
+  }
+#else
   l_sum += __shfl_xor(l_sum, 16);
   l_sum += __shfl_xor(l_sum, 32);
+#endif
 
   if (kgrp == 0 && midx < NUM_QO_PER_KV) {
     m_lds[wave_id * 16 + midx] = m_running;
@@ -522,8 +756,9 @@ __device__ __noinline__ void
 
   constexpr int LSE_S = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
   constexpr int O_S = LSE_S * HEAD_DIM;
+  long const part_off = MPK_ATTN_SPLIT_PART_OFF(LSE_S, split_part);
   float *o_out = reinterpret_cast<float *>(output_ptr) +
-                 static_cast<long>(query_start) * O_S +
+                 static_cast<long>(query_start) * O_S + part_off * HEAD_DIM +
                  static_cast<long>(kv_head_idx) * NUM_KV_CHUNKS *
                      NUM_QO_PER_KV * HEAD_DIM +
                  static_cast<long>(kv_chunk_idx) * NUM_QO_PER_KV * HEAD_DIM;
@@ -572,7 +807,7 @@ __device__ __noinline__ void
     // long comment there for why this conversion is not optional.
     constexpr float INV_LOG2E = 0.693147180559945309417f;
     float *lse_out = reinterpret_cast<float *>(lse_ptr) +
-                     static_cast<long>(query_start) * LSE_S +
+                     static_cast<long>(query_start) * LSE_S + part_off +
                      kv_head_idx * NUM_KV_CHUNKS * NUM_QO_PER_KV +
                      kv_chunk_idx * NUM_QO_PER_KV + q;
     *lse_out =
@@ -604,9 +839,13 @@ __device__ __noinline__ void
                                         int kv_chunk_idx,
                                         float scale_s,
                                         int sliding_window = 0,
-                                        void const *sinks_ptr = nullptr) {
+                                        void const *sinks_ptr = nullptr,
+                                        int split_part = 0) {
   using bf16 = __hip_bfloat16;
   static_assert(HEAD_DIM == 64, "This kernel is HD=64 only");
+#ifndef MPK_ATTN_SPLIT_CHUNK
+  (void)split_part;
+#endif
 
   int const req = request_id;
   int const query_start = qo_indptr[req];
@@ -626,14 +865,35 @@ __device__ __noinline__ void
 
   constexpr int KV_TILE = 16;
   constexpr int NUM_K32 = HEAD_DIM / 32; // 2
+#if MPK_ATTN_V_PAD8
+  constexpr int V_LDS_STRIDE = HEAD_DIM + 8;
+#else
+  constexpr int V_LDS_STRIDE = HEAD_DIM;
+#endif
+  constexpr int K_LDS_BYTES = KV_TILE * HEAD_DIM * (int)sizeof(_Float16);
+  constexpr int ATTN_LDS_BUF =
+      K_LDS_BYTES + KV_TILE * V_LDS_STRIDE * (int)sizeof(_Float16);
 
   char const *k_base = reinterpret_cast<char const *>(paged_k_cache_ptr);
   char const *v_base = reinterpret_cast<char const *>(paged_v_cache_ptr);
 
-  // LDS: K[16][64] + V[16][64] = 4 KB total
+  // LDS: K[16][64] + V[16][stride]. Default stride 64 is 4 KB; PAD8 uses
+  // stride 72 so PV's four token-strided reads miss the same banks.
   extern __shared__ char smem_minimal[];
+#if MPK_ATTN_LDS_PINGPONG
+  auto lds_k_at = [&](int buf) -> _Float16 * {
+    return reinterpret_cast<_Float16 *>(smem_minimal + buf * ATTN_LDS_BUF);
+  };
+  auto lds_v_at = [&](int buf) -> _Float16 * {
+    return reinterpret_cast<_Float16 *>(smem_minimal + buf * ATTN_LDS_BUF +
+                                        K_LDS_BYTES);
+  };
+  _Float16 *lds_k = lds_k_at(0);
+  _Float16 *lds_v = lds_v_at(0);
+#else
   _Float16 *lds_k = reinterpret_cast<_Float16 *>(smem_minimal);
-  _Float16 *lds_v = reinterpret_cast<_Float16 *>(smem_minimal + 2048);
+  _Float16 *lds_v = reinterpret_cast<_Float16 *>(smem_minimal + K_LDS_BYTES);
+#endif
 
   // 256 threads × 4 bf16 = 16 tok × 64 dim = 1024 elements
   int my_tok = tid / 16;
@@ -697,6 +957,7 @@ __device__ __noinline__ void
         constexpr int LSE_STRIDE = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
         float *lse_out = reinterpret_cast<float *>(lse_ptr) +
                          static_cast<long>(query_start) * LSE_STRIDE +
+                         MPK_ATTN_SPLIT_PART_OFF(LSE_STRIDE, split_part) +
                          kv_head_idx * NUM_KV_CHUNKS * NUM_QO_PER_KV +
                          kv_chunk_idx * NUM_QO_PER_KV + midx;
         *lse_out = -1e30f;
@@ -712,7 +973,46 @@ __device__ __noinline__ void
     }
     ntiles = chunk_last_tile - chunk_first_tile;
   }
+#ifdef MPK_ATTN_SPLIT_CHUNK
+  // Idle ranks take the high half of this chunk's tiles so ntiles=4 (ctx512
+  // full attn) becomes two parallel ntiles=2 shared-LDS scans. Window layers
+  // have ntiles=1; the helper writes LSE=-inf and the pairwise fold is an
+  // identity. NUM_KV_CHUNKS=16 lost on extra merge; this keeps the 8-way
+  // merge and folds the pair into the primary slot first.
+  if (ntiles >= 2) {
+    int const mid = ntiles / 2;
+    if (split_part == 0) {
+      ntiles = mid;
+    } else {
+      kv_start += mid * KV_TILE;
+      ntiles = ntiles - mid;
+    }
+    effective_len = ntiles * KV_TILE;
+    int const remaining = seqlen_k - kv_start;
+    if (effective_len > remaining) {
+      effective_len = remaining;
+    }
+    if (effective_len <= 0) {
+      ntiles = 0;
+    } else {
+      ntiles = (effective_len + KV_TILE - 1) / KV_TILE;
+    }
+  } else if (split_part != 0) {
+    ntiles = 0;
+  }
+#endif
   if (ntiles == 0) {
+#ifdef MPK_ATTN_SPLIT_CHUNK
+    if (split_part != 0 && warp_id == 0 && kgrp == 0 && midx < NUM_QO_PER_KV) {
+      constexpr int LSE_STRIDE = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
+      float *lse_out = reinterpret_cast<float *>(lse_ptr) +
+                       static_cast<long>(query_start) * LSE_STRIDE +
+                       MPK_ATTN_SPLIT_PART_OFF(LSE_STRIDE, split_part) +
+                       kv_head_idx * NUM_KV_CHUNKS * NUM_QO_PER_KV +
+                       kv_chunk_idx * NUM_QO_PER_KV + midx;
+      *lse_out = -1e30f;
+    }
+#endif
     return;
   }
 
@@ -751,7 +1051,14 @@ __device__ __noinline__ void
   // Set MPK_ATTN_NO_WAVE_LOCAL to ablate back to the shared-LDS loop.
 #ifndef MPK_ATTN_NO_WAVE_LOCAL
   if constexpr (NUM_KV_CHUNKS > 1) {
-    if (ntiles >= MPK_ATTN_WAVE_LOCAL_MIN_TILES && sliding_window == 0 &&
+#ifdef MPK_ATTN_WL_PAIR
+    // ntiles=4 at ctx512/8 chunks: 2 waves × 2 tiles, not 4 waves × 1.
+    // 4×1 failed PPL; T=8 (2 tiles/wave) passed. Same per-wave association.
+    int const wl_min = 4;
+#else
+    int const wl_min = MPK_ATTN_WAVE_LOCAL_MIN_TILES;
+#endif
+    if (ntiles >= wl_min && sliding_window == 0 &&
         sinks_ptr == nullptr) {
       __attn_wave_local_scan_hd64<NUM_QO_PER_KV,
                                   HEAD_DIM,
@@ -772,7 +1079,8 @@ __device__ __noinline__ void
                                                 scale_s,
                                                 kv_start,
                                                 effective_len,
-                                                ntiles);
+                                                ntiles,
+                                                split_part);
       return;
     }
   }
@@ -822,27 +1130,82 @@ __device__ __noinline__ void
   // Assign the vector type and extract -- a reinterpret through a generic
   // uint2 reference throws the address space away and reverts to flat_load.
   auto load_kv_pair = [&](uint2 *kd, uint2 *vd, long off) {
-    _kv_u32x2 const kv =
-        *(__attribute__((address_space(1))) _kv_u32x2 const *)(k_base + off);
-    _kv_u32x2 const vv =
-        *(__attribute__((address_space(1))) _kv_u32x2 const *)(v_base + off);
+    _kv_u32x2 const kv = mpk_hd64_load_kv_as1(k_base + off);
+    _kv_u32x2 const vv = mpk_hd64_load_kv_as1(v_base + off);
     *kd = make_uint2(kv[0], kv[1]);
     *vd = make_uint2(vv[0], vv[1]);
   };
 
   // ===== PROLOGUE: K[0]+V[0] -> LDS =====
   int tile0_len = (KV_TILE < effective_len) ? KV_TILE : effective_len;
+#ifdef MPK_ATTN_PROLOGUE_PF_OVERLAP
+  uint2 k_raw = make_uint2(0u, 0u), v_raw = make_uint2(0u, 0u);
+  int const t0_live = my_tok < tile0_len;
+  if (t0_live) {
+#if MPK_ATTN_SCALAR_PAGE
+    long kv0 = get_kv_tile_off(kv_start) + lane_kv_off;
+    load_kv_pair(&k_raw, &v_raw, kv0);
+#else
+    long kv0 = get_kv_off(kv_start + my_tok);
+    __load_bf16x4_raw(&k_raw, k_base + kv0);
+    __load_bf16x4_raw(&v_raw, v_base + kv0);
+#endif
+  }
+  uint2 k_pre, v_pre;
+  bool has_pre = false;
+  if (ntiles > 1) {
+    int tile1_len = ((effective_len - KV_TILE) < KV_TILE)
+                        ? (effective_len - KV_TILE)
+                        : KV_TILE;
+    if (my_tok < tile1_len) {
+#if MPK_ATTN_SCALAR_PAGE
+      long kv1 = get_kv_tile_off(kv_start + KV_TILE) + lane_kv_off;
+      load_kv_pair(&k_pre, &v_pre, kv1);
+#else
+      long kv1 = get_kv_off(kv_start + KV_TILE + my_tok);
+      __load_bf16x4_raw(&k_pre, k_base + kv1);
+      __load_bf16x4_raw(&v_pre, v_base + kv1);
+#endif
+      has_pre = true;
+    }
+  }
+  if (t0_live) {
+    _Float16 k_fp[4], v_fp[4];
+    __cvt_bf16x4_to_fp16(k_fp, k_raw);
+    __cvt_bf16x4_to_fp16(v_fp, v_raw);
+    *(uint64_t *)&lds_k[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+    *(uint64_t *)&lds_v[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+  } else {
+    _Float16 zero[4] = {0, 0, 0, 0};
+    *(uint64_t *)&lds_k[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)zero;
+    *(uint64_t *)&lds_v[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)zero;
+  }
+#else
   if (my_tok < tile0_len) {
+#if MPK_ATTN_SCALAR_PAGE
+    // Same scalar page-id + GLOBAL load as the tile-1+ prefetch. The old
+    // prologue used per-lane get_kv_off + a generic load (serialized page-id
+    // drain). Ablate with MPK_ATTN_SCALAR_PAGE=0.
+    long kv0 = get_kv_tile_off(kv_start) + lane_kv_off;
+    uint2 k_raw, v_raw;
+    load_kv_pair(&k_raw, &v_raw, kv0);
+    _Float16 k_fp[4], v_fp[4];
+    __cvt_bf16x4_to_fp16(k_fp, k_raw);
+    __cvt_bf16x4_to_fp16(v_fp, v_raw);
+    *(uint64_t *)&lds_k[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+    *(uint64_t *)&lds_v[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+#else
     long kv0 = get_kv_off(kv_start + my_tok);
     _Float16 k_fp[4], v_fp[4];
     __load_bf16x4_to_fp16(k_fp, k_base + kv0);
     __load_bf16x4_to_fp16(v_fp, v_base + kv0);
     *(uint64_t *)&lds_k[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
-    *(uint64_t *)&lds_v[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)v_fp;
+    *(uint64_t *)&lds_v[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+#endif
   } else {
     _Float16 zero[4] = {0, 0, 0, 0};
     *(uint64_t *)&lds_k[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)zero;
-    *(uint64_t *)&lds_v[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)zero;
+    *(uint64_t *)&lds_v[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)zero;
   }
 
   // Prefetch K[1]+V[1] -> registers as raw dwords
@@ -864,44 +1227,172 @@ __device__ __noinline__ void
       has_pre = true;
     }
   }
+#endif
+#ifdef MPK_ATTN_PF2
+  // Second in-flight tile so t=0's QK/softmax/PV hide tile-2 HBM. Same
+  // addresses as the in-loop t+2 prefetch; one extra uint2 pair.
+  uint2 k_pre2 = {0, 0}, v_pre2 = {0, 0};
+  bool has_pre2 = false;
+  if (ntiles > 2) {
+    int tile2_len = ((effective_len - 2 * KV_TILE) < KV_TILE)
+                        ? (effective_len - 2 * KV_TILE)
+                        : KV_TILE;
+    if (my_tok < tile2_len) {
+#if MPK_ATTN_SCALAR_PAGE
+      long kv2p = get_kv_tile_off(kv_start + 2 * KV_TILE) + lane_kv_off;
+      load_kv_pair(&k_pre2, &v_pre2, kv2p);
+#else
+      long kv2p = get_kv_off(kv_start + 2 * KV_TILE + my_tok);
+      __load_bf16x4_raw(&k_pre2, k_base + kv2p);
+      __load_bf16x4_raw(&v_pre2, v_base + kv2p);
+#endif
+      has_pre2 = true;
+    }
+  }
+#endif
 
   // ===== MAIN LOOP =====
   __mfma_hd64_fp32x4 o_acc = {0, 0, 0, 0};
   float m_running = -INFINITY;
   float l_head[4] = {0, 0, 0, 0};
 
+#if MPK_ATTN_UNROLL_TILES
+#pragma unroll 8
+#endif
   for (int t = 0; t < ntiles; t++) {
     int tile_start = t * KV_TILE;
     int tile_len = ((effective_len - tile_start) < KV_TILE)
                        ? (effective_len - tile_start)
                        : KV_TILE;
 
+#if MPK_ATTN_LDS_PINGPONG
+    int const buf = t & 1;
+    lds_k = lds_k_at(buf);
+    lds_v = lds_v_at(buf);
+    _Float16 *lds_k_w = lds_k_at(buf ^ 1);
+    _Float16 *lds_v_w = lds_v_at(buf ^ 1);
+#else
+    _Float16 *lds_k_w = lds_k;
+    _Float16 *lds_v_w = lds_v;
+#endif
+
     __syncthreads();
+
+#ifdef MPK_ATTN_PF_AT_BAR
+    // t+1 stays in k_pre/v_pre for the post-PV commit. Issue t+2 now so LDS
+    // reads, WAR, QK, softmax, and PV hide that HBM.
+    uint2 k_pre2 = make_uint2(0u, 0u), v_pre2 = make_uint2(0u, 0u);
+    bool has_pre2 = false;
+    if (t + 2 < ntiles) {
+      int t2_start = (t + 2) * KV_TILE;
+      int t2_len = ((effective_len - t2_start) < KV_TILE)
+                       ? (effective_len - t2_start)
+                       : KV_TILE;
+      if (my_tok < t2_len) {
+#if MPK_ATTN_SCALAR_PAGE
+        long kv2 = get_kv_tile_off(kv_start + t2_start) + lane_kv_off;
+        load_kv_pair(&k_pre2, &v_pre2, kv2);
+#else
+        long kv2 = get_kv_off(kv_start + t2_start + my_tok);
+        __load_bf16x4_raw(&k_pre2, k_base + kv2);
+        __load_bf16x4_raw(&v_pre2, v_base + kv2);
+#endif
+        has_pre2 = true;
+      }
+    }
+#endif
 
     // Read K[t] from LDS — lane (midx, kgrp) needs
     // K[tok=midx][dim=kc*32+kgrp*8..+7]
     _Float16 kr[NUM_K32][8];
+#ifdef MPK_ATTN_QK_PIPE_K
+    static_assert(NUM_K32 == 2, "QK_PIPE_K splits the two HD64 QK MFMAs");
+    {
+      _Float16 const *k_ptr = &lds_k[midx * HEAD_DIM + 0 * 32 + kgrp * 8];
+#ifdef MPK_ATTN_K_VEC_LOAD
+      mpk_hd64_load_k8(kr[0], k_ptr);
+#else
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        kr[0][i] = k_ptr[i];
+      }
+#endif
+    }
+    __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
+    scores = __mfma_qk_hd64(scores, kr[0], qr[0]);
+    {
+      _Float16 const *k_ptr = &lds_k[midx * HEAD_DIM + 1 * 32 + kgrp * 8];
+#ifdef MPK_ATTN_K_VEC_LOAD
+      mpk_hd64_load_k8(kr[1], k_ptr);
+#else
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        kr[1][i] = k_ptr[i];
+      }
+#endif
+    }
+#else
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       _Float16 const *k_ptr = &lds_k[midx * HEAD_DIM + kc * 32 + kgrp * 8];
+#ifdef MPK_ATTN_K_VEC_LOAD
+      mpk_hd64_load_k8(kr[kc], k_ptr);
+#else
 #pragma unroll
       for (int i = 0; i < 8; i++) {
         kr[kc][i] = k_ptr[i];
       }
+#endif
     }
+#endif
 
     // Read V[t] from LDS — lane (midx, kgrp) needs
     // V[dim=warp*16+midx][tok=kgrp*4..kgrp*4+3] (transposed for PV MFMA where
     // A=V).
     __mfma_hd64_fp16x4 va;
+#ifndef MPK_ATTN_V_AFTER_QK
     {
       _Float16 const *v_ptr =
-          &lds_v[(kgrp * 4) * HEAD_DIM + warp_id * 16 + midx];
-      va[0] = v_ptr[0 * HEAD_DIM];
-      va[1] = v_ptr[1 * HEAD_DIM];
-      va[2] = v_ptr[2 * HEAD_DIM];
-      va[3] = v_ptr[3 * HEAD_DIM];
+          &lds_v[(kgrp * 4) * V_LDS_STRIDE + warp_id * 16 + midx];
+      va[0] = v_ptr[0 * V_LDS_STRIDE];
+      va[1] = v_ptr[1 * V_LDS_STRIDE];
+      va[2] = v_ptr[2 * V_LDS_STRIDE];
+      va[3] = v_ptr[3 * V_LDS_STRIDE];
     }
+#endif
+
+#ifdef MPK_ATTN_QK_BEFORE_WAR
+    // K and V are in registers. QK does not touch LDS, so it can run before
+    // the WAR rendezvous and overlap other warps' remaining LDS reads.
+    __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      scores = __mfma_qk_hd64(scores, kr[kc], qr[kc]);
+    }
+    scores[0] *= scale_s;
+    scores[1] *= scale_s;
+    scores[2] *= scale_s;
+    scores[3] *= scale_s;
+#pragma unroll
+    for (int h = 0; h < 4; h++) {
+      if (kgrp * 4 + h >= tile_len) {
+        scores[h] = -INFINITY;
+      }
+    }
+#ifndef MPK_NO_SW_MASK
+    if (sliding_window > 0) {
+      int const win_first = seqlen_k - sliding_window;
+      if (win_first > 0) {
+#pragma unroll
+        for (int h = 0; h < 4; h++) {
+          if (kv_start + tile_start + kgrp * 4 + h < win_first) {
+            scores[h] = -INFINITY;
+          }
+        }
+      }
+    }
+#endif
+#endif
 
     // Every warp has now copied tile t out of LDS into registers (kr, va).
     // Later in this same iteration each thread overwrites lds_k/lds_v with
@@ -913,16 +1404,73 @@ __device__ __noinline__ void
     // LDS, and it silently corrupts K/V for the lagging warp.
     //
     // This barrier closes the read half of the double-buffer-free pipeline.
-    // It only fires when the prefetch is live (ntiles > 1); with one tile per
-    // chunk the writes are dead and this costs a single s_barrier.
+    // MPK_ATTN_LDS_PINGPONG writes t+1 into the other 4 KB, so the WAR is
+    // gone and the mid-loop barrier can drop; the top-of-loop barrier still
+    // publishes the previous write.
+    //
+    // MPK_ATTN_SKIP_LAST_WAR_BAR: on the last tile (and whenever ntiles==1)
+    // nobody writes LDS after the reads, so the WAR rendezvous is idle.
+    // The predicate is tile-uniform (`t + 1 < ntiles`), not per-lane
+    // has_pre, so every thread takes the same branch.
+#if !MPK_ATTN_LDS_PINGPONG
+#ifndef MPK_ATTN_V_AFTER_QK
+#if MPK_ATTN_SKIP_LAST_WAR_BAR
+    if (t + 1 < ntiles) {
+      __syncthreads();
+    }
+#else
     __syncthreads();
+#endif
+#endif
+#endif
 
+#ifdef MPK_ATTN_PF_DURING_QK
+    // t+1 stays in k_pre/v_pre for the post-PV commit. Issue t+2 now so QK
+    // and softmax hide that HBM; default issues it after PV.
+    uint2 k_pre2 = make_uint2(0u, 0u), v_pre2 = make_uint2(0u, 0u);
+    bool has_pre2 = false;
+    if (t + 2 < ntiles) {
+      int t2_start = (t + 2) * KV_TILE;
+      int t2_len = ((effective_len - t2_start) < KV_TILE)
+                       ? (effective_len - t2_start)
+                       : KV_TILE;
+      if (my_tok < t2_len) {
+#if MPK_ATTN_SCALAR_PAGE
+        long kv2 = get_kv_tile_off(kv_start + t2_start) + lane_kv_off;
+        load_kv_pair(&k_pre2, &v_pre2, kv2);
+#else
+        long kv2 = get_kv_off(kv_start + t2_start + my_tok);
+        __load_bf16x4_raw(&k_pre2, k_base + kv2);
+        __load_bf16x4_raw(&v_pre2, v_base + kv2);
+#endif
+        has_pre2 = true;
+      }
+    }
+#endif
+
+#ifdef MPK_ATTN_COMMIT_DURING_QK
+    // Tile t's K/V are in kr/va. Overwrite LDS with t+1 so cvt/ds_write hide
+    // under the two QK MFMAs. Prefetch of t+2 stays after PV.
+    if (has_pre) {
+      _Float16 v_fp[4], k_fp[4];
+      __cvt_bf16x4_to_fp16(v_fp, v_pre);
+      __cvt_bf16x4_to_fp16(k_fp, k_pre);
+      *(uint64_t *)&lds_v_w[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+      *(uint64_t *)&lds_k_w[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+    }
+#endif
+
+#ifndef MPK_ATTN_QK_BEFORE_WAR
     // 2x QK MFMA
+#ifdef MPK_ATTN_QK_PIPE_K
+    scores = __mfma_qk_hd64(scores, kr[1], qr[1]);
+#else
     __mfma_hd64_fp32x4 scores = {0, 0, 0, 0};
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       scores = __mfma_qk_hd64(scores, kr[kc], qr[kc]);
     }
+#endif
 
     scores[0] *= scale_s;
     scores[1] *= scale_s;
@@ -962,18 +1510,40 @@ __device__ __noinline__ void
       }
     }
 #endif
+#endif
+
+#ifdef MPK_ATTN_COMMIT_DURING_SOFTMAX
+    // Tile t's K/V are in kr/va. Overwrite LDS with t+1 now so the cvt and
+    // ds_writes fly under softmax VALU instead of after softmax (commit-
+    // before-PV) or after PV (default). Prefetch of t+2 stays after PV.
+    if (has_pre) {
+      _Float16 v_fp[4], k_fp[4];
+      __cvt_bf16x4_to_fp16(v_fp, v_pre);
+      __cvt_bf16x4_to_fp16(k_fp, k_pre);
+      *(uint64_t *)&lds_v_w[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+      *(uint64_t *)&lds_k_w[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+    }
+#endif
 
     // Online softmax
+#ifdef MPK_ATTN_SCORE_MAX3
+    float tile_max;
+    asm volatile("v_max3_f32 %0, %1, %2, %3"
+                 : "=v"(tile_max)
+                 : "v"(scores[0]), "v"(scores[1]), "v"(scores[2]));
+    tile_max = fmaxf(tile_max, scores[3]);
+#else
     float tile_max =
         fmaxf(fmaxf(scores[0], scores[1]), fmaxf(scores[2], scores[3]));
+#endif
     {
       float a = tile_max, b = tile_max;
-      asm volatile("s_nop 1\n\tv_permlane32_swap_b32_e32 %0, %1"
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
                    : "+v"(a), "+v"(b));
       tile_max = fmaxf(a, b);
       a = tile_max;
       b = tile_max;
-      asm volatile("s_nop 1\n\tv_permlane16_swap_b32_e32 %0, %1"
+      asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
                    : "+v"(a), "+v"(b));
       tile_max = fmaxf(a, b);
     }
@@ -982,45 +1552,94 @@ __device__ __noinline__ void
     float rescale =
         (m_running == -INFINITY) ? 0.0f : __fast_exp2_hd64(m_running - new_max);
 
+#ifdef MPK_ATTN_EXP2_BEFORE_OACC
+    float w0 = __fast_exp2_hd64(scores[0] - new_max);
+    float w1 = __fast_exp2_hd64(scores[1] - new_max);
+    float w2 = __fast_exp2_hd64(scores[2] - new_max);
+    float w3 = __fast_exp2_hd64(scores[3] - new_max);
+#endif
+
     o_acc[0] *= rescale;
     o_acc[1] *= rescale;
     o_acc[2] *= rescale;
     o_acc[3] *= rescale;
 
+#ifndef MPK_ATTN_EXP2_BEFORE_OACC
     float w0 = __fast_exp2_hd64(scores[0] - new_max);
     float w1 = __fast_exp2_hd64(scores[1] - new_max);
     float w2 = __fast_exp2_hd64(scores[2] - new_max);
     float w3 = __fast_exp2_hd64(scores[3] - new_max);
+#endif
 
+#ifndef MPK_ATTN_PV_BEFORE_LHEAD
+#ifdef MPK_ATTN_LHEAD_FMA
+    l_head[0] = fmaf(l_head[0], rescale, w0);
+    l_head[1] = fmaf(l_head[1], rescale, w1);
+    l_head[2] = fmaf(l_head[2], rescale, w2);
+    l_head[3] = fmaf(l_head[3], rescale, w3);
+#else
     l_head[0] = l_head[0] * rescale + w0;
     l_head[1] = l_head[1] * rescale + w1;
     l_head[2] = l_head[2] * rescale + w2;
     l_head[3] = l_head[3] * rescale + w3;
+#endif
     m_running = new_max;
+#endif
 
-    // Write V[t+1] from v_pre
+#ifdef MPK_ATTN_PF_DURING_SOFTMAX
+    // t+1 stays in k_pre/v_pre for the post-PV commit. Issue t+2 so softmax
+    // VALU and PV hide that HBM; PF_DURING_QK issues during QK instead.
+    uint2 k_pre2 = make_uint2(0u, 0u), v_pre2 = make_uint2(0u, 0u);
+    bool has_pre2 = false;
+    if (t + 2 < ntiles) {
+      int t2_start = (t + 2) * KV_TILE;
+      int t2_len = ((effective_len - t2_start) < KV_TILE)
+                       ? (effective_len - t2_start)
+                       : KV_TILE;
+      if (my_tok < t2_len) {
+#if MPK_ATTN_SCALAR_PAGE
+        long kv2 = get_kv_tile_off(kv_start + t2_start) + lane_kv_off;
+        load_kv_pair(&k_pre2, &v_pre2, kv2);
+#else
+        long kv2 = get_kv_off(kv_start + t2_start + my_tok);
+        __load_bf16x4_raw(&k_pre2, k_base + kv2);
+        __load_bf16x4_raw(&v_pre2, v_base + kv2);
+#endif
+        has_pre2 = true;
+      }
+    }
+#endif
+
+#ifdef MPK_ATTN_V_AFTER_QK
+    {
+      _Float16 const *v_ptr =
+          &lds_v[(kgrp * 4) * V_LDS_STRIDE + warp_id * 16 + midx];
+      va[0] = v_ptr[0 * V_LDS_STRIDE];
+      va[1] = v_ptr[1 * V_LDS_STRIDE];
+      va[2] = v_ptr[2 * V_LDS_STRIDE];
+      va[3] = v_ptr[3 * V_LDS_STRIDE];
+    }
+#if MPK_ATTN_SKIP_LAST_WAR_BAR
+    if (t + 1 < ntiles) {
+      __syncthreads();
+    }
+#else
+    __syncthreads();
+#endif
+#endif
+
+#if MPK_ATTN_PF_BEFORE_PV
+    // Commit tile t+1 to LDS, then issue t+2 from HBM before PV so the
+    // payload is in flight during the 16x16x16 PV. kr/va are already in
+    // registers; the next iteration's top-of-loop barrier still publishes
+    // these LDS writes. Same addresses as the default schedule.
     if (has_pre) {
-      _Float16 v_fp[4];
+      _Float16 v_fp[4], k_fp[4];
       __cvt_bf16x4_to_fp16(v_fp, v_pre);
-      *(uint64_t *)&lds_v[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)v_fp;
-    }
-
-    // PV MFMA (1x for HD=64; warp covers 16 dims)
-    __mfma_hd64_fp16x4 pb;
-    pb[0] = (_Float16)w0;
-    pb[1] = (_Float16)w1;
-    pb[2] = (_Float16)w2;
-    pb[3] = (_Float16)w3;
-    o_acc = __mfma_pv_hd64(o_acc, (_Float16 const *)&va, (_Float16 const *)&pb);
-
-    // Write K[t+1] from k_pre
-    if (has_pre) {
-      _Float16 k_fp[4];
       __cvt_bf16x4_to_fp16(k_fp, k_pre);
-      *(uint64_t *)&lds_k[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+      *(uint64_t *)&lds_v_w[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+      *(uint64_t *)&lds_k_w[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
     }
-
-    // Prefetch K[t+2]+V[t+2]
     has_pre = false;
     if (t + 2 < ntiles) {
       int t2_start = (t + 2) * KV_TILE;
@@ -1039,14 +1658,156 @@ __device__ __noinline__ void
         has_pre = true;
       }
     }
+    __mfma_hd64_fp16x4 pb;
+    pb[0] = (_Float16)w0;
+    pb[1] = (_Float16)w1;
+    pb[2] = (_Float16)w2;
+    pb[3] = (_Float16)w3;
+    o_acc = __mfma_pv_hd64(o_acc, (_Float16 const *)&va, (_Float16 const *)&pb);
+#else
+#ifdef MPK_ATTN_COMMIT_BEFORE_PV
+    // Write V[t+1] and K[t+1] before PV. Prefetch of t+2 stays after PV
+    // (that is the PF_BEFORE_PV variable). kr/va are already in registers.
+    if (has_pre) {
+      _Float16 v_fp[4], k_fp[4];
+      __cvt_bf16x4_to_fp16(v_fp, v_pre);
+      __cvt_bf16x4_to_fp16(k_fp, k_pre);
+      *(uint64_t *)&lds_v_w[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+      *(uint64_t *)&lds_k_w[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+    }
+    __mfma_hd64_fp16x4 pb;
+    pb[0] = (_Float16)w0;
+    pb[1] = (_Float16)w1;
+    pb[2] = (_Float16)w2;
+    pb[3] = (_Float16)w3;
+    o_acc = __mfma_pv_hd64(o_acc, (_Float16 const *)&va, (_Float16 const *)&pb);
+#else
+#ifndef MPK_ATTN_COMMIT_DURING_SOFTMAX
+#ifndef MPK_ATTN_COMMIT_DURING_QK
+#ifndef MPK_ATTN_V_COMMIT_AFTER_PV
+    // Write V[t+1] from v_pre
+    if (has_pre) {
+      _Float16 v_fp[4];
+      __cvt_bf16x4_to_fp16(v_fp, v_pre);
+      *(uint64_t *)&lds_v_w[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+    }
+#endif
+#endif
+#endif
+
+    // PV MFMA (1x for HD=64; warp covers 16 dims)
+    __mfma_hd64_fp16x4 pb;
+    pb[0] = (_Float16)w0;
+    pb[1] = (_Float16)w1;
+    pb[2] = (_Float16)w2;
+    pb[3] = (_Float16)w3;
+    o_acc = __mfma_pv_hd64(o_acc, (_Float16 const *)&va, (_Float16 const *)&pb);
+
+#ifndef MPK_ATTN_COMMIT_DURING_SOFTMAX
+#ifndef MPK_ATTN_COMMIT_DURING_QK
+    // Write K[t+1] from k_pre
+    if (has_pre) {
+      _Float16 k_fp[4];
+      __cvt_bf16x4_to_fp16(k_fp, k_pre);
+      *(uint64_t *)&lds_k_w[my_tok * HEAD_DIM + my_dim] = *(uint64_t *)k_fp;
+#ifdef MPK_ATTN_V_COMMIT_AFTER_PV
+      _Float16 v_fp[4];
+      __cvt_bf16x4_to_fp16(v_fp, v_pre);
+      *(uint64_t *)&lds_v_w[my_tok * V_LDS_STRIDE + my_dim] = *(uint64_t *)v_fp;
+#endif
+    }
+#endif
+#endif
+#endif
+
+#ifdef MPK_ATTN_PV_BEFORE_LHEAD
+#ifdef MPK_ATTN_LHEAD_FMA
+    l_head[0] = fmaf(l_head[0], rescale, w0);
+    l_head[1] = fmaf(l_head[1], rescale, w1);
+    l_head[2] = fmaf(l_head[2], rescale, w2);
+    l_head[3] = fmaf(l_head[3], rescale, w3);
+#else
+    l_head[0] = l_head[0] * rescale + w0;
+    l_head[1] = l_head[1] * rescale + w1;
+    l_head[2] = l_head[2] * rescale + w2;
+    l_head[3] = l_head[3] * rescale + w3;
+#endif
+    m_running = new_max;
+#endif
+
+    // Prefetch K[t+2]+V[t+2]
+    has_pre = false;
+#ifdef MPK_ATTN_PF2
+    has_pre = has_pre2;
+    k_pre = k_pre2;
+    v_pre = v_pre2;
+    has_pre2 = false;
+    if (t + 3 < ntiles) {
+      int t3_start = (t + 3) * KV_TILE;
+      int t3_len = ((effective_len - t3_start) < KV_TILE)
+                       ? (effective_len - t3_start)
+                       : KV_TILE;
+      if (my_tok < t3_len) {
+#if MPK_ATTN_SCALAR_PAGE
+        long kv3 = get_kv_tile_off(kv_start + t3_start) + lane_kv_off;
+        load_kv_pair(&k_pre2, &v_pre2, kv3);
+#else
+        long kv3 = get_kv_off(kv_start + t3_start + my_tok);
+        __load_bf16x4_raw(&k_pre2, k_base + kv3);
+        __load_bf16x4_raw(&v_pre2, v_base + kv3);
+#endif
+        has_pre2 = true;
+      }
+    }
+#elif defined(MPK_ATTN_PF_DURING_QK) || defined(MPK_ATTN_PF_DURING_SOFTMAX) || \
+    defined(MPK_ATTN_PF_AT_BAR)
+    has_pre = has_pre2;
+    k_pre = k_pre2;
+    v_pre = v_pre2;
+#else
+    if (t + 2 < ntiles) {
+      int t2_start = (t + 2) * KV_TILE;
+      int t2_len = ((effective_len - t2_start) < KV_TILE)
+                       ? (effective_len - t2_start)
+                       : KV_TILE;
+      if (my_tok < t2_len) {
+#if MPK_ATTN_SCALAR_PAGE
+        long kv2 = get_kv_tile_off(kv_start + t2_start) + lane_kv_off;
+        load_kv_pair(&k_pre, &v_pre, kv2);
+#else
+        long kv2 = get_kv_off(kv_start + t2_start + my_tok);
+        __load_bf16x4_raw(&k_pre, k_base + kv2);
+        __load_bf16x4_raw(&v_pre, v_base + kv2);
+#endif
+        has_pre = true;
+      }
+    }
+#endif
+#endif
   }
 
   // ===== Output =====
   // Reduce l_head across lanes within MFMA-M slot (kgrp lanes 16..63 hold
   // partials).
   float l_sum = l_head[0] + l_head[1] + l_head[2] + l_head[3];
+#ifdef MPK_ATTN_LSE_DPP
+  // Same xor-16 then xor-32 association as __shfl_xor, via VALU permlane
+  // instead of LDS ds_bpermute.
+  {
+    float a = l_sum, b = l_sum;
+    asm volatile(MPK_HD64_PERM_PREFIX "v_permlane16_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    l_sum = a + b;
+    a = l_sum;
+    b = l_sum;
+    asm volatile(MPK_HD64_PERM_PREFIX "v_permlane32_swap_b32_e32 %0, %1"
+                 : "+v"(a), "+v"(b));
+    l_sum = a + b;
+  }
+#else
   l_sum += __shfl_xor(l_sum, 16);
   l_sum += __shfl_xor(l_sum, 32);
+#endif
 
   if (midx < NUM_QO_PER_KV) {
     int q_head_local = midx;
@@ -1069,18 +1830,32 @@ __device__ __noinline__ void
       // worked. Shipping config is 8 chunks, so this costs nothing in practice.
       constexpr int LSE_S = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
       constexpr int O_S = LSE_S * HEAD_DIM;
+      long const part_off = MPK_ATTN_SPLIT_PART_OFF(LSE_S, split_part);
       float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
       float *o = reinterpret_cast<float *>(output_ptr) +
-                 static_cast<long>(query_start) * O_S +
+                 static_cast<long>(query_start) * O_S + part_off * HEAD_DIM +
                  static_cast<long>(kv_head_idx) * NUM_KV_CHUNKS *
                      NUM_QO_PER_KV * HEAD_DIM +
                  static_cast<long>(kv_chunk_idx) * NUM_QO_PER_KV * HEAD_DIM +
                  static_cast<long>(q_head_local) * HEAD_DIM;
+#if MPK_ATTN_O_VEC_STORE
+      // Four consecutive dims (warp*16+kgrp*4) as one AS(1) dwordx4.
+      // Same bytes as the scalar loop; merge loads this buffer.
+      using _o_f32x4 = float __attribute__((ext_vector_type(4)));
+      _o_f32x4 ov;
+#pragma unroll
+      for (int h = 0; h < 4; h++) {
+        ov[h] = o_acc[h] * inv_l;
+      }
+      *(__attribute__((address_space(1))) _o_f32x4 *)(o + warp_id * 16 +
+                                                        kgrp * 4) = ov;
+#else
 #pragma unroll
       for (int h = 0; h < 4; h++) {
         int dim_offset = warp_id * 16 + kgrp * 4 + h;
         o[dim_offset] = o_acc[h] * inv_l;
       }
+#endif
     }
 
     // Write LSE (for sink correction or split-KV merge).
@@ -1089,6 +1864,7 @@ __device__ __noinline__ void
       constexpr int LSE_STRIDE = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
       float *lse_out = reinterpret_cast<float *>(lse_ptr) +
                        static_cast<long>(query_start) * LSE_STRIDE +
+                       MPK_ATTN_SPLIT_PART_OFF(LSE_STRIDE, split_part) +
                        kv_head_idx * NUM_KV_CHUNKS * NUM_QO_PER_KV +
                        kv_chunk_idx * NUM_QO_PER_KV + q_head_local;
       // LSE in NATURAL log, which is what the merge expects (it multiplies by
@@ -1125,5 +1901,57 @@ __device__ __noinline__ void
     }
   }
 }
+
+#ifdef MPK_ATTN_SPLIT_CHUNK
+// Fold the helper's (O, LSE) into the primary chunk slot so the existing
+// NUM_KV_CHUNKS-way merge is unchanged. Identity when helper LSE is -inf
+// (window layers, ntiles<2). Same merge as merge_splitkv_ck_fmha: LSE is
+// natural log, O is already per-chunk normalized.
+template <int NUM_QO_PER_KV, int HEAD_DIM, int NUM_KV_HEADS, int NUM_KV_CHUNKS>
+__device__ __forceinline__ void
+    mpk_fold_split_chunk_partials(float *lse_ptr,
+                                  float *o_ptr,
+                                  int query_start,
+                                  int kv_head_idx,
+                                  int kv_chunk_idx) {
+  constexpr int LSE_S = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
+  constexpr int NOUT = NUM_QO_PER_KV * HEAD_DIM;
+  constexpr float LOG2E = 1.44269504088896340736f;
+  constexpr float INV_LOG2E = 0.693147180559945309417f;
+  int const tid = threadIdx.x;
+  float *lse0 = lse_ptr + static_cast<long>(query_start) * LSE_S +
+                kv_head_idx * NUM_KV_CHUNKS * NUM_QO_PER_KV +
+                kv_chunk_idx * NUM_QO_PER_KV;
+  float *lse1 = lse0 + LSE_S;
+  float *o0 = o_ptr + static_cast<long>(query_start) * LSE_S * HEAD_DIM +
+              static_cast<long>(kv_head_idx) * NUM_KV_CHUNKS * NUM_QO_PER_KV *
+                  HEAD_DIM +
+              static_cast<long>(kv_chunk_idx) * NUM_QO_PER_KV * HEAD_DIM;
+  float *o1 = o0 + LSE_S * HEAD_DIM;
+
+  __shared__ float s_w0[8], s_w1[8], s_lse[8];
+  static_assert(NUM_QO_PER_KV <= 8, "mpk_fold_split_chunk_partials smem");
+  if (tid < NUM_QO_PER_KV) {
+    float const m0 = lse0[tid] * LOG2E;
+    float const m1 = lse1[tid] * LOG2E;
+    float const mg = fmaxf(m0, m1);
+    float const w0 = (m0 < -1.0e20f) ? 0.0f : exp2f(m0 - mg);
+    float const w1 = (m1 < -1.0e20f) ? 0.0f : exp2f(m1 - mg);
+    float const d = w0 + w1;
+    s_w0[tid] = (d > 0.0f) ? (w0 / d) : 0.0f;
+    s_w1[tid] = (d > 0.0f) ? (w1 / d) : 0.0f;
+    s_lse[tid] = (d > 0.0f) ? ((mg + log2f(d)) * INV_LOG2E) : -1e30f;
+  }
+  __syncthreads();
+  for (int idx = tid; idx < NOUT; idx += 256) {
+    int const q = idx / HEAD_DIM;
+    o0[idx] = o0[idx] * s_w0[q] + o1[idx] * s_w1[q];
+  }
+  __syncthreads();
+  if (tid < NUM_QO_PER_KV) {
+    lse0[tid] = s_lse[tid];
+  }
+}
+#endif
 
 } // namespace kernel

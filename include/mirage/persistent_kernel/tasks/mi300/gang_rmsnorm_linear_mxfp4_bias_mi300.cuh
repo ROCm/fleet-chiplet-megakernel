@@ -34,6 +34,7 @@
 // QKV compute: ~26us -> ~8us per layer.
 
 #pragma once
+#include "mpk_atoms.cuh" // st_wt_*, ld_sys_s32 (QKV K-split handshake)
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
 #include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
@@ -122,15 +123,38 @@ struct QkvWeightLds {
   static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
 };
 
+#ifdef MPK_QKV_KSPLIT
+// 2-way K-split scratch: k_part 0 writes its 4 AccVGPR floats per thread,
+// k_part 1 adds them and runs the RoPE/KV epilogue. 8 XCDs × 32 tiles is
+// the most the 31-worker geometry can ever ask for (10 tiles/XCD today).
+constexpr int MPK_QKV_KSPLIT_MAX_TILE = 32;
+__device__ float g_qkv_kpart_acc[8 * MPK_QKV_KSPLIT_MAX_TILE * 256 * 4];
+__device__ int g_qkv_kpart_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+// Quantized token row (fp8 + scales) published by k_part 0 so k_part 1
+// can skip RMSNorm. 3072 B covers TOK_REGION+SC_REGION at H=2944 (2984 B).
+constexpr int MPK_QKV_KSPLIT_TOK_BYTES = 3072;
+__device__ uint8_t
+    g_qkv_kpart_tok[8 * MPK_QKV_KSPLIT_MAX_TILE * MPK_QKV_KSPLIT_TOK_BYTES];
+__device__ int g_qkv_kpart_tok_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
+#endif
+#endif
+
 // Issue the HBM->LDS weight DMA for one QKV tile. Does NOT wait: the caller
 // drains with `s_waitcnt vmcnt(0)` once it has something else to do first.
 // `tile_idx` selects the weight group exactly as the kvupd kernel does, so a
 // worker prefetching for the next layer must pass the tile index it will
 // itself execute there (xcd_rank is stable across layers).
+//
+// `k_iter0` / `k_niters` select a K-range inside the tile (one MFMA iter =
+// 64 B of packed FP4 per row). k_niters < 0 means the full K, which is the
+// non-split default.
 template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
 __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
                                                          int n_wgs_per_xcd,
-                                                         int tile_idx) {
+                                                         int tile_idx,
+                                                         int k_iter0 = 0,
+                                                         int k_niters = -1) {
   using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
   extern __shared__ char _rnlm_smem[];
 
@@ -147,12 +171,22 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
       (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
                                                      G::W_OFF +
                                                      warp_id * 1024);
+  constexpr int ROW_BYTES = REDUCTION_SIZE / 2;
+  int const k_byte0 = k_iter0 * 64;
+  int const k_byte1 = k_niters < 0 ? ROW_BYTES : (k_iter0 + k_niters) * 64;
+  // Scales stay full-tile: they are 16 rows × (K/32) and each K-iter's 4 B
+  // is strided per row, so a linear [k_sc0, k_sc1) skip would drop the wrong
+  // bytes. TILE_SCALE is 1.5 KB; loading it twice is cheaper than being wrong.
 #pragma unroll
   for (int t = 0; t < G::NUM_WAVES; t++) {
 #pragma unroll
     for (int j = 0; j < G::LPT; j++) {
       int idx = tid + j * 256;
       int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
+      int const off_in_row = (clamped * 16) % ROW_BYTES;
+      if (off_in_row < k_byte0 || off_in_row >= k_byte1) {
+        continue;
+      }
       uint32_t voff =
           wg_voff +
           static_cast<uint32_t>(t * G::TILE_ROWS * (REDUCTION_SIZE / 2)) +
@@ -1142,6 +1176,21 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
   __syncthreads();
 
   // Step 3: write TOK_ROWS * HEAD_DIM bf16 values out.
+#ifdef MPK_ROPE_VEC_STORE
+  static_assert(HEAD_DIM % 4 == 0, "RoPE vec store needs 4-bf16 groups");
+  for (int idx = (int)tid * 4; idx < TOK_ROWS * HEAD_DIM; idx += 256 * 4) {
+    int const t = idx / HEAD_DIM;
+    if (t >= n_valid) {
+      continue;
+    }
+    int const d = idx - t * HEAD_DIM;
+    unsigned long long packed;
+    __builtin_memcpy(&packed, &s_rope[idx], 8);
+    st_wt_u64(&dst[(long long)(tok_row_base + t) * dst_stride + head_offset +
+                   d],
+              packed);
+  }
+#else
   for (int idx = tid; idx < TOK_ROWS * HEAD_DIM; idx += 256) {
     int const t = idx / HEAD_DIM;
     if (t >= n_valid) {
@@ -1151,6 +1200,7 @@ __device__ __forceinline__ void _kvupd_rope_epilogue_packed(
     dst[(long long)(tok_row_base + t) * dst_stride + head_offset + d] =
         s_rope[idx];
   }
+#endif
 }
 
 // ── Layer 0 variant (no MulSumAdd) ─────────────────────────────────────
@@ -2343,7 +2393,14 @@ __device__ __noinline__ void
         // into this exact LDS region during the previous layer's Phase 9
         // barrier spin. Defaulted so the standalone generated variant and the
         // layer-0 / world_size>1 caller need no change.
-        bool weights_preloaded = false) {
+        bool weights_preloaded = false
+#ifdef MPK_QKV_KSPLIT
+        // 0 = K-lo (iters [0, K_LO)), 1 = K-hi (iters [K_LO, MFMA_ITERS)).
+        // Default 0 so callers that have not opted in keep the full K-range.
+        ,
+        int k_part = 0
+#endif
+        ) {
 
   static_assert(OUTPUT_PER_WG % 16 == 0);
   static_assert(REDUCTION_SIZE % 128 == 0);
@@ -2367,6 +2424,26 @@ __device__ __noinline__ void
   constexpr int MFMA_N = 16;
   constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
   constexpr int NUM_BBLK = (BATCH_SIZE + TOK_ROWS - 1) / TOK_ROWS;
+#ifdef MPK_QKV_KSPLIT
+  static_assert(TOK_ROWS == 1,
+                "MPK_QKV_KSPLIT is the TOK_ROWS==1 decode window only");
+  static_assert(TILES_PER_WAVE == 1,
+                "MPK_QKV_KSPLIT assumes one tile per wave (OUTPUT_PER_WG==64)");
+#ifdef MPK_QKV_MFMA_UNROLLED
+#error "MPK_QKV_KSPLIT is incompatible with MPK_QKV_MFMA_UNROLLED"
+#endif
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+#ifndef MPK_QKV_KSPLIT
+#error "MPK_QKV_KSPLIT_SHARED_NORM requires MPK_QKV_KSPLIT"
+#endif
+#endif
+  // Odd MFMA_ITERS (23) splits 12 + 11. Even nki exits via QKV_TAIL_B1,
+  // odd nki via the bank-0 tail — both already exist in the branching loop.
+  constexpr int K_LO = (MFMA_ITERS + 1) / 2;
+  int const k_iter0 = k_part ? K_LO : 0;
+  int const nki = k_part ? (MFMA_ITERS - K_LO) : K_LO;
+  int const iters_m1_val = nki - 1;
+#endif
 
   // The +16 pad is load-bearing, not alignment slack. At ds_read_b128
   // granularity lane `col` lands in bank group (col * TOK_ROW_STRIDE/16) % 8;
@@ -2478,10 +2555,56 @@ __device__ __noinline__ void
 #ifndef MPK_ABLATE_QKV_DMA
   if (!weights_preloaded) {
     qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
-        weight_ptr, n_wgs_per_xcd, tile_idx);
+        weight_ptr,
+        n_wgs_per_xcd,
+        tile_idx
+#ifdef MPK_QKV_KSPLIT
+        ,
+        k_iter0,
+        nki
+#endif
+    );
   }
 #endif
 
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+  static_assert(TOK_REGION + SC_REGION <= MPK_QKV_KSPLIT_TOK_BYTES,
+                "token publish blob exceeds g_qkv_kpart_tok slot");
+  if (k_part == 1) {
+    // k_part 0 owns RMSNorm+quant and publishes the fp8 row; k_part 1 only
+    // waits and copies it into LDS. Same-XCD: producer write-through +
+    // waitcnt, consumer vL1 invalidate -- not buffer_inv sc1, which would
+    // drop this XCD's L2 (the rejected K-split's handshake did that).
+    int const tok_slot =
+        _kvupd_get_xcd_id() * MPK_QKV_KSPLIT_MAX_TILE + wg_idx;
+    uint8_t *tok_src =
+        &g_qkv_kpart_tok[tok_slot * MPK_QKV_KSPLIT_TOK_BYTES];
+    int *tok_ready = &g_qkv_kpart_tok_ready[tok_slot];
+    if (tid == 0) {
+      while (ld_sys_s32(tok_ready) < 1) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      asm volatile("buffer_inv" ::: "memory");
+    }
+    __syncthreads();
+    constexpr int nbytes = TOK_REGION + SC_REGION;
+#pragma unroll 1
+    for (int off = tid * 8; off < nbytes; off += 256 * 8) {
+      unsigned long long v;
+      uint8_t *srcp = tok_src + off;
+      asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=v"(v)
+                   : "v"(srcp)
+                   : "memory");
+      __builtin_memcpy(s_tok_fp8 + off, &v, 8);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      st_wt_u32(tok_ready, 0u);
+    }
+  } else {
+#endif
   // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
   {
     float *d_ws = (float *)workspace_f32_ptr;
@@ -2756,6 +2879,27 @@ __device__ __noinline__ void
       (unsigned short const *)norm_scratch_ptr, REDUCTION_SIZE, tok_row_base,
       batch_count - tok_row_base, s_tok_fp8, s_tok_scales);
 #endif
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+    {
+      int const tok_slot =
+          _kvupd_get_xcd_id() * MPK_QKV_KSPLIT_MAX_TILE + wg_idx;
+      uint8_t *tok_dst =
+          &g_qkv_kpart_tok[tok_slot * MPK_QKV_KSPLIT_TOK_BYTES];
+      constexpr int nbytes = TOK_REGION + SC_REGION;
+#pragma unroll 1
+      for (int off = tid * 8; off < nbytes; off += 256 * 8) {
+        unsigned long long v;
+        __builtin_memcpy(&v, s_tok_fp8 + off, 8);
+        st_wt_u64(tok_dst + off, v);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      __syncthreads();
+      if (tid == 0) {
+        st_wt_u32(&g_qkv_kpart_tok_ready[tok_slot], 1u);
+      }
+    }
+  }
+#endif
 
   // ── Phase B: Drain buffer_load_lds, scatter scales to LDS ──
   {
@@ -2837,8 +2981,18 @@ __device__ __noinline__ void
     int global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len_val;
     int num_new_tokens = qo_indptr[request_id + 1] - qo_indptr[request_id];
     gp_out = global_seq_len - num_new_tokens + token_in_request;
-    dst_out = kv_indices[first_page + gp_out / PAGE_SIZE] * PAGE_SIZE +
-              gp_out % PAGE_SIZE;
+#ifdef MPK_QKV_GLOBAL_PAGE
+    // kv_indices is always a device-global paging table. Keeping that address
+    // space through the dereference changes the final dependent page lookup
+    // from FLAT (vmcnt+lgkmcnt) to GLOBAL (vmcnt only), so QKV's LDS waits do
+    // not accidentally retire it before the MFMA can cover its latency.
+    auto const *global_kv_indices =
+        (__attribute__((address_space(1))) int const *)kv_indices;
+    int page_idx = global_kv_indices[first_page + gp_out / PAGE_SIZE];
+#else
+    int page_idx = kv_indices[first_page + gp_out / PAGE_SIZE];
+#endif
+    dst_out = page_idx * PAGE_SIZE + gp_out % PAGE_SIZE;
   };
 
   if constexpr (TOK_ROWS == 1) {
@@ -2883,6 +3037,21 @@ __device__ __noinline__ void
                   "(REDUCTION_SIZE / 128); at an even count use the default "
                   "branching loop, which emits both tails");
 #endif
+#if defined(MPK_QKV_MFMA_UNROLLED) && defined(MPK_QKV_TSC_PTR_INCREMENT)
+#error                                                                         \
+    "MPK_QKV_TSC_PTR_INCREMENT targets the scalar-counter loop; "              \
+    "MPK_QKV_MFMA_UNROLLED replaces that loop"
+#endif
+#if defined(MPK_QKV_DS_BEFORE_ADDR) && !defined(MPK_QKV_PF_BEFORE_WAIT)
+#error "MPK_QKV_DS_BEFORE_ADDR requires MPK_QKV_PF_BEFORE_WAIT"
+#endif
+#if defined(MPK_QKV_DS_BEFORE_ADDR) &&                                          \
+    (defined(MPK_QKV_MFMA_UNROLLED) || defined(MPK_QKV_TSC_PTR_INCREMENT))
+#error "MPK_QKV_DS_BEFORE_ADDR is the default PF_BEFORE_WAIT pointer-bump path"
+#endif
+#if defined(MPK_QKV_SKIP_B1_WAIT) && !defined(MPK_QKV_PF_BEFORE_WAIT)
+#error "MPK_QKV_SKIP_B1_WAIT requires MPK_QKV_PF_BEFORE_WAIT"
+#endif
 
     for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
       int wave_tile = warp_id + tile_iter * NUM_WAVES;
@@ -2908,13 +3077,31 @@ __device__ __noinline__ void
             (unsigned)(uintptr_t)(s_tok_fp8 + b_row * TOK_ROW_STRIDE + g * 16);
         unsigned ts_addr =
             (unsigned)(uintptr_t)(s_tok_scales + b_row * SC_STRIDE);
+#ifdef MPK_QKV_KSPLIT
+        // Start this part's K-range at the natural LDS offset so the other
+        // half's hole stays where the full-K layout put it. k_part 1 can
+        // then reuse the same ping-pong loop with a shorter trip count.
+        w_addr += (unsigned)(k_iter0 * 64);
+        ws_addr += (unsigned)(k_iter0 * 4);
+        t_addr += (unsigned)(k_iter0 * 0x80);
+        ts_addr += (unsigned)k_iter0;
+        // k_part is a runtime argument in the fused kernel, so nki-1 is a
+        // VGPR. s_cmp_lt_i32 needs an SGPR; the assembler rejects
+        // `s_cmp_lt_i32 s13, v0`. Lane 0's value is uniform per workgroup.
+        int iters_m1_sgpr;
+        asm volatile("v_readfirstlane_b32 %0, %1"
+                     : "=s"(iters_m1_sgpr)
+                     : "v"(iters_m1_val));
+#endif
 
         asm volatile(
+#ifndef MPK_QKV_ACC_UNDER_LDS
             // Zero accumulator
             "v_accvgpr_write_b32 a0, 0\n"
             "v_accvgpr_write_b32 a1, 0\n"
             "v_accvgpr_write_b32 a2, 0\n"
             "v_accvgpr_write_b32 a3, 0\n"
+#endif
 
             // ── Two disjoint operand banks (see below) ──
             //   Bank 0: A v[22:25], A scale v7,  B v[8:15],  B scale v16
@@ -2942,6 +3129,14 @@ __device__ __noinline__ void
             "ds_read_b128 v[8:11], %[ta]\n"            // token B lo (16B FP8)
             "ds_read_b128 v[12:15], %[ta] offset:64\n" // token B hi (16B FP8)
             "ds_read_u8   v16, %[tsa]\n" // token B scale
+#ifdef MPK_QKV_ACC_UNDER_LDS
+            // AccVGPR zeros do not depend on bank 0. Issue them after the
+            // five ds_reads so they hide under the first-iter LDS wait.
+            "v_accvgpr_write_b32 a0, 0\n"
+            "v_accvgpr_write_b32 a1, 0\n"
+            "v_accvgpr_write_b32 a2, 0\n"
+            "v_accvgpr_write_b32 a3, 0\n"
+#endif
 
 // ── MFMA_ITERS-1 in-loop MFMAs, alternating banks ──
 //
@@ -2965,6 +3160,44 @@ __device__ __noinline__ void
 #endif
 
             // ---- consume bank 0, prefetch into bank 1 ----
+#ifdef MPK_QKV_PF_BEFORE_WAIT
+#ifdef MPK_QKV_DS_BEFORE_ADDR
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+            "ds_read_u8   v19, v17\n"
+            "ds_read_b128 v[26:29], %[wa] offset:64\n"
+            "ds_read_u8   v18, %[wsa] offset:4\n"
+            "ds_read_b128 v[32:35], %[ta] offset:0x80\n"
+            "ds_read_b128 v[36:39], %[ta] offset:0xc0\n"
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#else
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%=, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
+#else
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v19, %[tsa]\n"
+#else
+            "ds_read_u8   v19, v17\n"
+#endif
+            "ds_read_b128 v[26:29], %[wa]\n"
+            "ds_read_u8   v18, %[wsa]\n"
+            "ds_read_b128 v[32:35], %[ta]\n"
+            "ds_read_b128 v[36:39], %[ta] offset:64\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#else
             "s_waitcnt lgkmcnt(0)\n" // bank 0 operands resident
 
             // Advance addresses for the next iteration
@@ -2973,25 +3206,83 @@ __device__ __noinline__ void
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_QKV_MFMA_UNROLLED
             "v_add_u32_e32 v17, MPK_QKV_TSC_%=, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            // The scalar loop counter still drives the loop branch, but the
+            // token-scale LDS address is its own monotonic byte pointer.
+            // Advancing it directly removes the s13 -> VALU dependency in
+            // front of ds_read_u8 without changing any requested address.
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
 #else
             "s_add_i32 s13, s13, 1\n"
             "v_add_u32_e32 v17, s13, %[tsa]\n"
 #endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v19, %[tsa]\n" // B scale  -> bank 1
+#else
             "ds_read_u8   v19, v17\n"                  // B scale  -> bank 1
+#endif
             "ds_read_b128 v[26:29], %[wa]\n"           // A data   -> bank 1
             "ds_read_u8   v18, %[wsa]\n"               // A scale  -> bank 1
             "ds_read_b128 v[32:35], %[ta]\n"           // B lo     -> bank 1
             "ds_read_b128 v[36:39], %[ta] offset:64\n" // B hi     -> bank 1
+#endif
 
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 
 #ifndef MPK_QKV_MFMA_UNROLLED
+#ifndef MPK_QKV_KSPLIT
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+#else
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
+#endif
             "s_cbranch_scc0 QKV_TAIL_B1_%=\n"
 #endif
 
             // ---- consume bank 1, prefetch into bank 0 ----
+#ifdef MPK_QKV_PF_BEFORE_WAIT
+#ifdef MPK_QKV_DS_BEFORE_ADDR
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+            "ds_read_u8   v16, v17\n"
+            "ds_read_b128 v[22:25], %[wa] offset:64\n"
+            "ds_read_u8   v7, %[wsa] offset:4\n"
+            "ds_read_b128 v[8:11], %[ta] offset:0x80\n"
+            "ds_read_b128 v[12:15], %[ta] offset:0xc0\n"
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifndef MPK_QKV_SKIP_B1_WAIT
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#else
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%= + 1, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
+#else
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v16, %[tsa]\n"
+#else
+            "ds_read_u8   v16, v17\n"
+#endif
+            "ds_read_b128 v[22:25], %[wa]\n"
+            "ds_read_u8   v7, %[wsa]\n"
+            "ds_read_b128 v[8:11], %[ta]\n"
+            "ds_read_b128 v[12:15], %[ta] offset:64\n"
+#ifndef MPK_QKV_SKIP_B1_WAIT
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#endif
+#else
             "s_waitcnt lgkmcnt(0)\n" // bank 1 operands resident
 
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
@@ -2999,15 +3290,23 @@ __device__ __noinline__ void
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_QKV_MFMA_UNROLLED
             "v_add_u32_e32 v17, MPK_QKV_TSC_%= + 1, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
 #else
             "s_add_i32 s13, s13, 1\n"
             "v_add_u32_e32 v17, s13, %[tsa]\n"
 #endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v16, %[tsa]\n" // B scale  -> bank 0
+#else
             "ds_read_u8   v16, v17\n"                  // B scale  -> bank 0
+#endif
             "ds_read_b128 v[22:25], %[wa]\n"           // A data   -> bank 0
             "ds_read_u8   v7, %[wsa]\n"                // A scale  -> bank 0
             "ds_read_b128 v[8:11], %[ta]\n"            // B lo     -> bank 0
             "ds_read_b128 v[12:15], %[ta] offset:64\n" // B hi     -> bank 0
+#endif
 
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
@@ -3024,7 +3323,11 @@ __device__ __noinline__ void
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 #else
+#ifndef MPK_QKV_KSPLIT
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+#else
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
+#endif
             "s_cbranch_scc1 PIPELINED_QKV_%=\n"
 
             // ── Final MFMA ──
@@ -3064,7 +3367,19 @@ __device__ __noinline__ void
               [wa] "+v"(w_addr),
               [wsa] "+v"(ws_addr),
               [ta] "+v"(t_addr)
-            : [tsa] "v"(ts_addr), [iters_m1] "n"(MFMA_ITERS - 1),
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+              ,
+              [tsa] "+v"(ts_addr)
+#endif
+            :
+#ifndef MPK_QKV_TSC_PTR_INCREMENT
+              [tsa] "v"(ts_addr),
+#endif
+#ifdef MPK_QKV_KSPLIT
+              [iters_m1] "s"(iters_m1_sgpr),
+#else
+              [iters_m1] "n"(MFMA_ITERS - 1),
+#endif
               [unroll_pairs] "n"((MFMA_ITERS - 1) / 2)
             : "memory",
               "s13",
@@ -3078,7 +3393,9 @@ __device__ __noinline__ void
               "v14",
               "v15",
               "v16",
+#ifndef MPK_QKV_TSC_PTR_INCREMENT
               "v17",
+#endif
               "v18",
               "v19",
               "v22",
@@ -3108,6 +3425,68 @@ __device__ __noinline__ void
       acc[2] = qa2;
       acc[3] = qa3;
 
+#ifdef MPK_QKV_KSPLIT
+      // k_part 0 publishes its 4 AccVGPR floats and skips RoPE/KV; k_part 1
+      // waits, adds, and runs the epilogue. Same-XCD, different CUs. Payload
+      // is write-through so a later consumer cannot reuse a stale L2 line
+      // from last layer; ready is a system-scope poll.
+      {
+        int const slot =
+            _kvupd_get_xcd_id() * MPK_QKV_KSPLIT_MAX_TILE + wg_idx;
+        float *part = &g_qkv_kpart_acc[(slot * 256 + tid) * 4];
+        int *ready = &g_qkv_kpart_ready[slot];
+        if (k_part == 0) {
+          float4 v;
+          v.x = qa0;
+          v.y = qa1;
+          v.z = qa2;
+          v.w = qa3;
+          st_wt_f32x4(part, v);
+          // vmcnt is per-wave: s_barrier does not retire the other three
+          // waves' write-through stores. Drain first, then rendezvous, then
+          // publish.
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          __syncthreads();
+          if (tid == 0) {
+            st_wt_u32(ready, 1u);
+          }
+          continue;
+        }
+        if (tid == 0) {
+          while (ld_sys_s32(ready) < 1) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+          // Same-XCD AccVGPR handshake: producer already drained its
+          // write-through stores. sc1 would drop this XCD's L2 -- that was
+          // part of the rejected K-split's +114 µs.
+          asm volatile("buffer_inv" ::: "memory");
+#else
+          asm volatile("buffer_inv sc1" ::: "memory");
+#endif
+        }
+        __syncthreads();
+        _gl_f32x4 pv;
+        asm volatile("global_load_dwordx4 %0, %1, off nt\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(pv)
+                     : "v"(part)
+                     : "memory");
+        qa0 += pv[0];
+        qa1 += pv[1];
+        qa2 += pv[2];
+        qa3 += pv[3];
+        acc[0] = qa0;
+        acc[1] = qa1;
+        acc[2] = qa2;
+        acc[3] = qa3;
+        __syncthreads();
+        if (tid == 0) {
+          st_wt_u32(ready, 0u);
+        }
+      }
+#endif
+
       // ── Fused KV_UPD epilogue (N-axis packed) ──────────────────────────
       // Position metadata is per token and already in s_global_pos /
       // s_dst_idx. RoPE scratch aliases the token region, which is dead now
@@ -3135,7 +3514,12 @@ __device__ __noinline__ void
       // complete when it arrives here, so the aliased region really is dead
       // before the first store. The epilogue's own __syncthreads calls are all
       // *after* its step-1 stores and cannot substitute.
+#ifdef MPK_QKV_ROPE_NO_BAR
+      static_assert(TOK_ROWS == 1,
+                    "MPK_QKV_ROPE_NO_BAR is the TOK_ROWS==1 decode window only");
+#else
       __syncthreads();
+#endif
       int kv_head = _kvupd_get_xcd_id();
       unsigned short const *cos_base = (unsigned short const *)cos_ptr;
       unsigned short const *sin_base = (unsigned short const *)sin_ptr;

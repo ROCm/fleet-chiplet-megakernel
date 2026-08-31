@@ -61,8 +61,10 @@ _BS1_ONLY_OPTS = (
     "MPK_W13_KMAJOR_RECYCLE",
     # Rides on the batch-1-only recycle schedule.
     "MPK_W13_T1_BIAS_EARLY",
-    # Redline-style next-group LM-head pipeline has a batch-1 LDS layout.
+    # The next-group LM-head pipeline has a batch-1 LDS layout.
     "MPK_LM_HEAD_GROUP_PIPELINE",
+    # XCD-pair MoE map: conc1, 4 experts, 46+46 groups.
+    "MPK_MOE_XCD_PAIR",
 )
 
 

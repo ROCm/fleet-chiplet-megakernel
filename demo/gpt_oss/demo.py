@@ -2115,6 +2115,9 @@ if __name__ == "__main__":
         ck_fmha_q_ws = mpk.attach_input(
             torch_tensor=ck_fmha_q_ws_tensor, name="ck_fmha_q_workspace")
         lse_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv
+        # Always 2x: MPK_ATTN_SPLIT_CHUNK helper partials live in the second
+        # half (offset +LSE_S). Unused when the flag is off.
+        lse_dim1 = lse_dim1 * 2
         ck_fmha_lse_acc_tensor = torch.zeros(
             bs, lse_dim1, dtype=torch.float32, device="cuda")
         ck_fmha_lse_acc = mpk.attach_input(
@@ -2127,7 +2130,7 @@ if __name__ == "__main__":
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
         # partials into ck_fmha_o_acc; merge step combines them into attn_out.
         if use_split_attn_chunks or fuse_full_layer:
-            o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim
+            o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim * 2
             ck_fmha_o_acc_tensor = torch.zeros(
                 bs, o_acc_dim1, dtype=torch.float32, device="cuda")
             ck_fmha_o_acc = mpk.attach_input(
@@ -2191,7 +2194,9 @@ if __name__ == "__main__":
             # release lines, 16 ints each. It sits immediately above the chunk
             # barrier -- see FULL_LAYER_LAYER_BARRIER_SLOT in
             # gang_full_layer_fused_mi300.cuh.
-            counter_size = 768 + 128 * args.max_num_batched_requests + 272
+            # +128 ints: 8 per-XCD O-proj slice-ready flags (MPK_ROUTER_XCD_FOLD).
+            # See FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh.
+            counter_size = 768 + 128 * args.max_num_batched_requests + 272 + 128
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count

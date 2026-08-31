@@ -123,6 +123,21 @@ __device__ __forceinline__ int ld_sys_s32(int *addr) {
 #endif
 }
 
+__device__ __forceinline__ unsigned long long ld_sys_u64(void *addr) {
+#if defined(__HIP_DEVICE_COMPILE__) &&                                         \
+    (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+  unsigned long long val;
+  asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1\n"
+               "s_waitcnt vmcnt(0)"
+               : "=v"(val)
+               : "v"(addr)
+               : "memory");
+  return val;
+#else
+  return *reinterpret_cast<unsigned long long volatile *>(addr);
+#endif
+}
+
 // Two independent system-scope polls, one wait. `ld_sys_s32` serializes each
 // load behind its own vmcnt(0), so a two-flag spin pays two HBM round trips
 // per miss. Issue both, then one wait.

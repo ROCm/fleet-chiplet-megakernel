@@ -360,7 +360,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       // Group zero remains synchronous. Every later group was streamed into
       // this recycled tile by the preceding group's MFMA loop. Fleet's queue
       // stages TaskDesc only immediately before its dependency acquire; unlike
-      // Redline's immutable fixed-rank plan, it has no publication-safe earlier
+      // an immutable fixed-rank plan, it has no publication-safe earlier
       // descriptor from which to prefetch group zero. Adding that hook requires
       // a separate scheduler protocol change, so this patch deliberately does
       // not move task-descriptor reads across the dependency loop.

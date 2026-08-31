@@ -442,13 +442,37 @@ def get_compile_command(
             _psi = os.environ.get("MPK_PHASE_START_ITER", "")
             if _psi:
                 flags = flags + ["-DMPK_PHASE_START_ITER=" + str(int(_psi))]
+        # Splits the slot-11 -> slot-0 span. The phase table reports it as one
+        # ~4.3 us/layer block and MPK_DRAIN_STATS accounts only ~1.7 us of it;
+        # the remainder runs inside the fused-layer function ahead of its
+        # slot-0 mark, including the per-layer buffer_inv, where no existing
+        # counter reaches. Three tid-0 stamps per layer, printed at
+        # termination.
+        # Reads g_phase_arm to stay on the same steady-state decode window as
+        # the phase table, so requires MPK_PHASE_SLOTS.
+        if int(os.environ.get("MPK_INTERLAYER_SPLIT", "0")) == 1:
+            if int(os.environ.get("MPK_PHASE_SLOTS", "0")) != 1:
+                raise ValueError(
+                    "MPK_INTERLAYER_SPLIT requires MPK_PHASE_SLOTS=1: it gates "
+                    "on g_phase_arm and its output is only meaningful when "
+                    "subtracted from the PSLOTW slot-0 column."
+                )
+            flags = flags + ["-DMPK_INTERLAYER_SPLIT"]
         if _opt("MPK_W2_CONSUMER_GATE"):
+            # Only workers that read next-layer W2 wait at Phase 9.
+            # Ablation 2026-08-30 (=0): +69 / +42 / +45 µs, hash e86d7dc all
+            # six. Keep default ON (~40–70 µs).
             flags = flags + ["-DMPK_W2_CONSUMER_GATE"]
         if _opt("MPK_WIDE_FP8_QUANT"):
+            # Ablation 2026-08-30 (=0): −14 / +3 / +6 µs, hash e86d7dc all
+            # six. Mixed/noise; keep default ON.
             flags = flags + ["-DMPK_WIDE_FP8_QUANT"]
         if int(os.environ.get("MPK_ABLATE_W13_QUANT", "0")) == 1:
             flags = flags + ["-DMPK_ABLATE_W13_QUANT"]
         if _opt("MPK_OPROJ_NO_WB"):
+            # Skip L2 writeback on O-proj write-through stores.
+            # Ablation 2026-08-30 (=0): +99 / +94 / +77 µs, hash e86d7dc all
+            # six. Keep default ON (~80–100 µs).
             flags = flags + ["-DMPK_OPROJ_NO_WB"]
         # Ablation for fair-share prefill admission (default ON). Set to 1 to
         # restore the greedy rule where one prefiller may take the entire
@@ -461,12 +485,178 @@ def get_compile_command(
         # computes QK on all four waves and barriers twice per 16-token tile.
         if int(os.environ.get("MPK_ATTN_NO_WAVE_LOCAL", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_NO_WAVE_LOCAL"]
+        # Opt-in: at ntiles=4 (ctx512 full-attn, 8 chunks × 64 tokens) enter
+        # the wave-local scan as 2 waves × 2 sequential tiles, not the
+        # shared-LDS loop. 4 waves × 1 tile failed PPL; T=8 (2 tiles/wave)
+        # passed. Waves 2-3 stay empty. Reassociates vs sequential 4-tile
+        # softmax -- hash will move; PPL-gate a TPOT win.
+        if int(os.environ.get("MPK_ATTN_WL_PAIR", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_WL_PAIR"]
+        if int(os.environ.get("MPK_ATTN_KV_PREFETCH", "0")) == 1:
+            # Idle ranks 23-30 issue this XCD's past-KV into L2 during QKV.
+            # Attention CUs then hit XCD L2 instead of refilling after MoE
+            # eviction. Fire-and-forget; skips the last tile (QKV st_wt of
+            # the current token). Hash-identical if it only moves cache.
+            flags = flags + ["-DMPK_ATTN_KV_PREFETCH"]
+        if int(os.environ.get("MPK_ATTN_SPLIT_CHUNK", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Idle ranks 23-30 scan the high
+            # half of each chunk (ntiles=4 → 2+2). Pairwise-fold, then 8-way
+            # merge. A/B 2026-08-31: +77 / +53 / +66 µs. Variant hash
+            # 9e1d4bfc all three (reassociation, not a race). Extra WGs +
+            # handshake beat the shorter scan. Do not retry extra-WG splits.
+            flags = flags + ["-DMPK_ATTN_SPLIT_CHUNK"]
         # Ablation for the wave-local scan's scalar page-id hoist + GLOBAL
         # (non-FLAT) K/V loads (default ON). Setting this to 0 restores the
         # per-lane page lookup, which serializes the four prefetch rounds
-        # behind a full vmcnt(0) lgkmcnt(0) drain each.
+        # behind a full vmcnt(0) lgkmcnt(0) drain each. Also covers tile-0's
+        # LDS fill (was the leftover per-lane path): 1.756/1.733/1.762 vs
+        # 1.733/1.730/1.743, hash 7984e601957c1ee2, PPL NLL 2.599956 / 0
+        # argmax mismatches.
         if int(os.environ.get("MPK_ATTN_SCALAR_PAGE", "1")) == 0:
             flags = flags + ["-DMPK_ATTN_SCALAR_PAGE=0"]
+        if int(os.environ.get("MPK_ATTN_LDS_PINGPONG", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Ping-pong shared-LDS K/V so the
+            # mid-iteration WAR __syncthreads() can drop (ctx512 ntiles=4).
+            # Hash e86d7dc79a77df324d8d65026cd42d5c all six runs. A/B
+            # −47 / +14 / −13 µs (C1 1.779 looks like a control spike).
+            flags = flags + ["-DMPK_ATTN_LDS_PINGPONG"]
+        if int(os.environ.get("MPK_ATTN_SKIP_LAST_WAR_BAR", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss/neutral). Drop the shared-LDS
+            # WAR __syncthreads on the last tile (no t+1 overwrite). Hash
+            # e86d7dc all six. A/B +33 / +4 / +1 µs.
+            flags = flags + ["-DMPK_ATTN_SKIP_LAST_WAR_BAR"]
+        if int(os.environ.get("MPK_ATTN_PF_BEFORE_PV", "0")) == 1:
+            # Shared-LDS ntiles=4: commit K/V[t+1] then issue tile t+2 HBM
+            # loads before the PV MFMA so they fly under PV. Default issues
+            # them after PV. Bit-identical addresses.
+            # A/B 2026-08-30: +3 / +18 / −9 µs, hash e86d7dc all six.
+            # Only pair 2 >10 µs (loss). Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_ATTN_PF_BEFORE_PV"]
+        if int(os.environ.get("MPK_ATTN_V_PAD8", "0")) == 1:
+            # Pad V LDS rows 64→72 fp16 so PV's four token-strided ds_reads
+            # are bank+4 instead of 4-way same-bank. Bit-identical values.
+            # A/B 2026-08-30: −4 / −43 / +16 µs, hash e86d7dc all six.
+            # Pair 2 is a 1.765 control spike; pair 3 loses. Stays opt-in.
+            flags = flags + ["-DMPK_ATTN_V_PAD8"]
+        if int(os.environ.get("MPK_ATTN_O_VEC_STORE", "0")) == 1:
+            # One AS(1) dwordx4 O store per lane instead of four scalars.
+            # Same bytes; no inline-asm addresses.
+            # A/B 2026-08-30: −19 / −28 / +6 µs. V1 hash 1ca7e851 vs e86d7dc;
+            # V2–V3 matched. Do not promote. Stays opt-in.
+            flags = flags + ["-DMPK_ATTN_O_VEC_STORE"]
+        if int(os.environ.get("MPK_ATTN_LSE_DPP", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). l_sum permlane16 then 32 vs
+            # __shfl_xor. Hash e86d7dc all six. A/B +18 / −18 / +1 µs.
+            # Only pair 2 >10 µs (win); pair 1 loses. Stays opt-in.
+            flags = flags + ["-DMPK_ATTN_LSE_DPP"]
+        if int(os.environ.get("MPK_ATTN_KV_NT_GL", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). builtin nt on HD64 AS(1) K/V.
+            # Hash e86d7dc all six. A/B +19 / −4 / +15 µs. No HSA abort.
+            # Stays opt-in. Do not retry K/V nt (asm or builtin).
+            flags = flags + ["-DMPK_ATTN_KV_NT_GL"]
+        if int(os.environ.get("MPK_ATTN_K_VEC_LOAD", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Eight scalar HD64 K LDS fp16s ->
+            # two dword loads. Hash e86d7dc all six. A/B +30 / +5 / +24 µs.
+            # Stays opt-in. Do not retry K LDS vec.
+            flags = flags + ["-DMPK_ATTN_K_VEC_LOAD"]
+        if int(os.environ.get("MPK_ATTN_PF2", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Prologue tile-2 prefetch; t+3
+            # in-loop. Hash e86d7dc all six. A/B −8 / +13 / −8 µs. Only pair 2
+            # >10 µs (loss). Stays opt-in. Do not retry depth-2 prologue PF.
+            flags = flags + ["-DMPK_ATTN_PF2"]
+        if int(os.environ.get("MPK_ATTN_V_AFTER_QK", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). V LDS after QK+softmax; WAR moves.
+            # Hash e86d7dc all six. A/B +7 / −14 / −10 µs. Only pair 2 >10 µs.
+            # Pair 3 −10 on the nose. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_ATTN_V_AFTER_QK"]
+        if int(os.environ.get("MPK_ATTN_PF_DURING_QK", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). t+2 K/V during QK; t+1 stays in
+            # k_pre. Hash e86d7dc all six. A/B −26 / +18 / −16 µs. C1/C2
+            # 1.754/1.756 slow controls; V2 1.774. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_ATTN_PF_DURING_QK"]
+        if int(os.environ.get("MPK_ATTN_PF_DURING_SOFTMAX", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). t+2 K/V after softmax.
+            # Hash e86d7dc all six. A/B +87 / −8 / +16 µs. V1 1.819. Stays
+            # opt-in. Do not retry t+2 HBM issue site (QK / softmax / PV).
+            flags = flags + ["-DMPK_ATTN_PF_DURING_SOFTMAX"]
+        if int(os.environ.get("MPK_ATTN_PF_AT_BAR", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss/neutral). t+2 after top barrier.
+            # Hash e86d7dc except C3 7e167f4a flake. A/B −3 / +9 / +2 µs.
+            # Stays opt-in. Stop t+2 HBM issue sites (barrier / QK / softmax / PV).
+            flags = flags + ["-DMPK_ATTN_PF_AT_BAR"]
+        if int(os.environ.get("MPK_ATTN_PV_BEFORE_LHEAD", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). PV before l_head/m_running.
+            # Hash e86d7dc all six. A/B +19 / −21 / 0 µs. Only pair 2 wins.
+            # Stays opt-in. Stop softmax/PV VALU reordering.
+            flags = flags + ["-DMPK_ATTN_PV_BEFORE_LHEAD"]
+        if int(os.environ.get("MPK_ATTN_V_COMMIT_AFTER_PV", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate / hash). t+1 V after PV.
+            # Hash e86d7dc except C3 36c42ad flake. A/B −18 / +6 / −10 µs.
+            # C1 1.748 slow-ish. Stays opt-in. Stop HD64 t+1 V/K commit sites.
+            flags = flags + ["-DMPK_ATTN_V_COMMIT_AFTER_PV"]
+        if int(os.environ.get("MPK_ATTN_COMMIT_BEFORE_PV", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of 2×>10 µs). Commit K with V
+            # before PV; t+2 prefetch still after. Hash e86d7dc all six.
+            # A/B −18 / −2 / −7 µs. V1 1.713. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_ATTN_COMMIT_BEFORE_PV"]
+        if int(os.environ.get("MPK_ATTN_COMMIT_DURING_SOFTMAX", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). K/V t+1 after QK under softmax.
+            # Hash e86d7dc all six. A/B −13 / +24 / −21 µs. C3 1.759 slow
+            # control; C2 1.729 fast. Only one clean >10 µs win. Stays opt-in.
+            # Do not retry LDS commit around softmax/PV.
+            flags = flags + ["-DMPK_ATTN_COMMIT_DURING_SOFTMAX"]
+        if int(os.environ.get("MPK_ATTN_PROLOGUE_PF_OVERLAP", "0")) == 1:
+            # TESTED AND NOT ADOPTED (hash). Tile-1 K/V under tile-0 commit.
+            # V1 hash bd0764cb vs e86d7dc; V2–V3 matched. A/B −14 / +2 / −3.
+            # Stays opt-in. Do not retry until V1 hash is explained.
+            flags = flags + ["-DMPK_ATTN_PROLOGUE_PF_OVERLAP"]
+        if int(os.environ.get("MPK_ATTN_UNROLL_TILES", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). `#pragma unroll 8` on HD64
+            # tile loop. Hash e86d7dc all six. A/B +13 / +3 / −16 µs.
+            # Only pair 3 >10 µs; C1 1.725 fast. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_ATTN_UNROLL_TILES"]
+        if int(os.environ.get("MPK_ATTN_COMMIT_DURING_QK", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate / hash). t+1 K/V LDS
+            # commit after WAR, before QK. Hash e86d7dc except C2
+            # fede7b93 flake. A/B −10 / −16 / −2 µs. Pair 1 is −10 on
+            # the nose; pair 2 hash-invalid. Stays opt-in. Stop moving
+            # HD64 t+1 LDS commit (QK / softmax / PV).
+            flags = flags + ["-DMPK_ATTN_COMMIT_DURING_QK"]
+        if int(os.environ.get("MPK_ATTN_QK_PIPE_K", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). QK0 after kr[0]; QK1
+            # after WAR. Hash e86d7dc all six. A/B −13 / −2 / 0 µs. C1
+            # 1.752 and C3 1.754 slow controls. Only pair 1 >10 µs and
+            # not clean. Stays opt-in. Do not retry QK/K LDS pipe.
+            flags = flags + ["-DMPK_ATTN_QK_PIPE_K"]
+        if int(os.environ.get("MPK_ATTN_QK_BEFORE_WAR", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). QK before WAR bar.
+            # Hash e86d7dc all six. A/B −5 / −13 / +1 µs. C2 1.756 slow
+            # control. Stays opt-in. Do not retry QK vs WAR placement.
+            flags = flags + ["-DMPK_ATTN_QK_BEFORE_WAR"]
+        if int(os.environ.get("MPK_ATTN_PERM_NO_NOP", "0")) == 1:
+            # Opt-in: drop s_nop 1 before HD64 v_permlane tile_max / l_sum.
+            # TESTED AND NOT ADOPTED (hazard). Hash 1252cce0 vs e86d7dc all
+            # three variants. A/B −124 / −125 / −110 µs is wrong tile_max.
+            # Do not retry dropping the permlane nop.
+            flags = flags + ["-DMPK_ATTN_PERM_NO_NOP"]
+        if int(os.environ.get("MPK_ATTN_SCORE_MAX3", "0")) == 1:
+            # Opt-in: v_max3_f32 + v_max_f32 for the 4 lane-local scores.
+            # TESTED AND NOT ADOPTED (short of gate). Hash e86d7dc all six.
+            # A/B −3 / −20 / −8 µs. Only pair 2 >10 µs. Stays opt-in.
+            flags = flags + ["-DMPK_ATTN_SCORE_MAX3"]
+        if int(os.environ.get("MPK_ATTN_EXP2_BEFORE_OACC", "0")) == 1:
+            # Opt-in: HD64 weight v_exp immediately after rescale exp, before
+            # o_acc muls.
+            # TESTED AND NOT ADOPTED (loss). Hash e86d7dc all six. A/B
+            # −1 / +65 / +12 µs. V2 1.797. Stays opt-in. Do not retry
+            # softmax exp2 vs o_acc order.
+            flags = flags + ["-DMPK_ATTN_EXP2_BEFORE_OACC"]
+        if int(os.environ.get("MPK_ATTN_LHEAD_FMA", "0")) == 1:
+            # Opt-in: l_head[i] = fmaf(l_head[i], rescale, w). Hash-gated.
+            # TESTED AND NOT ADOPTED (short of gate). Hash e86d7dc all six.
+            # A/B +2 / −19 / −5 µs. Only pair 2 >10 µs. Stays opt-in.
+            # Stop softmax VALU micro-ops.
+            flags = flags + ["-DMPK_ATTN_LHEAD_FMA"]
         # Tiles-per-chunk threshold for the wave-local scan (default 8; 4 is
         # faster but fails the perplexity gate -- see the header comment).
         _wl_min = os.environ.get("MPK_ATTN_WAVE_LOCAL_MIN_TILES")
@@ -479,7 +669,7 @@ def get_compile_command(
         # between consecutive same-accumulator MFMAs with s_nop; these remove
         # it, dropping the adjacent cadence to 8 states.
         #
-        # The Redline W2 four-chain body is available directly in Fleet's
+        # The W2 four-chain body is available directly in Fleet's
         # default unrolled arm; it no longer requires
         # MPK_MFMA_PINGPONG_SCHED. MPK_MOE_DUAL_ACCUMULATOR (W13) likewise
         # works in the unscheduled arm, which carries no s_nop but still pays
@@ -524,6 +714,76 @@ def get_compile_command(
         # were mixed (one win, one tie, one loss), so it remains opt-in.
         if int(os.environ.get("MPK_MOE_W2_EPILOGUE_OVERLAP", "0")) == 1:
             flags = flags + ["-DMPK_MOE_W2_EPILOGUE_OVERLAP"]
+        _stripe_rot = os.environ.get("MPK_MOE_XCD_STRIPE_ROT", "")
+        if _stripe_rot != "":
+            # Rotate the MoE interleaved tile map: global_tile =
+            # tile_idx*8 + ((xcd_id + ROT) & 7). ROT=4 gives the four extra
+            # real W13 tiles (92 % 8) to XCDs 4–7.
+            #
+            # A/B ROT=4 vs default (three alternating pairs, ctx512/64tok):
+            # 1.779→1.741 (−38), 1.732→1.724 (−8), 1.738→1.727 (−11) µs;
+            # hash e86d7dc all six. Directional but C1 is a 1.779 control
+            # spike and pair 2 is inside ~10 µs noise — stays opt-in.
+            flags = flags + [f"-DMPK_MOE_XCD_STRIPE_ROT={int(_stripe_rot)}"]
+        if int(os.environ.get("MPK_MOE_XCD_STRIPE_LAYER", "0")) == 1:
+            # Rotate leftover real W13 tiles by task_layer_idx so extras
+            # cycle through all 8 XCDs over 36 layers, unlike static ROT=4.
+            # A/B 2026-08-30: −43 / +10 / −6 µs, hash e86d7dc all six.
+            # Only pair 1 clears 10 µs; C1 is a 1.782 control spike
+            # (same pattern as ROT=4). Stays opt-in.
+            flags = flags + ["-DMPK_MOE_XCD_STRIPE_LAYER"]
+        if int(os.environ.get("MPK_MOE_XCD_STRIPE_TILE", "0")) == 1:
+            # Rotate leftover W13 tiles by tile_idx, not layer or ROT=4:
+            # global_tile = tile_idx*8 + ((xcd_id + tile_idx) & 7).
+            # A/B 2026-08-30: −12 / +25 / +31 µs, hash e86d7dc all six.
+            # Two of three pairs lose. Stays opt-in. Do not retry XCD
+            # stripe maps (ROT / LAYER / TILE).
+            flags = flags + ["-DMPK_MOE_XCD_STRIPE_TILE"]
+        if int(os.environ.get("MPK_MOE_BAR_BUSY_POLL", "0")) == 1:
+            # Drop s_sleep(1) from the W13→W2 expert barrier poll only.
+            # A/B 2026-08-30: +20 / +6 / +6 µs, hash e86d7dc all six.
+            # All three pairs lose. Stays opt-in; keep s_sleep(1) default.
+            flags = flags + ["-DMPK_MOE_BAR_BUSY_POLL"]
+        if int(os.environ.get("MPK_W13_SCALE_GLOBAL", "0")) == 1:
+            # HBM W13 block-scale dwordx4 via global_load instead of flat.
+            # A/B 1: +15 / −34 / −18, C1 hash d7c2ef44. Re-A/B 2:
+            # −20 / +7 / −6; V1 hash 308a007c, rest e86d7dc.
+            # Clean pairs are noise. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_W13_SCALE_GLOBAL"]
+        if int(os.environ.get("MPK_W13_SETPRIO", "0")) == 1:
+            # Raise wave priority around the recycled W13 tile-0/tile-1
+            # MFMA asm so compute issues ahead of same-CU pollers.
+            # A/B 2026-08-30: −5 / −25 / 0 µs, hash e86d7dc all six.
+            # Only pair 2 clears 10 µs. Stays opt-in.
+            flags = flags + ["-DMPK_W13_SETPRIO"]
+        if int(os.environ.get("MPK_ATTN_SETPRIO", "0")) == 1:
+            # Raise wave priority around fused-layer CK FMHA so attention
+            # issues ahead of O-proj slice waiters.
+            # A/B 2026-08-30: −23 / −5 / −5 µs, hash e86d7dc all six.
+            # Only pair 1 clears 10 µs (C1 1.754). Stays opt-in.
+            flags = flags + ["-DMPK_ATTN_SETPRIO"]
+        if int(os.environ.get("MPK_W13_ACC_PAD16", "0")) == 1:
+            # Recycle W13 tails use s_nop 15; s_nop 15 (32) before AccVGPR
+            # read. gfx950 AccVGPR retirement was measured at 11 clocks;
+            # one s_nop 15 is 16. A/B 2026-08-30: −20 / +30 / +10 µs,
+            # hash e86d7dc all six (Hazard 2 did not fire). Mixed; V2
+            # 1.758. Stays opt-in. Keep the 32-slot pad as default.
+            flags = flags + ["-DMPK_W13_ACC_PAD16"]
+        if int(os.environ.get("MPK_W13_ACC_READ_OVERLAP", "0")) == 1:
+            # Spend the second Hazard-2 s_nop 15 on AccVGPR reads of the
+            # older a[4:7] chain, then s_nop 11 before reading a[0:3].
+            # Keeps 32 issue slots to a0 (16+4+12) unlike PAD16.
+            # A/B 2026-08-30: +3 / +6 / −7 µs, hash e86d7dc all six.
+            # Noise. Stays opt-in. Do not retry AccVGPR pad/overlap.
+            flags = flags + ["-DMPK_W13_ACC_READ_OVERLAP"]
+        if int(os.environ.get("MPK_OPROJ_SKIP_GATE_BUSY_POLL", "0")) == 1:
+            # Drop s_sleep(1) on the Phase 7a' poll that MoE-only ranks
+            # use before they read rmsnorm_out_moe. Not the W2 barrier
+            # or O-proj slice poll.
+            # A/B 2026-08-30: +5 / −2 / −35 µs, hash e86d7dc all six.
+            # Pair 3 is a 1.771 control spike; pairs 1–2 inside noise.
+            # Stays opt-in. Do not retry more busy-poll analogs.
+            flags = flags + ["-DMPK_OPROJ_SKIP_GATE_BUSY_POLL"]
         # Read the O-proj weight fragments K-major so a wave's 64 ds_read_b128
         # addresses are consecutive instead of 16-way bank-conflicting on the
         # 2048-byte row stride. This is a *contract with the checkpoint*: the
@@ -532,7 +792,19 @@ def get_compile_command(
         # MPK_OPROJ_KMAJOR variable. Setting it on only one side is silently
         # wrong numerics, not a build error.
         if _opt("MPK_OPROJ_KMAJOR"):
+            # Ablation 2026-08-30 (=0): +23 / +11 / +22 µs, hash e86d7dc all
+            # six. Keep default ON.
             flags = flags + ["-DMPK_OPROJ_KMAJOR"]
+        # Walk the four O-proj K-parallel LDS operand streams with pointers
+        # instead of rebuilding their thread-varying addresses from the K
+        # index before each MFMA. The gfx950 specialization drops 256 bytes
+        # and 45 instructions from the fused O-proj function while preserving
+        # all eight MFMAs, LDS requests, waits, and accumulator order.
+        #
+        # TESTED AND NOT ADOPTED: 1.772/1.721/1.731 vs 1.749/1.764/1.732
+        # (−23 / +43 / +1 us), text hash identical (7984e601957c1ee2).
+        if int(os.environ.get("MPK_OPROJ_PTR_WALK", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_PTR_WALK"]
         # Same permutation, same checkpoint contract, applied to the LM head --
         # per 16-row MFMA tile, since its record is 64 rows wide and each of
         # the four resident waves owns one tile. Row-major the 1472-byte row
@@ -570,7 +842,7 @@ def get_compile_command(
         # that issue it, so cheaper issue buys nothing.
         if int(os.environ.get("MPK_LM_HEAD_WAVE_TILE_DMA", "0")) == 1:
             flags = flags + ["-DMPK_LM_HEAD_WAVE_TILE_DMA"]
-        # Production Redline LM-head group pipeline: K-major host layout,
+        # Production LM-head group pipeline: K-major host layout,
         # synchronous group zero, scale ping-pong, and 23 K128 direct-to-LDS
         # requests for group g+workers_per_xcd interleaved with group g's
         # unchanged MFMA chain. Batch-1 qualification won five of six
@@ -609,6 +881,8 @@ def get_compile_command(
         # concurrency one. This tree builds with AMD clang 20 and is not
         # affected -- re-validate before enabling on a newer compiler.
         if _opt("MPK_QKV_LDS_NORM"):
+            # Ablation 2026-08-30 (=0): +28 / +14 / −13 µs, hash e86d7dc all
+            # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_QKV_LDS_NORM"]
         # Replace the TopK per-lane serial argmax (23 VALU ops on a ~21-deep
         # dependency chain) with a v_max3_f32 reduction tree plus an
@@ -616,6 +890,8 @@ def get_compile_command(
         # the comment at the asm block for why the equality matches are
         # visited in reverse.
         if _opt("MPK_TOPK_LOCAL_MAX3"):
+            # Ablation 2026-08-30 (=0): +1 / −25 / +9 µs, hash e86d7dc all
+            # six. Mixed (C2 1.758 spike); keep default ON.
             flags = flags + ["-DMPK_TOPK_LOCAL_MAX3"]
         # Unroll the QKV MFMA ping-pong loop in the assembler. MFMA_ITERS is a
         # compile-time constant, so `.rept` can emit the bank-0/bank-1 pairs
@@ -630,30 +906,137 @@ def get_compile_command(
         # MoE loops below, but fleet's QKV loop already carries a different
         # LDS wait structure and there is no bubble left for it to remove.
         if int(os.environ.get("MPK_QKV_MFMA_UNROLLED", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate / hash) even with
+            # PF_BEFORE_WAIT. Hash e86d7dc except C2 87918d87 flake.
+            # A/B 0 / −14 / −6 µs. Pair 2 hash-invalid. Stays opt-in.
             flags = flags + ["-DMPK_QKV_MFMA_UNROLLED"]
+        if _opt("MPK_QKV_PF_BEFORE_WAIT"):
+            # PROMOTED 2026-08-30. Next-bank QKV ds_reads before lgkmcnt(5).
+            # Hash e86d7dc all six. A/B −30 / −17 / −7 µs (V 1.710 / 1.724 /
+            # 1.733 vs C 1.740 / 1.741 / 1.740). Two pairs >10 µs; third
+            # directional. Disable with MPK_QKV_PF_BEFORE_WAIT=0.
+            flags = flags + ["-DMPK_QKV_PF_BEFORE_WAIT"]
+        if int(os.environ.get("MPK_QKV_KSPLIT_SHARED_NORM", "0")) == 1:
+            # Opt-in 2-way QKV K-split that shares RMSNorm: k_part 0 norms and
+            # publishes the quantized row; k_part 1 waits and MFMAs. Acc
+            # handshake is vL1-only (the rejected MPK_QKV_KSPLIT used
+            # buffer_inv sc1 and redid RMSNorm on both parts: +114 µs).
+            # Implies MPK_QKV_KSPLIT. High-rank K-hi mapping.
+            flags = flags + ["-DMPK_QKV_KSPLIT", "-DMPK_QKV_KSPLIT_SHARED_NORM"]
+        elif int(os.environ.get("MPK_QKV_KSPLIT", "0")) == 1:
+            # Opt-in 2-way K-split of the QKV MXFP4 GEMM. Decode / TOK_ROWS==1
+            # only. Incompatible with MPK_QKV_MFMA_UNROLLED.
+            #
+            # Prefix K-hi on 10-19: +141 / +92 / +103 µs, hash 96a92716 4/6.
+            # High-rank K-hi on 21-30 (preserves O-proj overlap on 10-20):
+            # +114 / +131 / +115 µs, hash 96a92716 all 6. Do not retry QKV
+            # K-split: extra RMSNorm HBM + handshake + 20-way epoch sit on
+            # the attention-start path and dominate any K-chain cut.
+            flags = flags + ["-DMPK_QKV_KSPLIT"]
+        if int(os.environ.get("MPK_QKV_SKIP_B1_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). Drop lgkmcnt(5) before
+            # the bank-1 MFMA. Hash e86d7dc all six. A/B −16 / −2 / −5 µs.
+            # Only pair 1 >10 µs. Stays opt-in. Stop QKV wait-shift.
+            flags = flags + ["-DMPK_QKV_SKIP_B1_WAIT"]
+        if int(os.environ.get("MPK_W13_SKIP_B1_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (hazard). Drop lgkmcnt(0) before a[4:7].
+            # All three V hashes missed e86d7dc (dcb666 / c085a4 / bceab6).
+            # A/B +4 / +21 / +15 µs. Keep the wait. Do not retry W13 skip of
+            # the bank-1 lgkmcnt(0).
+            flags = flags + ["-DMPK_W13_SKIP_B1_WAIT"]
+        if int(os.environ.get("MPK_QKV_ROPE_NO_BAR", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of 2×>10 µs). Skip RoPE alias
+            # syncthreads at BATCH_SIZE==1. Hash e86d7dc all six.
+            # A/B −6 / +1 / −69 µs. C3 1.787 slow-control spike. Keep the
+            # barrier. Stays opt-in. Do not retry epilogue-barrier skips.
+            flags = flags + ["-DMPK_QKV_ROPE_NO_BAR"]
+        if int(os.environ.get("MPK_QKV_TSC_PTR_INCREMENT", "0")) == 1:
+            # Opt-in QKV ISA probe: advance the LDS token-scale pointer by one
+            # byte per MFMA instead of rebuilding it from the scalar loop
+            # counter. This keeps the same ds_read_u8 addresses and loop/MFMA
+            # order, but removes the s13 -> v_add dependency before each scale
+            # read.
+            #
+            # TESTED AND NOT ADOPTED (mixed) on PF_BEFORE_WAIT too.
+            # Hash e86d7dc all six. A/B −27 / +4 / −72 µs. C3 1.804 spike;
+            # pair 2 +4 on fast C 1.715. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_QKV_TSC_PTR_INCREMENT"]
+        if int(os.environ.get("MPK_QKV_ACC_UNDER_LDS", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). QKV bank-0 ds before AccVGPR
+            # zeros. Hash e86d7dc all six. A/B +29 / −7 / −10 µs. Pair 1
+            # loses 29 µs (C 1.717 fast). Pair 3 −10 on the nose. Stays
+            # opt-in. Do not retry QKV AccVGPR vs first-iter ds order.
+            flags = flags + ["-DMPK_QKV_ACC_UNDER_LDS"]
+        if int(os.environ.get("MPK_QKV_DS_BEFORE_ADDR", "0")) == 1:
+            # Opt-in: QKV PF_BEFORE_WAIT data/scale ds_reads use wa/wsa/ta+imm
+            # offset, then v_add. Token-scale still v17 from s13.
+            flags = flags + ["-DMPK_QKV_DS_BEFORE_ADDR"]
+        if int(os.environ.get("MPK_QKV_GLOBAL_PAGE", "0")) == 1:
+            # Opt-in QKV paging probe: retain address_space(1) on the final
+            # kv_indices dereference. This changes its generic FLAT page load
+            # (vmcnt+lgkmcnt) to GLOBAL (vmcnt only), avoiding accidental
+            # retirement by the following LDS waits while preserving overlap.
+            # TESTED AND NOT ADOPTED: 1.732/1.736/1.747 vs 1.746/1.728/1.750
+            # (+14 / −8 / +3 us). Hashes e86d7dc except C3 (87918d, extractor
+            # or one-run drift; V3 matched the stable hash).
+            flags = flags + ["-DMPK_QKV_GLOBAL_PAGE"]
+        if int(os.environ.get("MPK_ROPE_VEC_STORE", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss/neutral). Packed RoPE step-3
+            # st_wt_u64. Hash e86d7dc all six. A/B +19 / +6 / −1 µs.
+            # Pair 1 loses >10 µs. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_ROPE_VEC_STORE"]
         # The same `.rept` transform on the MoE tile-0 ping-pong loops. These
         # unroll the *unscheduled* arm, so they are mutually exclusive with
         # MPK_MFMA_PINGPONG_SCHED -- the kernel #errors on the combination
         # rather than letting the flag expand to nothing.
         #
         # Ship on: 1.876 against 1.882 (four runs each, alternating, three of
-        # four pairs better), generated text unchanged.
+        # four pairs better), generated text unchanged. W2 unroll ablation
+        # 2026-08-30: =0 was +6 / −6 / +23 µs, hash e86d7dc; keep default ON.
+        # W13 unroll ablation 2026-08-30: =0 was +1 / −1 / −24 µs (C3 1.752
+        # spike); keep default ON.
         if _opt("MPK_W13_T0_MFMA_UNROLLED"):
             flags = flags + ["-DMPK_W13_T0_MFMA_UNROLLED"]
         if _opt("MPK_W2_T0_MFMA_UNROLLED"):
             flags = flags + ["-DMPK_W2_T0_MFMA_UNROLLED"]
+        if int(os.environ.get("MPK_W2_PF_BEFORE_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (confirm failed). First A/B +6 / −16 /
+            # −26 µs. Confirm C=ON V=0: −15 / +8 / +8. OFF was faster on
+            # pair 1; pairs 2–3 short of 10 µs. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_W2_PF_BEFORE_WAIT"]
         # Rotate QKV/attention ownership onto the ranks that have no O-proj or
         # TopK work, so their MoE-tail slack absorbs the next layer's QKV
         # weight prefetch. A rotation, so tile coverage is unchanged -- see the
         # block comment at the top of gang_full_layer_fused_mi300.cuh.
         if int(os.environ.get("MPK_ROTATE_QKV_ATTN_RANKS", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Rotate QKV/attn off O-proj ranks.
+            # Hash e86d7dc all six. A/B −18 / +18 / +17 µs. Only pair 1 wins.
+            # 32 workers/XCD + rotate (2026-08-31): +6 / +26 / +9 µs, hash
+            # 96a92716 all six. Do not retry this rotation (31 or 32).
             flags = flags + ["-DMPK_ROTATE_QKV_ATTN_RANKS"]
+        if int(os.environ.get("MPK_OPROJ_SWAP_ATTN", "0")) == 1:
+            # TESTED AND NOT ADOPTED (neutral). Swap O-proj tiles [0, ATTN)
+            # onto idle ranks [23, 31). Dual of MPK_ROTATE_QKV_ATTN_RANKS.
+            # Hash 96a92716 all six. A/B +11 / −6 / −10 µs. Mean ~−2 µs.
+            # Last O-proj/TopK arriver is not an attention rank: SLICE_RELEASE
+            # already equalizes GEMM start on the slice flags. Stays opt-in.
+            # Do not retry this remap.
+            flags = flags + ["-DMPK_OPROJ_SWAP_ATTN"]
+        if int(os.environ.get("MPK_OPROJ_PIPE_SLICE_MFMA", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Convert XCD 2w, MFMA 4, then
+            # wait/convert 2w+1. Hash 96a92716 all six. A/B +33 / +46 / +15 µs.
+            # Slices arrive together; extra inv/convert costs more than it hides.
+            # Rotation+pipe was +39 / +36 / +42 µs, hash e2dafdf. Do not retry
+            # splitting the two-slice wait (SPLIT_SLICE, this, or rotation).
+            flags = flags + ["-DMPK_OPROJ_PIPE_SLICE_MFMA"]
         # Diagnostic companion to the above: override the rotation distance.
         # Only meaningful together with MPK_ROTATE_QKV_ATTN_RANKS.
         _qkv_rot = os.environ.get("MPK_QKV_ROT_OVERRIDE", "")
         if _qkv_rot != "":
             flags = flags + [f"-DMPK_QKV_ROT_OVERRIDE={int(_qkv_rot)}"]
         if _opt("MPK_XCD_LOCAL_BARRIER"):
+            # Ablation 2026-08-30 (=0): +1 / +12 / −18 µs, hash e86d7dc all
+            # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_XCD_LOCAL_BARRIER"]
         # Ablation (default OFF): put the layer-gate compare target back in
         # LDS. It only ever needed to be a register -- every access is
@@ -663,6 +1046,8 @@ def get_compile_command(
         if int(os.environ.get("MPK_GATE_PREV_LDS", "0")) == 1:
             flags = flags + ["-DMPK_GATE_PREV_LDS"]
         if _opt("MPK_OPROJ_TREE_BARRIER"):
+            # Ablation 2026-08-30 (=0): +15 / +6 / +16 µs, hash e86d7dc all
+            # six. Keep default ON.
             flags = flags + ["-DMPK_OPROJ_TREE_BARRIER"]
         if _opt("MPK_W13_LINEAR_LOAD"):
             # One W13 tile per wave, walked linearly in 23 1-KiB chunks,
@@ -681,6 +1066,8 @@ def get_compile_command(
             # `router_tile_n` of them. Per-XCD, not device-wide: the store is a
             # plain global_store into a non-coherent L2, so each XCD needs its
             # own writer. Correctness-relevant -- check the generated text.
+            # Ablation 2026-08-30 (=0): +30 / +12 / +22 µs, hash e86d7dc all
+            # six. Keep default ON.
             flags = flags + ["-DMPK_ONE_NORM_WRITER"]
         _moe_delay = int(os.environ.get("MPK_MOE_ENTRY_DELAY", "0"))
         if _moe_delay > 0:
@@ -724,10 +1111,9 @@ def get_compile_command(
             # barrier wait bounds the skew instead of describing the population.
             flags = flags + ["-DMPK_MOE_INNER_WIDE"]
         if _opt("MPK_W13_T1_LINEAR_LOAD"):
-            # The same transform at the W13 tile_iter=1 site. Separate knob so
-            # T0 and T1 stay independently measurable: T1's loads are issued to
-            # overlap the SwiGLU epilogue, so the striped form's extra traffic
-            # may already be hidden there the way it is on the W2 arm.
+            # The same transform at the W13 tile_iter=1 site. Unlike W2,
+            # turning it off loses: 1.719→1.731, 1.712→1.736, 1.736→1.753
+            # (+12 / +24 / +17 µs), hash e86d7dc all six. Keep default ON.
             flags = flags + ["-DMPK_W13_T1_LINEAR_LOAD"]
         if _opt("MPK_W13_T1_EARLY_SCALE_LOAD"):
             # Hoist the W13 tile-1 block-scale global reads up beside the
@@ -748,10 +1134,11 @@ def get_compile_command(
             # This is the scale half of the QKV prefetch; the DMA hoist
             # itself is already done in the fused layer's Phase 9. It is the
             # costliest of the six, worth roughly 0.07 ms/token.
+            # Ablation 2026-08-30 (=0): +50 / +65 / +26 µs, hash e86d7dc.
             flags = flags + ["-DMPK_QKV_PREFETCH_SCALES"]
         if _opt("MPK_W13_KMAJOR_RECYCLE"):
             # Canonical K128-major W13 layout plus tile-1 fragment recycling
-            # (Redline bb53b08b) and counted tile-0 handoff waits (adbf5fa8).
+            # and counted tile-0 handoff waits.
             # Replaces the split-stage path. Host applies the matching
             # permutation under the same flag.
             #
@@ -759,6 +1146,198 @@ def get_compile_command(
             # pairs, identical generated text (Paris). Five ctx-4096
             # repeats matched the control token dump. Batch-1 only.
             flags = flags + ["-DMPK_W13_KMAJOR_RECYCLE"]
+        if int(os.environ.get("MPK_W13_RECYCLE_EAGER_DRAIN", "0")) == 1:
+            # Opt-in ISA probe: replace tile-1's progressive vmcnt(22..0)
+            # fragment waits with one vmcnt(0) before its MFMA loop. This
+            # removes 22 wait instructions but gives up overlap with any late
+            # recycled fragments; arithmetic and LDS contents are unchanged.
+            #
+            # TESTED AND NOT ADOPTED: 1.747/1.718/1.738 control vs
+            # 1.785/1.778/1.778 variant (all three pairs worse, +38/+60/+40
+            # us), text hash identical (7984e601957c1ee2).
+            flags = flags + ["-DMPK_W13_RECYCLE_EAGER_DRAIN"]
+        if int(os.environ.get("MPK_W13_RECYCLE_PAIR_WAIT", "0")) == 1:
+            # Opt-in ISA probe: retire two recycled tile-1 fragments at the
+            # start of each MFMA pair instead of waiting separately for each
+            # fragment. This removes 11 of the 22 in-loop s_waitcnt
+            # instructions while keeping all later pairs in flight; unlike
+            # TESTED AND NOT ADOPTED: 1.738/1.755/1.758 vs 1.758/1.743/1.740
+            # (+20 / −12 / −18 us), hash identical (e86d7dc79a77). Mixed.
+            flags = flags + ["-DMPK_W13_RECYCLE_PAIR_WAIT"]
+        if int(os.environ.get("MPK_W13_RECYCLE_EARLY_ISSUE", "0")) == 1:
+            # Opt-in ISA probe: after each tile-0 fragment's LDS reads finish,
+            # issue the tile-1 direct-to-LDS overwrite before that fragment's
+            # MFMA rather than after it. Request order and all 23 progressive
+            # fragment waits are unchanged; each request gains approximately
+            # one MFMA interval of HBM flight time without extending a live
+            # TESTED AND NOT ADOPTED: Decode 1.722/1.748/1.797 vs
+            # 1.733/1.745/1.729 (+11 / −3 / −68 us; p3 control was a 1.797
+            # spike). Hash identical (e86d7dc79a77).
+            flags = flags + ["-DMPK_W13_RECYCLE_EARLY_ISSUE"]
+        if int(os.environ.get("MPK_W13_REC_LOOP_VMCNT21", "0")) == 1:
+            # TESTED AND NOT ADOPTED (neutral). T0 recycle .rept vmcnt(21)
+            # vs 22. Hash e86d7dc all six. A/B 0 / −2 / −8 µs. No pair >10 µs.
+            # Stays opt-in. Do not retry loop vmcnt 21 vs 22.
+            flags = flags + ["-DMPK_W13_REC_LOOP_VMCNT21"]
+        if int(os.environ.get("MPK_W13_REC_HEAD_VMCNT21", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). Header vmcnt(21).
+            # Hash e86d7dc all six. A/B −9 / 0 / −10 µs. Only pair 3 hits
+            # 10 µs; pair 1 is 9. Stays opt-in. Do not retry ±1 vmcnt.
+            flags = flags + ["-DMPK_W13_REC_HEAD_VMCNT21"]
+        if int(os.environ.get("MPK_W13_REC_NO_NT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Drop nt on recycle buffer_load_lds.
+            # Hash e86d7dc all six. A/B +77 / +58 / +46 µs. Keep nt.
+            # Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_W13_REC_NO_NT"]
+        if int(os.environ.get("MPK_W13_REC_NO_INNER_NOP", "0")) == 1:
+            # TESTED AND NOT ADOPTED (neutral). Drop recycle s_nop 2/3.
+            # A/B +3 / 0 / 0 µs. V1–V3 hash e86d7dc; C2 hash ce6e0a48
+            # (control flake, decode 1.734). Nops were hidden under lgkmcnt.
+            # Stays opt-in. Do not retry T0 inner nops.
+            flags = flags + ["-DMPK_W13_REC_NO_INNER_NOP"]
+        if int(os.environ.get("MPK_W13_T1_NO_INNER_NOP", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Drop T1 pair s_nop 2/3.
+            # Hash e86d7dc all six. A/B −6 / +9 / +30 µs. No pair wins >10 µs.
+            # C3 1.727 fast control; V3 1.757. Same as T0: nops under lgkmcnt
+            # or dropping them hurts. Stays opt-in. Do not retry T1 nops.
+            flags = flags + ["-DMPK_W13_T1_NO_INNER_NOP"]
+        if int(os.environ.get("MPK_W13_T1_ZERO_IN_T0", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Zero T1 AccVGPR in T0 tail.
+            # Hash e86d7dc all six. A/B +7 / −4 / −35 µs. C3 1.762 slow
+            # control; V3 1.727. Only one pair >10 µs. Stays opt-in. Do not
+            # retry AccVGPR zero placement vs T1 wait.
+            flags = flags + ["-DMPK_W13_T1_ZERO_IN_T0"]
+        if int(os.environ.get("MPK_W13_T1_HEAD_VMCNT0", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). T1 header vmcnt(0). Hash e86d7dc
+            # all six. A/B +95 / +4 / +34 µs. V1 1.826. Full drain at T1
+            # header loses T1 hide. Stays opt-in. Do not retry T1 header
+            # drain (same class as T0 EAGER_DRAIN).
+            flags = flags + ["-DMPK_W13_T1_HEAD_VMCNT0"]
+        if int(os.environ.get("MPK_W13_T1_ACC_PAD16", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). T1-only AccVGPR pad16.
+            # Hash e86d7dc all six. A/B +2 / +4 / +9 µs. All pairs lose;
+            # none >10 µs. Stays opt-in. Do not retry AccVGPR pad variants.
+            flags = flags + ["-DMPK_W13_T1_ACC_PAD16"]
+        if int(os.environ.get("MPK_W13_T1_MFMA_BEFORE_F1", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). First T1 MFMA before f1 wait.
+            # Hash e86d7dc all six. A/B −13 / +3 / +74 µs. C1 1.749 slow
+            # control; V3 1.812. Stays opt-in. Do not retry T1 first-pair
+            # reorder (MFMA vs f1 wait).
+            flags = flags + ["-DMPK_W13_T1_MFMA_BEFORE_F1"]
+        if int(os.environ.get("MPK_W13_T0_ACC_UNDER_LDS", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). T0 AccVGPR zeros after
+            # header ds_read. Hash e86d7dc all six. A/B −2 / +4 / −10 µs.
+            # Pair 3 is −10 on the nose. Stays opt-in. Do not retry AccVGPR
+            # zero vs vmcnt/ds order (T0 or T1).
+            flags = flags + ["-DMPK_W13_T0_ACC_UNDER_LDS"]
+        if int(os.environ.get("MPK_W13_T0_LAST_REC_EARLY", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). Last T1 recycle before
+            # leftover T0 MFMA. Hash e86d7dc all six. A/B −8 / −1 / −23 µs.
+            # Only pair 3 >10 µs; C1/C3 1.748 slow controls. Stays opt-in.
+            # Do not retry that issue site.
+            flags = flags + ["-DMPK_W13_T0_LAST_REC_EARLY"]
+        if int(os.environ.get("MPK_W13_T0_HEAD_PF_B1", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). First T0 bank-1 ds
+            # under header lgkmcnt(5). Hash e86d7dc all six. A/B +6 / −8 /
+            # −18 µs. Only pair 3 >10 µs. Stays opt-in. Do not retry T0
+            # first-iteration bank-1 peel.
+            flags = flags + ["-DMPK_W13_T0_HEAD_PF_B1"]
+        if int(os.environ.get("MPK_W13_T0_DS_AFTER_MFMA", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Bank-1 ds after T0 MFMA a[0:3].
+            # Hash e86d7dc all six. A/B +60 / +10 / −10 µs. V1 1.793. C3
+            # 1.749 slow control. Stays opt-in. Stop moving T0 inner
+            # bank-1 ds after MFMA0 (LDS must fly under a[0:3]).
+            flags = flags + ["-DMPK_W13_T0_DS_AFTER_MFMA"]
+        if int(os.environ.get("MPK_W13_T0_B0_WAIT_SHIFT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Shift T0 bank-0 lgkmcnt to
+            # after next pair's bank-1 ds. Hash e86d7dc all six. A/B −40 /
+            # +14 / 0 µs. C1 1.759 slow control; C2 1.726 fast. Stays
+            # opt-in. Stop T0 inner lgkmcnt/ds wait reordering.
+            flags = flags + ["-DMPK_W13_T0_B0_WAIT_SHIFT"]
+        if int(os.environ.get("MPK_W13_T1_HEAD_PF_B1", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). T1 f1 wait + bank-1 ds in
+            # header, lgkmcnt(5). Hash e86d7dc all six. A/B 0 / +9 / +18 µs.
+            # C3 1.726 fast. Stays opt-in. Do not retry T1 first bank-1 peel.
+            flags = flags + ["-DMPK_W13_T1_HEAD_PF_B1"]
+        if int(os.environ.get("MPK_W13_T1_B0_WAIT_SHIFT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). T1 bank-0 lgkmcnt shift.
+            # Hash e86d7dc all six. A/B +18 / −1 / −22 µs. C1 1.718 fast;
+            # C3 1.750 slow. Stays opt-in. Stop T0/T1 bank-0 wait-shift.
+            flags = flags + ["-DMPK_W13_T1_B0_WAIT_SHIFT"]
+        if int(os.environ.get("MPK_W13_TSC_DS_OFFSET", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Token-scale ds_read_u8 offset
+            # vs v_add v17. Hash e86d7dc all six. A/B +10 / +12 / −16 µs.
+            # Only pair 3 wins. Stays opt-in. Do not retry W13 scale-addr
+            # VALU folding.
+            flags = flags + ["-DMPK_W13_TSC_DS_OFFSET"]
+        if int(os.environ.get("MPK_W13_DS_BEFORE_ADDR", "0")) == 1:
+            # Opt-in: T0/T1 bank-1 ds_reads use wa/wsa/ta+imm offset, then
+            # v_add. Same addresses; LDS issue no longer waits on those adds.
+            # TESTED AND NOT ADOPTED (mixed). Hash e86d7dc all six. A/B
+            # +15 / −17 / +23 µs. Only pair 2 wins. Stays opt-in. Do not
+            # retry W13 bank-1 ds-before-v_add.
+            flags = flags + ["-DMPK_W13_DS_BEFORE_ADDR"]
+        if int(os.environ.get("MPK_W13_B0_ADDR_AFTER_DS", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). Defer T0/T1 bank-0 pointer bumps
+            # until after a[4:7] + trailing ds_read. Hash e86d7dc all six.
+            # A/B +20 / −2 / +86 µs. V3 1.820. Stays opt-in. Do not retry
+            # recycle LDS address folding.
+            flags = flags + ["-DMPK_W13_B0_ADDR_AFTER_DS"]
+        if int(os.environ.get("MPK_W13_REC_DOUBLE_ISSUE", "0")) == 1:
+            # TESTED AND NOT ADOPTED (hash). Both T0 recycle DTL loads after
+            # a[0:3]. V3 hash d7c2ef44 vs e86d7dc; V1–V2 matched. A/B −17 /
+            # +1 / −12 µs. Stays opt-in. Do not retry until V3 hash is
+            # explained.
+            flags = flags + ["-DMPK_W13_REC_DOUBLE_ISSUE"]
+        if int(os.environ.get("MPK_QKV_DS_BEFORE_ADDR", "0")) == 1:
+            # Opt-in: QKV PF_BEFORE_WAIT bank prefetch uses wa/wsa/ta+imm
+            # offset, then v_add. Default branching loop only.
+            # TESTED AND NOT ADOPTED (loss/neutral). Hash e86d7dc all six.
+            # A/B +1 / +8 / +4 µs. Stays opt-in. Stop LDS offset-then-bump
+            # (QKV and W13).
+            flags = flags + ["-DMPK_QKV_DS_BEFORE_ADDR"]
+        if int(os.environ.get("MPK_W13_REC_DRAIN_T0", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss/neutral). Header vmcnt(0) then drop
+            # in-loop vmcnt(22). Hash V e86d7dc; C2 6899449d flake. A/B −1 /
+            # +30 / +12 µs. Stays opt-in. Do not retry drain-then-drop.
+            flags = flags + ["-DMPK_W13_REC_DRAIN_T0"]
+        if int(os.environ.get("MPK_W13_REC_NO_LOOP_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (hazard). Drop in-loop vmcnt(22) only.
+            # All three variants missed e86d7dc (0af22a / 1ebea3 / 0e6804).
+            # A/B +5 / +2 / −8 µs. Loop wait is T0 LDS RAW. Stays opt-in.
+            # Do not retry without a prior T0 drain (DRAIN_T0 already lost).
+            flags = flags + ["-DMPK_W13_REC_NO_LOOP_WAIT"]
+        if int(os.environ.get("MPK_W13_REC_POST_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Recycle after vmcnt(22)+ds_read.
+            # Hash e86d7dc all six. A/B −6 / −16 / +13 µs. Only pair 2 >10 µs.
+            # C3 control 1.709. Stays opt-in. Do not retry issue-after-wait.
+            flags = flags + ["-DMPK_W13_REC_POST_WAIT"]
+        if int(os.environ.get("MPK_W13_REC_FIFO", "0")) == 1:
+            # TESTED AND NOT ADOPTED (short of gate). 2 KiB/wave T1 f0/f1 FIFO.
+            # Hash e86d7dc all six. A/B −10 / −33 / −9 µs. Only pair 2 >10 µs
+            # (C2 1.753 spike). Pair 1 −10 on the nose. Stays opt-in.
+            flags = flags + ["-DMPK_W13_REC_FIFO"]
+        if int(os.environ.get("MPK_W13_T1_HEAD_VMCNT21", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). T1 header vmcnt(21) vs 22.
+            # Hash e86d7dc all six. A/B +4 / +18 / −8 µs. C2 1.716 fast
+            # control. Stays opt-in. Do not retry T1 header ±1.
+            flags = flags + ["-DMPK_W13_T1_HEAD_VMCNT21"]
+        if int(os.environ.get("MPK_W13_T1_DS_UNDER_SWIGLU", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). T1 header vmcnt(22)+ds_reads
+            # under T0 SwiGLU store. Hash e86d7dc all six. A/B +4 / +19 /
+            # +51 µs. Stays opt-in. Do not retry header-under-SwiGLU.
+            flags = flags + ["-DMPK_W13_T1_DS_UNDER_SWIGLU"]
+        if int(os.environ.get("MPK_W13_T1_WAIT_BEFORE_ACC", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). T1 header vmcnt+ds before
+            # AccVGPR. Hash e86d7dc all six. A/B +5 / −12 / +12 µs. Only
+            # pair 2 >10 µs. Stays opt-in. Do not retry AccVGPR vs wait order.
+            flags = flags + ["-DMPK_W13_T1_WAIT_BEFORE_ACC"]
+        if int(os.environ.get("MPK_W13_T1_WAIT_UNDER_STORE", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). T1 vmcnt(22) between SwiGLU
+            # compute and packed store. Hash e86d7dc all six. A/B −3 / +12 /
+            # +86 µs. C1 1.760 slow control; V3 1.832. Stays opt-in. Do not
+            # retry wait-before-store (same class as DS_UNDER).
+            flags = flags + ["-DMPK_W13_T1_WAIT_UNDER_STORE"]
         if _opt("MPK_W13_T1_SPLIT_LDS_STAGE") and not _opt(
                 "MPK_W13_KMAJOR_RECYCLE"):
             # Split the W13 tile-1 HBM->LDS transfer in two. 11 of its 23 KiB
@@ -781,6 +1360,10 @@ def get_compile_command(
             # line until that line ages out, which shows up as a long tail on
             # exactly the gate sites ATT flags as hottest. Every gate should
             # poll with sc0 sc1.
+            #
+            # Level 2 (default) also converts intra-XCD MoE/O-proj polls
+            # (`MPK_LD_GATE2`). A/B 2026-08-30 of =1 vs 2: +5 / −19 / +9 µs,
+            # hash e86d7dc all six. Mixed; keep 2.
             flags = flags + [f"-DMPK_SYS_POLL_LOAD={_sp}"]
         # DEFAULT OFF, and not a tuning choice: this one is a correctness bug.
         #
@@ -807,6 +1390,18 @@ def get_compile_command(
         # a latency A/B at ctx 512 will show it as free.
         if int(os.environ.get("MPK_QKV_GATE_NO_AGENT_FENCE", "0")) == 1:
             flags = flags + ["-DMPK_QKV_GATE_NO_AGENT_FENCE"]
+        # PROMOTED 2026-08-31. Replace the qkv_epoch consumer agent fence with
+        # a producer drain. Phase 4 already publishes intra-XCD stores this way
+        # (waitcnt, then syncthreads, then the arrival atomic). Phase 2 was
+        # missing the drain and compensating with `buffer_inv sc1`.
+        #
+        # A/B vs fence-on control, hash 96a92716 all 6:
+        #   1.732/1.706, 1.729/1.710, 1.726/1.696  (−26 / −19 / −30 µs).
+        # Dropping the fence alone (MPK_QKV_GATE_NO_AGENT_FENCE) is a ctx-4096
+        # race; this arm keeps the L2 and retires Q/K/V stores before the
+        # epoch bump. Disable with MPK_QKV_EPOCH_PRODUCER_DRAIN=0.
+        if int(os.environ.get("MPK_QKV_EPOCH_PRODUCER_DRAIN", "1")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_PRODUCER_DRAIN"]
         if mpk_w13_prequant(mpk.max_num_batched_tokens):
             # Move the W13 activation quant out of the 184 MoE workgroups that
             # each redo it and into the one router workgroup per XCD that
@@ -832,12 +1427,48 @@ def get_compile_command(
             # 1.826/1.820 -- one loss, one tie, one small win. The extra
             # barrier pays back the contention it removes on this path.
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
+        if int(os.environ.get("MPK_LAYER_GATE_BUSY_POLL", "0")) == 1:
+            # Drop s_sleep(1) from the Phase 9 layer-gate spin only.
+            # A/B 2026-08-30: −12 / −13 / +3 µs, hash e86d7dc all six. Two of
+            # three pairs clear 10 µs; pair 3 is noise. Stays opt-in.
+            flags = flags + ["-DMPK_LAYER_GATE_BUSY_POLL"]
+        if int(os.environ.get("MPK_SLICE_BUSY_POLL", "0")) == 1:
+            # Drop s_sleep(1) from the default O-proj two-slice wait.
+            # A/B 2026-08-30: −3 / −26 / +16 µs, hash e86d7dc; C2 1.768 spike.
+            # Stays opt-in.
+            flags = flags + ["-DMPK_SLICE_BUSY_POLL"]
+        if int(os.environ.get("MPK_OPROJ_POLL_BEFORE_DRAIN", "0")) == 1:
+            # Poll attn slices before draining O-proj weight DMA so the
+            # 3.2 µs slice wait hides remaining buffer_load_lds. Default
+            # drains+barriers first.
+            # A/B 2026-08-30: −2 / +8 / +12 µs, hash e86d7dc all six.
+            # Neutral/loss. DMA is already done before the slice wait.
+            flags = flags + ["-DMPK_OPROJ_POLL_BEFORE_DRAIN"]
         if int(os.environ.get("MPK_SLICE_DUAL_POLL", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed). Issue the two attention-slice
             # release loads, then one vmcnt(0), instead of load-wait twice.
             # 1.814/1.820, 1.826/1.814, 1.826/1.811 -- mean ~7 us, not 3/3.
             # Text unchanged (Paris) in all six runs.
             flags = flags + ["-DMPK_SLICE_DUAL_POLL"]
+        if int(os.environ.get("MPK_OPROJ_SPLIT_SLICE_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss/neutral). Wait/acquire/quantize
+            # XCD 2w, then 2w+1. Hash e86d7dc all six. A/B +23 / −1 / −7 µs.
+            flags = flags + ["-DMPK_OPROJ_SPLIT_SLICE_WAIT"]
+        if int(os.environ.get("MPK_OPROJ_BIAS_NO_WAIT", "0")) == 1:
+            # TESTED AND NOT ADOPTED. Drop vmcnt(0) before O-proj bias+res
+            # consume. A/B +11 / −15 / 0 µs. V1 hash c84daa7a vs e86d7dc;
+            # V2–V3 matched. The wait is a real fence. Stays opt-in.
+            flags = flags + ["-DMPK_OPROJ_BIAS_NO_WAIT"]
+        if int(os.environ.get("MPK_OPROJ_RED_VEC", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed/noise). 16B LDS reduce slot.
+            # Hash e86d7dc all six. A/B +2 / −14 / −7 µs; only pair 2 >10 µs
+            # and C2 1.759 looks like a control spike. Stays opt-in.
+            flags = flags + ["-DMPK_OPROJ_RED_VEC"]
+        if int(os.environ.get("MPK_OPROJ_AMAX_DPP", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed/noise). 8-lane E8M0 amax via DPP.
+            # Hash e86d7dc all six. A/B −6 / −33 / +7 µs; only pair 2 clears
+            # 10 us, and C2 1.758 looks like a control spike.
+            flags = flags + ["-DMPK_OPROJ_AMAX_DPP"]
         if _opt("MPK_NARROW_OPROJ_HIER"):
             # One tid polls the O-proj hierarchical release; the acquire
             # __syncthreads already below carries the other 255. Unlike
@@ -848,6 +1479,8 @@ def get_compile_command(
             # vs =0) was 1.820/1.824, 1.820/1.824, 1.823/1.818 -- two of
             # three still favor ON. Incompatible with MPK_OPROJ_LEAN_ACQUIRE
             # (that arm deletes the rendezvous).
+            # Ablation 2026-08-30 (=0): +6 / +35 / −5 µs, hash e86d7dc all
+            # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_NARROW_OPROJ_HIER"]
         if _opt("MPK_ATTN_SLICE_RELEASE"):
             # Replace the eight-XCD attention rendezvous with a per-XCD slice
@@ -859,6 +1492,8 @@ def get_compile_command(
             #
             # 1.880 -> 1.864 ms, three alternating pairs, every pair a win and
             # the generated text unchanged in all six runs.
+            # Ablation 2026-08-30 (=0): +7 / +11 / +11 µs, hash e86d7dc;
+            # keep default ON.
             #
             # NUM_REQS == 1 only, and it only takes effect on the K-parallel
             # O-proj shape; both are static_asserted rather than silently
@@ -911,6 +1546,8 @@ def get_compile_command(
             # layer's workspace read, so a worker with no W2 tile is reporting
             # the retirement of nothing while still gating the release. At the
             # shipped geometry that is 8 of 31 workers per XCD.
+            # Ablation 2026-08-30 (=0): −15 / −11 / +26 µs, hash e86d7dc all
+            # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_W2_ONLY_ARRIVE"]
         if _opt("MPK_LEAN_ARRIVE"):
             # Remove the two dependent loads that sit in front of the Phase 9
@@ -919,12 +1556,17 @@ def get_compile_command(
             # `s_layer_rel_prev` snapshot). Both counters are monotonic and
             # bounded by the barrier itself, so one division of the value the
             # atomic already returns yields both.
+            # Ablation 2026-08-30 (=0): +46 / +27 / +35 µs, hash e86d7dc on
+            # 5/6 (C1 4dc49423 flake). Keep default ON.
             flags = flags + ["-DMPK_LEAN_ARRIVE"]
         if int(os.environ.get("MPK_W13_BIAS_PF_T0_ONLY", "0")) == 1:
             # Restrict the above to tile 0. Tile 1's MFMA block is register
             # -tighter than tile 0's, so hoisting a second live pair across it
             # can cost more in occupancy than the flat_load wait it removes;
             # this is the control that isolates the two halves.
+            #
+            # Not a valid single-flag A/B while MPK_W13_T1_BIAS_EARLY is on:
+            # the kernel #errors. A/B 2026-08-30 compile-failed all 3 variants.
             flags = flags + ["-DMPK_W13_BIAS_PF_T0_ONLY"]
         if _opt("MPK_W13_T1_BIAS_EARLY"):
             # Recycle-only: issue tile-1 bias after the counted T1-scale wait
@@ -933,6 +1575,8 @@ def get_compile_command(
             # 1.783/1.766 ms (control/variant), all text bit-identical; direct
             # W13 timing moved compute 7.52 -> 7.32 us. The kernel enforces
             # the required recycle/bias flags.
+            # Ablation 2026-08-30 (=0): +4 / +27 / +3 µs, hash e86d7dc;
+            # keep default ON.
             flags = flags + ["-DMPK_W13_T1_BIAS_EARLY"]
         if _opt("MPK_ROUTER_FUSED_DP"):
             # Fold the router dot product into the RMSNorm's ssq pass. irms is
@@ -964,7 +1608,37 @@ def get_compile_command(
             # (-0.001 / -0.006 / -0.005) and the generated text is unchanged,
             # which for a strictly-fewer-instructions change on a strictly
             # worse data path is the expected shape of the result.
+            # Ablation 2026-08-30 (=0): +36 / −18 / +22 µs, hash e86d7dc all
+            # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_ROUTER_DUAL_REDUCE"]
+        if int(os.environ.get("MPK_ROUTER_XCD_FOLD", "0")) == 1:
+            # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
+            # C 1.708/1.707/1.711 vs V 1.900/1.861/1.882, hashes
+            # 69fb06ae / 3f6ec50e / 7b27990e vs control 96a92716. Three
+            # different variant hashes = torn cache line at the 368-col
+            # XCD boundary (736 % 128 != 0) plus 8 syncthreads/inv.
+            # Neighbor-wait fix is in the kernel; do not default-on.
+            # Requires TREE_BARRIER + FUSED_DP. Host counter_size +128.
+            flags = flags + ["-DMPK_ROUTER_XCD_FOLD"]
+        if _opt("MPK_MOE_XCD_PAIR"):
+            # Static per-XCD-pair MoE map: one selected expert per XCD
+            # pair (expert_idx = xcd>>1, 23+23 groups), TopK publishes each
+            # pick to that pair as a u64, W13 uses the carried id and
+            # route_val = expert_idx+1. Implies EARLY_ROUTING (Phase 7b u64
+            # wait + tile_idx packing).
+            #
+            # A/B 2026-08-31 GPU 3, hash 96a92716 all six:
+            # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
+            # (−64 / −82 / −46 µs). Keep default ON (bs=1).
+            flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
+        elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
+            # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
+            # C 1.711/1.712/1.704 vs V 1.728/1.713/1.732, hashes
+            # 58d947dc / 60c3409f / 071e3461 vs control 96a92716. Fleet
+            # d_mask is compacted ascending, so expert_idx==0 is not the
+            # first-selected expert; also d_routing[carried] can miss the
+            # pick-time st_wt. Do not default-on. Use MPK_MOE_XCD_PAIR.
+            flags = flags + ["-DMPK_EARLY_ROUTING"]
         # The same transform on the LM head's g-group argmax: two `__shfl_xor`
         # steps carrying a (value, index) pair become one interleaved
         # permlane16_swap / permlane32_swap chain. Four ds_bpermute and two
@@ -1007,6 +1681,8 @@ def get_compile_command(
         # -0.007) with the generated text unchanged. The reach is what makes
         # the difference against the router's 1 us: same idiom, but on the
         # prologues rather than once per token.
+        # Ablation 2026-08-30 (=0): −57 / −25 / 0 µs, hash e86d7dc; C1 1.797
+        # and C2 1.756 look like control spikes, pair 3 tie. Keep default ON.
         if _opt("MPK_RMSNORM_DPP_REDUCE"):
             flags = flags + ["-DMPK_RMSNORM_DPP_REDUCE"]
         if _opt("MPK_ML_TABLE_PREFETCH"):
@@ -1035,6 +1711,8 @@ def get_compile_command(
             # (measurement-noise-floor-ctx512). What carries it is that the
             # direct instrument agrees in both sign and magnitude, and that
             # the change is strictly less work on the critical path.
+            # Ablation 2026-08-30 (=0): +21 / −4 / −14 µs, hash e86d7dc all
+            # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_ML_TABLE_PREFETCH"]
         if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
             # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
@@ -1044,6 +1722,9 @@ def get_compile_command(
             # buffer_load_lds -- so the poller sees the release late by its own
             # prefetch's latency. Waves 1-3 are idle during the spin and keep
             # their share.
+            # A/B 2026-08-30: +45 / +8 / +18 µs, hash e86d7dc all six.
+            # Holding wave 0 out of prefetch costs more than it saves on the
+            # poll. Stays opt-in. Do not retry.
             flags = flags + ["-DMPK_QKV_PF_WAVE_SPLIT"]
         # The MoE W13 tile-space padding must be a whole scheduling round, i.e.
         # 8 * workers_per_xcd, and the host computes it from the same variable.
@@ -1064,6 +1745,8 @@ def get_compile_command(
             # makes chunk k's accumulate depend on chunk k-1's max, so the 31
             # o loads cannot overlap. Two-pass reduces the lse values first,
             # then every weight is known and all 31 o loads issue independently.
+            # Ablation 2026-08-30 (=0): +40 / +4 / +18 µs; variant hash
+            # 2c80f6a3 vs e86d7dc (rescale reassociation). Keep default ON.
             flags = flags + ["-DMPK_MERGE_TWO_PASS"]
         if _opt("MPK_MERGE_KV_OUTER"):
             # Interchange the split-KV merge's loop nest to KV-outer/dim-inner.
@@ -1075,7 +1758,24 @@ def get_compile_command(
             # within a kv step, replacing 4 B accesses at an 8 B stride with one
             # wide load. The merge is serial on the last chunk worker and the
             # per-XCD barrier waits on it.
+            # Ablation 2026-08-30 (=0): +17 / +22 / +21 µs; variant hash
+            # 9e5e10aa vs e86d7dc. Keep default ON.
             flags = flags + ["-DMPK_MERGE_KV_OUTER"]
+        if int(os.environ.get("MPK_MERGE_WIDE_DIM", "0")) == 1:
+            # GPT-OSS merge probe: use 16 lanes/head instead of 32. This halves
+            # redundant LSE/exp2 work and widens each chunk's O load from
+            # dwordx2 to dwordx4 while preserving per-dimension arithmetic.
+            # Phase-slot decode (start_iter=70): rank-22 O-proj span −0.46 us/layer
+            # (~−17 us/token) vs control, MoE unchanged, instrumented decode
+            # 1.861 vs 1.866 ms. Not adopted — inside noise.
+            # A/B 2026-08-30: −23 / +6 / −6 µs, hash e86d7dc all six.
+            # Only pair 1 >10 µs (C1 1.757). Stays opt-in.
+            flags = flags + ["-DMPK_MERGE_WIDE_DIM"]
+        if int(os.environ.get("MPK_MERGE_O_PRELOAD", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Load-all then FMA in two-pass
+            # merge. Hash e86d7dc all six. A/B −26 / +28 / −3 µs. C1 1.753
+            # spike; V2 1.750. Stays opt-in. Do not retry.
+            flags = flags + ["-DMPK_MERGE_O_PRELOAD"]
         if _opt("MPK_ROUTING_DERIVED_EPOCH"):
             # Derive the Phase 7b release epoch from layer_epoch instead of
             # reading the flag back from HBM. The read-back is a dependent,
@@ -1089,6 +1789,8 @@ def get_compile_command(
             # -23/+7/-10 us/token (variant-control), all text bit-identical.
             # The two losses are within noise; aggregate median improved
             # 1.773 -> 1.760 ms/token.
+            # Ablation 2026-08-30 (=0): +14 / +31 / +4 µs, hash e86d7dc all
+            # six. Keep default ON.
             flags = flags + ["-DMPK_ROUTING_DERIVED_EPOCH"]
         if int(os.environ.get("MPK_ROUTING_LANE_RELEASE", "0")) == 1:
             # TESTED AND NOT ADOPTED (correct, but neutral: 2.022 vs 2.025
@@ -1174,6 +1876,33 @@ def get_compile_command(
             # Kept as a separate knob rather than folded into
             # MPK_W13_LINEAR_LOAD, which is a win on its own.
             flags = flags + ["-DMPK_W2_LINEAR_LOAD"]
+        if int(os.environ.get("MPK_W2_T1_LINEAR_LOAD", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed). Linear 23-chunk W2 T1 reload.
+            # Hash e86d7dc all six. A/B +7 / −29 / −4 µs. Only pair 2 >10 µs
+            # (C2 1.749 spike). Stays opt-in. Do not retry at the post-T0 site.
+            flags = flags + ["-DMPK_W2_T1_LINEAR_LOAD"]
+        if int(os.environ.get("MPK_W2_T1_DURING_EPI", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss). T1 stripe under T0 epilogue.
+            # Hash e86d7dc all six. A/B +44 / 0 / +12 µs. Stays opt-in.
+            # Do not retry T1 DMA under the epilogue.
+            flags = flags + ["-DMPK_W2_T1_DURING_EPI"]
+        if int(os.environ.get("MPK_W2_SCALE_OVERLAP", "0")) == 1:
+            # TESTED AND NOT ADOPTED (mixed/noise). Skip lgkmcnt before W2
+            # scale LDS scatter. Hash e86d7dc all six. A/B −1 / −26 / −11 µs.
+            # Pairs 2–3 clear 10 µs but C2 1.760 is a control spike; variants
+            # sit at 1.734–1.738 vs C1 1.739. Stays opt-in.
+            flags = flags + ["-DMPK_W2_SCALE_OVERLAP"]
+        if int(os.environ.get("MPK_OPROJ_A_PAD_HOIST", "0")) == 1:
+            # TESTED AND NOT ADOPTED. Hoist a[4:7] zeros once per tile.
+            # First A/B −25 / −39 / +8 µs (C1/C2 1.745 slow-ish). Confirm
+            # C=ON V=0: −11 / +13 / +1; C3 hash b6f3e18 flake. Off is not a
+            # 2/3 loss, ON is not a 2/3 confirm. Reverted to opt-in.
+            flags = flags + ["-DMPK_OPROJ_A_PAD_HOIST"]
+        if int(os.environ.get("MPK_OPROJ_NEXT_WT", "0")) == 1:
+            # TESTED AND NOT ADOPTED (loss/neutral). Prefetch KI+1 weight
+            # before MFMA KI. Hash e86d7dc all six. A/B +15 / −2 / +6 µs.
+            # C1 1.716 is a fast control; no pair wins >10 µs. Stays opt-in.
+            flags = flags + ["-DMPK_OPROJ_NEXT_WT"]
         if int(os.environ.get("MPK_DRAIN_OVERLAP", "0")) == 1:
             # Measurement arm, NOT a shipping mode. Moves Phase 9's
             # `s_waitcnt vmcnt(0)` from before the arrival to after it, so the
@@ -1209,6 +1938,8 @@ def get_compile_command(
             # ~7.7 us per worker per layer. 2.482 -> 2.456 ms/iter at B=1
             # seq 512. Only applies to the fused-layer path; the LM-head
             # variant is excluded because it uses input slots 24..27 itself.
+            # Ablation 2026-08-30 (=0): −4 / +41 / +63 µs; V1 hash 08e135e4
+            # vs e86d7dc, pairs 2–3 e86d7dc. Keep default ON.
             flags = flags + ["-DMPK_PREFETCH_NEXT_QKV"]
         # Timing-only. Deletes the QKV weight HBM->LDS DMA from the GEMM
         # kernel outright, leaving garbage weights in LDS -- numerics are

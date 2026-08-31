@@ -322,7 +322,9 @@ __device__ __attribute__((noinline)) void
                   void *routing_indices_ptr,
                   void *active_expert_ids_ptr,
                   void *gang_counter_ptr,
-                  int num_active_tokens) {
+                  int num_active_tokens,
+                  int *early_routing_ready = nullptr,
+                  unsigned int early_routing_epoch = 0) {
   constexpr int CHUNK_N = NUM_EXPERTS / 8;
   int xcd_id = get_xcd_id();
   void *logits_base = static_cast<T *>(logits_scratch_ptr) -
@@ -358,7 +360,9 @@ __device__ __attribute__((noinline)) void
                                                      active_expert_ids_ptr,
                                                      0,
                                                      NUM_EXPERTS,
-                                                     true);
+                                                     true,
+                                                     early_routing_ready,
+                                                     early_routing_epoch);
 
   // Reset counter for the next layer's use.
   if (threadIdx.x == 0) {
