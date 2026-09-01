@@ -324,3 +324,64 @@ def pack_mxfp4_workgroup(blocks: torch.Tensor, scales: torch.Tensor,
     packed = torch.cat([data_flat, sc_flat], dim=2)
     assert packed.shape == (E, expert_wgs, wg_bytes)
     return packed.contiguous()
+
+
+def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
+                                    output_per_wg: int = 16) -> torch.Tensor:
+    """Repack packed O-proj workgroups into lane-native K128 fragments.
+
+    Ported from fleet's `demo/gpt_oss/demo.py`, which is the definition of the
+    layout `-DMPK_OPROJ_KMAJOR` compiles the kernel to expect. The only change
+    is that this accepts the rank-3 `[1, n_wgs, wg_bytes]` that
+    `pack_mxfp4_workgroup` returns as well as fleet's rank-2, and gives back
+    whichever rank it was handed.
+
+    The data prefix goes from ``[row, k128, quarter, 16B]`` to
+    ``[k128, quarter, row, 16B]``; the scale suffix stays row-major. Since
+    ``lane_id == quarter * 16 + row`` for the 16x16x128 MFMA A operand, the new
+    order puts lane L's fragment at byte ``L * 16`` of its K128 block, so a
+    wave reads 64 consecutive 16-byte chunks instead of 16-way-conflicting on a
+    2048-byte row stride. See the MPK_OPROJ_KMAJOR block in
+    gang_linear_mxfp4_res_bias_rmsnorm_topk_mi300.cuh.
+
+    This is a permutation, not a requantization -- every lane still receives
+    exactly the bytes it received before, so results are bit-exact.
+
+    **Host and kernel must agree.** Applying this without -DMPK_OPROJ_KMAJOR,
+    or the reverse, is not a build error and not a crash: every lane reads a
+    valid byte, just the wrong one. The symptom is silently wrong logits.
+    """
+    squeezed = False
+    if packed.ndim == 3:
+        if packed.shape[0] != 1:
+            raise ValueError(
+                f"expected a single-expert O-proj tile, got E={packed.shape[0]}")
+        packed = packed.squeeze(0)
+        squeezed = True
+    if packed.ndim != 2:
+        raise ValueError(
+            f"expected a rank-2 [n_wgs, wg_bytes] O-proj tile, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg != 16:
+        raise ValueError(
+            "the K-major O-proj layout is defined for 16-row tiles only "
+            f"(got output_per_wg={output_per_wg}); the kernel-side "
+            "static_assert enforces the same thing")
+
+    n_wgs, wg_bytes = packed.shape
+    # Solve for the reduction size: each row costs K/2 data bytes + K/32
+    # scale bytes, so wg_bytes = OPW * K * (1/2 + 1/32).
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(
+            f"wg_bytes={wg_bytes} is not a valid MXFP4 record for "
+            f"output_per_wg={output_per_wg}")
+    k128_blocks = reduction // 128
+
+    data = packed[:, :data_bytes].reshape(
+        n_wgs, output_per_wg, k128_blocks, 4, 16)
+    # [wg, row, k128, quarter, byte] -> [wg, k128, quarter, row, byte]
+    data = data.permute(0, 2, 3, 1, 4).reshape(n_wgs, data_bytes)
+    out = torch.cat([data, packed[:, data_bytes:]], dim=1).contiguous()
+    return out.unsqueeze(0).contiguous() if squeezed else out

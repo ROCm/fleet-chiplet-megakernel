@@ -443,22 +443,28 @@ class GptOssPreTrainedModel(PreTrainedModel):
 
 
 class GptOssModel(GptOssPreTrainedModel):
-    def __init__(self, config: GptOssConfig, world_size: int, max_num_pages: int, page_size: int):
+    def __init__(self, config: GptOssConfig, world_size: int, max_num_pages: int, page_size: int,
+                 kv_layout: str = "native", kv_pool=None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        key_cache = torch.empty(
-            (config.num_hidden_layers, max_num_pages, page_size,
-             config.num_key_value_heads // world_size, config.head_dim),
-            dtype=torch.bfloat16, device="cuda",
-        )
-        value_cache = torch.empty(
-            (config.num_hidden_layers, max_num_pages, page_size,
-             config.num_key_value_heads // world_size, config.head_dim),
-            dtype=torch.bfloat16, device="cuda",
-        )
-        self.kv_cache = (key_cache, value_cache)
+        # KV storage is behind KVPool so the same model can run on fleet's own
+        # layer-major tensors or directly on vLLM's per-layer
+        # (2, blocks, block_size, n_kv, head) pool. Both present the identical
+        # `kv_cache[side][layer]` 4-D view the kernels attach to; see kv_pool.py.
+        from kv_pool import KVPool
+        if kv_pool is not None:
+            self.kv_cache = kv_pool
+        elif kv_layout == "vllm":
+            self.kv_cache = KVPool.allocate_vllm_like(
+                config.num_hidden_layers, max_num_pages, page_size,
+                config.num_key_value_heads // world_size, config.head_dim)
+        else:
+            self.kv_cache = KVPool.allocate_native(
+                config.num_hidden_layers, max_num_pages, page_size,
+                config.num_key_value_heads // world_size, config.head_dim)
+        print(self.kv_cache.describe())
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([
@@ -488,20 +494,24 @@ class GptOssModel(GptOssPreTrainedModel):
 
 class GptOssForCausalLM(GptOssPreTrainedModel):
     def __init__(self, config: GptOssConfig, world_size: int = 1,
-                 max_num_pages: int = 16, page_size: int = 4096):
+                 max_num_pages: int = 16, page_size: int = 4096,
+                 kv_layout: str = "native", kv_pool=None):
         super().__init__(config)
-        self.model = GptOssModel(config, world_size, max_num_pages, page_size)
+        self.model = GptOssModel(config, world_size, max_num_pages, page_size,
+                                 kv_layout=kv_layout, kv_pool=kv_pool)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, world_size=1,
-                        max_num_pages=16, page_size=4096, **kwargs):
+                        max_num_pages=16, page_size=4096,
+                        kv_layout="native", kv_pool=None, **kwargs):
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         model = cls(config, world_size=world_size,
-                    max_num_pages=max_num_pages, page_size=page_size)
+                    max_num_pages=max_num_pages, page_size=page_size,
+                    kv_layout=kv_layout, kv_pool=kv_pool)
 
         import glob
         import os

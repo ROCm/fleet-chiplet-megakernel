@@ -1220,6 +1220,22 @@ class PersistentKernel:
         self._is_compiled = False
         self._dummy_counter = 0
         self._dummy_tensor_refs = []  # prevent GC of dummy tensors (pointer reuse)
+        # Every tensor ever passed to attach_input, kept alive for the kernel's
+        # lifetime. attach_torch_tensor (graph.cc) stores nothing but the raw
+        # data_ptr(), and runtime.cc then bakes that address into the generated
+        # source as a literal -- so the C++ side holds no reference and cannot
+        # keep the allocation alive. If the caller drops its last Python
+        # reference and torch.cuda.empty_cache() runs, the block is returned to
+        # the driver and unmapped, and the kernel dereferences an address that
+        # is no longer valid memory.
+        #
+        # Note the two distinct failure modes, because only one of them is
+        # loud: without empty_cache() the block stays mapped in torch's
+        # allocator and the kernel reads whatever is reallocated there --
+        # plausible, wrong output, no error. With empty_cache() it is a
+        # "Memory access fault ... Reason: Unknown" naming an address that
+        # resolves to no live tensor. This list makes both impossible.
+        self._attached_tensor_refs = []
         if mode not in valid_persistent_kernel_modes:
             raise ValueError(f"Invalid persistent kernel mode: {mode}")
         self.mode = mode
@@ -1313,6 +1329,11 @@ class PersistentKernel:
         t = self.kn_graph.new_input(dims=dims, strides=strides, dtype=dtype)
         # FIXME: currently assert that name is not None
         assert name is not None
+        # Take a reference BEFORE handing the pointer across, so the tensor
+        # cannot be collected between here and the kernel's last launch. See
+        # _attached_tensor_refs in __init__ for why the C++ side cannot do this
+        # itself, and for the two ways it fails when nobody does.
+        self._attached_tensor_refs.append(torch_tensor)
         self.kn_graph.attach_torch_tensor(t, torch_tensor, name)
         return t
 
