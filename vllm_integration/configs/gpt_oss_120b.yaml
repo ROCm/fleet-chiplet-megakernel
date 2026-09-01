@@ -104,6 +104,62 @@ build:
   ## the prefetch and nothing else.
   w13_prefetch_toggle: true
 
+  ## Fleet's shipped-on optimization set.
+  ##
+  ## Every one of these is #ifdef-gated in fleet's headers with NO default, and
+  ## fleet turns them on from python/mirage/mpk/persistent_kernel.py via
+  ## mpk_opt(), whose contract is "default ON; MPK_<name>=0 disables". That build
+  ## path is mirage's, which this tree deliberately does not use -- so before
+  ## this list existed we compiled fleet's headers with every optimization
+  ## inside them switched OFF. We were running fleet's slow path while including
+  ## fleet's fast code. That, not the header pin, is the bulk of the gap against
+  ## fleet's own 1.835 ms.
+  ##
+  ## Listed explicitly rather than derived: fleet's set for gpt-oss-120b at
+  ## batch 1, transcribed at upstream 2ee5278. Two of fleet's are deliberately
+  ## absent --
+  ##   MPK_OPROJ_KMAJOR   host-coupled. It repacks the O-proj tiles host-side,
+  ##                      and fleet's own demo warns that setting it on one side
+  ##                      only is SILENTLY WRONG numerics. Needs the plugin's
+  ##                      packer first.
+  ##   MPK_NDEBUG         disables device asserts. The instrumentation is worth
+  ##                      more here than the cycles, and it is the one flag
+  ##                      whose "win" cannot be verified by measurement.
+  ##
+  ## Dependency edges the headers enforce with #error, which is why the order
+  ## here is not arbitrary:
+  ##   ROUTER_DUAL_REDUCE      needs ROUTER_FUSED_DP
+  ##   W13_PREQUANT            needs ROUTER_FUSED_DP, and batch 1
+  ##   W13_T0_COUNTED_HANDOFF  needs W13_PREQUANT and W13_LINEAR_LOAD
+  extra_defines:
+    - MPK_ROUTER_FUSED_DP
+    - MPK_ROUTER_DUAL_REDUCE
+    - MPK_W13_LINEAR_LOAD
+    - MPK_W13_T1_LINEAR_LOAD
+    - MPK_W13_PREQUANT
+    - MPK_W13_T0_COUNTED_HANDOFF
+    - MPK_W13_T0_MFMA_UNROLLED
+    - MPK_W2_T0_MFMA_UNROLLED
+    - MPK_W13_T1_EARLY_SCALE_LOAD
+    - MPK_W13_T1_SPLIT_LDS_STAGE
+    - MPK_W13_BIAS_PREFETCH
+    - MPK_W2_CONSUMER_GATE
+    - MPK_W2_ONLY_ARRIVE
+    - MPK_WIDE_FP8_QUANT
+    - MPK_XCD_LOCAL_BARRIER
+    - MPK_OPROJ_TREE_BARRIER
+    - MPK_OPROJ_NO_WB
+    - MPK_ONE_NORM_WRITER
+    - MPK_LEAN_ARRIVE
+    - MPK_QKV_LDS_NORM
+    - MPK_QKV_PREFETCH_SCALES
+    - MPK_RMSNORM_DPP_REDUCE
+    - MPK_TOPK_LOCAL_MAX3
+    - MPK_ML_TABLE_PREFETCH
+    - MPK_MERGE_TWO_PASS
+    - MPK_MERGE_KV_OUTER
+    - MPK_ATTN_SLICE_RELEASE
+
 measured:
   ## Search results, not derivations. Each carries the alternative that was tried
   ## and what it cost, so the next person does not re-run the experiment.
