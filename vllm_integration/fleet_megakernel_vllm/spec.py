@@ -294,6 +294,13 @@ def _moe_spec(cfg, config_stem, so_path):
         "oproj_output_per_wg": cfg.oproj_opw,
         "w13_output_per_wg": cfg.w13_output_per_wg,
         "w2_output_per_wg": cfg.w2_output_per_wg,
+        # Not a tile size: it says which LAYOUT the .so was compiled to read the
+        # O-proj tile in. MPK_OPROJ_KMAJOR rewrites the kernel's LDS address
+        # arithmetic, and the host must repack to match; one side without the
+        # other is silently wrong numerics, not a crash. Read off the same
+        # build.extra_defines list that emits the -D, so the plugin cannot
+        # disagree with the binary it is about to load.
+        "oproj_kmajor": "MPK_OPROJ_KMAJOR" in cfg.extra_defines,
     }
 
     stem = cfg.name_clean

@@ -1421,6 +1421,50 @@ def emit_extra_defines(cfg: ModelConfig) -> str:
     return "".join(f"    -D{d} \\\n" for d in cfg.extra_defines)
 
 
+def emit_oproj_kmajor_shuffle(cfg: ModelConfig) -> str:
+    """The host half of MPK_OPROJ_KMAJOR, derived from the same YAML entry.
+
+    MPK_OPROJ_KMAJOR is a TWO-SIDED contract: the flag rewrites the kernel's
+    LDS address arithmetic, and the host must repack the O-proj tile to match.
+    Get one side without the other and it is not a build error and not a
+    crash -- every lane still reads a valid byte of the tile, just the wrong
+    one -- so the model emits plausible wrong logits. Fleet's own demo carries
+    the same warning.
+
+    Which is why this is DERIVED from build.extra_defines rather than being a
+    second knob someone has to remember to flip in step. The flag being in the
+    list is what puts the shuffle in the driver; there is no way to express
+    the broken half-configuration.
+
+    The kernel-side static_assert requires a 16-row tile, and so does the
+    shuffle (lane_id spans exactly 16 rows x 4 K-quarters, which is what makes
+    lane_id * 16 the fragment address). Assert it here too so the mismatch is
+    a generation-time error naming oproj_output_per_wg, rather than a
+    compile-time error inside a header.
+    """
+    if "MPK_OPROJ_KMAJOR" not in cfg.extra_defines:
+        return ""
+    if cfg.oproj_opw != 16:
+        raise ValueError(
+            f"MPK_OPROJ_KMAJOR needs oproj_output_per_wg=16, got "
+            f"{cfg.oproj_opw}; the kernel-side static_assert says the same")
+    return (
+        "        # MPK_OPROJ_KMAJOR is on: repack [row, k128, quarter, 16B] ->\n"
+        "        # [k128, quarter, row, 16B] so lane L's fragment sits at byte\n"
+        "        # L*16 of its K128 block and the wave reads 64 consecutive\n"
+        "        # 16-byte chunks instead of 16-way-conflicting on the 2048-byte\n"
+        "        # row stride. A permutation, not a requantization -- bit-exact.\n"
+        "        o_packed = shuffle_oproj_workgroups_kmajor(o_packed, OPROJ_OPW)\n")
+
+
+def emit_oproj_kmajor_import(cfg: ModelConfig) -> str:
+    """Import the shuffle only where it is used, so the dense drivers are
+    byte-identical to what they were before this flag existed."""
+    if "MPK_OPROJ_KMAJOR" not in cfg.extra_defines:
+        return ""
+    return ",\n    shuffle_oproj_workgroups_kmajor"
+
+
 def emit_header_root(cfg: ModelConfig) -> str:
     """The shell variable naming the megakernel header tree, plus its rationale.
 
@@ -4588,7 +4632,7 @@ from safetensors import safe_open
 # points build different slabs for the same kernel.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fleet_megakernel_vllm.mxfp4_pack import (  # noqa: E402
-    pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup)
+    pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup{emit_oproj_kmajor_import(cfg)})
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -5044,6 +5088,7 @@ def main():
             o_blocks, o_scales, output_per_wg=OPROJ_OPW,
             target_out_dim=HIDDEN_SIZE,
             target_num_blocks=OPROJ_REDUCTION // 32)
+{emit_oproj_kmajor_shuffle(cfg)}\
 {emit_weight_append(cfg, 'oproj_weight_base')}
 
         # O-proj bias (zeros)

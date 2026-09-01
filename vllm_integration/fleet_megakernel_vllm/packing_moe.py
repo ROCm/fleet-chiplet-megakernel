@@ -160,8 +160,21 @@ def pack_moe_layer(*, w_q, w_k, w_v, q_bias, k_bias, v_bias, w_o, o_bias,
     # ── [2] O-proj weight: pad rows->PH, cols->num_q*hd, MXFP4 ──
     wo = pad_2d(w_o, target_rows=PH, target_cols=attn_reduction)
     ob_blk, ob_sc = quantize(wo)
-    out.append(pack(ob_blk, ob_sc, output_per_wg=oproj_opw, target_out_dim=PH,
-                    target_num_blocks=attn_reduction // 32))  # [2]
+    o_packed = pack(ob_blk, ob_sc, output_per_wg=oproj_opw, target_out_dim=PH,
+                    target_num_blocks=attn_reduction // 32)
+    if S.gemm.get("oproj_kmajor"):
+        # The .so was compiled with -DMPK_OPROJ_KMAJOR, so the kernel reads this
+        # tile as [k128, quarter, row, 16B] rather than [row, k128, quarter,
+        # 16B]. Repack to match. Skipping this against a K-major .so is not a
+        # crash -- every lane still reads a valid byte of the tile, just the
+        # wrong one -- so it would surface as plausible wrong logits. Both the
+        # flag and this branch come off build.extra_defines (spec.py), which is
+        # what keeps them from drifting apart. The driver does the same thing at
+        # its own O-proj pack site; the two entry points must agree byte for
+        # byte or they build different slabs for the same kernel.
+        from .mxfp4_pack import shuffle_oproj_workgroups_kmajor
+        o_packed = shuffle_oproj_workgroups_kmajor(o_packed, oproj_opw)
+    out.append(o_packed)  # [2]
 
     # ── [3] O-proj bias: pad to PH, packed to [n_wgs, oproj_opw] ──
     ob = o_bias if o_bias is not None else z1(PH)

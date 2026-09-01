@@ -116,15 +116,39 @@ build:
   ## fleet's own 1.835 ms.
   ##
   ## Listed explicitly rather than derived: fleet's set for gpt-oss-120b at
-  ## batch 1, transcribed at upstream 2ee5278. Two of fleet's are deliberately
+  ## batch 1, transcribed at upstream 2ee5278. One of fleet's is deliberately
   ## absent --
-  ##   MPK_OPROJ_KMAJOR   host-coupled. It repacks the O-proj tiles host-side,
-  ##                      and fleet's own demo warns that setting it on one side
-  ##                      only is SILENTLY WRONG numerics. Needs the plugin's
-  ##                      packer first.
   ##   MPK_NDEBUG         disables device asserts. The instrumentation is worth
   ##                      more here than the cycles, and it is the one flag
   ##                      whose "win" cannot be verified by measurement.
+  ##
+  ## MPK_OPROJ_KMAJOR is host-coupled: the flag rewrites the kernel's LDS
+  ## address arithmetic and the host must repack the O-proj tile to match.
+  ## Setting one side only is not a build error and not a crash -- every lane
+  ## reads a valid byte of the tile, just the wrong one -- so it is silently
+  ## wrong numerics, which is why fleet's own demo warns about it. Listing it
+  ## here is what turns the host repack ON: emit_oproj_kmajor_shuffle derives
+  ## the driver's shuffle_oproj_workgroups_kmajor call from this same entry, so
+  ## the broken half-configuration cannot be expressed. Removing it from this
+  ## list removes both halves together.
+  ##
+  ## It is kept on FLEET PARITY, not on measurement: 5 interleaved rounds put it
+  ## at +3.6 us/token median on the device-side layers timer with the sign
+  ## flipping across rounds (-5.2 .. +11.7), and +0.007 ms on wall clock against
+  ## a 0.040 spread. Both read as noise. That is the expected result once the
+  ## disassembly is read -- the flag trades 8 v&lowbar;add3/v&lowbar;lshlrev for 8 v&lowbar;lshl&lowbar;add
+  ## (net -6 instructions) and changes NO memory-op or MFMA count, so any win
+  ## has to come from LDS bank conflicts at run time, and at OPW=16 there are
+  ## not enough to find. Do not re-run this experiment expecting a win; do not
+  ## drop the flag expecting one either. It is here so this tree's flag set
+  ## equals fleet's, which is the thing that was actually worth 0.9 ms.
+  ##
+  ## Measuring it needed a harness change: MPK&lowbar;OPROJ&lowbar;KMAJOR is the first
+  ## host-coupled flag, and ab&lowbar;interleave.sh swapped only the .so, so the
+  ## baseline arm ran the NEW driver against the OLD .so -- the silent
+  ## half-configuration, manufactured by the instrument. It came back as fluent
+  ## garbage at next&lowbar;token=21173. Use DRIVER&lowbar;A / DRIVER&lowbar;B for any flag whose
+  ## effect reaches the host.
   ##
   ## Dependency edges the headers enforce with #error, which is why the order
   ## here is not arbitrary:
@@ -149,6 +173,7 @@ build:
     - MPK_XCD_LOCAL_BARRIER
     - MPK_OPROJ_TREE_BARRIER
     - MPK_OPROJ_NO_WB
+    - MPK_OPROJ_KMAJOR
     - MPK_ONE_NORM_WRITER
     - MPK_LEAN_ARRIVE
     - MPK_QKV_LDS_NORM

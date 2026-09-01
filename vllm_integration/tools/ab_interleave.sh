@@ -27,6 +27,29 @@
 # Writes /tmp/<name>_run<N>.log, then:
 #   python3 tools/compare_runs.py --arm <name-a> /tmp/<name-a>_run*.log \
 #                                 --arm <name-b> /tmp/<name-b>_run*.log
+#
+# Host-coupled arms: DRIVER_A / DRIVER_B
+# --------------------------------------
+# Swapping only the .so assumes the driver is the same for both arms. That
+# holds for every flag whose effect is confined to device code, and it is FALSE
+# for a host-coupled one -- MPK_OPROJ_KMAJOR is the live example: the flag
+# rewrites the kernel's LDS address arithmetic AND the driver must repack the
+# O-proj tile to match. Pair the new driver with the old .so and you have not
+# measured the baseline, you have measured the broken half-configuration, which
+# does not crash and does not fail to build -- every lane reads a valid byte of
+# the tile, just the wrong one. It comes back as fluent garbage and a first
+# token that differs across arms.
+#
+# So for those, give each arm its own driver:
+#   DRIVER_A=/tmp/old_demo.py DRIVER_B=demo_gpt_oss_120b.py \
+#       tools/ab_interleave.sh base /tmp/base.so kmajor /tmp/kmajor.so 2
+#
+# Unset means "use the driver already in the tree" -- the previous behaviour,
+# so existing invocations are unaffected. The live driver is restored on exit
+# exactly like the live .so.
+#
+# Either way, read the per-run "iter 1" line this prints. Two arms that
+# disagree on the first token are not two measurements of the same model.
 
 set -e
 
@@ -38,6 +61,7 @@ ROUNDS="${5:-3}"
 
 MK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LIVE_SO="$MK_DIR/generated/gpt_oss_120b.so"
+LIVE_DRIVER="$MK_DIR/demo_gpt_oss_120b.py"
 MODEL="${MODEL_PATH:-/home/claudeuser/models/gpt-oss-120b}"
 
 # Load-bearing, same as run_arm.sh: a shorter prompt gives artificially low
@@ -49,19 +73,26 @@ MAXLEN=512
 # interrupted A/B does not leave the tree holding whichever arm ran last.
 RESTORE="$(mktemp /tmp/ab_live_XXXX.so)"
 cp "$LIVE_SO" "$RESTORE"
+RESTORE_DRIVER="$(mktemp /tmp/ab_live_XXXX.py)"
+cp "$LIVE_DRIVER" "$RESTORE_DRIVER"
 cleanup() {
     cp "$RESTORE" "$LIVE_SO" && rm -f "$RESTORE"
+    cp "$RESTORE_DRIVER" "$LIVE_DRIVER" && rm -f "$RESTORE_DRIVER"
     rm -f "${STAGE_A:-}" "${STAGE_B:-}" 2>/dev/null || true
+    rm -f "${STAGE_DA:-}" "${STAGE_DB:-}" 2>/dev/null || true
     rm -f /tmp/gpucore* "$MK_DIR"/gpucore* 2>/dev/null || true
-    echo "[ab] restored original $LIVE_SO"
+    echo "[ab] restored original $LIVE_SO and $LIVE_DRIVER"
 }
 trap cleanup EXIT
 
 for so in "$SO_A" "$SO_B"; do
     [ -f "$so" ] || { echo "[ab] no such .so: $so" >&2; exit 2; }
 done
-echo "[ab] A=$NAME_A md5=$(md5sum "$SO_A" | cut -d' ' -f1)"
-echo "[ab] B=$NAME_B md5=$(md5sum "$SO_B" | cut -d' ' -f1)"
+for drv in "${DRIVER_A:-}" "${DRIVER_B:-}"; do
+    [ -z "$drv" ] || [ -f "$drv" ] || { echo "[ab] no such driver: $drv" >&2; exit 2; }
+done
+echo "[ab] A=$NAME_A md5=$(md5sum "$SO_A" | cut -d' ' -f1) driver=${DRIVER_A:-<tree>}"
+echo "[ab] B=$NAME_B md5=$(md5sum "$SO_B" | cut -d' ' -f1) driver=${DRIVER_B:-<tree>}"
 
 # Stage both arms outside the tree BEFORE the loop. The natural way to invoke
 # this is with one arm already installed as the live .so -- and then `cp` sees
@@ -73,10 +104,22 @@ STAGE_B="$(mktemp /tmp/ab_b_XXXX.so)"
 cp "$SO_A" "$STAGE_A"
 cp "$SO_B" "$STAGE_B"
 
+# Same staging argument for the drivers: one arm's driver is typically the one
+# already in the tree, and cp would see source and destination as one file.
+STAGE_DA=""
+STAGE_DB=""
+if [ -n "${DRIVER_A:-}" ]; then
+    STAGE_DA="$(mktemp /tmp/ab_da_XXXX.py)"; cp "$DRIVER_A" "$STAGE_DA"
+fi
+if [ -n "${DRIVER_B:-}" ]; then
+    STAGE_DB="$(mktemp /tmp/ab_db_XXXX.py)"; cp "$DRIVER_B" "$STAGE_DB"
+fi
+
 one_run() {
-    local name="$1" so="$2" i="$3"
+    local name="$1" so="$2" i="$3" drv="${4:-}"
     local log="/tmp/${name}_run${i}.log"
     cp "$so" "$LIVE_SO"
+    [ -z "$drv" ] || cp "$drv" "$LIVE_DRIVER"
     echo "[ab] round $i: $name -> $log"
     # Over ~3 min is hanging, not slow. Bound it and move on.
     cd "$MK_DIR" && HIP_VISIBLE_DEVICES=0 timeout 280 python3 \
@@ -87,6 +130,9 @@ one_run() {
         sleep 3
     }
     grep -h "Non-outlier avg" "$log" || echo "[ab]   (no avg line)"
+    # A host-coupled arm fails as wrong numerics, not as a crash, so surface the
+    # first token every run rather than only at compare time.
+    grep -h -m1 "iter 1: next_token" "$log" || echo "[ab]   (no iter 1 line)"
     # Cores from a crashed run fill the disk fast (it sits at ~95%).
     rm -f /tmp/gpucore* "$MK_DIR"/gpucore* 2>/dev/null || true
 }
@@ -95,11 +141,11 @@ for i in $(seq 1 "$ROUNDS"); do
     # Alternate which arm leads each round, so neither arm always occupies the
     # cold slot right after the other's teardown.
     if [ $((i % 2)) -eq 1 ]; then
-        one_run "$NAME_A" "$STAGE_A" "$i"
-        one_run "$NAME_B" "$STAGE_B" "$i"
+        one_run "$NAME_A" "$STAGE_A" "$i" "$STAGE_DA"
+        one_run "$NAME_B" "$STAGE_B" "$i" "$STAGE_DB"
     else
-        one_run "$NAME_B" "$STAGE_B" "$i"
-        one_run "$NAME_A" "$STAGE_A" "$i"
+        one_run "$NAME_B" "$STAGE_B" "$i" "$STAGE_DB"
+        one_run "$NAME_A" "$STAGE_A" "$i" "$STAGE_DA"
     fi
 done
 

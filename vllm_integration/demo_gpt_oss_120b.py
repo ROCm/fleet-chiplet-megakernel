@@ -32,7 +32,8 @@ from safetensors import safe_open
 # points build different slabs for the same kernel.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fleet_megakernel_vllm.mxfp4_pack import (  # noqa: E402
-    pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup)
+    pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup,
+    shuffle_oproj_workgroups_kmajor)
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -602,6 +603,12 @@ def main():
             o_blocks, o_scales, output_per_wg=OPROJ_OPW,
             target_out_dim=HIDDEN_SIZE,
             target_num_blocks=OPROJ_REDUCTION // 32)
+        # MPK_OPROJ_KMAJOR is on: repack [row, k128, quarter, 16B] ->
+        # [k128, quarter, row, 16B] so lane L's fragment sits at byte
+        # L*16 of its K128 block and the wave reads 64 consecutive
+        # 16-byte chunks instead of 16-way-conflicting on the 2048-byte
+        # row stride. A permutation, not a requantization -- bit-exact.
+        o_packed = shuffle_oproj_workgroups_kmajor(o_packed, OPROJ_OPW)
         weight_tensors.append(o_packed)  # [2] oproj_weight (OPW=16)
 
         # O-proj bias (zeros)
