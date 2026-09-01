@@ -150,6 +150,37 @@ build:
   ## garbage at next&lowbar;token=21173. Use DRIVER&lowbar;A / DRIVER&lowbar;B for any flag whose
   ## effect reaches the host.
   ##
+  ## MPK_SYS_POLL_LOAD is a LEVEL, not a boolean, and that is why it was
+  ## missing from this list for as long as it was. The list below was built by
+  ## scanning fleet's persistent_kernel.py for `_opt(` call sites, which finds
+  ## every boolean flag and structurally cannot find this one: it is set from
+  ## `int(os.environ.get("MPK_SYS_POLL_LOAD", "2"))` at :730, defaulting to 2.
+  ## The gap was caught by reading the `Compiling megakernel using the
+  ## following command line:` banner in fleet's own demo log -- the compiler
+  ## invocation is ground truth, and a scan of the code that BUILDS it is not.
+  ##
+  ## What it does: swaps every release-gate poll from `ld_nt_s32` to
+  ## `ld_sys_s32` (`global_load_dword ... sc0 sc1`). Level 1 converts the
+  ## fused-layer gates (qkv_epoch / attn_release / routing_ready /
+  ## layer_release), level 2 additionally converts the two per-XCD barriers
+  ## inside MoE and O-proj. Six live sites in the headers we compile.
+  ##
+  ## Why it should matter here: `nt` is only an eviction HINT -- it does not
+  ## force a vL1 miss -- so a spin on an `nt` load can keep re-reading a stale
+  ## line until that line ages out. That is a long tail on exactly the sites
+  ## that are already hottest, and this tree's own ATT work
+  ## ([[att-trace-2114us-breakdown]]) put barriers at 12% of decode.
+  ##
+  ## Measured, 3 interleaved rounds, and it is the first flag since the bulk
+  ## transcription that both instruments resolve in the same direction:
+  ##   device `layers`  1802.2 -> 1763.5 us  (-38.7, -1.07 us/layer, -2.14%),
+  ##                    sign held in all 3 rounds, range -40.8 .. -21.8
+  ##   Non-outlier avg  2.111 -> 2.056 ms    (-0.055 vs 0.023 within-arm spread)
+  ## The ISA says why, and it is exactly the predicted edit: instruction counts
+  ## are IDENTICAL (13204 both sides, same mfma/ds/buffer/global mix) and only
+  ## the cache bits move -- 6 global_load_dword go `nt` -> `sc0 sc1`, 16 -> 10
+  ## and 15 -> 21. Six loads, six gate sites, no codegen change.
+  ##
   ## Dependency edges the headers enforce with #error, which is why the order
   ## here is not arbitrary:
   ##   ROUTER_DUAL_REDUCE      needs ROUTER_FUSED_DP
@@ -184,6 +215,7 @@ build:
     - MPK_MERGE_TWO_PASS
     - MPK_MERGE_KV_OUTER
     - MPK_ATTN_SLICE_RELEASE
+    - MPK_SYS_POLL_LOAD=2
 
 measured:
   ## Search results, not derivations. Each carries the alternative that was tried
