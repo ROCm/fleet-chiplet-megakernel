@@ -21,6 +21,74 @@
 
 namespace kernel {
 
+#ifdef MPK_RMSNORM_DPP_REDUCE
+// ── The RMSNorm sum-of-squares wave reduction, off the LDS data path ────────
+//
+// Every RMSNorm prologue in this pipeline finishes its accumulation loop with
+// the same six-step butterfly -- `ssq += __shfl_xor(ssq, off)` for off in
+// 32/16/8/4/2/1 -- and then reads lane 0 and nothing else. `__shfl_xor`
+// lowers to ds_bpermute, so that is six LDS round trips and six lgkmcnt waits
+// for data that never left the register file.
+//
+// All six steps have a VALU-native equivalent on gfx950:
+// `v_permlane32_swap_b32` is xor-32, `v_permlane16_swap_b32` is xor-16, and
+// DPP `row_shl` covers the four intra-row steps. Nothing here touches LDS.
+//
+// Two details are worth stating because both are easy to get wrong:
+//
+// The `s_nop 1` before each stage is required, not defensive. Table 11 of the
+// CDNA4 ISA ("Required Software-inserted Wait States") lists two wait states
+// for `VALU writes VGPR` -> `VALU DPP reads that VGPR`, and the same two for
+// `VALU writes vdst` -> `V_PERMLANE* reads vdst`. Each stage reads a register
+// the previous stage's add just wrote, so each needs the gap. There is no
+// listed hazard in the other direction, which is why the adds follow their
+// swap immediately.
+//
+// The four row_shl stages fold the move into the add: `v_add_f32` takes the
+// DPP swizzle on src0, so one instruction does what a `v_mov_b32_dpp` plus a
+// `v_add_f32` would. Out-of-range lanes read zero under `bound_ctrl:1` and
+// adding zero is a no-op, exactly as it was when the move materialised it.
+//
+// ── Contract: the result is valid in lane 0 ────────────────────────────────
+//
+// This is where it differs from the butterfly it replaces. `__shfl_xor`
+// leaves the total in all 64 lanes; row_shl accumulates toward lane 0 of each
+// row of 16 and leaves the rest holding partial sums. Every caller here reads
+// `if (lane == 0) red[wave] = ssq` and nothing else, so that is all that is
+// promised. Hence the name.
+//
+// Bit-identical at lane 0: the association tree is the same 32/16/8/4/2/1 the
+// shuffles walked, so this does not reassociate the sum. Verified over 8192
+// cases including mixed-magnitude inputs, where a different tree rounds away
+// a different set of addends. See tests/standalone/test_rmsnorm_dpp_reduce.hip.
+__device__ __forceinline__ void rmsnorm_wave_sum_to_lane_zero(float &ssq) {
+  // The swap exchanges one operand's low half with the other's high half, so
+  // seeding the peer with a copy of ssq turns swap-plus-add into the butterfly
+  // step. The DPP stages need no peer at all.
+  float peer = ssq;
+  asm volatile("s_nop 1\n"
+               "v_permlane32_swap_b32 %[s], %[p]\n"
+               "v_add_f32 %[s], %[s], %[p]\n"
+               "v_mov_b32_e32 %[p], %[s]\n"
+               "s_nop 1\n"
+               "v_permlane16_swap_b32 %[s], %[p]\n"
+               "v_add_f32 %[s], %[s], %[p]\n"
+               "s_nop 1\n"
+               "v_add_f32_dpp %[s], %[s], %[s] row_shl:8 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "s_nop 1\n"
+               "v_add_f32_dpp %[s], %[s], %[s] row_shl:4 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "s_nop 1\n"
+               "v_add_f32_dpp %[s], %[s], %[s] row_shl:2 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1\n"
+               "s_nop 1\n"
+               "v_add_f32_dpp %[s], %[s], %[s] row_shl:1 row_mask:0xf "
+               "bank_mask:0xf bound_ctrl:1"
+               : [s] "+v"(ssq), [p] "+v"(peer));
+}
+#endif
+
 namespace gang_rmsnorm_detail {
 using bf16 = __hip_bfloat16;
 
@@ -89,10 +157,17 @@ __device__ __forceinline__ void rmsnorm_inline_amd(void const *input_ptr,
   }
 
 // ── Phase 2: wavefront reduction (AMD wavefront = 64 lanes) ──
+  #ifdef MPK_RMSNORM_DPP_REDUCE
+  // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+  // all the cross-wave publish below reads -- see the contract note at
+  // rmsnorm_wave_sum_to_lane_zero.
+  rmsnorm_wave_sum_to_lane_zero(sum);
+  #else
 #pragma unroll
   for (int offset = 32; offset > 0; offset >>= 1) {
     sum += __shfl_xor(sum, offset);
   }
+  #endif
 
   // ── Phase 3: cross-wavefront reduction via shared memory ──
   // Use a static __shared__ array — independent of CK pipeline's dynamic LDS.
@@ -362,10 +437,17 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   }
 
 // Wave-level reduction (64 lanes)
+  #ifdef MPK_RMSNORM_DPP_REDUCE
+  // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+  // all the cross-wave publish below reads -- see the contract note at
+  // rmsnorm_wave_sum_to_lane_zero.
+  rmsnorm_wave_sum_to_lane_zero(ssq);
+  #else
 #pragma unroll
   for (int off = 32; off > 0; off >>= 1) {
     ssq += __shfl_xor(ssq, off);
   }
+  #endif
 
   // Cross-wave reduction via LDS.
   //
@@ -449,10 +531,17 @@ __device__ __attribute__((noinline)) void gang_rmsnorm_linear_bias_topk_kernel(
   }
 
 // Wave-level reduction for dp
+  #ifdef MPK_RMSNORM_DPP_REDUCE
+  // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+  // all the cross-wave publish below reads -- see the contract note at
+  // rmsnorm_wave_sum_to_lane_zero.
+  rmsnorm_wave_sum_to_lane_zero(dp);
+  #else
 #pragma unroll
   for (int off = 32; off > 0; off >>= 1) {
     dp += __shfl_xor(dp, off);
   }
+  #endif
 
   // Cross-wave LDS reduce. Into red_dp, not red: red[0] is still the irms
   // broadcast that step 2 above reads.

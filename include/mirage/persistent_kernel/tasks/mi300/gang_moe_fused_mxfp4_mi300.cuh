@@ -174,6 +174,133 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "bank-0 tail.");
 #endif
 
+// ── Assembler-unrolled T0 MFMA loops ────────────────────────────────────────
+//
+// These unroll the *unscheduled* ping-pong arm -- the one that runs when
+// MPK_MFMA_PINGPONG_SCHED is off, which is the live configuration. The
+// scheduled arm has a different body (hazard padding, a top-of-loop test and a
+// single tail), so a flag set on top of it would expand nothing and read as a
+// free no-op in a measurement. Fail the build instead of measuring a lie.
+#if defined(MPK_MFMA_PINGPONG_SCHED) &&                                        \
+    (defined(MPK_W13_T0_MFMA_UNROLLED) || defined(MPK_W2_T0_MFMA_UNROLLED))
+#error "MPK_W13_T0_MFMA_UNROLLED / MPK_W2_T0_MFMA_UNROLLED unroll the "        \
+       "unscheduled ping-pong arm and have no effect under "                   \
+       "MPK_MFMA_PINGPONG_SCHED. Drop one of the two."
+#endif
+#ifdef MPK_W13_T0_MFMA_UNROLLED
+  // .rept emits (W13_MFMA_ITERS-1)/2 bank pairs and exactly one bank-0 tail,
+  // which only covers W13_MFMA_ITERS when the count is odd. At an even count
+  // the last K block's operands land in bank 1 and the emitted tail would
+  // re-run block W13_MFMA_ITERS-2 out of bank 0 -- silently wrong rather than a
+  // build error, so catch it here. The branching arm handles both parities.
+  static_assert(W13_MFMA_ITERS % 2 == 1,
+                "MPK_W13_T0_MFMA_UNROLLED assumes an odd W13_MFMA_ITERS "
+                "(W13_K / 128); at an even count use the default branching "
+                "loop, which emits both tails");
+#endif
+#ifdef MPK_W2_T0_MFMA_UNROLLED
+  static_assert(W2_MFMA_ITERS % 2 == 1,
+                "MPK_W2_T0_MFMA_UNROLLED assumes an odd W2_MFMA_ITERS "
+                "(W2_K / 128); at an even count use the default branching "
+                "loop, which emits both tails");
+#endif
+
+// ── Multi-chain MFMA accumulation ───────────────────────────────────────────
+//
+// A scaled MFMA is 32 cycles on CDNA4, and consecutive ops accumulating into
+// the same a[0:3] carry a SrcC RAW dependency that forces 32 states of
+// separation. MPK_MFMA_PINGPONG_SCHED *fills* that gap with `s_nop 15;
+// s_nop 10`. These flags *remove* it: the K reduction is split across
+// independent accumulator chains, so adjacent MFMAs target disjoint SrcC and
+// the cadence drops to 8 states. Each chain is then reused after 16 states,
+// which same-opcode SrcC forwarding permits.
+//
+// That 16-state reuse is not architecturally documented. It is verified on
+// hardware by tests/standalone/test_mfma_pipeline_hazards.hip, which checks
+// both schedules bit-exactly against order-matched references (the chains
+// reassociate the FP32 sum, so a single-chain reference would report
+// rounding as a hazard).
+//
+// The unscheduled arm -- the live one -- has no `s_nop` to delete, but it does
+// not escape the dependency: its two MFMAs sit about eleven issue slots apart
+// (one wait, four address updates, five ds_reads), so the hardware supplies the
+// remaining ~21 states itself. Splitting the chains removes that stall too, and
+// the only thing the flag needs from the schedule is that consecutive MFMAs
+// alternate banks -- which both arms already do. So this is gated on the W13
+// body existing in *some* two-bank form, not on the padding being present.
+#if defined(MPK_MOE_DUAL_ACCUMULATOR)
+#define MPK_W13_DUAL_ACC 1
+  // Unchanged from the single-chain loop: pairs plus one chain-0 tail.
+  static_assert(W13_MFMA_ITERS % 2 == 1,
+                "MPK_MOE_DUAL_ACCUMULATOR requires an odd W13_MFMA_ITERS.");
+#endif
+
+#if defined(MPK_MFMA_PINGPONG_SCHED) && defined(MPK_MOE_QUAD_ACCUMULATOR)
+#define MPK_W2_QUAD_ACC 1
+// One ping-pong pair of the quad-chain W2 body: CH_A consumes bank 0, CH_B
+// bank 1. Both edges are between disjoint chains, so each is 8 states (5
+// issued address updates + s_nop 2, then s_nop 3 + the 4 updates that open
+// the next pair) instead of the 32 a shared accumulator would force.
+#define MPK_W2_QUAD_PAIR(CH_A, CH_B)                                           \
+  "v_add_u32_e32 %[wa], 64, %[wa]\n"                                           \
+  "v_add_u32_e32 %[wsa], 4, %[wsa]\n"                                          \
+  "v_add_u32_e32 %[ta], 0x80, %[ta]\n"                                         \
+  "s_add_i32 s13, s13, 1\n"                                                    \
+  "v_add_u32_e32 v17, s13, %[tsa]\n"                                           \
+  "ds_read_u8   v19, v17\n"                                                    \
+  "ds_read_b128 v[26:29], %[wa]\n"                                             \
+  "ds_read_u8   v18, %[wsa]\n"                                                 \
+  "ds_read_b128 v[32:35], %[ta]\n"                                             \
+  "ds_read_b128 v[36:39], %[ta] offset:64\n"                                   \
+  "v_mfma_scale_f32_16x16x128_f8f6f4 " CH_A ", v[22:25], v[8:15], " CH_A       \
+  ", v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"                                       \
+  "v_add_u32_e32 %[wa], 64, %[wa]\n"                                           \
+  "v_add_u32_e32 %[wsa], 4, %[wsa]\n"                                          \
+  "v_add_u32_e32 %[ta], 0x80, %[ta]\n"                                         \
+  "s_add_i32 s13, s13, 1\n"                                                    \
+  "v_add_u32_e32 v17, s13, %[tsa]\n"                                           \
+  "s_nop 2\n"                                                                  \
+  "s_waitcnt lgkmcnt(0)\n"                                                     \
+  "v_mfma_scale_f32_16x16x128_f8f6f4 " CH_B ", v[26:29], v[32:39], " CH_B      \
+  ", v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"                                      \
+  "ds_read_u8   v16, v17\n"                                                    \
+  "ds_read_b128 v[22:25], %[wa]\n"                                             \
+  "ds_read_u8   v7, %[wsa]\n"                                                  \
+  "ds_read_b128 v[8:11], %[ta]\n"                                              \
+  "ds_read_b128 v[12:15], %[ta] offset:64\n"                                   \
+  "s_nop 3\n"                                                                  \
+  "s_waitcnt lgkmcnt(0)\n"
+  // The quad body consumes four K blocks per trip and leaves a three-MFMA
+  // tail on chains 0/1/2, so K block k lands on chain k % 4 throughout.
+  static_assert(W2_MFMA_ITERS % 4 == 3,
+                "MPK_MOE_QUAD_ACCUMULATOR requires W2_MFMA_ITERS % 4 == 3: "
+                "the scheduled loop emits 4*trips + 3 MFMAs.");
+#endif
+
+// ── W2 epilogue overlap ─────────────────────────────────────────────────────
+//
+// The `s_nop 15; s_nop 15` after the last W2 MFMA exists for Hazard 2: an
+// AccVGPR read must not beat the eight-pass MFMA to retirement. Under the quad
+// schedule three of the four chains matured several MFMAs earlier, so that
+// wait can be *spent* instead of idled -- read and merge the mature chains
+// first, and touch the final MFMA's chain last.
+//
+// The final MFMA of the tail writes a[8:11]. Reading a12..a15, a0..a3, a4..a7
+// and issuing the eight merge adds puts 20 instructions between that MFMA and
+// the first read of a8 -- above the 11-clock retirement threshold measured on
+// gfx950 (fleet pads to 32 to stay clear of it). The three chains read early
+// are each well past their own last write: a[4:7] by ~18 states, a[0:3] by
+// ~24, a[12:15] by an entire loop trip.
+//
+// The merge order is unchanged from the padded arm (c0, c1, c3, c2), so this
+// flag is a pure scheduling change -- it must not move a single ULP.
+#if defined(MPK_W2_QUAD_ACC) && defined(MPK_MOE_W2_EPILOGUE_OVERLAP)
+#define MPK_W2_EPI_OVERLAP 1
+#elif defined(MPK_MOE_W2_EPILOGUE_OVERLAP)
+#error                                                                         \
+    "MPK_MOE_W2_EPILOGUE_OVERLAP needs MPK_MOE_QUAD_ACCUMULATOR (+ MPK_MFMA_PINGPONG_SCHED): with one accumulator chain there is no mature chain to read during the wait."
+#endif
+
   // Common constants
   constexpr int K_PER_MFMA = 128; // FP4/FP8 MFMA: 16x16x128
   constexpr int NUM_WAVES = 4;
@@ -635,6 +762,125 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         expert_weight, static_cast<uint32_t>(W13_EXPERT_BYTES));
     uint32_t w13_wg_voff_base = static_cast<uint32_t>(wg_idx) * W13_WG_BYTES;
 
+#ifdef MPK_W13_T0_COUNTED_HANDOFF
+#ifndef MPK_W13_PREQUANT
+#error                                                                         \
+    "MPK_W13_T0_COUNTED_HANDOFF reorders the prequantized-activation handoff ahead of the weight burst. Without MPK_W13_PREQUANT there is no handoff -- the activation is quantized in place from BF16 -- and nothing to hoist."
+#endif
+#ifndef MPK_W13_LINEAR_LOAD
+#error                                                                         \
+    "MPK_W13_T0_COUNTED_HANDOFF moves the tile-0 weight drain past the Phase B barrier, which is only sound when each wave issues every request filling the tile it reads. That is MPK_W13_LINEAR_LOAD; the striped load interleaves all four waves across all four tiles."
+#endif
+    static_assert(SINGLE_TOK,
+                  "MPK_W13_T0_COUNTED_HANDOFF sweeps one contiguous activation "
+                  "row. The packed multi-row path gathers per token and has no "
+                  "single payload to issue ahead of the weights.");
+    // ── Handoff payload issued ahead of the tile-0 weight burst ─────────────
+    //
+    // Two reads have to happen before the MFMA can start: the prequantized
+    // activation row the router published, and this workgroup's W13 block
+    // scales. The default schedule issues both *after* the 23 KiB tile-0
+    // weight burst, and gfx950 retires VMEM strictly in issue order -- so
+    // waiting for either of them means `vmcnt(0)`, which waits for all 23 KiB
+    // of weights the MFMA has not asked for yet. The activation copy and the
+    // scale scatter, neither of which touches a weight byte, end up gated on
+    // the whole weight fetch.
+    //
+    // Issued here instead, they are the *oldest* requests in the queue, so a
+    // counted wait can retire exactly them: `vmcnt(25)` leaves the 2 scale and
+    // 23 weight requests untouched, and `vmcnt(23)` later leaves the 23 weight
+    // requests untouched. The weights keep flying underneath both rendezvous.
+    //
+    // Every count below is per *wave*, because vmcnt is a per-wave counter, so
+    // the arithmetic is only sound if all four waves issue the same number of
+    // requests. The two work splits are therefore chosen to be wave-uniform
+    // rather than thread-uniform -- see each one. That is the whole reason
+    // this is not simply the existing code moved up.
+    constexpr int PQ_DW4 = W13_K / 16;               // 184 activation
+    constexpr int PQ_SC = W13_K / 128;               // 23 scale bytes
+    constexpr int PQ_SC_DW4 = (PQ_SC + 15) / 16;     // 2
+    constexpr int PQ_TOTAL_DW4 = PQ_DW4 + PQ_SC_DW4; // 186
+    // Ceiling, so wave 3 covers the remainder. 47*4 == 188 >= 186, and the
+    // two surplus units fall off the end under the `< PQ_TOTAL_DW4` test --
+    // wave 3 still has 45 live lanes, so it issues the load like everyone
+    // else. A floor here would leave the tail unfetched.
+    constexpr int PQ_DW4_PER_WAVE =
+        (PQ_TOTAL_DW4 + NUM_WAVES - 1) / NUM_WAVES; // 47
+    static_assert(PQ_DW4_PER_WAVE <= 64,
+                  "one dwordx4 per lane per wave is what makes the activation "
+                  "cost exactly one VMEM request per wave");
+    static_assert((NUM_WAVES - 1) * PQ_DW4_PER_WAVE < PQ_TOTAL_DW4,
+                  "the last wave must have at least one live lane, or it "
+                  "issues no request and its vmcnt below is off by one");
+    // The scale bytes ride the same sweep as the data rather than taking a
+    // second request. They are contiguous with the data in the source (the
+    // router wrote FP8 then E8M0 into one allocation) but not in LDS, where
+    // the token region is padded to W13_TOK_ROW_STRIDE. Both bases are
+    // 16-aligned and the gap is exactly one dwordx4, so the destination is the
+    // source unit shifted by one past the data -- no repacking, no second
+    // load.
+    static_assert(W13_TOK_ROW_STRIDE - W13_K == 16,
+                  "the LDS scale base is assumed to sit exactly one dwordx4 "
+                  "past the end of the token data");
+    static_assert(LDS_W13_OFF >= W13_TOK_ROW_STRIDE + PQ_SC_DW4 * 16,
+                  "the scale sweep rounds up to a whole dwordx4 and would "
+                  "spill past the token staging region into the W13 tiles");
+    // Source over-read: `input_base` is sized for the BF16 row this path
+    // replaced (2 bytes/elem), and the payload is 1 byte/elem plus one byte
+    // per 128, so the sweep ends far inside the allocation.
+    static_assert(PQ_TOTAL_DW4 * 16 <= W13_K * 2,
+                  "the rounded-up sweep reads past the handoff allocation");
+
+    i32x4_t pq_chunk;
+    int const pq_unit = warp_id * PQ_DW4_PER_WAVE + lane_id;
+    bool const pq_active = lane_id < PQ_DW4_PER_WAVE && pq_unit < PQ_TOTAL_DW4;
+    if (pq_active) {
+        // Inline asm, not `((i32x4_t const *)pq)[unit]`: the point is to keep
+        // the load opaque to LLVM's waitcnt pass so it does not "helpfully"
+        // insert its own `vmcnt(0)` in front of the consume below and undo the
+        // whole reordering.
+        uint8_t const *pq_src = (uint8_t const *)input_base + pq_unit * 16;
+        asm volatile("global_load_dwordx4 %0, %1, off"
+                     : "=v"(pq_chunk)
+                     : "v"(pq_src)
+                     : "memory");
+    }
+
+    // W13 block scales, one tile per wave. The default split is by `tid` over
+    // all 368 dwordx4, which gives waves 0-1 two requests and waves 2-3 one --
+    // a per-wave asymmetry that would otherwise force three different vmcnt
+    // values. Splitting by tile instead makes it 92 units per wave, hence two
+    // requests for every wave, and one vmcnt for all of them. It is also the
+    // same wave-owns-tile-w mapping the linear weight load already uses.
+    constexpr int W13_SC_DW4_PER_TILE = W13_TILE_SCALE / 16;         // 92
+    constexpr int W13_SC_LPT_WAVE = (W13_SC_DW4_PER_TILE + 63) / 64; // 2
+    static_assert(W13_SC_LPT_WAVE == 2,
+                  "the vmcnt values below count two scale requests per wave");
+    static_assert((W13_SC_LPT_WAVE - 1) * 64 < W13_SC_DW4_PER_TILE,
+                  "every scale request must have a live lane in every wave");
+    i32x4_t w13_sc_buf[W13_SC_LPT_WAVE];
+    {
+        i32x4_t const *sc_src =
+            (i32x4_t const *)wg_scales + warp_id * W13_SC_DW4_PER_TILE;
+#pragma unroll
+        for (int j = 0; j < W13_SC_LPT_WAVE; j++) {
+          int idx = lane_id + j * 64;
+          if (idx < W13_SC_DW4_PER_TILE) {
+            asm volatile("flat_load_dwordx4 %0, %1"
+                         : "=v"(w13_sc_buf[j])
+                         : "v"(sc_src + idx)
+                         : "memory");
+          }
+        }
+    }
+
+    // Younger-request counts consumed below, spelled out once here so the two
+    // wait sites cannot drift from the issue order above.
+    constexpr int W13_T0_WEIGHT_REQS = (W13_TILE_DATA + 1023) / 1024; // 23
+    constexpr int PQ_VMCNT = W13_SC_LPT_WAVE + W13_T0_WEIGHT_REQS;    // 25
+    constexpr int SC_VMCNT = W13_T0_WEIGHT_REQS;                      // 23
+#endif
+
     // W13 T0: direct HBM→LDS via buffer_load_dwordx4 lds:1
     // Single inline asm block to prevent compiler vmcnt serialization.
     // Without this, compiler inserts s_waitcnt vmcnt(0) between each
@@ -877,6 +1123,21 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
       // worse: the chunk then lives in VGPRs across all of Phase A, and the
       // activation load competes for the same vmcnt queue as the 23 KiB of
       // weights the MFMA actually waits on.
+#ifdef MPK_W13_T0_COUNTED_HANDOFF
+      // The read already happened, above the weight burst. All that is left is
+      // to land it, and `vmcnt(25)` retires exactly the one request that
+      // carried it -- the 2 scale and 23 weight requests issued after it are
+      // still in flight and stay that way.
+      asm volatile("s_waitcnt vmcnt(%c[n])" ::[n] "n"(PQ_VMCNT) : "memory");
+      if (pq_active) {
+        // Units past the data carry the E8M0 scale bytes, which live one
+        // dwordx4 further along in LDS than in the source; see the sweep.
+        int const dst_unit = pq_unit + (pq_unit >= PQ_DW4 ? 1 : 0);
+        ((i32x4_t *)s_tok_fp8)[dst_unit] = pq_chunk;
+      }
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      __syncthreads();
+#else
       {
         uint8_t const *pq = (uint8_t const *)input_base;
         constexpr int PQ_DW4 = W13_K / 16;
@@ -890,6 +1151,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         }
       }
       __syncthreads();
+#endif
 #elif defined(MPK_WIDE_FP8_QUANT)
       _gang_wave_parallel_fp8_quant_wide<W13_K>(input_base, s_tok_fp8,
                                                 s_tok_scales);
@@ -905,6 +1167,32 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 #ifdef MPK_W13_LDS_PREFETCH
     // ── Phase B: Drain tile_iter=0 HBM loads + scales concurrently ──────────
     {
+#ifdef MPK_W13_T0_COUNTED_HANDOFF
+      // Scales were issued above the weight burst, so retiring them is
+      // `vmcnt(23)` -- the 23 tile-0 weight requests are the only thing
+      // younger, and they keep flying through this scatter and its barrier.
+      // The old `vmcnt(0)` here is the drain this flag exists to remove: it
+      // made the scale scatter, which touches no weight byte, wait for all
+      // 23 KiB of weights.
+      //
+      // flat_load bumps lgkmcnt as well as vmcnt, hence the second wait.
+      asm volatile("s_waitcnt vmcnt(%c[n])" ::[n] "n"(SC_VMCNT) : "memory");
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      {
+        i32x4_t *dst_sc = (i32x4_t *)(lds_w13_base + warp_id * W13_TILE_BYTES +
+                                      W13_TILE_DATA_PADDED);
+#pragma unroll
+        for (int j = 0; j < W13_SC_LPT_WAVE; j++) {
+          int idx = lane_id + j * 64;
+          if (idx < W13_SC_DW4_PER_TILE) {
+            dst_sc[idx] = w13_sc_buf[j];
+          }
+        }
+      }
+
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      __syncthreads();
+#else
       constexpr int W13_SC_DW4_PER_TILE = W13_TILE_SCALE / 16; // 96
 
       // Issue scale loads BEFORE draining buffer_load_lds — both HBM reads
@@ -943,6 +1231,7 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
 
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
       __syncthreads();
+#endif
 
       // (timestamp [2] moved inside asm block below)
 #ifdef MPK_W13_T1_EARLY_SCALE_LOAD
@@ -1018,6 +1307,32 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
         }
+#endif
+#ifdef MPK_W13_T0_COUNTED_HANDOFF
+        // The tile-0 weight burst has still not been waited on. That is the
+        // point of the flag: both handoff rendezvous above used counted waits
+        // and left all 23 requests flying, so the weights have been in the air
+        // across the activation store, the scale scatter and two barriers.
+        // Here is the first instruction that actually reads a weight byte, so
+        // here is where they are drained.
+        //
+        // A per-wave drain is sufficient only because MPK_W13_LINEAR_LOAD
+        // gives wave w sole ownership of tile w -- it issues every request
+        // that fills the region it is about to read. Under the striped load
+        // the four waves interleave across all four tiles, and moving the
+        // drain to after the barrier would let a wave read bytes a sibling
+        // has not landed. Hence the #error pairing the two flags.
+#if defined(MPK_W13_T1_SPLIT_LDS_STAGE)
+        // The tile-1 prefix was issued just above and must keep flying under
+        // the tile-0 MFMA; retiring the older tile-0 requests is a counted
+        // wait, not a drain.
+        constexpr int W13_T0_DRAIN_KEEP =
+            (W13_TILES_PER_WAVE > 1) ? W13_T1_STAGE_CHUNKS : 0;
+#else
+        constexpr int W13_T0_DRAIN_KEEP = 0;
+#endif
+        asm volatile("s_waitcnt vmcnt(%c[n])" ::[n] "n"(W13_T0_DRAIN_KEEP)
+                     : "memory");
 #endif
         uint8_t *lds_w13_data = lds_w13_base + warp_id * W13_TILE_BYTES;
         uint8_t *lds_w13_sc = lds_w13_data + W13_TILE_DATA_PADDED;
@@ -1175,6 +1490,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "v_accvgpr_write_b32 a1, 0\n"
               "v_accvgpr_write_b32 a2, 0\n"
               "v_accvgpr_write_b32 a3, 0\n"
+#ifdef MPK_W13_DUAL_ACC
+              // Odd K blocks accumulate into a disjoint second chain, merged
+              // back into a[0:3] after the tail.
+              "v_accvgpr_write_b32 a4, 0\n"
+              "v_accvgpr_write_b32 a5, 0\n"
+              "v_accvgpr_write_b32 a6, 0\n"
+              "v_accvgpr_write_b32 a7, 0\n"
+#endif
 
               // Pre-issue 5 reads for iteration 0 into bank 0
               "ds_read_b128 v[22:25], %[wa]\n"
@@ -1182,7 +1505,9 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "ds_read_b128 v[8:11], %[ta]\n"
               "ds_read_b128 v[12:15], %[ta] offset:64\n"
               "ds_read_u8   v16, %[tsa]\n"
+#ifndef MPK_W13_T0_MFMA_UNROLLED
               "s_mov_b32 s13, 0\n"
+#endif
 #ifdef MPK_MFMA_PINGPONG_SCHED
               // See the MPK_MFMA_PINGPONG_SCHED block comment above the W13
               // T0 loop for the state accounting. The wait for iteration 0's
@@ -1217,28 +1542,58 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
               "s_add_i32 s13, s13, 1\n"
               "v_add_u32_e32 v17, s13, %[tsa]\n"
+#ifdef MPK_W13_DUAL_ACC
+              // MFMA_B targets a disjoint chain, so there is no SrcC RAW edge
+              // to cover here: 5 issued address updates + s_nop 2 (3 states)
+              // = the 8-state adjacent cadence.
+              "s_nop 2\n"
+#else
               "s_nop 15\n"
               "s_nop 10\n"
+#endif
               "s_waitcnt lgkmcnt(0)\n"
 
-              // ---- consume bank 1, then refill bank 0 ----
-              // Refilling bank 0 *after* MFMA_B (not before it, as the
-              // unscheduled loop does) is what removes the WAR window: MFMA_A
-              // was issued a full 32 states earlier, so it has finished
-              // sampling bank 0 before these writes land.
+          // ---- consume bank 1, then refill bank 0 ----
+          // Refilling bank 0 *after* MFMA_B (not before it, as the
+          // unscheduled loop does) is what keeps the WAR window closed.
+          //
+          // Single-chain: MFMA_A was issued a full 32 states earlier, so
+          // it has finished sampling bank 0 before these writes land.
+          //
+          // Dual-chain: the issue distance shrinks to ~11 states, so the
+          // margin is no longer the padding -- it is the `s_waitcnt
+          // lgkmcnt(0)` above, which stalls on bank 1's reads (issued
+          // before MFMA_A) for the balance of the LDS round trip. The
+          // refill therefore still lands well past MFMA_A's 32 cycles.
+          // Confirmed bit-exact on gfx950 by
+          // tests/standalone/test_mfma_pipeline_hazards.hip, whose
+          // uncontended LDS is the worst case for this hazard.
+#ifdef MPK_W13_DUAL_ACC
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], v[32:39], "
+              "a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
               "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif
               "ds_read_u8   v16, v17\n"
               "ds_read_b128 v[22:25], %[wa]\n"
               "ds_read_u8   v7, %[wsa]\n"
               "ds_read_b128 v[8:11], %[ta]\n"
               "ds_read_b128 v[12:15], %[ta] offset:64\n"
-              // MFMA_B -> next MFMA_A: s_nop 15 (16) + s_nop 11 (12) = 28,
-              // plus the 4 VALU address updates at the top of the next trip =
-              // 32. Only those 4 VALU are credited; the 5 ds_reads and the
-              // scalar loop control are uncredited margin.
+          // MFMA_B -> next MFMA_A: s_nop 15 (16) + s_nop 11 (12) = 28,
+          // plus the 4 VALU address updates at the top of the next trip =
+          // 32. Only those 4 VALU are credited; the 5 ds_reads and the
+          // scalar loop control are uncredited margin.
+#ifdef MPK_W13_DUAL_ACC
+              // Disjoint chains again: s_nop 3 (4 states) + the 4 address
+              // updates at the top of the next trip = 8. Chain 0 itself was
+              // last written 16 states ago, which same-opcode SrcC forwarding
+              // covers.
+              "s_nop 3\n"
+#else
               "s_nop 15\n"
               "s_nop 11\n"
+#endif
               "s_waitcnt lgkmcnt(0)\n"
               "s_branch PIPELINED_W13_T0_%=\n"
 
@@ -1251,14 +1606,36 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 #else
 
+// ── MPK_W13_T0_MFMA_UNROLLED ──
+//
+// W13_MFMA_ITERS is a compile-time constant, so the scalar loop control is
+// runtime work spent recomputing something the assembler already knows.
+// `.rept` emits the same bank-0/bank-1 pair (W13_MFMA_ITERS-1)/2 times and an
+// assembler symbol carries the token-scale offset. Per pair that removes two
+// s_add_i32, two s_cmpk_lt_i32, one s_cbranch_scc0, one s_cbranch_scc1 and one
+// s_branch -- and, more to the point, takes the taken-branch bubble off the
+// end of every pair, which sits directly between two MFMAs.
+//
+// It also drops the dual-tail hedge below: with a constant trip count the exit
+// parity is known here, so only the bank-0 final MFMA is reachable. That is
+// what the static_assert pins.
+#ifdef MPK_W13_T0_MFMA_UNROLLED
+              ".set MPK_W13_T0_SC_%=, 1\n"
+              ".rept %c[unroll_pairs]\n"
+#else
               "PIPELINED_W13_T0_%=:\n"
+#endif
               // ---- consume bank 0, prefetch into bank 1 ----
               "s_waitcnt lgkmcnt(0)\n"
               "v_add_u32_e32 %[wa], 64, %[wa]\n"
               "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
               "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_W13_T0_MFMA_UNROLLED
+              "v_add_u32_e32 v17, MPK_W13_T0_SC_%=, %[tsa]\n"
+#else
               "s_add_i32 s13, s13, 1\n"
               "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
               "ds_read_u8   v19, v17\n"
               "ds_read_b128 v[26:29], %[wa]\n"
               "ds_read_u8   v18, %[wsa]\n"
@@ -1266,23 +1643,59 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "ds_read_b128 v[36:39], %[ta] offset:64\n"
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
               "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifndef MPK_W13_T0_MFMA_UNROLLED
               "s_cmpk_lt_i32 s13, %[iters_m1]\n"
               "s_cbranch_scc0 W13_T0_TAIL_B1_%=\n"
+#endif
 
               // ---- consume bank 1, prefetch into bank 0 ----
               "s_waitcnt lgkmcnt(0)\n"
               "v_add_u32_e32 %[wa], 64, %[wa]\n"
               "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
               "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_W13_T0_MFMA_UNROLLED
+              "v_add_u32_e32 v17, MPK_W13_T0_SC_%= + 1, %[tsa]\n"
+#else
               "s_add_i32 s13, s13, 1\n"
               "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
               "ds_read_u8   v16, v17\n"
               "ds_read_b128 v[22:25], %[wa]\n"
               "ds_read_u8   v7, %[wsa]\n"
               "ds_read_b128 v[8:11], %[ta]\n"
               "ds_read_b128 v[12:15], %[ta] offset:64\n"
+#ifdef MPK_W13_DUAL_ACC
+              // Odd K blocks onto the second chain. Nothing else in this half
+              // moves: the ~11 slots back to the bank-0 MFMA were never issue
+              // work the schedule chose, they were the hardware holding the
+              // shared SrcC for its remaining ~21 states. Disjoint SrcC drops
+              // that to the 8-state adjacent cadence.
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], v[32:39], "
+              "a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
               "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif
+#ifdef MPK_W13_T0_MFMA_UNROLLED
+              ".set MPK_W13_T0_SC_%=, MPK_W13_T0_SC_%= + 2\n"
+              ".endr\n"
+
+              // ── Final MFMA (bank 0) ──
+              // (W13_MFMA_ITERS-1)/2 pairs consumed an even number of K
+              // blocks, so the odd one out is always block W13_MFMA_ITERS-1,
+              // whose operands the last pair prefetched into bank 0.
+              "s_waitcnt lgkmcnt(0)\n"
+#ifdef MPK_W13_DUAL_ACC
+              // Chain 0 last ran one half ago -- about eleven issued slots,
+              // under the 16 states same-opcode SrcC forwarding needs. Inside
+              // the loop the *next* pair's four address updates make up the
+              // difference; the tail has no next pair, so pad it explicitly.
+              // Five states once per tile against 704 removed.
+              "s_nop 4\n"
+#endif
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+              "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
               "s_cmpk_lt_i32 s13, %[iters_m1]\n"
               "s_cbranch_scc1 PIPELINED_W13_T0_%=\n"
 
@@ -1294,14 +1707,28 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               // with them in bank 1. One tail alone would silently use the
               // wrong bank for one parity.
               "s_waitcnt lgkmcnt(0)\n"
+#ifdef MPK_W13_DUAL_ACC
+              // Same short chain-0 reuse as the unrolled tail; see there.
+              "s_nop 4\n"
+#endif
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
               "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
               "s_branch W13_T0_ACC_%=\n"
 
               "W13_T0_TAIL_B1_%=:\n"
               "s_waitcnt lgkmcnt(0)\n"
+#ifdef MPK_W13_DUAL_ACC
+              // Dead at the live odd W13_MFMA_ITERS, but it is the bank-1
+              // final, so it belongs to the odd chain like every other bank-1
+              // MFMA -- keeping it on a[0:3] would double-count into chain 0
+              // at an even count.
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], v[32:39], "
+              "a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
               "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
               "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif
+#endif // MPK_W13_T0_MFMA_UNROLLED
 #endif
 
               "W13_T0_ACC_%=:\n"
@@ -1330,10 +1757,25 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "s_nop 15\n"
               "s_nop 15\n"
 #endif
+#ifdef MPK_W13_DUAL_ACC
+              // Chain 1's last MFMA retired well before chain 0's tail, and
+              // the bank-0 input registers are dead here, so stage the odd
+              // partials there and merge in FP32.
+              "v_accvgpr_read_b32 v22, a4\n"
+              "v_accvgpr_read_b32 v23, a5\n"
+              "v_accvgpr_read_b32 v24, a6\n"
+              "v_accvgpr_read_b32 v25, a7\n"
+#endif
               "v_accvgpr_read_b32 %[acc0], a0\n"
               "v_accvgpr_read_b32 %[acc1], a1\n"
               "v_accvgpr_read_b32 %[acc2], a2\n"
               "v_accvgpr_read_b32 %[acc3], a3\n"
+#ifdef MPK_W13_DUAL_ACC
+              "v_add_f32_e32 %[acc0], v22, %[acc0]\n"
+              "v_add_f32_e32 %[acc1], v23, %[acc1]\n"
+              "v_add_f32_e32 %[acc2], v24, %[acc2]\n"
+              "v_add_f32_e32 %[acc3], v25, %[acc3]\n"
+#endif
               : [acc0] "=v"(acc[0]),
                 [acc1] "=v"(acc[1]),
                 [acc2] "=v"(acc[2]),
@@ -1343,17 +1785,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 [ta] "+v"(t_addr)
 #if defined(MPK_W13_T1_SPLIT_LDS_STAGE) &&                                     \
     !defined(MPK_W13_T1_SPLIT_NOSUFFIX) && !defined(MPK_W13_T1_SPLIT_STAGE_PROBE)
-                ,
+                    ,
                 [t1_voff] "+v"(t1_suffix_voff)
 #endif
-              : [tsa] "v"(ts_addr), [iters_m1] "n"(W13_MFMA_ITERS - 1)
+              : [tsa] "v"(ts_addr),
+                [iters_m1] "n"(W13_MFMA_ITERS - 1),
+                [unroll_pairs] "n"((W13_MFMA_ITERS - 1) / 2)
 #if defined(MPK_W13_T1_SPLIT_LDS_STAGE) &&                                     \
     !defined(MPK_W13_T1_SPLIT_NOSUFFIX) && !defined(MPK_W13_T1_SPLIT_STAGE_PROBE)
-                ,
+                    ,
                 [rsrc] "s"(w13_rsrc),
                 [t1_lds_base] "s"(lds_t1_suffix_base),
-                [sfx_reps] "n"((W13_TILE_DATA - W13_T1_STAGED_DATA_BYTES +
-                                1023) / 1024 - 1)
+                [sfx_reps] "n"(
+                    (W13_TILE_DATA - W13_T1_STAGED_DATA_BYTES + 1023) / 1024 -
+                    1)
 #endif
               : "memory",
                 "m0",
@@ -1390,7 +1835,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "a0",
                 "a1",
                 "a2",
-                "a3");
+                "a3"
+#ifdef MPK_W13_DUAL_ACC
+                ,
+                "a4",
+                "a5",
+                "a6",
+                "a7"
+#endif
+          );
         }
 
         // ── Issue tile_iter=1 per-wave HBM→LDS loads BEFORE SwiGLU ──
@@ -1930,6 +2383,13 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "v_accvgpr_write_b32 a1, 0\n"
                 "v_accvgpr_write_b32 a2, 0\n"
                 "v_accvgpr_write_b32 a3, 0\n"
+#ifdef MPK_W13_DUAL_ACC
+                // Odd K blocks accumulate into a disjoint second chain.
+                "v_accvgpr_write_b32 a4, 0\n"
+                "v_accvgpr_write_b32 a5, 0\n"
+                "v_accvgpr_write_b32 a6, 0\n"
+                "v_accvgpr_write_b32 a7, 0\n"
+#endif
 
                 // Pre-issue 5 reads for iteration 0 into bank 0
                 "ds_read_b128 v[22:25], %[wa]\n"
@@ -1966,21 +2426,36 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
                 "s_add_i32 s13, s13, 1\n"
                 "v_add_u32_e32 v17, s13, %[tsa]\n"
+#ifdef MPK_W13_DUAL_ACC
+                // Disjoint chains: 5 issued updates + s_nop 2 = 8 states.
+                "s_nop 2\n"
+#else
                 "s_nop 15\n"
                 "s_nop 10\n"
+#endif
                 "s_waitcnt lgkmcnt(0)\n"
 
-                // ---- consume bank 1, then refill bank 0 ----
+            // ---- consume bank 1, then refill bank 0 ----
+#ifdef MPK_W13_DUAL_ACC
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], "
+                "v[32:39], a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
                 "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], "
                 "v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif
                 "ds_read_u8   v16, v17\n"
                 "ds_read_b128 v[22:25], %[wa]\n"
                 "ds_read_u8   v7, %[wsa]\n"
                 "ds_read_b128 v[8:11], %[ta]\n"
                 "ds_read_b128 v[12:15], %[ta] offset:64\n"
-                // 16 + 12 = 28, plus 4 VALU next trip = 32.
+            // 16 + 12 = 28, plus 4 VALU next trip = 32.
+#ifdef MPK_W13_DUAL_ACC
+                // Disjoint chains: s_nop 3 + 4 updates next trip = 8 states.
+                "s_nop 3\n"
+#else
                 "s_nop 15\n"
                 "s_nop 11\n"
+#endif
                 "s_waitcnt lgkmcnt(0)\n"
                 "s_branch PIPELINED_W13_T1_%=\n"
 
@@ -2019,8 +2494,14 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 "ds_read_u8   v7, %[wsa]\n"
                 "ds_read_b128 v[8:11], %[ta]\n"
                 "ds_read_b128 v[12:15], %[ta] offset:64\n"
+#ifdef MPK_W13_DUAL_ACC
+                // Odd K blocks onto the second chain; see the T0 body.
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], "
+                "v[32:39], a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
                 "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
                 "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif
                 "s_cmpk_lt_i32 s13, %[iters_m1]\n"
                 "s_cbranch_scc1 PIPELINED_W13_T1_%=\n"
 
@@ -2032,14 +2513,24 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 // with them in bank 1. One tail alone would silently use the
                 // wrong bank for one parity.
                 "s_waitcnt lgkmcnt(0)\n"
+#ifdef MPK_W13_DUAL_ACC
+                // Short chain-0 reuse out of the loop; see the T0 tail.
+                "s_nop 4\n"
+#endif
                 "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
                 "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
                 "s_branch W13_T1_ACC_%=\n"
 
                 "W13_T1_TAIL_B1_%=:\n"
                 "s_waitcnt lgkmcnt(0)\n"
+#ifdef MPK_W13_DUAL_ACC
+                // Bank-1 final belongs to the odd chain; see the T0 tail.
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], "
+                "v[32:39], a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
                 "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
                 "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif
 #endif
 
                 "W13_T1_ACC_%=:\n"
@@ -2049,10 +2540,23 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                 // time.
                 "s_nop 15\n"
                 "s_nop 15\n"
+#ifdef MPK_W13_DUAL_ACC
+                // Bank-0 inputs are dead here; stage the odd partials there.
+                "v_accvgpr_read_b32 v22, a4\n"
+                "v_accvgpr_read_b32 v23, a5\n"
+                "v_accvgpr_read_b32 v24, a6\n"
+                "v_accvgpr_read_b32 v25, a7\n"
+#endif
                 "v_accvgpr_read_b32 %[acc0], a0\n"
                 "v_accvgpr_read_b32 %[acc1], a1\n"
                 "v_accvgpr_read_b32 %[acc2], a2\n"
                 "v_accvgpr_read_b32 %[acc3], a3\n"
+#ifdef MPK_W13_DUAL_ACC
+                "v_add_f32_e32 %[acc0], v22, %[acc0]\n"
+                "v_add_f32_e32 %[acc1], v23, %[acc1]\n"
+                "v_add_f32_e32 %[acc2], v24, %[acc2]\n"
+                "v_add_f32_e32 %[acc3], v25, %[acc3]\n"
+#endif
                 : [acc0] "=v"(acc[0]),
                   [acc1] "=v"(acc[1]),
                   [acc2] "=v"(acc[2]),
@@ -2095,7 +2599,15 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
                   "a0",
                   "a1",
                   "a2",
-                  "a3");
+                  "a3"
+#ifdef MPK_W13_DUAL_ACC
+                  ,
+                  "a4",
+                  "a5",
+                  "a6",
+                  "a7"
+#endif
+            );
           }
           // tile_iter=1 SwiGLU epilogue
           if (tok_active) {
@@ -2931,6 +3443,21 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "v_accvgpr_write_b32 a1, 0\n"
             "v_accvgpr_write_b32 a2, 0\n"
             "v_accvgpr_write_b32 a3, 0\n"
+#ifdef MPK_W2_QUAD_ACC
+            // K block k accumulates into chain k % 4.
+            "v_accvgpr_write_b32 a4, 0\n"
+            "v_accvgpr_write_b32 a5, 0\n"
+            "v_accvgpr_write_b32 a6, 0\n"
+            "v_accvgpr_write_b32 a7, 0\n"
+            "v_accvgpr_write_b32 a8, 0\n"
+            "v_accvgpr_write_b32 a9, 0\n"
+            "v_accvgpr_write_b32 a10, 0\n"
+            "v_accvgpr_write_b32 a11, 0\n"
+            "v_accvgpr_write_b32 a12, 0\n"
+            "v_accvgpr_write_b32 a13, 0\n"
+            "v_accvgpr_write_b32 a14, 0\n"
+            "v_accvgpr_write_b32 a15, 0\n"
+#endif
 
             // Pre-issue 5 reads for iteration 0 into bank 0
             "ds_read_b128 v[22:25], %[wa]\n"
@@ -2938,8 +3465,34 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[8:11], %[ta]\n"
             "ds_read_b128 v[12:15], %[ta] offset:64\n"
             "ds_read_u8   v16, %[tsa]\n"
+#ifndef MPK_W2_T0_MFMA_UNROLLED
             "s_mov_b32 s13, 0\n"
+#endif
 #ifdef MPK_MFMA_PINGPONG_SCHED
+#ifdef MPK_W2_QUAD_ACC
+            // Four independent chains, four K blocks per trip. No two
+            // adjacent MFMAs share SrcC and no chain is reused within a trip,
+            // so every edge is the 8-state cadence. 5 trips cover K blocks
+            // 0..19 and the tail covers 20..22 on chains 0/1/2 -- chain k % 4
+            // throughout.
+            "s_waitcnt lgkmcnt(0)\n"
+
+            "PIPELINED_W2_T0_%=:\n"
+            "s_cmpk_lt_i32 s13, %[iters_m3]\n"
+            "s_cbranch_scc0 W2_T0_FINAL_%=\n" MPK_W2_QUAD_PAIR("a[0:3]",
+                                                               "a[4:7]")
+                MPK_W2_QUAD_PAIR(
+                    "a[8:11]",
+                    "a[12:15]") "s_branch PIPELINED_W2_T0_%=\n"
+
+                                "W2_T0_FINAL_%=:\n" MPK_W2_QUAD_PAIR(
+                                    "a[0:3]",
+                                    "a[4:7]") "v_mfma_scale_f32_16x16x128_"
+                                              "f8f6f4 a[8:11], v[22:25], "
+                                              "v[8:15], "
+                                              "a[8:11], v7, v16 "
+                                              "op_sel_hi:[0,0,0] cbsz:4\n"
+#else
             // Identical schedule to the W13 T0 loop; see the state accounting
             // in the block comment there.
             "s_waitcnt lgkmcnt(0)\n"
@@ -2988,16 +3541,28 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "W2_T0_FINAL_%=:\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif // MPK_W2_QUAD_ACC
 #else
 
+// ── MPK_W2_T0_MFMA_UNROLLED ──
+// Same transform as the W13 T0 loop above; see the rationale there.
+#ifdef MPK_W2_T0_MFMA_UNROLLED
+            ".set MPK_W2_T0_SC_%=, 1\n"
+            ".rept %c[unroll_pairs]\n"
+#else
             "PIPELINED_W2_T0_%=:\n"
+#endif
             // ---- consume bank 0, prefetch into bank 1 ----
             "s_waitcnt lgkmcnt(0)\n"
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_W2_T0_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_W2_T0_SC_%=, %[tsa]\n"
+#else
             "s_add_i32 s13, s13, 1\n"
             "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
             "ds_read_u8   v19, v17\n"
             "ds_read_b128 v[26:29], %[wa]\n"
             "ds_read_u8   v18, %[wsa]\n"
@@ -3005,16 +3570,22 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[36:39], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifndef MPK_W2_T0_MFMA_UNROLLED
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc0 W2_T0_TAIL_B1_%=\n"
+#endif
 
             // ---- consume bank 1, prefetch into bank 0 ----
             "s_waitcnt lgkmcnt(0)\n"
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_W2_T0_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_W2_T0_SC_%= + 1, %[tsa]\n"
+#else
             "s_add_i32 s13, s13, 1\n"
             "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
             "ds_read_u8   v16, v17\n"
             "ds_read_b128 v[22:25], %[wa]\n"
             "ds_read_u8   v7, %[wsa]\n"
@@ -3022,6 +3593,18 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "ds_read_b128 v[12:15], %[ta] offset:64\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_W2_T0_MFMA_UNROLLED
+            ".set MPK_W2_T0_SC_%=, MPK_W2_T0_SC_%= + 2\n"
+            ".endr\n"
+
+            // ── Final MFMA (bank 0) ──
+            // (W2_MFMA_ITERS-1)/2 pairs consumed an even number of K blocks,
+            // so the odd one out is always block W2_MFMA_ITERS-1, whose
+            // operands the last pair prefetched into bank 0.
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+            "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc1 PIPELINED_W2_T0_%=\n"
 
@@ -3041,18 +3624,79 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
             "s_waitcnt lgkmcnt(0)\n"
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#endif // MPK_W2_T0_MFMA_UNROLLED
 #endif
 
-            "W2_T0_ACC_%=:\n"
-            // 32 clocks: the scaled MFMA is a 32-cycle op on CDNA4. The old
-            // "s_nop 7; s_nop 0" was 9 clocks (correct only for a 4-pass
-            // MFMA) and returned a partially-retired accumulator every time.
-            "s_nop 15\n"
-            "s_nop 15\n"
-            "v_accvgpr_read_b32 %[acc0], a0\n"
-            "v_accvgpr_read_b32 %[acc1], a1\n"
-            "v_accvgpr_read_b32 %[acc2], a2\n"
-            "v_accvgpr_read_b32 %[acc3], a3\n"
+                                              "W2_T0_ACC_%=:\n"
+#ifndef MPK_W2_EPI_OVERLAP
+                                              // 32 clocks: the scaled MFMA is a
+                                              // 32-cycle op on CDNA4. The old
+                                              // "s_nop 7; s_nop 0" was 9 clocks
+                                              // (correct only for a 4-pass
+                                              // MFMA) and returned a
+                                              // partially-retired accumulator
+                                              // every time.
+                                              //
+                                              // MPK_MOE_W2_EPILOGUE_OVERLAP
+                                              // fills this wait with the
+                                              // reduction of the three chains
+                                              // that already retired; see the
+                                              // note by MPK_W2_EPI_OVERLAP for
+                                              // the state accounting that makes
+                                              // dropping the pad safe.
+                                              "s_nop 15\n"
+                                              "s_nop 15\n"
+#endif
+#ifdef MPK_W2_QUAD_ACC
+                                              // Merge order c0, c1, c3, c2 --
+                                              // the sequence the
+                                              // epilogue-overlap arm produces,
+                                              // kept here too so enabling that
+                                              // flag is a pure scheduling
+                                              // change and not a numerical one.
+                                              "v_accvgpr_read_b32 v32, a12\n"
+                                              "v_accvgpr_read_b32 v33, a13\n"
+                                              "v_accvgpr_read_b32 v34, a14\n"
+                                              "v_accvgpr_read_b32 v35, a15\n"
+#endif
+                                              "v_accvgpr_read_b32 %[acc0], a0\n"
+                                              "v_accvgpr_read_b32 %[acc1], a1\n"
+                                              "v_accvgpr_read_b32 %[acc2], a2\n"
+                                              "v_accvgpr_read_b32 %[acc3], a3\n"
+#ifdef MPK_W2_QUAD_ACC
+                                              "v_accvgpr_read_b32 v22, a4\n"
+                                              "v_accvgpr_read_b32 v23, a5\n"
+                                              "v_accvgpr_read_b32 v24, a6\n"
+                                              "v_accvgpr_read_b32 v25, a7\n"
+                                              "v_add_f32_e32 %[acc0], v22, "
+                                              "%[acc0]\n"
+                                              "v_add_f32_e32 %[acc1], v23, "
+                                              "%[acc1]\n"
+                                              "v_add_f32_e32 %[acc2], v24, "
+                                              "%[acc2]\n"
+                                              "v_add_f32_e32 %[acc3], v25, "
+                                              "%[acc3]\n"
+                                              "v_add_f32_e32 %[acc0], v32, "
+                                              "%[acc0]\n"
+                                              "v_add_f32_e32 %[acc1], v33, "
+                                              "%[acc1]\n"
+                                              "v_add_f32_e32 %[acc2], v34, "
+                                              "%[acc2]\n"
+                                              "v_add_f32_e32 %[acc3], v35, "
+                                              "%[acc3]\n"
+                                              "v_accvgpr_read_b32 v26, a8\n"
+                                              "v_accvgpr_read_b32 v27, a9\n"
+                                              "v_accvgpr_read_b32 v28, a10\n"
+                                              "v_accvgpr_read_b32 v29, a11\n"
+                                              "v_add_f32_e32 %[acc0], v26, "
+                                              "%[acc0]\n"
+                                              "v_add_f32_e32 %[acc1], v27, "
+                                              "%[acc1]\n"
+                                              "v_add_f32_e32 %[acc2], v28, "
+                                              "%[acc2]\n"
+                                              "v_add_f32_e32 %[acc3], v29, "
+                                              "%[acc3]\n"
+#endif
             : [acc0] "=v"(acc[0]),
               [acc1] "=v"(acc[1]),
               [acc2] "=v"(acc[2]),
@@ -3060,7 +3704,11 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               [wa] "+v"(w2_w_addr),
               [wsa] "+v"(w2_ws_addr),
               [ta] "+v"(w2_t_addr)
-            : [tsa] "v"(w2_ts_addr), [iters_m1] "n"(W2_MFMA_ITERS - 1)
+            : [tsa] "v"(w2_ts_addr),
+              [iters_m1] "n"(W2_MFMA_ITERS - 1),
+              // Trip bound for the quad body: 5 trips of 4, then a 3-MFMA tail.
+              [iters_m3] "n"(W2_MFMA_ITERS - 3),
+              [unroll_pairs] "n"((W2_MFMA_ITERS - 1) / 2)
             : "memory",
               "s13",
               "v7",
@@ -3095,7 +3743,23 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               "a0",
               "a1",
               "a2",
-              "a3");
+              "a3"
+#ifdef MPK_W2_QUAD_ACC
+              ,
+              "a4",
+              "a5",
+              "a6",
+              "a7",
+              "a8",
+              "a9",
+              "a10",
+              "a11",
+              "a12",
+              "a13",
+              "a14",
+              "a15"
+#endif
+        );
       }
 
       MOE_DBG_SUBPHASE(3006);

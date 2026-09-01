@@ -366,21 +366,42 @@ __device__ __noinline__ void
       for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
         int wave_tile = warp_id + tile_iter * NUM_WAVES;
         int w_row = wave_tile * 16 + col;
-        int const row_data_base = w_row * (LM_REDUCTION_SIZE / 2);
         int const row_scale_base = w_row * LM_NUM_BLOCKS_32;
 
+        // ── Weight fragment addressing ────────────────────────────────────
+        //
+        // This path reads the A-operand straight from HBM. Row-major, the 64
+        // lanes of a wave hit sixteen rows LM_REDUCTION_SIZE/2 bytes apart,
+        // so one load instruction touches sixteen scattered spans; K-major it
+        // is 64 consecutive 16-byte fragments, one contiguous 1 KiB burst.
+        // See the longer note in gang_rmsnorm_linear_mxfp4_bias_argmax_
+        // mi300.cuh -- same permutation, same host repack
+        // (shuffle_lm_head_record_kmajor, gated on the same flag), and both
+        // LM-head consumers have to agree with it or the numerics are
+        // silently wrong.
+#ifdef MPK_LM_HEAD_KMAJOR
+        // One K128 block holds all 16 rows x 4 quarters x 16 B.
+        constexpr int LM_TILE_DATA = 16 * (LM_REDUCTION_SIZE / 2);
+        constexpr int LM_K_STRIDE = 16 * (K_PER_MFMA / 2);
+        uint8_t const *tile_data = wg_data + wave_tile * LM_TILE_DATA;
+        int const data_lane_offset = lane_id * 16;
+#define MPK_LM_W_FRAG(KI)                                                      \
+  _gang_lm_load_fp4_a_kmajor(tile_data + data_lane_offset + (KI)*LM_K_STRIDE)
+#else
+        int const row_data_base = w_row * (LM_REDUCTION_SIZE / 2);
+#define MPK_LM_W_FRAG(KI)                                                      \
+  (*(i32x8_t const *)(wg_data + row_data_base + (KI) * (K_PER_MFMA / 2) +      \
+                      g * 16))
+#endif
+
         f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
-        i32x8_t a0 =
-            *(i32x8_t const *)(wg_data + row_data_base + 0 * 64 + g * 16);
+        i32x8_t a0 = MPK_LM_W_FRAG(0);
         int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-        i32x8_t a1 =
-            *(i32x8_t const *)(wg_data + row_data_base + 1 * 64 + g * 16);
+        i32x8_t a1 = MPK_LM_W_FRAG(1);
         int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-        i32x8_t a2 =
-            *(i32x8_t const *)(wg_data + row_data_base + 2 * 64 + g * 16);
+        i32x8_t a2 = MPK_LM_W_FRAG(2);
         int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-        i32x8_t a3 =
-            *(i32x8_t const *)(wg_data + row_data_base + 3 * 64 + g * 16);
+        i32x8_t a3 = MPK_LM_W_FRAG(3);
         int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
 
 #pragma unroll 1
@@ -391,9 +412,8 @@ __device__ __noinline__ void
             acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
           }
           if (ki + 4 < MFMA_ITERS) {
-            int kt4 = (ki + 4) * K_PER_MFMA;
-            a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
-            sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+            a0 = MPK_LM_W_FRAG(ki + 4);
+            sa0 = (int)wg_scales[row_scale_base + (ki + 4) * 4 + g];
           }
           {
             i32x8_t b =
@@ -402,9 +422,8 @@ __device__ __noinline__ void
             acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
           }
           if (ki + 5 < MFMA_ITERS) {
-            int kt5 = (ki + 5) * K_PER_MFMA;
-            a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
-            sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+            a1 = MPK_LM_W_FRAG(ki + 5);
+            sa1 = (int)wg_scales[row_scale_base + (ki + 5) * 4 + g];
           }
           {
             i32x8_t b =
@@ -413,9 +432,8 @@ __device__ __noinline__ void
             acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
           }
           if (ki + 6 < MFMA_ITERS) {
-            int kt6 = (ki + 6) * K_PER_MFMA;
-            a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
-            sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+            a2 = MPK_LM_W_FRAG(ki + 6);
+            sa2 = (int)wg_scales[row_scale_base + (ki + 6) * 4 + g];
           }
           if (ki + 3 < MFMA_ITERS) {
             i32x8_t b =
@@ -424,11 +442,11 @@ __device__ __noinline__ void
             acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
           }
           if (ki + 7 < MFMA_ITERS) {
-            int kt7 = (ki + 7) * K_PER_MFMA;
-            a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
-            sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+            a3 = MPK_LM_W_FRAG(ki + 7);
+            sa3 = (int)wg_scales[row_scale_base + (ki + 7) * 4 + g];
           }
         }
+#undef MPK_LM_W_FRAG
 
         // Argmax epilogue: accumulate in registers, no HBM write
         if (col == 0) {

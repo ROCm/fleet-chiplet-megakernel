@@ -116,6 +116,10 @@
 
 #define HAZ_INS [tsa] "v"(ts_addr), [im1] "n"(MFMA_ITERS - 1)
 
+// The quad-chain body consumes four K blocks per trip and leaves a three-MFMA
+// tail, so it tests against MFMA_ITERS-3 rather than MFMA_ITERS-1.
+#define HAZ_INS_Q [tsa] "v"(ts_addr), [im3] "n"(MFMA_ITERS - 3)
+
 // Both operand banks are clobbered in every variant so the register
 // allocator cannot reuse them and perturb the schedule under test.
 #define HAZ_CLOBBER                                                            \
@@ -123,6 +127,12 @@
       "v16", "v17", "v18", "v19", "v22", "v23", "v24", "v25", "v26", "v27",    \
       "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39",    \
       "a0", "a1", "a2", "a3"
+
+// Multi-chain variants reserve up to four accumulator chains. Kept separate
+// from HAZ_CLOBBER so the single-chain baselines keep their exact allocation.
+#define HAZ_CLOBBER_Q                                                          \
+  HAZ_CLOBBER, "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11", "a12", "a13", \
+      "a14", "a15"
 
 // ---------------------------------------------------------------------------
 // BROKEN: the historical production schedule. Both hazards present.
@@ -257,6 +267,288 @@ __global__ void mfma_reference(float *out,
   HAZ_EPILOGUE
 }
 
+// ---------------------------------------------------------------------------
+// MULTI-CHAIN SCHEDULES
+//
+// The single-chain schedules above pay a 32-state SrcC RAW interlock between
+// every pair of MFMAs, because consecutive ops accumulate into the same
+// a[0:3]. Production fills that gap with `s_nop 15; s_nop 10`. Splitting the
+// K reduction across independent accumulator chains removes it instead:
+// adjacent MFMAs target disjoint SrcC, so the cadence drops to 8 states and
+// each individual chain is still reused only after 16.
+//
+// The 16-state chain reuse relies on same-opcode SrcC forwarding. That is the
+// property these variants exist to verify -- it is not architecturally
+// documented, so it is tested on hardware rather than assumed.
+//
+// IMPORTANT: chaining reassociates the FP32 reduction, so these variants are
+// NOT bit-exact with mfma_reference. Each is therefore checked against an
+// order-matched reference that partitions the K blocks the same way and
+// merges the chains in the same sequence, with all overlap removed. A
+// mismatch is then a pipeline hazard, not a rounding difference.
+//
+// Both structures require MFMA_ITERS == 23: the dual body emits pairs plus a
+// single chain-0 tail (odd), and the quad body emits four per trip plus a
+// three-MFMA tail (MFMA_ITERS % 4 == 3).
+// ---------------------------------------------------------------------------
+#if (MFMA_ITERS % 2) == 1
+
+// One fully serialized K block into the named chain. `CH` is the a[] range.
+#define HAZ_REF_BLOCK(CH)                                                      \
+  "ds_read_b128 v[22:25], %[wa]\nds_read_u8 v7, %[wsa]\n"                      \
+  "ds_read_b128 v[8:11], %[ta]\nds_read_b128 v[12:15], %[ta] offset:64\n"      \
+  "v_add_u32_e32 v17, s13, %[tsa]\nds_read_u8 v16, v17\n"                      \
+  "s_waitcnt lgkmcnt(0)\ns_nop 15\ns_nop 15\n"                                 \
+  "v_mfma_scale_f32_16x16x128_f8f6f4 " CH ", v[22:25], v[8:15], " CH            \
+  ", v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"                                       \
+  "s_nop 15\ns_nop 15\ns_nop 15\ns_nop 15\n"
+
+#define HAZ_REF_ADVANCE                                                        \
+  "v_add_u32_e32 %[wa], 64, %[wa]\nv_add_u32_e32 %[wsa], 1, %[wsa]\n"          \
+  "v_add_u32_e32 %[ta], 0x80, %[ta]\ns_add_i32 s13, s13, 1\n"
+
+// REFERENCE for the dual-chain schedule: even K blocks into a[0:3], odd into
+// a[4:7], no overlap anywhere, merged odd-into-even to match the fast variant.
+__global__ void mfma_reference_dual(float *out,
+                                    uint8_t const *Ad,
+                                    uint8_t const *As,
+                                    uint8_t const *Bd,
+                                    uint8_t const *Bs) {
+  HAZ_PROLOGUE
+  asm volatile(
+      "v_accvgpr_write_b32 a0, 0\nv_accvgpr_write_b32 a1, 0\n"
+      "v_accvgpr_write_b32 a2, 0\nv_accvgpr_write_b32 a3, 0\n"
+      "v_accvgpr_write_b32 a4, 0\nv_accvgpr_write_b32 a5, 0\n"
+      "v_accvgpr_write_b32 a6, 0\nv_accvgpr_write_b32 a7, 0\n"
+      "s_mov_b32 s13, 0\n"
+      "HAZREFD%=:\n" HAZ_REF_BLOCK("a[0:3]") HAZ_REF_ADVANCE
+          HAZ_REF_BLOCK("a[4:7]") HAZ_REF_ADVANCE
+      "s_cmpk_lt_i32 s13, %[im1]\ns_cbranch_scc1 HAZREFD%=\n"
+      // 11 pairs consumed K blocks 0..21; block 22 lands on chain 0.
+      HAZ_REF_BLOCK("a[0:3]")
+      "v_accvgpr_read_b32 v22, a4\nv_accvgpr_read_b32 v23, a5\n"
+      "v_accvgpr_read_b32 v24, a6\nv_accvgpr_read_b32 v25, a7\n"
+      "v_accvgpr_read_b32 %[a0], a0\nv_accvgpr_read_b32 %[a1], a1\n"
+      "v_accvgpr_read_b32 %[a2], a2\nv_accvgpr_read_b32 %[a3], a3\n"
+      "v_add_f32_e32 %[a0], v22, %[a0]\nv_add_f32_e32 %[a1], v23, %[a1]\n"
+      "v_add_f32_e32 %[a2], v24, %[a2]\nv_add_f32_e32 %[a3], v25, %[a3]\n"
+      : HAZ_OUTS:HAZ_INS
+      : HAZ_CLOBBER_Q);
+  HAZ_EPILOGUE
+}
+
+// DUAL: the production MPK_MFMA_PINGPONG_SCHED loop with the odd K blocks
+// moved to a[4:7]. The 27 states of pure padding per pair collapse to 7.
+__global__ void mfma_dual_acc(float *out,
+                              uint8_t const *Ad,
+                              uint8_t const *As,
+                              uint8_t const *Bd,
+                              uint8_t const *Bs) {
+  HAZ_PROLOGUE
+  asm volatile(
+      "v_accvgpr_write_b32 a0, 0\nv_accvgpr_write_b32 a1, 0\n"
+      "v_accvgpr_write_b32 a2, 0\nv_accvgpr_write_b32 a3, 0\n"
+      "v_accvgpr_write_b32 a4, 0\nv_accvgpr_write_b32 a5, 0\n"
+      "v_accvgpr_write_b32 a6, 0\nv_accvgpr_write_b32 a7, 0\n"
+      // Preload bank 0.
+      "ds_read_b128 v[22:25], %[wa]\nds_read_u8 v7, %[wsa]\n"
+      "ds_read_b128 v[8:11], %[ta]\nds_read_b128 v[12:15], %[ta] offset:64\n"
+      "ds_read_u8 v16, %[tsa]\ns_mov_b32 s13, 0\n"
+      "s_waitcnt lgkmcnt(0)\n"
+      "HAZDUAL%=:\n"
+      "s_cmpk_lt_i32 s13, %[im1]\ns_cbranch_scc0 HAZDUALFIN%=\n"
+      // ---- prefetch bank 1, then consume bank 0 into chain 0 ----
+      "v_add_u32_e32 %[wa], 64, %[wa]\nv_add_u32_e32 %[wsa], 1, %[wsa]\n"
+      "v_add_u32_e32 %[ta], 0x80, %[ta]\ns_add_i32 s13, s13, 1\n"
+      "v_add_u32_e32 v17, s13, %[tsa]\nds_read_u8 v19, v17\n"
+      "ds_read_b128 v[26:29], %[wa]\nds_read_u8 v18, %[wsa]\n"
+      "ds_read_b128 v[32:35], %[ta]\nds_read_b128 v[36:39], %[ta] offset:64\n"
+      "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], "
+      "v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+      // Chain 1 is disjoint from chain 0, so this edge needs 8 states, not
+      // 32: 5 VALU address updates + s_nop 2 (3 states).
+      "v_add_u32_e32 %[wa], 64, %[wa]\nv_add_u32_e32 %[wsa], 1, %[wsa]\n"
+      "v_add_u32_e32 %[ta], 0x80, %[ta]\ns_add_i32 s13, s13, 1\n"
+      "v_add_u32_e32 v17, s13, %[tsa]\n"
+      "s_nop 2\n"
+      "s_waitcnt lgkmcnt(0)\n"
+      // ---- consume bank 1 into chain 1, then refill bank 0 ----
+      "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], v[32:39], a[4:7], "
+      "v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+      "ds_read_u8 v16, v17\n"
+      "ds_read_b128 v[22:25], %[wa]\nds_read_u8 v7, %[wsa]\n"
+      "ds_read_b128 v[8:11], %[ta]\nds_read_b128 v[12:15], %[ta] offset:64\n"
+      // s_nop 3 (4 states) + the 4 VALU updates at the top of the next trip
+      // = 8 states before the next chain-0 MFMA. Chain 0 itself was last
+      // written 16 states ago.
+      "s_nop 3\n"
+      "s_waitcnt lgkmcnt(0)\n"
+      "s_branch HAZDUAL%=\n"
+      "HAZDUALFIN%=:\n"
+      // Odd trip count: the final operands are always in bank 0 / chain 0.
+      "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], "
+      "v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+      "s_nop 15\ns_nop 15\n"
+      // Chain 1 matured long before chain 0; reuse the now-dead bank-0 input
+      // registers to stage it, then merge in FP32.
+      "v_accvgpr_read_b32 v22, a4\nv_accvgpr_read_b32 v23, a5\n"
+      "v_accvgpr_read_b32 v24, a6\nv_accvgpr_read_b32 v25, a7\n"
+      "v_accvgpr_read_b32 %[a0], a0\nv_accvgpr_read_b32 %[a1], a1\n"
+      "v_accvgpr_read_b32 %[a2], a2\nv_accvgpr_read_b32 %[a3], a3\n"
+      "v_add_f32_e32 %[a0], v22, %[a0]\nv_add_f32_e32 %[a1], v23, %[a1]\n"
+      "v_add_f32_e32 %[a2], v24, %[a2]\nv_add_f32_e32 %[a3], v25, %[a3]\n"
+      : HAZ_OUTS:HAZ_INS
+      : HAZ_CLOBBER_Q);
+  HAZ_EPILOGUE
+}
+#endif // MFMA_ITERS odd
+
+#if (MFMA_ITERS % 4) == 3
+// Merge sequence shared by the quad reference and the quad fast variant:
+// c0 as the base, then c1, c3, c2. That is the order the epilogue overlap arm
+// produces, and FP32 addition is not associative, so the reference has to use
+// it too.
+#define HAZ_QUAD_MERGE                                                         \
+  "v_accvgpr_read_b32 v32, a12\nv_accvgpr_read_b32 v33, a13\n"                 \
+  "v_accvgpr_read_b32 v34, a14\nv_accvgpr_read_b32 v35, a15\n"                 \
+  "v_accvgpr_read_b32 %[a0], a0\nv_accvgpr_read_b32 %[a1], a1\n"               \
+  "v_accvgpr_read_b32 %[a2], a2\nv_accvgpr_read_b32 %[a3], a3\n"               \
+  "v_accvgpr_read_b32 v22, a4\nv_accvgpr_read_b32 v23, a5\n"                   \
+  "v_accvgpr_read_b32 v24, a6\nv_accvgpr_read_b32 v25, a7\n"                   \
+  "v_add_f32_e32 %[a0], v22, %[a0]\nv_add_f32_e32 %[a1], v23, %[a1]\n"         \
+  "v_add_f32_e32 %[a2], v24, %[a2]\nv_add_f32_e32 %[a3], v25, %[a3]\n"         \
+  "v_add_f32_e32 %[a0], v32, %[a0]\nv_add_f32_e32 %[a1], v33, %[a1]\n"         \
+  "v_add_f32_e32 %[a2], v34, %[a2]\nv_add_f32_e32 %[a3], v35, %[a3]\n"         \
+  "v_accvgpr_read_b32 v26, a8\nv_accvgpr_read_b32 v27, a9\n"                   \
+  "v_accvgpr_read_b32 v28, a10\nv_accvgpr_read_b32 v29, a11\n"                 \
+  "v_add_f32_e32 %[a0], v26, %[a0]\nv_add_f32_e32 %[a1], v27, %[a1]\n"         \
+  "v_add_f32_e32 %[a2], v28, %[a2]\nv_add_f32_e32 %[a3], v29, %[a3]\n"
+
+#define HAZ_ZERO_QUAD                                                          \
+  "v_accvgpr_write_b32 a0, 0\nv_accvgpr_write_b32 a1, 0\n"                     \
+  "v_accvgpr_write_b32 a2, 0\nv_accvgpr_write_b32 a3, 0\n"                     \
+  "v_accvgpr_write_b32 a4, 0\nv_accvgpr_write_b32 a5, 0\n"                     \
+  "v_accvgpr_write_b32 a6, 0\nv_accvgpr_write_b32 a7, 0\n"                     \
+  "v_accvgpr_write_b32 a8, 0\nv_accvgpr_write_b32 a9, 0\n"                     \
+  "v_accvgpr_write_b32 a10, 0\nv_accvgpr_write_b32 a11, 0\n"                   \
+  "v_accvgpr_write_b32 a12, 0\nv_accvgpr_write_b32 a13, 0\n"                   \
+  "v_accvgpr_write_b32 a14, 0\nv_accvgpr_write_b32 a15, 0\n"
+
+// REFERENCE for the quad-chain schedule: K block k into chain k % 4, no
+// overlap, merged in the shared sequence above.
+__global__ void mfma_reference_quad(float *out,
+                                    uint8_t const *Ad,
+                                    uint8_t const *As,
+                                    uint8_t const *Bd,
+                                    uint8_t const *Bs) {
+  HAZ_PROLOGUE
+  asm volatile(
+      HAZ_ZERO_QUAD "s_mov_b32 s13, 0\n"
+      "HAZREFQ%=:\n" HAZ_REF_BLOCK("a[0:3]") HAZ_REF_ADVANCE
+          HAZ_REF_BLOCK("a[4:7]") HAZ_REF_ADVANCE
+              HAZ_REF_BLOCK("a[8:11]") HAZ_REF_ADVANCE
+                  HAZ_REF_BLOCK("a[12:15]") HAZ_REF_ADVANCE
+      "s_cmpk_lt_i32 s13, %[im3]\ns_cbranch_scc1 HAZREFQ%=\n"
+      // 5 quads consumed K blocks 0..19; 20/21/22 land on chains 0/1/2.
+      HAZ_REF_BLOCK("a[0:3]") HAZ_REF_ADVANCE
+          HAZ_REF_BLOCK("a[4:7]") HAZ_REF_ADVANCE
+              HAZ_REF_BLOCK("a[8:11]") HAZ_QUAD_MERGE
+      : HAZ_OUTS:HAZ_INS_Q
+      : HAZ_CLOBBER_Q);
+  HAZ_EPILOGUE
+}
+
+// One ping-pong pair of the quad body. CH_A consumes bank 0, CH_B bank 1.
+#define HAZ_QUAD_PAIR(CH_A, CH_B)                                              \
+  "v_add_u32_e32 %[wa], 64, %[wa]\nv_add_u32_e32 %[wsa], 1, %[wsa]\n"          \
+  "v_add_u32_e32 %[ta], 0x80, %[ta]\ns_add_i32 s13, s13, 1\n"                  \
+  "v_add_u32_e32 v17, s13, %[tsa]\nds_read_u8 v19, v17\n"                      \
+  "ds_read_b128 v[26:29], %[wa]\nds_read_u8 v18, %[wsa]\n"                     \
+  "ds_read_b128 v[32:35], %[ta]\nds_read_b128 v[36:39], %[ta] offset:64\n"     \
+  "v_mfma_scale_f32_16x16x128_f8f6f4 " CH_A ", v[22:25], v[8:15], " CH_A        \
+  ", v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"                                       \
+  "v_add_u32_e32 %[wa], 64, %[wa]\nv_add_u32_e32 %[wsa], 1, %[wsa]\n"          \
+  "v_add_u32_e32 %[ta], 0x80, %[ta]\ns_add_i32 s13, s13, 1\n"                  \
+  "v_add_u32_e32 v17, s13, %[tsa]\n"                                           \
+  "s_nop 2\n"                                                                  \
+  "s_waitcnt lgkmcnt(0)\n"                                                     \
+  "v_mfma_scale_f32_16x16x128_f8f6f4 " CH_B ", v[26:29], v[32:39], " CH_B       \
+  ", v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"                                      \
+  "ds_read_u8 v16, v17\n"                                                      \
+  "ds_read_b128 v[22:25], %[wa]\nds_read_u8 v7, %[wsa]\n"                      \
+  "ds_read_b128 v[8:11], %[ta]\nds_read_b128 v[12:15], %[ta] offset:64\n"      \
+  "s_nop 3\n"                                                                  \
+  "s_waitcnt lgkmcnt(0)\n"
+
+// QUAD: four independent chains, four K blocks per trip. No pair of adjacent
+// MFMAs shares SrcC, and no chain is reused inside a trip at all.
+__global__ void mfma_quad_acc(float *out,
+                              uint8_t const *Ad,
+                              uint8_t const *As,
+                              uint8_t const *Bd,
+                              uint8_t const *Bs) {
+  HAZ_PROLOGUE
+  asm volatile(
+      HAZ_ZERO_QUAD
+      // Preload bank 0.
+      "ds_read_b128 v[22:25], %[wa]\nds_read_u8 v7, %[wsa]\n"
+      "ds_read_b128 v[8:11], %[ta]\nds_read_b128 v[12:15], %[ta] offset:64\n"
+      "ds_read_u8 v16, %[tsa]\ns_mov_b32 s13, 0\n"
+      "s_waitcnt lgkmcnt(0)\n"
+      "HAZQUAD%=:\n"
+      "s_cmpk_lt_i32 s13, %[im3]\ns_cbranch_scc0 HAZQUADFIN%=\n"
+      HAZ_QUAD_PAIR("a[0:3]", "a[4:7]")
+      HAZ_QUAD_PAIR("a[8:11]", "a[12:15]")
+      "s_branch HAZQUAD%=\n"
+      "HAZQUADFIN%=:\n"
+      // Three-MFMA tail for K blocks 20..22 on chains 0, 1, 2.
+      HAZ_QUAD_PAIR("a[0:3]", "a[4:7]")
+      "v_mfma_scale_f32_16x16x128_f8f6f4 a[8:11], v[22:25], v[8:15], a[8:11], "
+      "v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+      "s_nop 15\ns_nop 15\n" HAZ_QUAD_MERGE
+      : HAZ_OUTS:HAZ_INS_Q
+      : HAZ_CLOBBER_Q);
+  HAZ_EPILOGUE
+}
+
+// QUAD + EPILOGUE OVERLAP: the same schedule with the 32-clock hazard-2 pad
+// deleted. This is only safe because HAZ_QUAD_MERGE already reads the three
+// mature chains (c3, c0, c1) before it touches a8 -- 20 instructions after the
+// final a[8:11] MFMA issues, well past the 11-clock retirement threshold the
+// "broken" variant above trips at 9. If the reordering were not enough, this
+// variant is what would fail, and it would fail the same way `broken` does.
+//
+// It shares mfma_reference_quad: the merge order is identical, so unlike the
+// chaining flags this one has to be *bit-exact*, not just close.
+__global__ void mfma_quad_acc_overlap(float *out,
+                                      uint8_t const *Ad,
+                                      uint8_t const *As,
+                                      uint8_t const *Bd,
+                                      uint8_t const *Bs) {
+  HAZ_PROLOGUE
+  asm volatile(
+      HAZ_ZERO_QUAD
+      "ds_read_b128 v[22:25], %[wa]\nds_read_u8 v7, %[wsa]\n"
+      "ds_read_b128 v[8:11], %[ta]\nds_read_b128 v[12:15], %[ta] offset:64\n"
+      "ds_read_u8 v16, %[tsa]\ns_mov_b32 s13, 0\n"
+      "s_waitcnt lgkmcnt(0)\n"
+      "HAZQUADO%=:\n"
+      "s_cmpk_lt_i32 s13, %[im3]\ns_cbranch_scc0 HAZQUADOFIN%=\n"
+      HAZ_QUAD_PAIR("a[0:3]", "a[4:7]")
+      HAZ_QUAD_PAIR("a[8:11]", "a[12:15]")
+      "s_branch HAZQUADO%=\n"
+      "HAZQUADOFIN%=:\n"
+      HAZ_QUAD_PAIR("a[0:3]", "a[4:7]")
+      "v_mfma_scale_f32_16x16x128_f8f6f4 a[8:11], v[22:25], v[8:15], a[8:11], "
+      "v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+      // No s_nop here -- that is the whole point of the variant.
+      HAZ_QUAD_MERGE
+      : HAZ_OUTS:HAZ_INS_Q
+      : HAZ_CLOBBER_Q);
+  HAZ_EPILOGUE
+}
+#endif // MFMA_ITERS % 4 == 3
+
 typedef void (*hazard_kernel_t)(float *,
                                 uint8_t const *,
                                 uint8_t const *,
@@ -323,9 +615,10 @@ int main(int argc, char **argv) {
                         hipMemcpyDeviceToHost));
   };
 
-  // Ground truth from the non-overlapping reference.
+  // Ground truth from the non-overlapping single-chain reference.
   launch(mfma_reference, 1);
-  std::vector<float> truth(host.begin(), host.begin() + 1024);
+  std::vector<float> const base_truth(host.begin(), host.begin() + 1024);
+  std::vector<float> truth(base_truth);
   for (int i = 0; i < 1024; i++) {
     if (!std::isfinite(truth[i])) {
       std::printf("FAIL: reference produced a non-finite value at %d\n", i);
@@ -338,18 +631,40 @@ int main(int argc, char **argv) {
       "  iterations %d, grid %d, launches %d\n", MFMA_ITERS, grid, launches);
   std::printf("  reference lane0 accumulator: %.4f\n\n", truth[0]);
 
+  // Each variant is checked against a reference with the SAME reduction
+  // order. The multi-chain schedules reassociate the FP32 sum, so comparing
+  // them to the single-chain reference would report a rounding difference as
+  // a hazard.
   struct Variant {
     char const *name;
     hazard_kernel_t kernel;
+    hazard_kernel_t reference;
     bool must_match;
   } const variants[] = {
-      {"reference (no overlap)", mfma_reference, true},
-      {"fixed     (banked + 32clk)", mfma_fixed, true},
-      {"broken    (historical)", mfma_broken, false},
+      {"reference (no overlap)", mfma_reference, mfma_reference, true},
+      {"fixed     (banked + 32clk)", mfma_fixed, mfma_reference, true},
+      {"broken    (historical)", mfma_broken, mfma_reference, false},
+#if (MFMA_ITERS % 2) == 1
+      {"dual-acc  (2 chains, 8clk)", mfma_dual_acc, mfma_reference_dual, true},
+#endif
+#if (MFMA_ITERS % 4) == 3
+      {"quad-acc  (4 chains, 8clk)", mfma_quad_acc, mfma_reference_quad, true},
+      {"quad+epi  (no 32clk pad)",
+       mfma_quad_acc_overlap,
+       mfma_reference_quad,
+       true},
+#endif
   };
 
   int failures = 0;
   for (auto const &v : variants) {
+    if (v.reference != mfma_reference) {
+      launch(v.reference, 1);
+      truth.assign(host.begin(), host.begin() + 1024);
+    } else {
+      truth = base_truth;
+    }
+
     long wrong_blocks = 0, total_blocks = 0;
     double worst_rel = 0.0;
     for (int t = 0; t < launches; t++) {

@@ -88,8 +88,36 @@ struct QkvWeightLds {
   static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE;
 #endif
 
+  // ── Low LDS: reduction scratch, normalized activation, token staging ───
+  //
+  // Default layout keeps the historical aliasing: the RMSNorm cross-wave
+  // reduction scratch and the FP8 token region both start at byte 0, which is
+  // safe only because the reduction has finished by the time the quantizer
+  // writes. RED_OFF/TOK_OFF name that overlap instead of leaving it implicit.
+  //
+  // MPK_QKV_LDS_NORM gives the normalized bf16 row its own LDS block between
+  // them. Step 1 computes the norm redundantly in *every* block and writes it
+  // to a global scratch that Step 2 in the *same* block reads straight back,
+  // so the round trip carries no information between workgroups -- it is a
+  // write and a read of TOK_ROWS * REDUCTION_SIZE * 2 bytes per block per
+  // layer that LDS can absorb. The reduction scratch has to stay disjoint
+  // from the norm block (the batch loop reuses s_red for row b after writing
+  // norm row b-1), which is why this is a third region and not an alias.
+  static constexpr int RED_OFF = 0;
+  static constexpr int RED_BYTES = ((NUM_WAVES * 4 + 15) / 16) * 16;
+#ifdef MPK_QKV_LDS_NORM
+  static constexpr int NORM_OFF = RED_BYTES;
+  static constexpr int NORM_BYTES = TOK_ROWS * REDUCTION_SIZE * 2;
+  static constexpr int TOK_OFF = ((NORM_OFF + NORM_BYTES + 15) / 16) * 16;
+#else
+  static constexpr int NORM_OFF = 0;
+  static constexpr int NORM_BYTES = 0;
+  static constexpr int TOK_OFF = 0;
+#endif
+
   // Weight region base within the task's dynamic LDS.
-  static constexpr int W_OFF = ((TOK_REGION + SC_REGION + 15) / 16) * 16;
+  static constexpr int W_OFF =
+      ((TOK_OFF + TOK_REGION + SC_REGION + 15) / 16) * 16;
   // Total LDS the weight staging occupies, from the base of _rnlm_smem.
   static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
 };
@@ -634,10 +662,17 @@ __device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
       }
 
 // Wavefront reduction (AMD wavefront = 64 lanes)
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       // Cross-wave reduction via shared memory (reuse FP8 area, dead here)
       float *s_red = (float *)_rnlm_smem;
@@ -1509,10 +1544,17 @@ __device__ __noinline__ void
       }
 
 // Wavefront reduction (AMD wavefront = 64 lanes)
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       // Cross-wave reduction via shared memory (reuse FP8 area, dead here)
       float *s_red = (float *)_rnlm_smem;
@@ -1963,10 +2005,17 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
       }
 
 // Wavefront reduction
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       // Cross-wave reduction via shared memory
       float *s_red = (float *)_rnlm_smem;
@@ -2331,8 +2380,15 @@ __device__ __noinline__ void
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
 
+  // The geometry lives in QkvWeightLds so the fused layer's Phase 9 prefetch
+  // (which stages the NEXT layer's weights into this same region during the
+  // barrier spin) cannot drift from what the MFMA below reads. It is also the
+  // single owner of the low-LDS offsets, so declare it before the first
+  // pointer that depends on one.
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+
   extern __shared__ char _rnlm_smem[];
-  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem + G::TOK_OFF;
   uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
 
   int const tid = threadIdx.x;
@@ -2364,11 +2420,6 @@ __device__ __noinline__ void
   uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
 
   // ── Phase A: Issue HBM→LDS weight prefetch BEFORE RMSNorm ─────────────
-  //
-  // The geometry lives in QkvWeightLds so the fused layer's Phase 9 prefetch
-  // (which stages the NEXT layer's weights into this same region during the
-  // barrier spin) cannot drift from what the MFMA below reads.
-  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
   constexpr int QKV_TILE_SCALE = G::TILE_SCALE;
   constexpr int QKV_TILE_DATA_PADDED = G::TILE_DATA_PADDED;
   constexpr int QKV_TILE_BYTES = G::TILE_BYTES;
@@ -2379,7 +2430,9 @@ __device__ __noinline__ void
   // permissive by 3 KB.
   static_assert(G::W_END <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
                                 mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
-                "QKV LDS weights exceed MI350X LDS budget");
+                "QKV LDS weights exceed MI350X LDS budget (if you just set "
+                "MPK_QKV_LDS_NORM: it costs TOK_ROWS * REDUCTION_SIZE * 2 "
+                "extra bytes, which only fits at small TOK_ROWS)");
   // The shared geometry must agree with this kernel's own token-region math,
   // or the DMA writes where one says and the MFMA reads where the other says.
   static_assert(G::TOK_REGION == TOK_REGION && G::SC_REGION == SC_REGION,
@@ -2388,6 +2441,33 @@ __device__ __noinline__ void
   static_assert(TOK_ROWS * HEAD_DIM * 2 <= TOK_REGION,
                 "packed RoPE scratch must fit in the dead token region");
   uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
+
+  // ── Optional: keep the normalized activation in LDS ────────────────────
+  //
+  // Step 1 computes the RMSNorm redundantly in every block and Step 2 in the
+  // *same* block reads it straight back, so the global round trip through
+  // norm_scratch_ptr carries no information between workgroups. Under
+  // MPK_QKV_LDS_NORM the row lands in LDS instead and never leaves the CU.
+  //
+  // Only the TOK_ROWS rows this column block actually quantizes are staged;
+  // rows outside [tok_row_base, tok_row_base + TOK_ROWS) are still normalized
+  // (the loop below also writes x_output for them, which *is* a real global
+  // output) but their norm result is dropped on the floor, exactly as the
+  // global path's redundant writers overwrote each other.
+  //
+  // Hazard note: an equivalent LDS-norm path is known to miscompile on
+  // Clang 23 -- intermittent invalid decode tokens when a batched quantum
+  // drains to concurrency one. This tree builds with AMD clang 20, which is
+  // not affected; if you move to a newer compiler, re-validate before
+  // trusting this flag.
+#ifdef MPK_QKV_LDS_NORM
+  static_assert(G::NORM_OFF >= G::RED_BYTES,
+                "the RMSNorm cross-wave scratch must not overlap the norm "
+                "buffer: the batch loop reuses s_red for row b after pass 2 "
+                "has already written row b-1");
+  unsigned short *s_norm_out =
+      (unsigned short *)((uint8_t *)_rnlm_smem + G::NORM_OFF);
+#endif
 
   // MPK_ABLATE_QKV_DMA: timing-only upper bound on what any prefetch hoist
   // could recover. Skipping the load leaves garbage weights in LDS, so the
@@ -2408,7 +2488,9 @@ __device__ __noinline__ void
     unsigned short const *d_residual = (unsigned short const *)residual_ptr;
     unsigned short *d_x_out = (unsigned short *)x_output_ptr;
     unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
+#ifndef MPK_QKV_LDS_NORM
     unsigned short *d_norm_out = (unsigned short *)norm_scratch_ptr;
+#endif
 
     for (int b = 0; b < batch_count; b++) {
       float ssq = 0.0f;
@@ -2566,10 +2648,17 @@ __device__ __noinline__ void
         }
       }
 
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
 #pragma unroll
       for (int offset = 32; offset > 0; offset >>= 1) {
         ssq += __shfl_xor(ssq, offset);
       }
+      #endif
 
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;
@@ -2594,10 +2683,24 @@ __device__ __noinline__ void
       rms_rcp = s_red[0];
 
       // Pass 2: Apply norm weight using CACHED sums (no re-read of x_out)
+#ifdef MPK_QKV_LDS_NORM
+      // Rows this column block will not quantize have nothing left to
+      // contribute -- pass 1 already wrote their x_output -- so their pass 2
+      // is dead work here, where the global path merely made it invisible by
+      // having every block write the same bytes.
+      int const _lds_norm_row = b - tok_row_base;
+      if (_lds_norm_row < 0 || _lds_norm_row >= TOK_ROWS) {
+        continue;
+      }
+#endif
       {
         using bf16 = __hip_bfloat16;
         constexpr int VEC = 4;
+#ifdef MPK_QKV_LDS_NORM
+        bf16 *out = (bf16 *)s_norm_out + _lds_norm_row * REDUCTION_SIZE;
+#else
         bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
+#endif
         int ci = 0;
         int wi = 0;
 #pragma unroll
@@ -2636,10 +2739,23 @@ __device__ __noinline__ void
 
   // ── Step 2: Prepare activation in LDS ──────────────────────────────────
 
+#ifdef MPK_QKV_LDS_NORM
+  // s_norm_out already holds only this block's rows, so the row base is 0 and
+  // the clamp bound is TOK_ROWS rather than BATCH_SIZE. The quantizer reads
+  // through a generic pointer, which resolves to the LDS aperture here.
+  _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, TOK_ROWS, TOK_ROW_STRIDE,
+                           SC_STRIDE>(s_norm_out,
+                                      REDUCTION_SIZE,
+                                      0,
+                                      batch_count - tok_row_base,
+                                      s_tok_fp8,
+                                      s_tok_scales);
+#else
   _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE, TOK_ROW_STRIDE,
                            SC_STRIDE>(
       (unsigned short const *)norm_scratch_ptr, REDUCTION_SIZE, tok_row_base,
       batch_count - tok_row_base, s_tok_fp8, s_tok_scales);
+#endif
 
   // ── Phase B: Drain buffer_load_lds, scatter scales to LDS ──
   {
@@ -2755,6 +2871,19 @@ __device__ __noinline__ void
     constexpr int ROW_DATA = REDUCTION_SIZE / 2;   // 1536
     constexpr int ROW_SCALE = REDUCTION_SIZE / 32; // 96
 
+#ifdef MPK_QKV_MFMA_UNROLLED
+    // The .rept arm emits (MFMA_ITERS-1)/2 bank pairs and exactly one bank-0
+    // tail, which only covers MFMA_ITERS when the count is odd. At an even
+    // count the last iteration's operands land in bank 1 and the emitted tail
+    // would re-run iteration MFMA_ITERS-2 with bank 0 -- silently wrong, not a
+    // build error, so it is caught here instead. The branching arm handles
+    // both parities and stays available.
+    static_assert(MFMA_ITERS % 2 == 1,
+                  "MPK_QKV_MFMA_UNROLLED assumes an odd MFMA_ITERS "
+                  "(REDUCTION_SIZE / 128); at an even count use the default "
+                  "branching loop, which emits both tails");
+#endif
+
     for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
       int wave_tile = warp_id + tile_iter * NUM_WAVES;
 
@@ -2812,11 +2941,28 @@ __device__ __noinline__ void
             "ds_read_u8   v7, %[wsa]\n"                // weight A scale
             "ds_read_b128 v[8:11], %[ta]\n"            // token B lo (16B FP8)
             "ds_read_b128 v[12:15], %[ta] offset:64\n" // token B hi (16B FP8)
-            "ds_read_u8   v16, %[tsa]\n"               // token B scale
-            "s_mov_b32 s13, 0\n"                       // loop counter
+            "ds_read_u8   v16, %[tsa]\n" // token B scale
 
-            // ── MFMA_ITERS-1 in-loop MFMAs, alternating banks ──
+// ── MFMA_ITERS-1 in-loop MFMAs, alternating banks ──
+//
+// MPK_QKV_MFMA_UNROLLED: MFMA_ITERS is a compile-time constant, so the
+// scalar loop control is doing runtime work to recompute something the
+// assembler already knows. `.rept` emits the same bank-0/bank-1 pair
+// (MFMA_ITERS-1)/2 times and an assembler symbol carries the token-scale
+// offset, which removes per pair: two s_add_i32, two s_cmpk_lt_i32, one
+// s_cbranch_scc0, one s_cbranch_scc1 and one s_branch -- and, more to the
+// point, takes the taken-branch bubble off the end of every pair.
+//
+// The unrolled arm also drops the dual-tail hedge below: with a constant
+// trip count the exit parity is known here, so only the bank-0 final MFMA
+// is reachable. That is what the static_assert pins.
+#ifdef MPK_QKV_MFMA_UNROLLED
+            ".set MPK_QKV_TSC_%=, 1\n"
+            ".rept %[unroll_pairs]\n"
+#else
+            "s_mov_b32 s13, 0\n" // loop counter
             "PIPELINED_QKV_%=:\n"
+#endif
 
             // ---- consume bank 0, prefetch into bank 1 ----
             "s_waitcnt lgkmcnt(0)\n" // bank 0 operands resident
@@ -2825,9 +2971,12 @@ __device__ __noinline__ void
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%=, %[tsa]\n"
+#else
             "s_add_i32 s13, s13, 1\n"
-
             "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
             "ds_read_u8   v19, v17\n"                  // B scale  -> bank 1
             "ds_read_b128 v[26:29], %[wa]\n"           // A data   -> bank 1
             "ds_read_u8   v18, %[wsa]\n"               // A scale  -> bank 1
@@ -2837,8 +2986,10 @@ __device__ __noinline__ void
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
             "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
 
+#ifndef MPK_QKV_MFMA_UNROLLED
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc0 QKV_TAIL_B1_%=\n"
+#endif
 
             // ---- consume bank 1, prefetch into bank 0 ----
             "s_waitcnt lgkmcnt(0)\n" // bank 1 operands resident
@@ -2846,9 +2997,12 @@ __device__ __noinline__ void
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%= + 1, %[tsa]\n"
+#else
             "s_add_i32 s13, s13, 1\n"
-
             "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
             "ds_read_u8   v16, v17\n"                  // B scale  -> bank 0
             "ds_read_b128 v[22:25], %[wa]\n"           // A data   -> bank 0
             "ds_read_u8   v7, %[wsa]\n"                // A scale  -> bank 0
@@ -2858,6 +3012,18 @@ __device__ __noinline__ void
             "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
 
+#ifdef MPK_QKV_MFMA_UNROLLED
+            ".set MPK_QKV_TSC_%=, MPK_QKV_TSC_%= + 2\n"
+            ".endr\n"
+
+            // ── Final MFMA (bank 0) ──
+            // (MFMA_ITERS-1)/2 pairs consumed an even number of iterations, so
+            // the odd one out is always iteration MFMA_ITERS-1, whose operands
+            // the last pair prefetched into bank 0.
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+            "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
             "s_cmpk_lt_i32 s13, %[iters_m1]\n"
             "s_cbranch_scc1 PIPELINED_QKV_%=\n"
 
@@ -2880,6 +3046,7 @@ __device__ __noinline__ void
             "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
 
             "QKV_ACC_%=:\n"
+#endif
             // 32 clocks before reading the accumulator. The scaled MFMA is a
             // 32-cycle op on CDNA4; the previous "s_nop 7; s_nop 0" was 9
             // clocks (the correct wait for a 4-pass MFMA) and returned a
@@ -2897,7 +3064,8 @@ __device__ __noinline__ void
               [wa] "+v"(w_addr),
               [wsa] "+v"(ws_addr),
               [ta] "+v"(t_addr)
-            : [tsa] "v"(ts_addr), [iters_m1] "n"(MFMA_ITERS - 1)
+            : [tsa] "v"(ts_addr), [iters_m1] "n"(MFMA_ITERS - 1),
+              [unroll_pairs] "n"((MFMA_ITERS - 1) / 2)
             : "memory",
               "s13",
               "v7",
@@ -2949,7 +3117,7 @@ __device__ __noinline__ void
       // above ends with s_waitcnt lgkmcnt(0), so when *this* wave falls out of
       // it, *its* ds_reads have landed -- but nothing has ordered it against
       // the other three waves, which may still be issuing the ds_read_b128
-      // pair that feeds their own MFMA. s_rope is _rnlm_smem, i.e. byte 0 of
+      // pair that feeds their own MFMA. s_rope is byte 0 of
       // s_tok_fp8, so wave 0's step-1 stores land exactly on token row 0's
       // activations: s_rope halfword (t*HEAD_DIM + ...) is byte 128*t + ...,
       // and token row 0's MFMA iteration i reads bytes [128*i, 128*i+128).
@@ -2971,7 +3139,7 @@ __device__ __noinline__ void
       int kv_head = _kvupd_get_xcd_id();
       unsigned short const *cos_base = (unsigned short const *)cos_ptr;
       unsigned short const *sin_base = (unsigned short const *)sin_ptr;
-      unsigned short *s_rope = (unsigned short *)_rnlm_smem;
+      unsigned short *s_rope = (unsigned short *)s_tok_fp8;
       if (wg_idx < NUM_Q_PER_KV) {
         int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
         _kvupd_rope_epilogue_packed<HEAD_DIM, TOK_ROWS>(

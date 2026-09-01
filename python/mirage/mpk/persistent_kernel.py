@@ -458,6 +458,166 @@ def get_compile_command(
             flags = flags + [f"-DMPK_ATTN_WAVE_LOCAL_MIN_TILES={int(_wl_min)}"]
         if int(os.environ.get("MPK_MFMA_PINGPONG_SCHED", "0")) == 1:
             flags = flags + ["-DMPK_MFMA_PINGPONG_SCHED"]
+        # Split the MoE K reduction across independent MFMA accumulator
+        # chains. MPK_MFMA_PINGPONG_SCHED *fills* the 32-state SrcC RAW gap
+        # between consecutive same-accumulator MFMAs with s_nop; these remove
+        # it, dropping the adjacent cadence to 8 states.
+        #
+        # MPK_MOE_QUAD_ACCUMULATOR (W2) is still a no-op without
+        # MPK_MFMA_PINGPONG_SCHED. MPK_MOE_DUAL_ACCUMULATOR (W13) is not: the
+        # unscheduled arm carries no s_nop but still pays the SrcC RAW as a
+        # hardware stall, roughly 21 states on top of the ~11 issued slots
+        # between its two MFMAs, so the chains have something to remove there
+        # too. The transform is credited with 47.6 us/token (2.6%) at
+        # concurrency 1 on a schedule that pads the SrcC RAW with explicit
+        # `s_nop`, and fleet could not reach it at all while the flag was
+        # gated behind a schedule that MPK_W13_T0_MFMA_UNROLLED (default on)
+        # refuses to build with.
+        #
+        # Chaining reassociates the FP32 K reduction, so results move by a few
+        # ULP -- expected, and covered by the perplexity gate rather than a
+        # bit-exact comparison. The schedules themselves are verified
+        # bit-exact against order-matched references in
+        # tests/standalone/test_mfma_pipeline_hazards.hip.
+        #
+        # Measured on the live arm and left off: 1.840 -> 1.852 ms, losing all
+        # three pairs, text bit-identical. That 47.6 us is real on a schedule
+        # that spends 27 states of explicit `s_nop` per pair covering the SrcC
+        # RAW, because the chains delete it. Fleet's arm has no
+        # such padding to delete: the `s_waitcnt lgkmcnt(0)` opening each half
+        # stalls on an LDS round trip issued one slot earlier, which is longer
+        # than the 32 states the accumulator needed anyway. So fleet already
+        # holds that win by a different route, and splitting the chains only
+        # adds four AGPRs, four zero-writes and a four-add FP32 merge per tile.
+        if int(os.environ.get("MPK_MOE_DUAL_ACCUMULATOR", "0")) == 1:
+            # W13 tiles 0 and 1: even K blocks on a[0:3], odd on a[4:7].
+            flags = flags + ["-DMPK_MOE_DUAL_ACCUMULATOR"]
+        if int(os.environ.get("MPK_MOE_QUAD_ACCUMULATOR", "0")) == 1:
+            # W2: K block k on chain k % 4, four blocks per trip.
+            flags = flags + ["-DMPK_MOE_QUAD_ACCUMULATOR"]
+        # Spend the W2 epilogue's 32-clock Hazard-2 pad on the reduction of the
+        # three accumulator chains that already retired, instead of idling it.
+        # Requires the quad chains to exist, so the kernel #errors if this is
+        # set without MPK_MOE_QUAD_ACCUMULATOR. Merge order is unchanged, so
+        # unlike the two flags above this one is bit-exact.
+        if int(os.environ.get("MPK_MOE_W2_EPILOGUE_OVERLAP", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_W2_EPILOGUE_OVERLAP"]
+        # Read the O-proj weight fragments K-major so a wave's 64 ds_read_b128
+        # addresses are consecutive instead of 16-way bank-conflicting on the
+        # 2048-byte row stride. This is a *contract with the checkpoint*: the
+        # tiles must have been permuted offline by
+        # shuffle_oproj_workgroups_kmajor(), which demo.py does off the same
+        # MPK_OPROJ_KMAJOR variable. Setting it on only one side is silently
+        # wrong numerics, not a build error.
+        if _opt("MPK_OPROJ_KMAJOR"):
+            flags = flags + ["-DMPK_OPROJ_KMAJOR"]
+        # Same permutation, same checkpoint contract, applied to the LM head --
+        # per 16-row MFMA tile, since its record is 64 rows wide and each of
+        # the four resident waves owns one tile. Row-major the 1472-byte row
+        # stride is 368 dwords (368 % 32 == 16), so the sixteen rows of a wave
+        # collapse onto two bank groups and every weight ds_read is 8-way
+        # conflicted; K-major the wave reads 64 consecutive fragments and each
+        # lane moves 16 bytes instead of 32, because an FP4 A-operand only
+        # occupies the low half of the i32x8 the MFMA intrinsic takes.
+        #
+        # Host side is shuffle_lm_head_record_kmajor() in demo.py, off this
+        # same variable -- one side alone is silently wrong numerics.
+        #
+        # Off by default: it measured *slower*, 1.837 -> 1.844 ms, losing all
+        # three alternating pairs (+0.007 / +0.012 / +0.002) with the generated
+        # text unchanged. The conflict analysis holds and the LDS read count
+        # does halve; it just buys nothing, because Phase C's weight reads are
+        # already covered by the Phase A HBM->LDS burst, and the FP4 operand's
+        # unused upper half now has to be zeroed explicitly instead of arriving
+        # free in the second half of a 32-byte read. Kept, gated, and measured
+        # rather than deleted, since the layout is a prerequisite for any later
+        # attempt at streaming the tile fragment-by-fragment.
+        if int(os.environ.get("MPK_LM_HEAD_KMAJOR", "0")) == 1:
+            flags = flags + ["-DMPK_LM_HEAD_KMAJOR"]
+        # Issue the LM head's Phase A weight prefetch as one per-wave train
+        # over its own 16-row tile -- scalar LDS destination in M0, advanced
+        # with s_addk_i32 -- instead of 24 striped intrinsic calls per thread
+        # that each re-scalarize a threadIdx-derived destination and clamp a
+        # partial last slot. Same bytes into the same LDS addresses.
+        #
+        # Off by default: 1.840 -> 1.844 ms, one win and two losses out of
+        # three pairs, text unchanged. It does what it says -- 24 requests per
+        # wave become 23, the clamp and the duplicate slot go away, and the
+        # run-to-run spread collapses from 1.8385-1.850 to 1.843-1.844 -- but
+        # the LM head's Phase A is bounded by HBM, not by the instructions
+        # that issue it, so cheaper issue buys nothing.
+        if int(os.environ.get("MPK_LM_HEAD_WAVE_TILE_DMA", "0")) == 1:
+            flags = flags + ["-DMPK_LM_HEAD_WAVE_TILE_DMA"]
+        # Widen the embedding gather to 8 bytes per lane. The scalar arm moves
+        # one element per lane per trip and blockDim.x is a runtime value, so a
+        # 2944-wide bf16 row is 23 trips at 128 threads, each paying a
+        # load->store waitcnt; four elements per lane makes it 6. The embedding
+        # is the head of every token's dependency chain and nothing overlaps
+        # it, so its latency is TPOT one-for-one. Falls back to the scalar arm
+        # unless the shape and both base pointers are 8-byte clean.
+        #
+        # Off by default: 1.843 -> 1.846 ms, one win and two losses out of
+        # three pairs, text bit-identical. The trip count does drop from 23 to
+        # 6, but 5,888 bytes is one L2-resident row and the whole task is a
+        # couple of microseconds against a 1.84-ms token, so the trips it
+        # removes were never the thing being waited on.
+        if int(os.environ.get("MPK_EMBED_WIDE", "0")) == 1:
+            flags = flags + ["-DMPK_EMBED_WIDE"]
+        # Keep the QKV RMSNorm result in LDS instead of round-tripping it
+        # through the global norm scratch. Every block computes the same norm
+        # and reads it back itself, so the write carried no information
+        # between workgroups; the buffer stays a kernel argument but goes
+        # unread on this path.
+        #
+        # The equivalent path is known to miscompile on Clang 23, producing
+        # intermittent invalid decode tokens when a batched quantum drains to
+        # concurrency one. This tree builds with AMD clang 20 and is not
+        # affected -- re-validate before enabling on a newer compiler.
+        if _opt("MPK_QKV_LDS_NORM"):
+            flags = flags + ["-DMPK_QKV_LDS_NORM"]
+        # Replace the TopK per-lane serial argmax (23 VALU ops on a ~21-deep
+        # dependency chain) with a v_max3_f32 reduction tree plus an
+        # equality-recovered index. Bit-exact including the tie-break -- see
+        # the comment at the asm block for why the equality matches are
+        # visited in reverse.
+        if _opt("MPK_TOPK_LOCAL_MAX3"):
+            flags = flags + ["-DMPK_TOPK_LOCAL_MAX3"]
+        # Unroll the QKV MFMA ping-pong loop in the assembler. MFMA_ITERS is a
+        # compile-time constant, so `.rept` can emit the bank-0/bank-1 pairs
+        # directly and drop the runtime counter, the two compares, the three
+        # branches per pair, and the taken-branch bubble at the end of each.
+        # Requires an odd MFMA_ITERS (static_assert'd at the asm block); 23 for
+        # the live REDUCTION_SIZE of 2944.
+        #
+        # Opt-in, unlike the two MoE unrolls below: it measured 1.883 against
+        # 1.881 for the same build without it (four runs each, alternating,
+        # three of the four pairs worse). The same transform pays off on the
+        # MoE loops below, but fleet's QKV loop already carries a different
+        # LDS wait structure and there is no bubble left for it to remove.
+        if int(os.environ.get("MPK_QKV_MFMA_UNROLLED", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_MFMA_UNROLLED"]
+        # The same `.rept` transform on the MoE tile-0 ping-pong loops. These
+        # unroll the *unscheduled* arm, so they are mutually exclusive with
+        # MPK_MFMA_PINGPONG_SCHED -- the kernel #errors on the combination
+        # rather than letting the flag expand to nothing.
+        #
+        # Ship on: 1.876 against 1.882 (four runs each, alternating, three of
+        # four pairs better), generated text unchanged.
+        if _opt("MPK_W13_T0_MFMA_UNROLLED"):
+            flags = flags + ["-DMPK_W13_T0_MFMA_UNROLLED"]
+        if _opt("MPK_W2_T0_MFMA_UNROLLED"):
+            flags = flags + ["-DMPK_W2_T0_MFMA_UNROLLED"]
+        # Rotate QKV/attention ownership onto the ranks that have no O-proj or
+        # TopK work, so their MoE-tail slack absorbs the next layer's QKV
+        # weight prefetch. A rotation, so tile coverage is unchanged -- see the
+        # block comment at the top of gang_full_layer_fused_mi300.cuh.
+        if int(os.environ.get("MPK_ROTATE_QKV_ATTN_RANKS", "0")) == 1:
+            flags = flags + ["-DMPK_ROTATE_QKV_ATTN_RANKS"]
+        # Diagnostic companion to the above: override the rotation distance.
+        # Only meaningful together with MPK_ROTATE_QKV_ATTN_RANKS.
+        _qkv_rot = os.environ.get("MPK_QKV_ROT_OVERRIDE", "")
+        if _qkv_rot != "":
+            flags = flags + [f"-DMPK_QKV_ROT_OVERRIDE={int(_qkv_rot)}"]
         if _opt("MPK_XCD_LOCAL_BARRIER"):
             flags = flags + ["-DMPK_XCD_LOCAL_BARRIER"]
         # Ablation (default OFF): put the layer-gate compare target back in
@@ -625,6 +785,49 @@ def get_compile_command(
             # point, so 240 pollers per XCD contend the very line that is
             # about to be written.
             flags = flags + ["-DMPK_NARROW_GATE_POLL"]
+        if _opt("MPK_ATTN_SLICE_RELEASE"):
+            # Replace the eight-XCD attention rendezvous with a per-XCD slice
+            # publish. Each XCD's merge owns a contiguous 512-element slice of
+            # the O-proj's 4096-wide reduction, so it can release its own the
+            # moment it lands; the O-proj waves then wait per slice -- wave w
+            # for XCDs 2w and 2w+1 -- instead of every wave waiting for the
+            # slowest merge on the machine.
+            #
+            # 1.880 -> 1.864 ms, three alternating pairs, every pair a win and
+            # the generated text unchanged in all six runs.
+            #
+            # NUM_REQS == 1 only, and it only takes effect on the K-parallel
+            # O-proj shape; both are static_asserted rather than silently
+            # ignored, so a shape that cannot use it fails the build instead of
+            # quietly falling back.
+            flags = flags + ["-DMPK_ATTN_SLICE_RELEASE"]
+        if _opt("MPK_W13_T0_COUNTED_HANDOFF"):
+            # Issue the W13 handoff payload -- the prequantized activation row
+            # and this workgroup's block scales -- *above* the 23 KiB tile-0
+            # weight burst instead of below it, and retire each with a counted
+            # vmcnt instead of a drain.
+            #
+            # gfx950 retires VMEM in issue order, so with the payload issued
+            # last the only wait that reaches it is vmcnt(0), and both handoff
+            # rendezvous end up gated on a weight fetch neither of them reads.
+            # Issued first, they are retired by vmcnt(25) and vmcnt(23) with
+            # the weights still in flight; the weight drain moves down to the
+            # first instruction that actually reads a weight byte from LDS.
+            #
+            # The two work splits are re-cut to be wave-uniform (46-47
+            # activation dwordx4 per wave, one W13 scale tile per wave) because
+            # vmcnt is a per-wave counter -- the default tid-major splits give
+            # different waves different request counts, which would otherwise
+            # force three separate vmcnt values.
+            #
+            # Requires MPK_W13_PREQUANT (there is no payload otherwise) and
+            # MPK_W13_LINEAR_LOAD (the post-barrier weight drain is only sound
+            # when a wave issues every request filling the tile it reads).
+            # Both are #error-enforced in the kernel.
+            #
+            # 1.865 -> 1.840 ms, three alternating pairs, every pair a win and
+            # the generated text unchanged in all six runs.
+            flags = flags + ["-DMPK_W13_T0_COUNTED_HANDOFF"]
         if _opt("MPK_W13_BIAS_PREFETCH"):
             # Hoist the W13 tile-0 SwiGLU bias to one global_load_dwordx2
             # issued above the MFMA block, and pack the epilogue's two bf16
@@ -664,6 +867,70 @@ def get_compile_command(
             # Reassociates the logit's rounding, so
             # verify by hashing the generated text, not by timing.
             flags = flags + ["-DMPK_ROUTER_FUSED_DP"]
+        if _opt("MPK_ROUTER_DUAL_REDUCE"):
+            # Reduce the router's two pass-1 partials -- the RMSNorm ssq and
+            # the unscaled dot product -- through one interleaved
+            # permlane32_swap / permlane16_swap / DPP row_shl chain instead of
+            # two six-step __shfl_xor butterflies. The shuffles lower to
+            # ds_bpermute, so the pair costs twelve LDS round trips to move
+            # data that never left the register file; the permlane/DPP
+            # equivalents are VALU-native, and interleaving the two fills each
+            # one's hazard slot with the other's work.
+            #
+            # Bit-identical: same xor-32 / xor-16 / 8-4-2-1 summation order.
+            # Requires MPK_ROUTER_FUSED_DP (there is no second partial to
+            # interleave with otherwise); enforced by #error in the kernel.
+            #
+            # 1.870 -> 1.869 ms. Small -- this is one reduction on one
+            # workgroup per XCD -- but it won all three alternating pairs
+            # (-0.001 / -0.006 / -0.005) and the generated text is unchanged,
+            # which for a strictly-fewer-instructions change on a strictly
+            # worse data path is the expected shape of the result.
+            flags = flags + ["-DMPK_ROUTER_DUAL_REDUCE"]
+        # The same transform on the LM head's g-group argmax: two `__shfl_xor`
+        # steps carrying a (value, index) pair become one interleaved
+        # permlane16_swap / permlane32_swap chain. Four ds_bpermute and two
+        # lgkmcnt waits become four VALU ops on data that never left the
+        # register file, and the value and index partials fill each other's
+        # swap hazard slot.
+        #
+        # Only two steps wide, so unlike the router it needs no DPP row_shl
+        # stages -- permlane16_swap *is* xor-16 and permlane32_swap *is*
+        # xor-32.
+        #
+        # Bit-identical in the group that is read: same xor-16 then xor-32
+        # order, and the select keeps the strict `>` so ties still favour the
+        # incumbent lane's index. Verified against the butterfly in
+        # tests/standalone/test_argmax_dual_reduce.hip, which also pins down
+        # why the contract is g == 0 only.
+        #
+        # Off by default: 1.8423 -> 1.8415 ms, one win in three alternating
+        # pairs (+0.001 / +0.006 / -0.0095) with the generated text unchanged.
+        # The router version of this transform saved 12 lane-crossing ops and
+        # bought 1 us; this one saves 4, once per token, on a single wave --
+        # too small to clear the run-to-run spread. Kept because it is correct
+        # and tested, not because it is faster.
+        if os.environ.get("MPK_ARGMAX_DUAL_REDUCE", "0") == "1":
+            flags = flags + ["-DMPK_ARGMAX_DUAL_REDUCE"]
+        # The same transform on the RMSNorm prologues' sum-of-squares. Seven
+        # live sites run the identical six-step `__shfl_xor` butterfly and then
+        # read lane 0 only, so each pays six ds_bpermute round trips and six
+        # lgkmcnt waits for data that never left the register file. Two
+        # permlane swaps and four DPP row_shl adds replace the whole chain.
+        #
+        # Wider reach than the router or the argmax: this one runs in the QKV
+        # and MoE prologues, not once per token in the tail.
+        #
+        # Bit-identical at lane 0 -- same 32/16/8/4/2/1 association tree, so
+        # the float sum is not reassociated. Verified over 8192 cases in
+        # tests/standalone/test_rmsnorm_dpp_reduce.hip.
+        #
+        # 1.8510 -> 1.8353 ms, all three alternating pairs (-0.019 / -0.021 /
+        # -0.007) with the generated text unchanged. The reach is what makes
+        # the difference against the router's 1 us: same idiom, but on the
+        # prologues rather than once per token.
+        if _opt("MPK_RMSNORM_DPP_REDUCE"):
+            flags = flags + ["-DMPK_RMSNORM_DPP_REDUCE"]
         if _opt("MPK_ML_TABLE_PREFETCH"):
             # Read layer N+1's pointer-table row during layer N's body instead
             # of after layer N's Phase 9 gate. The tables are host-built and

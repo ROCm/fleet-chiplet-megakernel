@@ -45,6 +45,82 @@
 
 namespace kernel {
 
+#ifdef MPK_ARGMAX_DUAL_REDUCE
+// ── The LM head's g-group argmax, as two VALU swaps instead of four LDS ─────
+//
+// The reduction this replaces is only two steps wide -- xor-16 then xor-32,
+// walking the four `g` groups and leaving `col` alone -- but each step costs
+// two `__shfl_xor`, one for the value and one for the index, and `__shfl_xor`
+// lowers to ds_bpermute: an LDS round trip and an lgkmcnt wait per shuffle for
+// data that never left the register file. Four round trips, two waits.
+//
+// Both steps have an exact VALU-native equivalent on gfx950 and they are the
+// only two the whole reduction needs: `v_permlane16_swap_b32` is xor-16 and
+// `v_permlane32_swap_b32` is xor-32, so unlike the router's six-step chain
+// this one needs no DPP row_shl stages at all.
+//
+// The swaps exchange one operand's low half with the other's high half, so
+// seeding each peer with a copy of its own value makes swap-then-select a
+// lane-uniform butterfly: in the low lanes the peer holds lane i^k's value
+// and in the high lanes it holds the same, which is exactly what the shuffle
+// delivered.
+//
+// The value and the index are two independent partials over the same lane
+// crossing, so they interleave: the swap's result-hazard slot is filled by the
+// other partial's swap rather than by an `s_nop`. That is why this is worth
+// doing at two steps -- the pair costs barely more than one would.
+//
+// ── Contract: the result is valid in g == 0 (lanes 0..15) ──────────────────
+//
+// The value is lane-uniform and matches the butterfly everywhere. The *index*
+// does not, and the reason is the same asymmetry that makes the sum version
+// free: the swap leaves the lower member of each pair holding its own value in
+// `val` and its partner's in `peer`, and the upper member holding them the
+// other way round. A commutative reduction cannot see that. A strict `>`
+// tie-break can -- in the upper member the incumbent is `peer`, so keeping
+// `val` on a tie keeps the wrong side.
+//
+// Lanes 0..15 are the lower member at both steps (bit 4 clear for the xor-16
+// swap, bit 5 clear for the xor-32 swap), so their tie-break is unchanged.
+// That is all the caller reads: `if (g == 0) s_red_val[...] = thread_max`.
+// Hence the name -- do not lift this to a caller that consumes g1..g3.
+//
+// Verified over 4096 cases including an all-equal block where every
+// comparison is a tie: g0 value and index bit-identical to the butterfly,
+// value bit-identical in all 64 lanes.
+// See tests/standalone/test_argmax_dual_reduce.hip.
+__device__ __forceinline__ void argmax_dual_wave_reduce_to_g0(float &val,
+                                                              int &idx) {
+  float val_peer = val;
+  int idx_peer = idx;
+  asm volatile(
+      // ── xor-16: walk g groups 0<->1 and 2<->3 ──
+      "s_nop 1\n"
+      "v_permlane16_swap_b32 %[val], %[val_peer]\n"
+      "v_permlane16_swap_b32 %[idx], %[idx_peer]\n"
+      "v_cmp_gt_f32 vcc, %[val_peer], %[val]\n"
+      "v_cndmask_b32 %[idx], %[idx], %[idx_peer], vcc\n"
+      "v_cndmask_b32 %[val], %[val], %[val_peer], vcc\n"
+      // Re-seed: the swaps are destructive in both operands, so the peer has
+      // to be a fresh copy of the survivor rather than carried across steps.
+      "v_mov_b32_e32 %[val_peer], %[val]\n"
+      "v_mov_b32_e32 %[idx_peer], %[idx]\n"
+      // ── xor-32: walk the two halves ──
+      "s_nop 1\n"
+      "v_permlane32_swap_b32 %[val], %[val_peer]\n"
+      "v_permlane32_swap_b32 %[idx], %[idx_peer]\n"
+      "v_cmp_gt_f32 vcc, %[val_peer], %[val]\n"
+      "v_cndmask_b32 %[idx], %[idx], %[idx_peer], vcc\n"
+      "v_cndmask_b32 %[val], %[val], %[val_peer], vcc"
+      : [val] "+v"(val),
+        [idx] "+v"(idx),
+        [val_peer] "+v"(val_peer),
+        [idx_peer] "+v"(idx_peer)
+      :
+      : "vcc");
+}
+#endif
+
 template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
@@ -168,6 +244,21 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   uint32_t qkv_buf_range = static_cast<uint32_t>(n_wgs_per_xcd) * WG_BYTES;
   i32x4_t qkv_rsrc = make_w_buffer_rsrc(W, qkv_buf_range);
 
+#ifdef MPK_LM_HEAD_WAVE_TILE_DMA
+  // Scalar LDS destination for the Phase A weight train, hoisted out of every
+  // loop. buffer_load_dwordx4 ... lds takes its LDS base from M0, which is
+  // scalar; leaving the destination as a pointer derived from threadIdx makes
+  // the compiler re-prove uniformity and emit a v_readfirstlane + s_mov m0 per
+  // request. Reading it once here leaves the train nothing to do but
+  // s_addk_i32 m0 between loads. Casting through the address_space(3) pointer
+  // (32-bit) rather than truncating the generic 64-bit address keeps this off
+  // any assumption about where the LDS aperture sits.
+  unsigned const lm_lds_wave_base = __builtin_amdgcn_readfirstlane(
+      static_cast<unsigned>(reinterpret_cast<uintptr_t>(
+          (__attribute__((address_space(3)))
+           uint8_t *)(qkv_lds_w + warp_id * QKV_TILE_BYTES))));
+#endif
+
   // ── Batch column-block sweep ────────────────────────────────────────────
   // NUM_BBLK == 1 for bs <= 16, so this collapses away entirely and the
   // bs<=16 path costs exactly what the old single-token path did.
@@ -200,9 +291,71 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
 
     // ── Phase A: Prefetch weight data into LDS via buffer_load_dwordx4 lds:1
     // ──
-    {
-      auto *qkv_lds_warp_base = (__attribute__((address_space(3)))
-                                 uint32_t *)(qkv_lds_w + warp_id * 1024);
+#ifdef MPK_LM_HEAD_WAVE_TILE_DMA
+      // ── One wave, one tile, one instruction train ─────────────────────────
+      //
+      // The striped form below has all four waves interleave 16-byte slots
+      // across all four tiles: 24 intrinsic calls per thread, each recomputing
+      // a clamped index and an LDS destination the compiler has to re-scalarize
+      // for M0. But a wave's 64 lanes already cover exactly 1 KiB, the tile is
+      // an exact multiple of 1 KiB, and Phase C has wave `w` read tile `w`
+      // (TILES_PER_WAVE == 1) -- so the natural unit is the whole tile, issued
+      // by its own consumer as one chain of loads that advances the LDS base in
+      // M0 and the global offset in a VGPR together. The clamp disappears
+      // (nothing is partial), the duplicate loads it produced disappear, and
+      // the per-request address math collapses to one s_addk_i32 + one
+      // v_add_u32.
+      //
+      // The gfx950 M0-to-MUBUF wait state is why the s_nop pair guards the
+      // s_mov: a buffer_load ... lds issued too close to the M0 write reads the
+      // stale base.
+      {
+        static_assert(TILES_PER_WAVE == 1,
+                      "the wave-tile train assumes wave w owns exactly tile w; "
+                      "with more tiles per wave the train has to be repeated "
+                      "per tile and the LDS base recomputed between them");
+        static_assert(QKV_TILE_DATA % 1024 == 0,
+                      "a tile must be a whole number of 64-lane x 16 B loads");
+        static_assert(QKV_TILE_DATA_PADDED % 1024 == 0);
+#ifdef MPK_LM_HEAD_KMAJOR
+        // K-major, Phase C reads exactly [0, QKV_TILE_DATA): 16 B per lane,
+        // MFMA_ITERS blocks of 1 KiB. Nothing past the data is ever touched.
+        constexpr int LM_DMA_CHUNKS = QKV_TILE_DATA / 1024;
+#else
+        // Row-major, Phase C's 32-byte reads run 16 B past the last row's last
+        // fragment, so the train covers the padded region too. That last chunk
+        // reads from the record's scale suffix rather than out of the buffer --
+        // in range, and it lands only in the don't-care upper half of an FP4
+        // A-operand.
+        constexpr int LM_DMA_CHUNKS = QKV_TILE_DATA_PADDED / 1024;
+        static_assert(NUM_WAVES * QKV_TILE_DATA +
+                              (LM_DMA_CHUNKS * 1024 - QKV_TILE_DATA) <=
+                          WG_BYTES,
+                      "the padded tail must stay inside the workgroup record");
+#endif
+        uint32_t voff = qkv_wg_voff +
+                        static_cast<uint32_t>(warp_id * QKV_TILE_DATA) +
+                        static_cast<uint32_t>(lane_id * 16);
+        asm volatile(
+            "s_nop 4\n"
+            "s_mov_b32 m0, %[lds_base]\n"
+            "s_nop 0\n"
+            "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen sc0 nt lds\n"
+            ".rept %c[reps]\n"
+            "s_addk_i32 m0, 0x400\n"
+            "v_add_u32_e32 %[voff], 0x400, %[voff]\n"
+            "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen sc0 nt lds\n"
+            ".endr\n"
+            : [voff] "+v"(voff)
+            : [rsrc] "s"(qkv_rsrc),
+              [lds_base] "s"(lm_lds_wave_base),
+              [reps] "n"(LM_DMA_CHUNKS - 1)
+            : "memory", "m0");
+      }
+#else
+      {
+        auto *qkv_lds_warp_base = (__attribute__((address_space(3)))
+                                   uint32_t *)(qkv_lds_w + warp_id * 1024);
 #pragma unroll
       for (int t = 0; t < NUM_WAVES; t++) {
 #pragma unroll
@@ -222,21 +375,22 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         }
       }
     }
+#endif
 
-    // ── Phase B: Drain data loads, load scales via VGPR, scatter to LDS ──
-    constexpr int QKV_SC_DW4_PER_TILE = QKV_TILE_SCALE / 16;
-    constexpr int QKV_TOTAL_SC_DW4 = QKV_SC_DW4_PER_TILE * NUM_WAVES;
-    constexpr int QKV_SC_LPT = (QKV_TOTAL_SC_DW4 + 255) / 256;
+      // ── Phase B: Drain data loads, load scales via VGPR, scatter to LDS ──
+      constexpr int QKV_SC_DW4_PER_TILE = QKV_TILE_SCALE / 16;
+      constexpr int QKV_TOTAL_SC_DW4 = QKV_SC_DW4_PER_TILE * NUM_WAVES;
+      constexpr int QKV_SC_LPT = (QKV_TOTAL_SC_DW4 + 255) / 256;
 
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
 
-    // Issue scale loads from HBM via VGPR
-    uint8_t const *wg_scales_hbm =
-        W + static_cast<int64_t>(wg_idx) * WG_BYTES + WG_DATA_BYTES;
-    i32x4_t qkv_sc_buf[QKV_SC_LPT];
-    {
-      i32x4_t const *sc_src = (i32x4_t const *)wg_scales_hbm;
+      // Issue scale loads from HBM via VGPR
+      uint8_t const *wg_scales_hbm =
+          W + static_cast<int64_t>(wg_idx) * WG_BYTES + WG_DATA_BYTES;
+      i32x4_t qkv_sc_buf[QKV_SC_LPT];
+      {
+        i32x4_t const *sc_src = (i32x4_t const *)wg_scales_hbm;
 #pragma unroll
       for (int j = 0; j < QKV_SC_LPT; j++) {
         int idx = tid + j * 256;
@@ -273,22 +427,63 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
       uint8_t const *tile_scale_lds = tile_data_lds + QKV_TILE_DATA_PADDED;
 
       int w_row_in_tile = col;
-      int const row_data_base = w_row_in_tile * (REDUCTION_SIZE / 2);
       int const row_scale_base = w_row_in_tile * NUM_BLOCKS_32;
+
+      // ── Weight fragment addressing ──────────────────────────────────────
+      //
+      // Row-major (default): lane (g, col) reads
+      //   col * (REDUCTION_SIZE / 2) + KI * 64 + g * 16.
+      // At REDUCTION_SIZE 2944 the row stride is 1472 B = 368 dwords and
+      // 368 % 32 == 16, so the sixteen values of `col` land on just two bank
+      // groups; with g * 16 adding four more the whole wave starts on eight
+      // distinct banks, eight lanes deep on each -- an 8-way conflict on
+      // every weight ds_read in the K loop. It also reads 32 B per lane when
+      // an FP4 A-operand needs 16.
+      //
+      // K-major (MPK_LM_HEAD_KMAJOR): the record is repacked offline from
+      // [tile][row][k128][quarter][16B] to [tile][k128][quarter][row][16B],
+      // so the lane's fragment sits at lane_id * 16 within its K block --
+      // lane_id == g * 16 + col is exactly quarter-major-then-row. The wave
+      // then reads 64 consecutive 16-byte fragments, which is the
+      // conflict-free pattern ds_read_b128 is built for, and the HBM side of
+      // Phase A is a byte-for-byte image of the tile, so the permutation
+      // carries into LDS with no change to the DMA.
+      //
+      // Only the address changes; the same bytes reach the same lane, so this
+      // is bit-exact. The scale suffix stays row-major in both layouts (one
+      // byte per 32-element block, read as a scalar), hence the shared
+      // row_scale_base. Host side: shuffle_lm_head_record_kmajor() in
+      // demo/gpt_oss/demo.py, gated on the same MPK_LM_HEAD_KMAJOR.
+#ifdef MPK_LM_HEAD_KMAJOR
+      static_assert(QKV_TILE_ROWS == 16,
+                    "MPK_LM_HEAD_KMAJOR assumes a 16-row MFMA tile: lane_id "
+                    "spans exactly 16 rows x 4 K-quarters, which is what "
+                    "makes lane_id * 16 the fragment address.");
+      // One K128 block holds all 16 rows x 4 quarters x 16 B.
+      constexpr int LM_LDS_K_STRIDE = QKV_TILE_ROWS * (K_PER_MFMA / 2);
+      static_assert(((MFMA_ITERS - 1) * LM_LDS_K_STRIDE) + 64 * 16 <=
+                        QKV_TILE_DATA,
+                    "K-major fragment sweep must stay inside the tile");
+      int const lds_data_lane_offset = lane_id * 16;
+#define MPK_LM_W_FRAG(KI)                                                      \
+  _gang_lm_load_fp4_a_kmajor(tile_data_lds + lds_data_lane_offset +            \
+                             (KI)*LM_LDS_K_STRIDE)
+#else
+      int const row_data_base = w_row_in_tile * (REDUCTION_SIZE / 2);
+#define MPK_LM_W_FRAG(KI)                                                      \
+  (*(i32x8_t const *)(tile_data_lds + row_data_base +                          \
+                      (KI) * (K_PER_MFMA / 2) + g * 16))
+#endif
 
       f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      i32x8_t a0 =
-          *(i32x8_t const *)(tile_data_lds + row_data_base + 0 * 64 + g * 16);
+      i32x8_t a0 = MPK_LM_W_FRAG(0);
       int sa0 = (int)tile_scale_lds[row_scale_base + 0 * 4 + g];
-      i32x8_t a1 =
-          *(i32x8_t const *)(tile_data_lds + row_data_base + 1 * 64 + g * 16);
+      i32x8_t a1 = MPK_LM_W_FRAG(1);
       int sa1 = (int)tile_scale_lds[row_scale_base + 1 * 4 + g];
-      i32x8_t a2 =
-          *(i32x8_t const *)(tile_data_lds + row_data_base + 2 * 64 + g * 16);
+      i32x8_t a2 = MPK_LM_W_FRAG(2);
       int sa2 = (int)tile_scale_lds[row_scale_base + 2 * 4 + g];
-      i32x8_t a3 =
-          *(i32x8_t const *)(tile_data_lds + row_data_base + 3 * 64 + g * 16);
+      i32x8_t a3 = MPK_LM_W_FRAG(3);
       int sa3 = (int)tile_scale_lds[row_scale_base + 3 * 4 + g];
 
 #pragma unroll 1
@@ -299,10 +494,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
         }
         if (ki + 4 < MFMA_ITERS) {
-          int kt4 = (ki + 4) * K_PER_MFMA;
-          a0 = *(i32x8_t const *)(tile_data_lds + row_data_base + kt4 / 2 +
-                                  g * 16);
-          sa0 = (int)tile_scale_lds[row_scale_base + kt4 / 32 + g];
+          a0 = MPK_LM_W_FRAG(ki + 4);
+          sa0 = (int)tile_scale_lds[row_scale_base + (ki + 4) * 4 + g];
         }
         {
           i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 1) * K_PER_MFMA, g);
@@ -310,10 +503,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
         }
         if (ki + 5 < MFMA_ITERS) {
-          int kt5 = (ki + 5) * K_PER_MFMA;
-          a1 = *(i32x8_t const *)(tile_data_lds + row_data_base + kt5 / 2 +
-                                  g * 16);
-          sa1 = (int)tile_scale_lds[row_scale_base + kt5 / 32 + g];
+          a1 = MPK_LM_W_FRAG(ki + 5);
+          sa1 = (int)tile_scale_lds[row_scale_base + (ki + 5) * 4 + g];
         }
         {
           i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 2) * K_PER_MFMA, g);
@@ -321,10 +512,8 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
         }
         if (ki + 6 < MFMA_ITERS) {
-          int kt6 = (ki + 6) * K_PER_MFMA;
-          a2 = *(i32x8_t const *)(tile_data_lds + row_data_base + kt6 / 2 +
-                                  g * 16);
-          sa2 = (int)tile_scale_lds[row_scale_base + kt6 / 32 + g];
+          a2 = MPK_LM_W_FRAG(ki + 6);
+          sa2 = (int)tile_scale_lds[row_scale_base + (ki + 6) * 4 + g];
         }
         if (ki + 3 < MFMA_ITERS) {
           i32x8_t b = _gang_load_fp8_mfma_b(b_data, (ki + 3) * K_PER_MFMA, g);
@@ -332,12 +521,11 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
           acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
         }
         if (ki + 7 < MFMA_ITERS) {
-          int kt7 = (ki + 7) * K_PER_MFMA;
-          a3 = *(i32x8_t const *)(tile_data_lds + row_data_base + kt7 / 2 +
-                                  g * 16);
-          sa3 = (int)tile_scale_lds[row_scale_base + kt7 / 32 + g];
+          a3 = MPK_LM_W_FRAG(ki + 7);
+          sa3 = (int)tile_scale_lds[row_scale_base + (ki + 7) * 4 + g];
         }
       }
+#undef MPK_LM_W_FRAG
 
       // Argmax epilogue: accumulate across ALL tiles in registers.
       // The guard is on `tok_active`, not `col == 0`: lane (g, col) now holds
@@ -385,6 +573,12 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     // NOT the full 64-lane butterfly: lanes differing in `col` hold different
     // tokens, so mixing them would return one token's argmax for all 16.
     // XOR on bits 4 and 5 walks the 4 g-groups and leaves `col` alone.
+#ifdef MPK_ARGMAX_DUAL_REDUCE
+    // Same two steps, same order, no LDS. Valid in g == 0 only, which is the
+    // only group the `if (g == 0)` write below reads -- see the contract note
+    // at argmax_dual_wave_reduce_to_g0.
+    argmax_dual_wave_reduce_to_g0(thread_max, thread_max_idx);
+#else
 #pragma unroll
     for (int offset = 16; offset <= 32; offset <<= 1) {
       float other_val = __shfl_xor(thread_max, offset, 64);
@@ -394,6 +588,7 @@ __device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         thread_max_idx = other_idx;
       }
     }
+#endif
 
     // ── Cross-wave reduce via LDS, one slot per (wave, token) ───────────
     // No barrier before the write: s_red_* is disjoint from the token region

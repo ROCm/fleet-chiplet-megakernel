@@ -715,6 +715,29 @@ __device__ __forceinline__ f32x4_t _gang_mfma_f4xf8(
       scale_b);
 }
 
+// Load one lane's 16-byte FP4 A-fragment and widen it to the i32x8 the
+// mfma_scale_f32_16x16x128_f8f6f4 intrinsic takes. With cbsz=4 (FP4 E2M1 on
+// src0) the instruction reads only the low 128 bits, so the top half is
+// don't-care -- the row-major LM-head arms leave it holding whatever followed
+// the fragment. Zeroing it keeps the value defined and costs nothing: it is
+// one 16-byte load either way, and half the bytes the 32-byte row-major read
+// moves. Used by the MPK_LM_HEAD_KMAJOR arms.
+__device__ __forceinline__ i32x8_t
+    _gang_lm_load_fp4_a_kmajor(uint8_t const *p) {
+  i32x4_t w;
+  __builtin_memcpy(&w, p, 16);
+  i32x8_t a;
+  a[0] = w[0];
+  a[1] = w[1];
+  a[2] = w[2];
+  a[3] = w[3];
+  a[4] = 0;
+  a[5] = 0;
+  a[6] = 0;
+  a[7] = 0;
+  return a;
+}
+
 // Load FP8 B-operand for 16x16x128 MFMA.
 // FP8 layout requires two 16-byte chunks at K offsets [g*16..g*16+15]
 // and [g*16+64..g*16+79] within the 128-element tile.
