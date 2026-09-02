@@ -89,6 +89,35 @@ build:
   ## Fleet is used out of the box -- on the include path, never copied, never
   ## edited. Branch amd&lowbar;mi355&lowbar;gpt&lowbar;oss120b.
   ##
+  ## The pin is not a value in this file: header&lowbar;dir points at this very
+  ## checkout, so "moving the pin" is a git merge of upstream into our branch,
+  ## and the pin is whatever our HEAD's merge-base with
+  ## origin/amd&lowbar;mi355&lowbar;gpt&lowbar;oss120b is. Recorded here because the number is
+  ## otherwise invisible from the config.
+  ##
+  ## 2026-09-02: 2ee5278 -> 9d478ea ("Decode 1.70 -> 1.64 ms: pin each routed
+  ## expert to one XCD pair"), 7 commits, 18 files, +5503/-307. Seven of those
+  ## files are headers this kernel includes, including the three heaviest
+  ## (gang&lowbar;moe&lowbar;fused&lowbar;mxfp4 +2040, paged&lowbar;attention&lowbar;decode&lowbar;minimal&lowbar;hd64
+  ## +900, gang&lowbar;full&lowbar;layer&lowbar;fused +453).
+  ##
+  ## MEASURED FREE, which is the point of landing it alone: 2 interleaved
+  ## rounds, medians 1.889 vs 1.889 ms, delta +0.000 against a 0.020 spread --
+  ## "within run-to-run noise, not resolvable". LDS still 736, tok1=35644,
+  ## coherent text both arms. The ISA moved by +27 instructions across 39
+  ## mnemonics with ZERO change to the mfma / ds&lowbar;\* / buffer&lowbar;\* counts: the
+  ## churn is e32/e64 encoding swaps that cancel (v&lowbar;cmp&lowbar;lt&lowbar;i32 e32 +11 /
+  ## e64 -11, v&lowbar;cndmask e32 +9 / e64 -8). That is the expected shape for a
+  ## header bump whose new code is all #ifdef-gated OFF in our build.
+  ##
+  ## So the 1.64 ms is NOT in this build yet. Upstream's wins are behind four
+  ## flags not in extra&lowbar;defines below -- MPK&lowbar;W13&lowbar;KMAJOR&lowbar;RECYCLE (+ its host
+  ## permute), MPK&lowbar;W13&lowbar;T1&lowbar;BIAS&lowbar;EARLY, MPK&lowbar;LM&lowbar;HEAD&lowbar;GROUP&lowbar;PIPELINE and
+  ## MPK&lowbar;MOE&lowbar;XCD&lowbar;PAIR (+ MPK&lowbar;EARLY&lowbar;ROUTING) -- each landed separately so
+  ## each carries its own number. Note W13&lowbar;KMAJOR&lowbar;RECYCLE #errors against
+  ## MPK&lowbar;W13&lowbar;T1&lowbar;SPLIT&lowbar;LDS&lowbar;STAGE, which IS in the list below and has to
+  ## come out in the same change.
+  ##
   ## Since this tree moved under fleet (as vllm&lowbar;integration/), header&lowbar;dir names
   ## its OWN grandparent. It is still an absolute path rather than a derived one
   ## because it is interpolated into the emitted build script, which
