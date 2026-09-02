@@ -489,9 +489,49 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
 # Same one-variable contract as MPK_OPROJ_KMAJOR -- a host/kernel disagreement
 # here is silently wrong numerics rather than a build error -- but this one is
 # opt-in rather than default-on, because it measured slower (1.837 -> 1.844 ms,
-# losing all three pairs). Read the raw variable, not mpk_opt(), so both sides
-# agree on the same default of off; persistent_kernel.py does the same.
+# losing all three pairs). The batch-1 group pipeline below also requires this
+# layout and is resolved at the pack site where batch size is available.
 LM_HEAD_KMAJOR = os.environ.get("MPK_LM_HEAD_KMAJOR", "0") == "1"
+
+
+# Ships on for batch-1. Host permute (pack site) and kernel flag both go
+# through mpk_opt with the same batch size so they cannot desync. Narrowed
+# off at bs>1 by _BS1_ONLY_OPTS.
+
+
+def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
+                                  output_per_wg: int = 128) -> torch.Tensor:
+    """Repack W13 data into lane-contiguous K128 fragments.
+
+    Within each 16-row tile the data prefix changes from
+    ``[row, k128, quarter, byte]`` to
+    ``[k128, quarter, row, byte]``. Scales remain row-major.
+    """
+    if packed.ndim != 3:
+        raise ValueError(
+            "expected rank-3 [experts, workgroups, bytes] W13 weights, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg != 128:
+        raise ValueError(
+            "MPK_W13_KMAJOR_RECYCLE requires W13_OPW=128 "
+            f"(got {output_per_wg})")
+
+    experts, workgroups, wg_bytes = packed.shape
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if reduction != PADDED_HIDDEN_SIZE or reduction % 128 != 0:
+        raise ValueError(
+            "MPK_W13_KMAJOR_RECYCLE requires the canonical padded hidden "
+            f"size {PADDED_HIDDEN_SIZE}, got {reduction}")
+    if data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(f"invalid W13 MXFP4 record width {wg_bytes}")
+
+    tiles = output_per_wg // 16
+    data = packed[..., :data_bytes].reshape(
+        experts, workgroups, tiles, 16, reduction // 128, 4, 16)
+    data = data.permute(0, 1, 2, 4, 5, 3, 6).reshape(
+        experts, workgroups, data_bytes)
+    return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()
 
 
 def shuffle_lm_head_record_kmajor(packed: torch.Tensor,
@@ -1912,7 +1952,9 @@ if __name__ == "__main__":
         lm_head_packed = pack_mxfp4_workgroup(
             lm_blocks, lm_scales, output_per_wg=lm_head_output_per_wg,
         ).squeeze(0)  # [n_wgs, wg_bytes]
-        if LM_HEAD_KMAJOR:
+        lm_head_kmajor = LM_HEAD_KMAJOR or _mpk_opt(
+            "MPK_LM_HEAD_GROUP_PIPELINE", args.max_num_batched_tokens)
+        if lm_head_kmajor:
             lm_head_packed = shuffle_lm_head_record_kmajor(
                 lm_head_packed, output_per_wg=lm_head_output_per_wg)
         print(f"LM head MXFP4: {lm_head_weight.shape} BF16 ({lm_head_weight.numel()*2/1e6:.0f} MB) "
@@ -2073,6 +2115,9 @@ if __name__ == "__main__":
         ck_fmha_q_ws = mpk.attach_input(
             torch_tensor=ck_fmha_q_ws_tensor, name="ck_fmha_q_workspace")
         lse_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv
+        # Always 2x: MPK_ATTN_SPLIT_CHUNK helper partials live in the second
+        # half (offset +LSE_S). Unused when the flag is off.
+        lse_dim1 = lse_dim1 * 2
         ck_fmha_lse_acc_tensor = torch.zeros(
             bs, lse_dim1, dtype=torch.float32, device="cuda")
         ck_fmha_lse_acc = mpk.attach_input(
@@ -2085,7 +2130,7 @@ if __name__ == "__main__":
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
         # partials into ck_fmha_o_acc; merge step combines them into attn_out.
         if use_split_attn_chunks or fuse_full_layer:
-            o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim
+            o_acc_dim1 = num_local_kv_heads * ck_fmha_num_kv_chunks * num_qo_per_kv * head_dim * 2
             ck_fmha_o_acc_tensor = torch.zeros(
                 bs, o_acc_dim1, dtype=torch.float32, device="cuda")
             ck_fmha_o_acc = mpk.attach_input(
@@ -2149,7 +2194,9 @@ if __name__ == "__main__":
             # release lines, 16 ints each. It sits immediately above the chunk
             # barrier -- see FULL_LAYER_LAYER_BARRIER_SLOT in
             # gang_full_layer_fused_mi300.cuh.
-            counter_size = 768 + 128 * args.max_num_batched_requests + 272
+            # +128 ints: 8 per-XCD O-proj slice-ready flags (MPK_ROUTER_XCD_FOLD).
+            # See FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh.
+            counter_size = 768 + 128 * args.max_num_batched_requests + 272 + 128
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
@@ -2285,6 +2332,10 @@ if __name__ == "__main__":
                 target_out_dim=2 * PADDED_INTERMEDIATE_SIZE,
                 target_num_blocks=w13_target_num_blocks,
             )
+            if _mpk_opt("MPK_W13_KMAJOR_RECYCLE",
+                        args.max_num_batched_tokens):
+                gu_packed = shuffle_w13_workgroups_kmajor(
+                    gu_packed, output_per_wg=w13_output_per_wg)
             moe_gate_up_proj_weights.append(gu_packed)
 
             # down_proj: blocks [E, hidden, nb, 16], scales [E, hidden, nb]

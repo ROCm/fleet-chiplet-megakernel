@@ -229,7 +229,12 @@ __device__ __attribute__((always_inline)) void
         moe_swiglu_out_ptr,
         moe_workspace_f32_ptr,
         moe_barrier_ptr,
-        moe_t);
+        moe_t
+#ifdef MPK_MOE_XCD_STRIPE_LAYER
+        ,
+        /*layer_idx=*/0
+#endif
+    );
   }
 
 #ifdef MPK_FUSED_PHASE_TIMING

@@ -731,7 +731,9 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
     int kv_chunk_idx,
     float scale_s,
     int sliding_window = 0,
-    void const *sinks_ptr = nullptr) {
+    void const *sinks_ptr = nullptr,
+    int split_part = 0) {
+  (void)split_part;
   int const req = request_id;
   const ck_tile::index_t query_start = qo_indptr_buffer_ptr[req];
   const ck_tile::index_t query_end = qo_indptr_buffer_ptr[req + 1];
@@ -767,7 +769,8 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
           kv_chunk_idx,
           scale_s,
           sliding_window,
-          sinks_ptr);
+          sinks_ptr,
+          split_part);
     } else {
       paged_attention_ck_fmha_decode<T,
                                      NUM_QO_PER_KV,

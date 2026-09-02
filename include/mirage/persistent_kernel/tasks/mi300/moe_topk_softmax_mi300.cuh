@@ -62,7 +62,9 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     void *__restrict__ active_expert_ids_ptr, // [NUM_EXPERTS + 1] int32
     int const start_expert,
     int const end_expert,
-    bool const renormalize) {
+    bool const renormalize,
+    int *early_routing_ready = nullptr,
+    unsigned int early_routing_epoch = 0) {
   T *input = static_cast<T *>(input_ptr);
   float *output = static_cast<float *>(output_ptr);
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
@@ -362,6 +364,40 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
           // would otherwise run the same expert twice and drop another.
           s_hit[local_expert] = 1;
         }
+#ifdef MPK_MOE_XCD_PAIR
+        // One selected expert per XCD pair. Publish (epoch, expert) to
+        // XCDs 2*s and 2*s+1 as soon as selection s lands, and write
+        // d_mask[s] in selection order so W2 can use the same slot. Drain
+        // the routing_indices store so the u64 cannot overtake it.
+        if (thread_row == 0 && early_routing_ready != nullptr) {
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          unsigned long long const record =
+              (unsigned long long)early_routing_epoch |
+              ((unsigned long long)(unsigned)expert << 32);
+          st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2) * 16 + 2],
+                    record);
+          st_wt_u64((void *)&early_routing_ready[(1 + k_idx * 2 + 1) * 16 + 2],
+                    record);
+          if (active_expert_ids != nullptr) {
+            st_wt_u32((void *)&active_expert_ids[k_idx], (unsigned)expert);
+          }
+        }
+#elif defined(MPK_EARLY_ROUTING)
+        // Early-routing probe: publish (epoch, first expert) as soon as TopK
+        // selection 0 lands, before the remaining 3 picks, softmax, and
+        // compact. MoE workers poll this u64 and start expert-0 W13 while
+        // this block finishes TopK. routing_indices[expert] was just
+        // st_wt'd; drain it so the u64 cannot overtake that payload.
+        if (k_idx == 0 && thread_row == 0 && early_routing_ready != nullptr) {
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          unsigned long long const record =
+              (unsigned long long)early_routing_epoch |
+              ((unsigned long long)(unsigned)expert << 32);
+          for (int x = 0; x < 8; x++) {
+            st_wt_u64((void *)&early_routing_ready[(1 + x) * 16 + 2], record);
+          }
+        }
+#endif
       }
 
       // ── Step 4: Branchless blanking of winner ──
@@ -391,6 +427,21 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   }
   __syncthreads();
 
+#ifdef MPK_MOE_XCD_PAIR
+  // Selection-order ids are already at [0, k). Compact would overwrite them
+  // into ascending expert-id order, which is the wrong slot for the XCD-pair
+  // map. Still sentinel-fill and publish the count.
+  if (active_expert_ids != nullptr && threadIdx.x < MI300_WARP_SIZE) {
+    int const lane = threadIdx.x;
+    int const count = k;
+    for (int e = count + lane; e < NUM_EXPERTS; e += MI300_WARP_SIZE) {
+      st_wt_u32((void *)&active_expert_ids[e], (unsigned)-1);
+    }
+    if (lane == 0) {
+      st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS], (unsigned)count);
+    }
+  }
+#else
   // ── Compact the hit set into a dense, ascending, deduplicated list ──
   // Wavefront 0 alone, so the running `count` needs no atomics: it is a plain
   // register carried across the chunk loop, uniform across the wave because
@@ -434,6 +485,7 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       st_wt_u32((void *)&active_expert_ids[NUM_EXPERTS], (unsigned)count);
     }
   }
+#endif
 }
 
 } // namespace kernel

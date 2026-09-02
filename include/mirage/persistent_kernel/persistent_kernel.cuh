@@ -96,6 +96,20 @@ __device__ unsigned long long g_spin_rank[64];
 __device__ unsigned long long g_n_rank[64];
 #endif
 
+#ifdef MPK_INTERLAYER_SPLIT
+// Splits the slot-11 -> slot-0 span, which the phase table reports as a single
+// ~4.3 us/layer block and which MPK_DRAIN_STATS only accounts ~1.7 us of.
+// The rest is inside the fused-layer function *before* its slot-0 mark, so no
+// existing counter can see it. Three segments, all tid 0, all per layer:
+//   fnpre  - function entry to just before the layer's L2 invalidate
+//   binv   - the buffer_inv itself
+//   post   - invalidate to the slot-0 mark
+__device__ unsigned long long g_il_fnpre_sum;
+__device__ unsigned long long g_il_binv_sum;
+__device__ unsigned long long g_il_post_sum;
+__device__ unsigned long long g_il_n;
+#endif
+
 #ifdef MPK_PHASE_SLOTS
 // Per-worker phase timestamps: one dword pair per slot per layer, reduced
 // into per-slot-pair spans.
@@ -3686,6 +3700,31 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                            (double)g_fwdpass_total_iters
                      : 0.0,
                  g_fwdpass_dropped);
+#ifdef MPK_DRAIN_STATS
+          // The hot-path dump only fires every 100k arrivals; a 64-token
+          // decode never reaches that. Print once at terminate so last-XCD
+          // identity and per-XCD spin are visible on a normal smoke run.
+          {
+            printf("[XCDSPIN] %llu %llu %llu %llu %llu %llu %llu %llu | last "
+                   "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+                   g_spin_xcd[0] / (g_n_xcd[0] ? g_n_xcd[0] : 1),
+                   g_spin_xcd[1] / (g_n_xcd[1] ? g_n_xcd[1] : 1),
+                   g_spin_xcd[2] / (g_n_xcd[2] ? g_n_xcd[2] : 1),
+                   g_spin_xcd[3] / (g_n_xcd[3] ? g_n_xcd[3] : 1),
+                   g_spin_xcd[4] / (g_n_xcd[4] ? g_n_xcd[4] : 1),
+                   g_spin_xcd[5] / (g_n_xcd[5] ? g_n_xcd[5] : 1),
+                   g_spin_xcd[6] / (g_n_xcd[6] ? g_n_xcd[6] : 1),
+                   g_spin_xcd[7] / (g_n_xcd[7] ? g_n_xcd[7] : 1),
+                   g_last_xcd[0],
+                   g_last_xcd[1],
+                   g_last_xcd[2],
+                   g_last_xcd[3],
+                   g_last_xcd[4],
+                   g_last_xcd[5],
+                   g_last_xcd[6],
+                   g_last_xcd[7]);
+          }
+#endif
 #ifdef MPK_PHASE_SLOTS
           // One line per (xcd_rank band, slot): mean ns of each slot-to-slot
           // span over every steady-state decode layer. Printed once at
@@ -3722,6 +3761,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               }
               printf("\n");
             }
+          }
+#endif
+#ifdef MPK_INTERLAYER_SPLIT
+          // Accounts the part of the slot-11 -> slot-0 span that lives inside
+          // the fused-layer function, which no other counter can see.
+          if (g_il_n > 0) {
+            unsigned long long n = g_il_n;
+            printf("[ILSPLIT] n=%llu fnpre_ns=%llu binv_ns=%llu post_ns=%llu "
+                   "total_ns=%llu\n",
+                   n,
+                   g_il_fnpre_sum / n,
+                   g_il_binv_sum / n,
+                   g_il_post_sum / n,
+                   (g_il_fnpre_sum + g_il_binv_sum + g_il_post_sum) / n);
           }
 #endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE

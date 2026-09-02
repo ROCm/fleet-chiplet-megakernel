@@ -57,6 +57,14 @@ _BS1_ONLY_OPTS = (
     # Rides on MPK_W13_PREQUANT (it reorders that flag's handoff), so it has
     # to go off wherever that one does.
     "MPK_W13_T0_COUNTED_HANDOFF",
+    # Canonical K128 recycle is batch-1 / OPW=128 only (kernel static_asserts).
+    "MPK_W13_KMAJOR_RECYCLE",
+    # Rides on the batch-1-only recycle schedule.
+    "MPK_W13_T1_BIAS_EARLY",
+    # The next-group LM-head pipeline has a batch-1 LDS layout.
+    "MPK_LM_HEAD_GROUP_PIPELINE",
+    # XCD-pair MoE map: conc1, 4 experts, 46+46 groups.
+    "MPK_MOE_XCD_PAIR",
 )
 
 

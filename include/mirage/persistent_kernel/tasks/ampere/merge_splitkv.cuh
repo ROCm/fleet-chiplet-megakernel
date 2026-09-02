@@ -15,6 +15,13 @@
 
 #pragma once
 
+#if defined(MPK_MERGE_O_PRELOAD) && !defined(MPK_MERGE_TWO_PASS)
+#error "MPK_MERGE_O_PRELOAD splits two-pass O loads from FMAs; needs TWO_PASS"
+#endif
+#if defined(MPK_MERGE_O_PRELOAD) && !defined(MPK_MERGE_KV_OUTER)
+#error "MPK_MERGE_O_PRELOAD is on the KV-outer two-pass arm"
+#endif
+
 // this kernel merges the result of one KV head chunk back to the full KV
 // cache，
 // it taks the output of multitoken_paged_attention_task_impl_32_64_split_kv and
@@ -192,9 +199,18 @@ __device__ __forceinline__ void
   constexpr int OUT_TOKEN_STRIDE =
       NUM_QO_GROUPS * NUM_QO_HEADS_PER_KV * HEAD_DIM;
 
-  // Use 32 threads per head to match work items (1 token * 8 heads = 8 groups =
-  // 256/32)
+  // The default uses 32 threads per head so all eight groups in a 256-thread
+  // block own one GPT-OSS query head.  The opt-in arm deliberately uses only
+  // the first two waves: each live lane owns four adjacent dimensions rather
+  // than two, so every chunk is one global_load_dwordx4 instead of dwordx2
+  // and only 16 lanes redundantly evaluate its LSE/exp2 weight.  The inactive
+  // waves still reach the caller's publication barriers; no handoff or
+  // acquire protocol changes.
+#if defined(MPK_MERGE_WIDE_DIM)
+  constexpr int THREADS_PER_TOKEN = 16;
+#else
   constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
+#endif
   constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
   constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
   static_assert(VAL_PER_THREAD == 1 || VAL_PER_THREAD % 2 == 0,
@@ -310,6 +326,49 @@ __device__ __forceinline__ void
         m_max = max(m_max, lse_log2[kv_idx]);
       }
       float d_sum = 0.f;
+#ifdef MPK_MERGE_O_PRELOAD
+      // Issue every chunk's O load before any FMA so they form one vmcnt
+      // queue. The mixed loop lets the compiler wait per chunk. FMA order
+      // and weights stay kv_idx 0..num_chunks-1.
+      float o_hold[NUM_KV_CHUNKS][VAL_PER_THREAD];
+      float w_hold[NUM_KV_CHUNKS];
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        w_hold[kv_idx] = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w_hold[kv_idx];
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr +
+                                                                     o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr +
+                                                                     o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+          o_hold[kv_idx][2] = t.z;
+          o_hold[kv_idx][3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_hold[kv_idx][i] = o_ptr[o_base + i];
+          }
+        }
+      }
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = w_hold[kv_idx];
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_hold[kv_idx][i] * w;
+        }
+      }
+#else
 #pragma unroll
       for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
         float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
@@ -378,6 +437,7 @@ __device__ __forceinline__ void
           o_global[i] += o_v[i] * w;
         }
       }
+#endif
       m_global = m_max;
       d_global = d_sum;
 #else
