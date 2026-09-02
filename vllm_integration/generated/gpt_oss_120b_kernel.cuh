@@ -1298,7 +1298,40 @@ gpt_oss_120b_kernel(
         }
         __syncthreads();
 
-        // Timing printout
+        // Timing printout -- OPT-IN, build with FLEET_MK_TIMER_PRINT=1.
+        //
+        // This is a device-side printf, i.e. a HOSTCALL: the wave stalls while a
+        // host thread drains the buffer. It costs 0.164 ms/token, measured as
+        // 3 interleaved rounds of the same .so built both ways --
+        //   printon  med 2.052  spread 0.010
+        //   printoff med 1.888  spread 0.014
+        // both tok1=35644, coherent text, "delta exceeds noise (improvement)".
+        // Reproduce with:
+        //   tools/ab_interleave.sh printon <on.so> printoff <off.so> 3
+        //   tools/compare_runs.py --arm printon /tmp/printon_run*.log \
+        //                         --arm printoff /tmp/printoff_run*.log
+        //
+        // It hid for as long as it did because it sits AFTER _tail_t1, so it is
+        // invisible to the very timer it reports, and because at one decode step
+        // per launch the stall overlaps the launch gap and cancels out of every
+        // A/B that keeps it on both arms -- which was every A/B this project has
+        // run. It surfaced only inside the persistent loop, where it fires once
+        // per decode STEP rather than once per launch, so N of them land in one
+        // launch and the gap stops amortising (158/168/156/199 us at N=1/2/4/8
+        // instead of ~158/N). The loop found it; the loop does not need it.
+        //
+        // Fleet does not pay this. Its three ungated printfs are a once-per-run
+        // teardown summary and two host-side calls, and its per-iteration
+        // [FWD_PASS] dump is gated behind MPK_QUIET_FWDPASS with a comment
+        // making the same point (persistent_kernel.cuh:3663). Leaving ours on by
+        // default meant every fleet-vs-fleet_mk number handicapped our own side.
+        //
+        // So: OFF by default, and this is a real latency change, not just an
+        // instrumentation default. Turn it on for attribution work --
+        // tools/layers_timer_stats.py and the embed/layers/tail split need it --
+        // but never quote a latency number from a build that has it on, for the
+        // same reason no number is quoted from a FLEET_MK_WORKER_STATE build.
+#ifdef FLEET_MK_TIMER_PRINT
         if (xcd_id == 0 && xcd_rank == 0 && tid == 0) {
             unsigned long long _tail_t1 = __builtin_amdgcn_s_memrealtime();
             double embed_us  = (double)(_embed_t1 - _embed_t0) * 10.0 / 1000.0;
@@ -1436,16 +1469,32 @@ gpt_oss_120b_kernel(
             }
 #endif
         }
+#endif  // FLEET_MK_TIMER_PRINT
 
-    } // end single decode step
-
-    // Zero MoE barrier for next iteration (saves external memset)
-    {
-        int *moe_bar = static_cast<int *>(ptr_table[xcd_table_base + 21]);
-        int global_rank = xcd_id * WORKERS_PER_XCD + xcd_rank;
-        for (int i = global_rank * 256 + tid; i < MOE_BARRIER_INTS;
-             i += TOTAL_WORKERS * 256) {
-            moe_bar[i] = 0;
+        // Zero MoE barrier for next iteration (saves external memset)
+        {
+            int *moe_bar = static_cast<int *>(ptr_table[xcd_table_base + 21]);
+            int global_rank = xcd_id * WORKERS_PER_XCD + xcd_rank;
+            for (int i = global_rank * 256 + tid; i < MOE_BARRIER_INTS;
+                 i += TOTAL_WORKERS * 256) {
+                moe_bar[i] = 0;
+            }
         }
-    }
+
+        // Provisional: see the note on this emitter. Removed in stage 3 on a
+        // measurement, not on the argument that it is redundant.
+        if (n_decode_iters > 1) {
+            int *loop_done  = counter_buf + SLOT_LOOP_DONE;
+            int *loop_local = counter_buf + SLOT_LOOP_LOCAL;
+            // Local, not __shared__: see the LDS note on this emitter.
+            // barrier_global reads `expected` on tid 0 only.
+            int loop_expected = 0;
+            if (tid == 0) {
+                int cur = __atomic_load_n(loop_done, __ATOMIC_RELAXED);
+                loop_expected = ((cur / NUM_XCDS) + 1) * NUM_XCDS;
+            }
+            fleet_mk::barrier_global(loop_done, loop_expected, TOTAL_WORKERS,
+                                  loop_local, xcd_id, WORKERS_PER_XCD);
+        }
+    } // end decode step loop
 }

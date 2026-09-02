@@ -103,7 +103,11 @@ def main():
         for log in sorted(logs, key=lambda p: (run_index(p) or 0, p)):
             raw = layers_us(log)
             if not raw:
-                print(f"{name:10} {'?':>4} -- no [FLEET_MK_TIME] records in {log}")
+                # The timer is opt-in since 2026-09-02 -- it is a device printf
+                # (hostcall) worth 0.164 ms/token, so the DEFAULT build has no
+                # such records and that is not a failure of the run.
+                print(f"{name:10} {'?':>4} -- no [FLEET_MK_TIME] records in {log}"
+                      f" (rebuild with FLEET_MK_TIMER_PRINT=1)")
                 continue
             v = [x for x in raw if x < args.outlier_us]
             if not v:

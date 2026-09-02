@@ -42,6 +42,7 @@ $HIPCC -x hip "$GEN_DIR/llama3_8b_launch.hip" \
     -DFLEET_MK_ENABLE_LEGACY \
     -DCK_TILE_FMHA_FWD_FAST_EXP2=1 \
     ${FLEET_MK_SUBPHASE_TIMING:+-DFLEET_MK_SUBPHASE_TIMING} \
+    ${FLEET_MK_TIMER_PRINT:+-DFLEET_MK_TIMER_PRINT} \
     ${FLEET_MK_EXTRA_DEFINES:+$FLEET_MK_EXTRA_DEFINES} \
     -Rpass-analysis=kernel-resource-usage \
     -shared \

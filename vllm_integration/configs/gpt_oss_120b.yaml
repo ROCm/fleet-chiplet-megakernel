@@ -181,6 +181,34 @@ build:
   ## the cache bits move -- 6 global_load_dword go `nt` -> `sc0 sc1`, 16 -> 10
   ## and 15 -> 21. Six loads, six gate sites, no codegen change.
   ##
+  ## Not in this list, and deliberately: FLEET&lowbar;MK&lowbar;TIMER&lowbar;PRINT. The
+  ## [FLEET&lowbar;MK&lowbar;TIME] embed/layers/tail line is a device printf, i.e. a HOSTCALL
+  ## -- the wave stalls while a host thread drains the buffer. It is worth
+  ## 0.164 ms/token, which is larger than every flag in the list above
+  ## combined, and it was ON by default in every number this tree quoted before
+  ## 2026-09-02.
+  ##
+  ## Measured as 3 interleaved rounds of the SAME .so built both ways:
+  ##   printon  med 2.052 ms  spread 0.010
+  ##   printoff med 1.888 ms  spread 0.014
+  ##   -> "delta exceeds noise (improvement)", both tok1=35644, text coherent.
+  ## The ISA agrees: s&lowbar;sendmsg 0 -> 7 and +1908 instructions across 83
+  ## mnemonics, all of it printf formatting.
+  ##
+  ## It hid because it sits AFTER &lowbar;tail&lowbar;t1, so it is invisible to the very
+  ## timer it reports, and because at one decode step per launch the stall
+  ## overlaps the launch gap and cancels out of any A/B that leaves it on both
+  ## arms -- which was every A/B run here. Fleet does not pay it: its
+  ## per-iteration [FWD&lowbar;PASS] dump is gated behind MPK&lowbar;QUIET&lowbar;FWDPASS with a
+  ## comment making the same point (persistent&lowbar;kernel.cuh:3663), so leaving
+  ## ours on handicapped our own side of every fleet comparison.
+  ##
+  ## It is an env toggle on the build script rather than an entry here because
+  ## attribution work still needs it -- tools/layers&lowbar;timer&lowbar;stats.py parses
+  ## those lines. Build with FLEET&lowbar;MK&lowbar;TIMER&lowbar;PRINT=1 to get them back, and
+  ## never quote a latency number from that build, for the same reason none is
+  ## quoted from a FLEET&lowbar;MK&lowbar;WORKER&lowbar;STATE build.
+  ##
   ## Dependency edges the headers enforce with #error, which is why the order
   ## here is not arbitrary:
   ##   ROUTER_DUAL_REDUCE      needs ROUTER_FUSED_DP

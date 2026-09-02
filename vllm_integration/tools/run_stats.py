@@ -58,7 +58,10 @@ def parse(path):
 def report(r):
     print(f"=== {r['path']} ===")
     if not r["rows"]:
-        print("  no [FLEET_MK_TIME] lines -- kernel timing not enabled or run died")
+        # Absent is the DEFAULT since 2026-09-02, not an error: the timer is a
+        # device printf / hostcall worth 0.164 ms/token, so it is opt-in now.
+        print("  no [FLEET_MK_TIME] lines -- rebuild with FLEET_MK_TIMER_PRINT=1"
+              " (off by default: hostcall, 0.164 ms/token), or the run died")
     else:
         totals = [x[3] for x in r["rows"]]
         kept, dropped = _trim_outliers(totals)

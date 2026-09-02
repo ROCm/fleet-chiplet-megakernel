@@ -117,6 +117,7 @@ $HIPCC -x hip "$GEN_DIR/gpt_oss_120b_launch.hip" \
     $W13_PREFETCH_FLAG \
     -DCK_TILE_FMHA_FWD_FAST_EXP2=1 \
     ${FLEET_MK_SUBPHASE_TIMING:+-DFLEET_MK_SUBPHASE_TIMING} \
+    ${FLEET_MK_TIMER_PRINT:+-DFLEET_MK_TIMER_PRINT} \
     ${FLEET_MK_EXTRA_DEFINES:+$FLEET_MK_EXTRA_DEFINES} \
     -Rpass-analysis=kernel-resource-usage \
     -shared \
