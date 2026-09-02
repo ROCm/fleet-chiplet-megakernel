@@ -298,6 +298,41 @@ build:
   ## is inlined in their place. +60 ds&lowbar;read&lowbar;b128, +40 ds&lowbar;read&lowbar;u8, +19
   ## v&lowbar;mfma&lowbar;scale&lowbar;f32&lowbar;16x16x128&lowbar;f8f6f4. Attribute per SYMBOL, never on
   ## whole-binary counts -- tools/dump&lowbar;device&lowbar;asm.py --symbols.
+  ##
+  ## MPK&lowbar;W13&lowbar;T1&lowbar;BIAS&lowbar;EARLY rides on the recycle path above: it issues the
+  ## tile-1 bias load after the counted T1-scale wait, so T0's SwiGLU and the
+  ## T1 fragment waits hide its HBM latency. Kernel-only -- unlike the two
+  ## KMAJOR flags it has NO host half, which was checked rather than assumed
+  ## (it appears nowhere in fleet's demo.py, only in the compiler flags and the
+  ## batch-1 gate list), so a plain .so swap is a valid A/B for it.
+  ##
+  ## Two prerequisites, both #error-enforced: MPK&lowbar;W13&lowbar;KMAJOR&lowbar;RECYCLE, and
+  ## tile-1 bias prefetch (MPK&lowbar;W13&lowbar;BIAS&lowbar;PREFETCH on with
+  ## MPK&lowbar;W13&lowbar;BIAS&lowbar;PF&lowbar;T0&lowbar;ONLY absent). Both hold here.
+  ##
+  ## NEGATIVE RESULT -- it is kept on fleet parity, NOT on measurement.
+  ## 4 interleaved rounds, 2026-09-02, all 8 runs tok1=35644 and coherent:
+  ##   kmajor    n=4  best 1.839  median 1.852  spread 0.018
+  ##   biasearly n=4  best 1.853  median 1.856  spread 0.020
+  ## delta +0.004 ms against a 0.020 spread -- compare&lowbar;runs.py VERDICT
+  ## "within run-to-run noise -- not resolvable". This is the expected shape,
+  ## not a contradiction of upstream: fleet's own three alternating pairs for
+  ## this flag are mixed-sign (1.783/1.768, 1.767/1.776, 1.783/1.766, see
+  ## python/mirage/mpk/persistent&lowbar;kernel.py:1571), and its ablation moved
+  ## +4 / +27 / +3 &micro;s. A flag whose true effect is single-digit &micro;s is
+  ## below what an end-to-end decode average can resolve; resolving it would
+  ## need direct W13 phase timing, which fleet did (7.52 -> 7.32 &micro;s) and
+  ## we have not.
+  ##
+  ## The flag IS live in the build, which is a separate claim from "it helps"
+  ## and was verified separately: --diff reported an IDENTICAL mnemonic
+  ## histogram (11910 both), which is ambiguous -- a pure scheduling move and
+  ## a gated-off flag look the same that way. --diff-fn on the MoE symbol
+  ## disambiguates: DIFF 2020 vs 2020 first@237, same totals with the
+  ## instruction STREAM diverging at index 237, i.e. a reordering. LDS 736,
+  ## registers unchanged (232 VGPR / 106 SGPR / 17 AGPR, occupancy 2).
+  ## Kept because being one flag closer to fleet is worth more than a
+  ## noise-level delta is worth avoiding -- same call as MPK&lowbar;OPROJ&lowbar;KMAJOR.
   extra_defines:
     - MPK_ROUTER_FUSED_DP
     - MPK_ROUTER_DUAL_REDUCE
@@ -310,6 +345,7 @@ build:
     - MPK_W13_T1_EARLY_SCALE_LOAD
     - MPK_W13_KMAJOR_RECYCLE
     - MPK_W13_BIAS_PREFETCH
+    - MPK_W13_T1_BIAS_EARLY
     - MPK_W2_CONSUMER_GATE
     - MPK_W2_ONLY_ARRIVE
     - MPK_WIDE_FP8_QUANT
