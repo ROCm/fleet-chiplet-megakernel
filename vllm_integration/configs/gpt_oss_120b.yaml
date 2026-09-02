@@ -281,6 +281,54 @@ build:
   ##                           W13_T0_COUNTED_HANDOFF, W13_BIAS_PREFETCH, and
   ##                           EXCLUDES W13_T1_SPLIT_LDS_STAGE (see below)
   ##
+  ## ## WITHDRAWN, 2026-09-02: MPK&lowbar;W13&lowbar;KMAJOR&lowbar;RECYCLE and
+  ## ## MPK&lowbar;W13&lowbar;T1&lowbar;BIAS&lowbar;EARLY are NO LONGER in the list below.
+  ##
+  ## Everything measured about them in the paragraphs that follow still stands
+  ## and is preserved for whoever tries this again. What was wrong was not the
+  ## measurement -- it was that the measurement covered only ONE of the two host
+  ## entry points that load this .so.
+  ##
+  ## The claim "the host half is DERIVED from this entry, so the broken
+  ## half-configuration cannot be expressed" was FALSE AS WRITTEN. It was true
+  ## of the emitted driver, demo&lowbar;gpt&lowbar;oss&lowbar;120b.py, which is what
+  ## emit&lowbar;w13&lowbar;kmajor&lowbar;shuffle writes into. It was NOT true of the vLLM plugin,
+  ## fleet&lowbar;megakernel&lowbar;vllm/packing&lowbar;moe.py, which is not generated, packs W13
+  ## at :198 with no K-major branch, and loads THE SAME .so (spec.py:404).
+  ## shuffle&lowbar;w13&lowbar;workgroups&lowbar;kmajor was added to mxfp4&lowbar;pack.py and never
+  ## called from the plugin. So for as long as this flag was in the list, the
+  ## vLLM path ran a K-major kernel against a row-major W13 slab -- precisely
+  ## the silent-wrong-logits state the derive-from-one-entry design exists to
+  ## make unrepresentable, reintroduced by hand one file over.
+  ##
+  ## MPK&lowbar;OPROJ&lowbar;KMAJOR does not have this defect: it carries a matching
+  ## `oproj&lowbar;kmajor` key in spec.py's gemm dict and a matching call site in
+  ## packing&lowbar;moe.py:165. Two host entry points, both wired. That is the shape a
+  ## host-coupled flag has to have here, and W13 only ever had half of it.
+  ##
+  ## Why withdrawn rather than completed. Wiring the plugin half is a small
+  ## edit, but it does not survive FLEET&lowbar;MK&lowbar;MOE&lowbar;ALIAS&lowbar;VLLM=1: under aliasing
+  ## &lowbar;moe&lowbar;data returns vLLM's own w13&lowbar;weight tensor untouched, and permuting
+  ## it would materialize the ~60 GiB duplicate the aliasing exists to avoid.
+  ## So the flag is not merely unwired under vLLM, it is in tension with the
+  ## single-copy weight path, which is the more valuable of the two. Against
+  ## that, the pair is worth -0.040 ms and +0.004 ms on the standalone demo --
+  ## one small win and one measured null. Correct under both entry points beats
+  ## 2% on one of them.
+  ##
+  ## MPK&lowbar;W13&lowbar;T1&lowbar;SPLIT&lowbar;LDS&lowbar;STAGE is RESTORED alongside, because the recycle
+  ## path replaced it. Dropping recycle without restoring split-stage would be a
+  ## third configuration nobody has measured, not a return to the state before
+  ## eb1e234. Expect the demo to go back to ~1.892 ms.
+  ##
+  ## The general lesson, which is why this block is long: the flag count IS the
+  ## hazard. Each host-coupled flag carries a second obligation in a file the
+  ## generator does not write, and nothing in the build fails when that
+  ## obligation is missed. Before adding another one, make the plugin honour it
+  ## in the same change, or do not add it.
+  ##
+  ## What follows is the original record, kept intact.
+  ##
   ## MPK&lowbar;W13&lowbar;KMAJOR&lowbar;RECYCLE is the second host-coupled flag, with the same
   ## failure mode as MPK&lowbar;OPROJ&lowbar;KMAJOR above: it rewrites the W13 tile's LDS
   ## address arithmetic so one K128 fragment is the exact 64-lane x 16-byte
@@ -377,9 +425,8 @@ build:
     - MPK_W13_T0_MFMA_UNROLLED
     - MPK_W2_T0_MFMA_UNROLLED
     - MPK_W13_T1_EARLY_SCALE_LOAD
-    - MPK_W13_KMAJOR_RECYCLE
+    - MPK_W13_T1_SPLIT_LDS_STAGE
     - MPK_W13_BIAS_PREFETCH
-    - MPK_W13_T1_BIAS_EARLY
     - MPK_W2_CONSUMER_GATE
     - MPK_W2_ONLY_ARRIVE
     - MPK_WIDE_FP8_QUANT
