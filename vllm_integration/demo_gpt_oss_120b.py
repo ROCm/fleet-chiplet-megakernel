@@ -856,9 +856,16 @@ def main():
     # Slack for the FLEET_MK_ILB_TIMING diagnostic probe barrier (compiled out in
     # production). Always allocated so a timing build needs no Python change.
     ILB_PROBE_INTS = 20 * 16
+    # End-of-decode-step barrier for the persistent loop: 1 global cache line
+    # + NUM_XCDS per-XCD lines, same shape as the embedding barrier.
+    # Appended LAST so it cannot shift EMBED_BARRIER_BASE, which is the sum of
+    # everything declared above it.
+    # Allocated unconditionally -- one decode step per launch never touches it,
+    # and 144 ints of a multi-megabyte buffer is not worth a conditional.
+    LOOP_BARRIER_INTS = (1 + NUM_XCDS) * 16
     counter_total_ints = (NUM_LAYERS * COUNTERS_PER_LAYER + RANK_COUNTER_INTS
                           + DECODE_ITER_COUNTER_INTS + EMBED_BARRIER_INTS
-                          + ILB_PROBE_INTS)
+                          + ILB_PROBE_INTS + LOOP_BARRIER_INTS)
     buf_counter = torch.zeros(counter_total_ints, dtype=torch.int32, device="cuda")
 
     # Logits scratch for fused OProj+Router+TopK kernel
@@ -1460,8 +1467,29 @@ def main():
             # ============================================================
             # PER-TOKEN LAUNCH LOOP (legacy path)
             # ============================================================
-            # Build a dummy DecodeControl (not used by kernel but still passed)
+            # DecodeControl. Zeroed, so iter_base_p1 == 0 and the kernel derives
+            # its decode epoch from the rank counter exactly as it always has.
             buf_decode_ctrl = torch.zeros(48, dtype=torch.uint8, device="cuda")
+            # int32 view for iter_base_p1, field 3 (after max_decode_tokens,
+            # start_pos, eos_token_id).
+            decode_ctrl_i32 = buf_decode_ctrl.view(torch.int32)
+
+            # FLEET_MK_HOST_EPOCH=1 hands the kernel the decode epoch from here
+            # instead of letting it divide the rank counter.
+            #
+            # This exists to be an EQUIVALENCE TEST, not a feature: the two
+            # derivations must agree token for token, and the whole point of
+            # the field is that the atomic's quotient stops being correct once
+            # one launch covers several decode steps. There is no way to trust
+            # it in that setting without first exercising it in this one, where
+            # a known-good answer is available to disagree with.
+            #
+            # The value is the loop index because prefill runs on PyTorch and
+            # never launches this kernel, so decode step di is the di'th launch
+            # and the counter's quotient is exactly di. Plus one for the bias.
+            host_epoch = os.environ.get("FLEET_MK_HOST_EPOCH", "0") == "1"
+            if host_epoch:
+                print("  [host epoch] iter_base_p1 supplied by driver")
 
             # We need a GPU-side token ID buffer so we can update it between graph launches
             buf_cur_token = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -1496,7 +1524,92 @@ def main():
             moe_barrier_bytes = buf_moe_barrier.nelement() * buf_moe_barrier.element_size()
             workspace_bytes = buf_moe_workspace_f32.nelement() * buf_moe_workspace_f32.element_size()
 
-            for di in range(output_len):
+            # ============================================================
+            # CHUNKED PERSISTENT LOOP (FLEET_MK_PERSIST=N)
+            # ============================================================
+            # One launch covers N decode steps. A rocprofv3 kernel+HIP-runtime
+            # trace of the per-token path measured, on one clock, 2024.9 us
+            # inside the dispatch against a 2213.6 us token cadence -- 188.0 us
+            # of dead time between dispatches, plus ~132 us inside the dispatch
+            # but outside s_memrealtime (wave ramp-up and drain for 240
+            # workgroups, which the device timer cannot see). That ~320 us/token
+            # is paid per LAUNCH, so covering N steps per launch should amortise
+            # it to ~320/N.
+            #
+            # N == 1 falls through to the per-token loop below untouched, so the
+            # two arms are the same binary and the A/B is clean.
+            persist_n = int(os.environ.get("FLEET_MK_PERSIST", "1"))
+            if persist_n > 1:
+                print(f"  [persist] {persist_n} decode steps per launch")
+                # The kernel writes every token but the last one here; the last
+                # is still in argmax_output, which is where the next chunk's
+                # first embedding also reads it from.
+                buf_tokens_out = torch.zeros(persist_n, dtype=torch.int32,
+                                             device="cuda")
+                # Pointer half of DecodeControl: 4 int32 (16 B) then 4 pointers,
+                # so as int64 the pointers start at index 2.
+                decode_ctrl_i64 = buf_decode_ctrl.view(torch.int64)
+                decode_ctrl_i64[2] = kv_indptr.data_ptr()
+                decode_ctrl_i64[3] = kv_last_page_len.data_ptr()
+                decode_ctrl_i64[4] = buf_tokens_out.data_ptr()
+                decode_ctrl_i64[5] = 0   # num_generated: kernel does not write it
+                decode_ctrl_i32[2] = -1  # eos_token_id: the kernel does not stop
+
+                di = 0
+                while di < output_len:
+                    if cur_token == tokenizer.eos_token_id and not args.ignore_eos:
+                        print(f"EOS at position {cur_pos}")
+                        break
+                    n_this = min(persist_n, output_len - di)
+
+                    wall_t0 = _time.perf_counter()
+
+                    # Step 0's KV metadata is the host's job -- the kernel only
+                    # advances it for iter > 0. Same two writes as the per-token
+                    # path, once per chunk instead of once per token.
+                    kv_indptr[1] = (cur_pos + page_size) // page_size
+                    kv_last_page_len[0] = (cur_pos % page_size) + 1
+
+                    decode_ctrl_i32[0] = n_this   # max_decode_tokens
+                    decode_ctrl_i32[1] = cur_pos  # start_pos
+                    # The epoch the kernel cannot derive itself: rank/30 counts
+                    # LAUNCHES, and a launch is now n_this steps.
+                    decode_ctrl_i32[3] = di + 1   # iter_base_p1
+
+                    timed = di >= args.warmup
+                    if timed:
+                        starter.record()
+                    launch_one_step(cur_token)
+                    if timed:
+                        ender.record()
+                    torch.cuda.synchronize()
+
+                    toks = buf_tokens_out[:n_this - 1].tolist() if n_this > 1 else []
+                    toks.append(buf_argmax_out[0].item())
+
+                    if timed:
+                        # Charge the launch evenly across the tokens it produced.
+                        # Per-token GPU time is not separable inside one launch,
+                        # which is the entire point of the change.
+                        per_tok = starter.elapsed_time(ender) / n_this
+                        wall_t1 = _time.perf_counter()
+                        per_tok_wall = (wall_t1 - wall_t0) * 1000 / n_this
+                        for _ in range(n_this):
+                            decode_times.append(per_tok)
+                            wall_times.append(per_tok_wall)
+
+                    for k, nt in enumerate(toks):
+                        if di + k < 5:
+                            print(f"  iter {di + k + 1}: next_token={nt} "
+                                  f"('{tokenizer.decode([nt])}')")
+                        tokens[cur_pos + 1] = nt
+                        cur_token = nt
+                        cur_pos += 1
+                    di += n_this
+
+            # persist_n > 1 already generated everything; range(0) skips this
+            # loop without re-indenting it, so the legacy path stays as written.
+            for di in range(0 if persist_n > 1 else output_len):
                 if cur_token == tokenizer.eos_token_id and not args.ignore_eos:
                     print(f"EOS at position {cur_pos}")
                     break
@@ -1507,6 +1620,9 @@ def main():
                 num_pages_used = (cur_pos + page_size) // page_size
                 kv_indptr[1] = num_pages_used
                 kv_last_page_len[0] = (cur_pos % page_size) + 1
+
+                if host_epoch:
+                    decode_ctrl_i32[3] = di + 1
 
                 if use_graph and graph_captured:
                     # Graph replay: zero + kernel in one submission

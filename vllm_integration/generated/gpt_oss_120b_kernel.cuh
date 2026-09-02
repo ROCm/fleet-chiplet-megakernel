@@ -412,6 +412,13 @@ static constexpr int EMBED_BARRIER_BASE =
 static constexpr int SLOT_EMBED_DONE  = EMBED_BARRIER_BASE;          // global (1 cache line)
 static constexpr int SLOT_EMBED_LOCAL = EMBED_BARRIER_BASE + 16;     // per-XCD (8 cache lines)
 
+// End-of-decode-step barrier, used only when one launch covers several steps.
+// Its own region, past every other, so adding it moved no existing offset.
+static constexpr int LOOP_BARRIER_BASE =
+    NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER + NUM_XCDS * 16 + 16 + (1 + NUM_XCDS) * 16 + 20 * 16;
+static constexpr int SLOT_LOOP_DONE  = LOOP_BARRIER_BASE;            // global (1 cache line)
+static constexpr int SLOT_LOOP_LOCAL = LOOP_BARRIER_BASE + 16;       // per-XCD (8 cache lines)
+
 // MoE barrier size (for zeroing between decode iterations)
 static constexpr int MOE_BARRIER_INTS = 16 * NUM_EXPERTS;  // 2048
 
@@ -431,7 +438,21 @@ struct DecodeControl {
     int max_decode_tokens;   // how many tokens to generate
     int start_pos;           // cur_pos for first decode token
     int eos_token_id;        // stop on this token (-1 = never)
-    int _pad0;
+    // Decode-step epoch, biased by one so that 0 means "not supplied".
+    //
+    // fleet's task_layer_idx must be the EXACT count of layer-executions that
+    // precede this one -- not merely monotonic. Its barriers derive
+    // `expected = layer_counter + 1` against counters that are never reset, so
+    // an epoch that runs ahead of the arrivals waits on a value nothing will
+    // ever write, and all 240 workers hang.
+    //
+    // The kernel's own `rank_counter / WORKERS_PER_XCD` supplies that count for
+    // free while one launch is one decode step. It stops being the answer the
+    // moment a launch covers N steps, because it counts LAUNCHES -- hence this
+    // field. It is biased so a zeroed DecodeControl (what every pre-existing
+    // caller passes) selects the atomic-derived value and is bit-identical to
+    // the behaviour before this field existed.
+    int iter_base_p1;        // 0 = derive from rank counter; else epoch + 1
     int *kv_indptr;          // writable: kernel updates per iteration
     int *kv_last_page_len;   // writable: kernel updates per iteration
     int *token_output_buf;   // [max_decode_tokens] output token IDs
@@ -698,6 +719,17 @@ gpt_oss_120b_kernel(
     // monotonic across the whole run -- which is what fleet's layer body needs
     // for task_layer_idx. Derived here rather than plumbed from Python so
     // there is no second copy to drift.
+    //
+    // "One launch is one decode step" is the load-bearing clause, and it is
+    // exactly what a persistent decode loop breaks: the atomic fires once per
+    // worker per LAUNCH, so across N steps inside one launch the quotient
+    // would freeze at its entry value. Frozen is not merely stale -- fleet
+    // reads it as "no layer has run yet", so every barrier from step 2 onward
+    // is already satisfied and the workers stream past data nobody wrote.
+    // That surfaces as fluent-but-wrong text, not as a crash. When
+    // decode_ctrl->iter_base_p1 is non-zero the host owns the epoch instead
+    // and this quotient is unused; the atomic still supplies xcd_rank either
+    // way, which is the half that is genuinely per-launch.
     __shared__ int s_xcd_rank;
     __shared__ int s_decode_iter;
     if (tid == 0) {
@@ -707,7 +739,9 @@ gpt_oss_120b_kernel(
     }
     __syncthreads();
     int xcd_rank = s_xcd_rank;
-    int decode_iter = s_decode_iter;
+    int decode_iter_base = (decode_ctrl && decode_ctrl->iter_base_p1)
+                               ? decode_ctrl->iter_base_p1 - 1
+                               : s_decode_iter;
 
     // Global tile_idx for mirage orchestrator (encodes xcd_id + xcd_rank)
     int tile_idx = xcd_id * WORKERS_PER_XCD + xcd_rank;
@@ -730,10 +764,45 @@ gpt_oss_120b_kernel(
     int cur_token = config.cur_token_ptr
         ? *config.cur_token_ptr : config.cur_token_id;
 
+    int const n_decode_iters =
+        (decode_ctrl && decode_ctrl->max_decode_tokens > 0)
+            ? decode_ctrl->max_decode_tokens : 1;
+
     // ================================================================
-    // Single decode step
+    // Decode step loop
     // ================================================================
-    {
+    for (int iter = 0; iter < n_decode_iters; iter++) {
+        int decode_iter = decode_iter_base + iter;
+        if (iter > 0 && xcd_id == 0 && xcd_rank == 0) {
+            // Every thread of this workgroup loads the token itself rather than
+            // having tid 0 broadcast it through LDS. A single __shared__ int
+            // here takes static LDS from 736 to 744, and 744 % 16 == 8
+            // misaligns the dynamic-LDS base the MoE and QKV staging phases
+            // index from -- the +1.09 ms/token regression. Measured at 744 on
+            // the first two builds of this loop; this is what took it back to
+            // 736. The load is a broadcast of one address across 256 threads,
+            // which the scalar cache serves once.
+            //
+            // Restricted to worker (0,0) because it is the only worker that
+            // reads cur_token for anything that matters -- it alone gathers the
+            // embedding. The other 239 keep their launch-time value, which is
+            // all touch_lds_pad wants of it, exactly as at one step per launch.
+            // Confining the read this way also keeps the loop correct after
+            // stage 3 removes the end-of-body barrier: tid 0 of THIS workgroup
+            // wrote argmax_output in the previous iteration's tail, so the
+            // ordering is workgroup-local and needs no device-wide barrier.
+            cur_token = static_cast<int>(
+                static_cast<long long *>(config.argmax_output)[0]);
+            if (tid == 0) {
+                int pos = decode_ctrl->start_pos + iter;
+                if (decode_ctrl->token_output_buf) {
+                    decode_ctrl->token_output_buf[iter - 1] = cur_token;
+                }
+                decode_ctrl->kv_indptr[1] = (pos + PAGE_SIZE) / PAGE_SIZE;
+                decode_ctrl->kv_last_page_len[0] = (pos % PAGE_SIZE) + 1;
+            }
+        }
+
         unsigned long long _embed_t0 = __builtin_amdgcn_s_memrealtime();
 
         // -- Embedding: write cur_token embedding into layer 0's residual buffer --

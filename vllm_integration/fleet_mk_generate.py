@@ -389,6 +389,17 @@ def emit_decode_iter_note(cfg: ModelConfig) -> str:
     // monotonic across the whole run -- which is what fleet's layer body needs
     // for task_layer_idx. Derived here rather than plumbed from Python so
     // there is no second copy to drift.
+    //
+    // "One launch is one decode step" is the load-bearing clause, and it is
+    // exactly what a persistent decode loop breaks: the atomic fires once per
+    // worker per LAUNCH, so across N steps inside one launch the quotient
+    // would freeze at its entry value. Frozen is not merely stale -- fleet
+    // reads it as "no layer has run yet", so every barrier from step 2 onward
+    // is already satisfied and the workers stream past data nobody wrote.
+    // That surfaces as fluent-but-wrong text, not as a crash. When
+    // decode_ctrl->iter_base_p1 is non-zero the host owns the epoch instead
+    // and this quotient is unused; the atomic still supplies xcd_rank either
+    // way, which is the half that is genuinely per-launch.
 '''
 
 
@@ -409,7 +420,167 @@ def emit_xcd_rank_atomic(cfg: ModelConfig) -> str:
 
 
 def emit_decode_iter_read(cfg: ModelConfig) -> str:
-    return "    int decode_iter = s_decode_iter;\n" if cfg.headers == "fleet" else ""
+    """decode_iter_base: host-supplied epoch when offered, else the atomic's.
+
+    The BASE, not the epoch: this launch may cover several decode steps, and
+    the loop adds `iter` to get the epoch of each one. The two agree token for
+    token at one step per launch -- measured, not assumed (2.044 ms median
+    either way, same tok1=35644).
+
+    The select is a scalar branch on a value uniform across the whole grid, so
+    it costs one s_cmp and no divergence. Reading decode_ctrl unconditionally
+    would fault the three callers that pass a null pointer for it.
+    """
+    if cfg.headers != "fleet":
+        return ""
+    return '''\
+    int decode_iter_base = (decode_ctrl && decode_ctrl->iter_base_p1)
+                               ? decode_ctrl->iter_base_p1 - 1
+                               : s_decode_iter;
+'''
+
+
+def emit_decode_iter_step(cfg: ModelConfig) -> str:
+    """This iteration's epoch, inside the loop body."""
+    if cfg.headers != "fleet":
+        return ""
+    return "        int decode_iter = decode_iter_base + iter;\n"
+
+
+def emit_persist_iters(cfg: ModelConfig) -> str:
+    """How many decode steps this launch covers.
+
+    One launch of this kernel costs ~320 us/token that has nothing to do with
+    the model: a rocprofv3 kernel+HIP trace of 430 steady-state tokens measured
+    2024.9 us inside the dispatch against a 1893 us in-kernel s_memrealtime
+    reading (~132 us of wave ramp-up and drain that the device timer cannot
+    see), plus a 188.0 us median gap between one dispatch ending and the next
+    beginning. Looping inside the launch pays that once per chunk instead of
+    once per token.
+
+    Zero means "not supplied", so every caller that passes a zeroed or null
+    DecodeControl -- which is all of them until the driver opts in -- gets
+    exactly one step and the pre-loop behaviour.
+    """
+    if cfg.headers != "fleet":
+        return "    int const n_decode_iters = 1;\n\n"
+    return '''\
+    int const n_decode_iters =
+        (decode_ctrl && decode_ctrl->max_decode_tokens > 0)
+            ? decode_ctrl->max_decode_tokens : 1;
+
+'''
+
+
+def emit_persist_prologue(cfg: ModelConfig) -> str:
+    """Per-iteration prologue: consume the last step's token, advance the KV.
+
+    A port of decode_bridge_kernel (the 1-block kernel the FLEET_MK_PIPE graph
+    path already runs between launches), moved inside the loop. It runs on
+    thread 0 of worker (0,0) only, and needs no barrier of its own:
+
+      - argmax -> cur_token is read by THE SAME THREAD that wrote it last
+        iteration, so no cross-worker visibility is required. The broadcast to
+        the rest of the workgroup is the __syncthreads() below, and worker
+        (0,0) is the only worker that gathers the embedding.
+      - kv_indptr / kv_last_page_len are read by all 240 workers, but they are
+        written here BEFORE (0,0) arrives at the embed barrier, which ends in
+        buffer_inv. No worker can reach layer 0 without (0,0) having arrived,
+        so every reader acquires them there. This is the same producer ->
+        embed-barrier -> consumer edge the embedding itself already uses.
+
+    Both metadata ints reach the layer body as raw `int const *` -- the KV
+    write slot and the RoPE angle both come from a compute_pos lambda that
+    re-reads them every layer -- so a device-side write does propagate. Nothing
+    is cached in a register across the loop.
+
+    Guarded on iter > 0: the first step's token and metadata come from the host
+    exactly as before, which is what keeps n_decode_iters == 1 bit-identical.
+    """
+    if cfg.headers != "fleet":
+        return ""
+    return '''\
+        if (iter > 0 && xcd_id == 0 && xcd_rank == 0) {
+            // Every thread of this workgroup loads the token itself rather than
+            // having tid 0 broadcast it through LDS. A single __shared__ int
+            // here takes static LDS from 736 to 744, and 744 % 16 == 8
+            // misaligns the dynamic-LDS base the MoE and QKV staging phases
+            // index from -- the +1.09 ms/token regression. Measured at 744 on
+            // the first two builds of this loop; this is what took it back to
+            // 736. The load is a broadcast of one address across 256 threads,
+            // which the scalar cache serves once.
+            //
+            // Restricted to worker (0,0) because it is the only worker that
+            // reads cur_token for anything that matters -- it alone gathers the
+            // embedding. The other 239 keep their launch-time value, which is
+            // all touch_lds_pad wants of it, exactly as at one step per launch.
+            // Confining the read this way also keeps the loop correct after
+            // stage 3 removes the end-of-body barrier: tid 0 of THIS workgroup
+            // wrote argmax_output in the previous iteration's tail, so the
+            // ordering is workgroup-local and needs no device-wide barrier.
+            cur_token = static_cast<int>(
+                static_cast<long long *>(config.argmax_output)[0]);
+            if (tid == 0) {
+                int pos = decode_ctrl->start_pos + iter;
+                if (decode_ctrl->token_output_buf) {
+                    decode_ctrl->token_output_buf[iter - 1] = cur_token;
+                }
+                decode_ctrl->kv_indptr[1] = (pos + PAGE_SIZE) / PAGE_SIZE;
+                decode_ctrl->kv_last_page_len[0] = (pos % PAGE_SIZE) + 1;
+            }
+        }
+
+'''
+
+
+def emit_persist_epilogue(cfg: ModelConfig) -> str:
+    """End-of-body barrier, on the multi-step path only.
+
+    The argument that this barrier is unnecessary is a real one, and it is
+    written out in emit_persist_prologue: every producer -> consumer edge
+    across the loop boundary is already covered, the last of them by the embed
+    barrier at the top of the next iteration. But "I reasoned that no barrier
+    is needed" is exactly the class of claim this kernel has been burned by,
+    and the failure mode here is fluent-but-wrong text rather than a crash --
+    the kind that survives a casual read of the output. So the loop is proven
+    correct with the barrier in place, and the barrier is removed afterwards
+    against a measurement (stage 3), not against an argument.
+
+    It is emitted inside `if (n_decode_iters > 1)` rather than outside, so the
+    one-step path executes not one extra instruction and stays bit-identical.
+
+    The expected value is a plain local, not the __shared__ the embed barrier
+    uses for the same job. That is not a style choice: a single extra
+    __shared__ int takes static LDS from 736 to 744, and 744 % 16 == 8
+    misaligns the dynamic-LDS base the MoE and QKV staging phases index from --
+    the +1.09 ms/token regression, which the build reports as its "LDS Size
+    [bytes/block]" line and nothing else would catch. Measured at 744 on the
+    first build of this loop.
+
+    It is correct because barrier_global reads `expected` only inside
+    `if (tid == 0)`, the same thread that computes it here. Padding LDS back to
+    752 instead would not work -- LLVM strips padding that is never read, which
+    is the whole reason touch_lds_pad exists.
+    """
+    if cfg.headers != "fleet":
+        return ""
+    return '''
+        // Provisional: see the note on this emitter. Removed in stage 3 on a
+        // measurement, not on the argument that it is redundant.
+        if (n_decode_iters > 1) {
+            int *loop_done  = counter_buf + SLOT_LOOP_DONE;
+            int *loop_local = counter_buf + SLOT_LOOP_LOCAL;
+            // Local, not __shared__: see the LDS note on this emitter.
+            // barrier_global reads `expected` on tid 0 only.
+            int loop_expected = 0;
+            if (tid == 0) {
+                int cur = __atomic_load_n(loop_done, __ATOMIC_RELAXED);
+                loop_expected = ((cur / NUM_XCDS) + 1) * NUM_XCDS;
+            }
+            fleet_mk::barrier_global(loop_done, loop_expected, TOTAL_WORKERS,
+                                  loop_local, xcd_id, WORKERS_PER_XCD);
+        }
+'''
 
 
 def emit_touch_lds_pad(cfg: ModelConfig) -> str:
@@ -791,10 +962,19 @@ TRAILING_COUNTERS = [
         "Slack for the FLEET_MK_ILB_TIMING diagnostic probe barrier (compiled out in",
         "production). Always allocated so a timing build needs no Python change.",
     ]),
+    ("LOOP_BARRIER_INTS", "(1 + NUM_XCDS) * 16", None, [
+        "End-of-decode-step barrier for the persistent loop: 1 global cache line",
+        "+ NUM_XCDS per-XCD lines, same shape as the embedding barrier.",
+        "Appended LAST so it cannot shift EMBED_BARRIER_BASE, which is the sum of",
+        "everything declared above it.",
+        "Allocated unconditionally -- one decode step per launch never touches it,",
+        "and 144 ints of a multi-megabyte buffer is not worth a conditional.",
+    ]),
 ]
 # The region the kernel's EMBED_BARRIER_BASE must point at. Everything declared
 # before it in TRAILING_COUNTERS is part of that offset.
 _EMBED_REGION = "EMBED_BARRIER_INTS"
+_LOOP_REGION = "LOOP_BARRIER_INTS"
 
 
 def emit_trailing_counters(cfg: ModelConfig, indent: str = " " * 4) -> str:
@@ -831,12 +1011,25 @@ def _wrap_sum(head: str, terms: list) -> str:
 
 def emit_embed_barrier_base(indent: str = " " * 4) -> str:
     """The kernel's EMBED_BARRIER_BASE expression, from the same list."""
+    return _region_base(_EMBED_REGION, indent)
+
+
+def emit_loop_barrier_base(indent: str = " " * 4) -> str:
+    """The kernel's LOOP_BARRIER_BASE expression, from the same list."""
+    return _region_base(_LOOP_REGION, indent)
+
+
+def _region_base(region: str, indent: str) -> str:
+    """Offset of one TRAILING_COUNTERS region: the sum of everything before it.
+
+    Same running sum the driver computes in Python, so the two cannot drift.
+    """
     terms = ["NUM_LAYERS * fleet_mk::COUNTERS_PER_LAYER"]
     for name, expr, _, _ in TRAILING_COUNTERS:
-        if name == _EMBED_REGION:
-            break
+        if name == region:
+            return f"{indent}{' + '.join(terms)};"
         terms.append(expr)
-    return f"{indent}{' + '.join(terms)};"
+    raise KeyError(f"no trailing-counter region named '{region}'")
 
 
 # ---------------------------------------------------------------------------
@@ -3014,6 +3207,13 @@ static constexpr int EMBED_BARRIER_BASE =
 static constexpr int SLOT_EMBED_DONE  = EMBED_BARRIER_BASE;          // global (1 cache line)
 static constexpr int SLOT_EMBED_LOCAL = EMBED_BARRIER_BASE + 16;     // per-XCD (8 cache lines)
 
+// End-of-decode-step barrier, used only when one launch covers several steps.
+// Its own region, past every other, so adding it moved no existing offset.
+static constexpr int LOOP_BARRIER_BASE =
+{emit_loop_barrier_base()}
+static constexpr int SLOT_LOOP_DONE  = LOOP_BARRIER_BASE;            // global (1 cache line)
+static constexpr int SLOT_LOOP_LOCAL = LOOP_BARRIER_BASE + 16;       // per-XCD (8 cache lines)
+
 // MoE barrier size (for zeroing between decode iterations)
 static constexpr int MOE_BARRIER_INTS = 16 * NUM_EXPERTS;  // 2048
 
@@ -3033,7 +3233,21 @@ struct DecodeControl {{
     int max_decode_tokens;   // how many tokens to generate
     int start_pos;           // cur_pos for first decode token
     int eos_token_id;        // stop on this token (-1 = never)
-    int _pad0;
+    // Decode-step epoch, biased by one so that 0 means "not supplied".
+    //
+    // fleet's task_layer_idx must be the EXACT count of layer-executions that
+    // precede this one -- not merely monotonic. Its barriers derive
+    // `expected = layer_counter + 1` against counters that are never reset, so
+    // an epoch that runs ahead of the arrivals waits on a value nothing will
+    // ever write, and all 240 workers hang.
+    //
+    // The kernel's own `rank_counter / WORKERS_PER_XCD` supplies that count for
+    // free while one launch is one decode step. It stops being the answer the
+    // moment a launch covers N steps, because it counts LAUNCHES -- hence this
+    // field. It is biased so a zeroed DecodeControl (what every pre-existing
+    // caller passes) selects the atomic-derived value and is bit-identical to
+    // the behaviour before this field existed.
+    int iter_base_p1;        // 0 = derive from rank counter; else epoch + 1
     int *kv_indptr;          // writable: kernel updates per iteration
     int *kv_last_page_len;   // writable: kernel updates per iteration
     int *token_output_buf;   // [max_decode_tokens] output token IDs
@@ -3323,10 +3537,13 @@ gpt_oss_120b_kernel(
     int cur_token = config.cur_token_ptr
         ? *config.cur_token_ptr : config.cur_token_id;
 
+{emit_persist_iters(cfg)}\
     // ================================================================
-    // Single decode step
+    // Decode step loop
     // ================================================================
-    {{
+    for (int iter = 0; iter < n_decode_iters; iter++) {{
+{emit_decode_iter_step(cfg)}\
+{emit_persist_prologue(cfg)}\
         unsigned long long _embed_t0 = __builtin_amdgcn_s_memrealtime();
 
         // -- Embedding: write cur_token embedding into layer 0's residual buffer --
@@ -5825,8 +6042,29 @@ def main():
             # ============================================================
             # PER-TOKEN LAUNCH LOOP (legacy path)
             # ============================================================
-            # Build a dummy DecodeControl (not used by kernel but still passed)
+            # DecodeControl. Zeroed, so iter_base_p1 == 0 and the kernel derives
+            # its decode epoch from the rank counter exactly as it always has.
             buf_decode_ctrl = torch.zeros(48, dtype=torch.uint8, device="cuda")
+            # int32 view for iter_base_p1, field 3 (after max_decode_tokens,
+            # start_pos, eos_token_id).
+            decode_ctrl_i32 = buf_decode_ctrl.view(torch.int32)
+
+            # FLEET_MK_HOST_EPOCH=1 hands the kernel the decode epoch from here
+            # instead of letting it divide the rank counter.
+            #
+            # This exists to be an EQUIVALENCE TEST, not a feature: the two
+            # derivations must agree token for token, and the whole point of
+            # the field is that the atomic's quotient stops being correct once
+            # one launch covers several decode steps. There is no way to trust
+            # it in that setting without first exercising it in this one, where
+            # a known-good answer is available to disagree with.
+            #
+            # The value is the loop index because prefill runs on PyTorch and
+            # never launches this kernel, so decode step di is the di'th launch
+            # and the counter's quotient is exactly di. Plus one for the bias.
+            host_epoch = os.environ.get("FLEET_MK_HOST_EPOCH", "0") == "1"
+            if host_epoch:
+                print("  [host epoch] iter_base_p1 supplied by driver")
 
             # We need a GPU-side token ID buffer so we can update it between graph launches
             buf_cur_token = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -5861,7 +6099,92 @@ def main():
             moe_barrier_bytes = buf_moe_barrier.nelement() * buf_moe_barrier.element_size()
             workspace_bytes = buf_moe_workspace_f32.nelement() * buf_moe_workspace_f32.element_size()
 
-            for di in range(output_len):
+            # ============================================================
+            # CHUNKED PERSISTENT LOOP (FLEET_MK_PERSIST=N)
+            # ============================================================
+            # One launch covers N decode steps. A rocprofv3 kernel+HIP-runtime
+            # trace of the per-token path measured, on one clock, 2024.9 us
+            # inside the dispatch against a 2213.6 us token cadence -- 188.0 us
+            # of dead time between dispatches, plus ~132 us inside the dispatch
+            # but outside s_memrealtime (wave ramp-up and drain for 240
+            # workgroups, which the device timer cannot see). That ~320 us/token
+            # is paid per LAUNCH, so covering N steps per launch should amortise
+            # it to ~320/N.
+            #
+            # N == 1 falls through to the per-token loop below untouched, so the
+            # two arms are the same binary and the A/B is clean.
+            persist_n = int(os.environ.get("FLEET_MK_PERSIST", "1"))
+            if persist_n > 1:
+                print(f"  [persist] {{persist_n}} decode steps per launch")
+                # The kernel writes every token but the last one here; the last
+                # is still in argmax_output, which is where the next chunk's
+                # first embedding also reads it from.
+                buf_tokens_out = torch.zeros(persist_n, dtype=torch.int32,
+                                             device="cuda")
+                # Pointer half of DecodeControl: 4 int32 (16 B) then 4 pointers,
+                # so as int64 the pointers start at index 2.
+                decode_ctrl_i64 = buf_decode_ctrl.view(torch.int64)
+                decode_ctrl_i64[2] = kv_indptr.data_ptr()
+                decode_ctrl_i64[3] = kv_last_page_len.data_ptr()
+                decode_ctrl_i64[4] = buf_tokens_out.data_ptr()
+                decode_ctrl_i64[5] = 0   # num_generated: kernel does not write it
+                decode_ctrl_i32[2] = -1  # eos_token_id: the kernel does not stop
+
+                di = 0
+                while di < output_len:
+                    if cur_token == tokenizer.eos_token_id and not args.ignore_eos:
+                        print(f"EOS at position {{cur_pos}}")
+                        break
+                    n_this = min(persist_n, output_len - di)
+
+                    wall_t0 = _time.perf_counter()
+
+                    # Step 0's KV metadata is the host's job -- the kernel only
+                    # advances it for iter > 0. Same two writes as the per-token
+                    # path, once per chunk instead of once per token.
+                    kv_indptr[1] = (cur_pos + page_size) // page_size
+                    kv_last_page_len[0] = (cur_pos % page_size) + 1
+
+                    decode_ctrl_i32[0] = n_this   # max_decode_tokens
+                    decode_ctrl_i32[1] = cur_pos  # start_pos
+                    # The epoch the kernel cannot derive itself: rank/30 counts
+                    # LAUNCHES, and a launch is now n_this steps.
+                    decode_ctrl_i32[3] = di + 1   # iter_base_p1
+
+                    timed = di >= args.warmup
+                    if timed:
+                        starter.record()
+                    launch_one_step(cur_token)
+                    if timed:
+                        ender.record()
+                    torch.cuda.synchronize()
+
+                    toks = buf_tokens_out[:n_this - 1].tolist() if n_this > 1 else []
+                    toks.append(buf_argmax_out[0].item())
+
+                    if timed:
+                        # Charge the launch evenly across the tokens it produced.
+                        # Per-token GPU time is not separable inside one launch,
+                        # which is the entire point of the change.
+                        per_tok = starter.elapsed_time(ender) / n_this
+                        wall_t1 = _time.perf_counter()
+                        per_tok_wall = (wall_t1 - wall_t0) * 1000 / n_this
+                        for _ in range(n_this):
+                            decode_times.append(per_tok)
+                            wall_times.append(per_tok_wall)
+
+                    for k, nt in enumerate(toks):
+                        if di + k < 5:
+                            print(f"  iter {{di + k + 1}}: next_token={{nt}} "
+                                  f"('{{tokenizer.decode([nt])}}')")
+                        tokens[cur_pos + 1] = nt
+                        cur_token = nt
+                        cur_pos += 1
+                    di += n_this
+
+            # persist_n > 1 already generated everything; range(0) skips this
+            # loop without re-indenting it, so the legacy path stays as written.
+            for di in range(0 if persist_n > 1 else output_len):
                 if cur_token == tokenizer.eos_token_id and not args.ignore_eos:
                     print(f"EOS at position {{cur_pos}}")
                     break
@@ -5872,6 +6195,9 @@ def main():
                 num_pages_used = (cur_pos + page_size) // page_size
                 kv_indptr[1] = num_pages_used
                 kv_last_page_len[0] = (cur_pos % page_size) + 1
+
+                if host_epoch:
+                    decode_ctrl_i32[3] = di + 1
 
                 if use_graph and graph_captured:
                     # Graph replay: zero + kernel in one submission
