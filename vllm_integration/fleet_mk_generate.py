@@ -289,6 +289,53 @@ def _fleet_mk_owned_first() -> int:
     raise AssertionError("no Fleet MK-owned counter region")
 
 
+def check_counter_region_collisions(cfg: ModelConfig) -> None:
+    """Reject fleet flags that allocate counter lines Fleet MK already owns.
+
+    The counter buffer is shared: the layer body addresses every counter as an
+    offset from one `oproj&#95;counters&#95;base` pointer, so a fleet flag that claims a
+    new region claims it out of the SAME arithmetic our SLOT&#95;* constants use.
+    COUNTER&#95;REGIONS reserves fleet's known regions, but a flag added to
+    build.extra&#95;defines later can introduce one that is not reserved, and the
+    failure mode is the usual one for this buffer -- not a build error and not a
+    crash, but two barriers sharing memory so neither can complete.
+
+    MPK&#95;ROUTER&#95;XCD&#95;FOLD is the live example. It publishes per-XCD O-proj
+    slice-ready flags at
+
+        FULL&#95;LAYER&#95;OPROJ&#95;XCD&#95;READY&#95;SLOT(n) = 48*16 + 128*n + 272
+
+    (gang&#95;full&#95;layer&#95;fused&#95;mi300.cuh:81, with the matching pointer computed at
+    gang&#95;linear&#95;mxfp4&#95;res&#95;bias&#95;rmsnorm&#95;topk&#95;mi300.cuh:416). At NUM&#95;REQS=1 that
+    is int 1168 = cache line 73 -- exactly the first line Fleet MK owns, which
+    today is SLOT&#95;QKV&#95;BARRIER&#95;NEW. Both headers ARE in our include set, so this
+    is one YAML line away from being live; it is not live today only because the
+    flag is absent. Fleet does not hit it because its own layer body has no
+    barrier there and its demo.py sizes counter&#95;size with a trailing +128.
+
+    Checked here, where the error can name the YAML key, rather than left to be
+    discovered as garbage tokens. Fixing it is a layout change (move Fleet MK's
+    slots up by 8 lines, which fits: COUNTERS&#95;PER&#95;LAYER has headroom), not a
+    flag change -- so the guard says that instead of just refusing.
+    """
+    if "MPK_ROUTER_XCD_FOLD" not in cfg.extra_defines:
+        return
+    fold_first = _region_bounds("fleet layer barrier")[1] + 1
+    owned_first = _fleet_mk_owned_first()
+    if fold_first + 8 <= owned_first:
+        return
+    collided = next(n for n, (off, _) in counter_slots().items()
+                    if off == owned_first)
+    raise ValueError(
+        f"MPK_ROUTER_XCD_FOLD allocates 8 cache lines at "
+        f"FULL_LAYER_OPROJ_XCD_READY_SLOT(1) = line {fold_first} "
+        f"({fold_first}..{fold_first + 7}), but Fleet MK's own slots start at "
+        f"line {owned_first} ({collided}). They would share memory and neither "
+        f"barrier could complete -- silently, as wrong tokens. Reserve the "
+        f"region in COUNTER_REGIONS (which moves Fleet MK's slots up 8 lines) "
+        f"before adding this flag to build.extra_defines.")
+
+
 def emit_counter_ownership() -> str:
     """The one-sentence split between the layer body's half and Fleet MK's."""
     first = _fleet_mk_owned_first()
@@ -1506,6 +1553,7 @@ def load_and_validate(config_path: str) -> ModelConfig:
         f"device_functions.cuh allocates {cfg.counters_per_layer // 16}. "
         f"Raise COUNTERS_PER_LAYER in the header first -- overflowing it "
         f"corrupts the next layer's counters.")
+    check_counter_region_collisions(cfg)
 
     # Pointer table layout depends on arch
     if cfg.arch == "dense":

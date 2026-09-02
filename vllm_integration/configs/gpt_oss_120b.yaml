@@ -118,6 +118,40 @@ build:
   ## MPK&lowbar;W13&lowbar;T1&lowbar;SPLIT&lowbar;LDS&lowbar;STAGE, which IS in the list below and has to
   ## come out in the same change.
   ##
+  ## CORRECTION, 2026-09-02: MPK&lowbar;LM&lowbar;HEAD&lowbar;GROUP&lowbar;PIPELINE is NOT reachable in
+  ## this build, so it is struck from that list of four. Every one of its ~20
+  ## #ifdef sites lives in gang&lowbar;rmsnorm&lowbar;linear&lowbar;mxfp4&lowbar;bias&lowbar;argmax&lowbar;mi300.cuh,
+  ## and a full-flag `hipcc -M` of gpt&lowbar;oss&lowbar;120b&lowbar;launch.hip -- 637 header
+  ## lines, every -D from the emitted build script -- contains ZERO references
+  ## to that header. (The scan is sound: gang&lowbar;full&lowbar;layer&lowbar;fused&lowbar;mi300 returns
+  ## 1.) The preprocessor is the authority here, not grep on the source,
+  ## because a #include can itself be conditional. Our LM head is our own
+  ## emitted gpt&lowbar;oss&lowbar;120b&lowbar;lmhead&lowbar;gemm&lowbar;argmax, kept because its argmax-only
+  ## tail never materializes logits. Adding the flag would be a no-op -D, and
+  ## porting fleet's shuffle&lowbar;lm&lowbar;head&lowbar;record&lowbar;kmajor host permute beside it
+  ## would be a one-sided repack against a kernel that never reads it -- the
+  ## silent-wrong-logits failure mode the KMAJOR flags are derived-in-pairs to
+  ## prevent. Adopting fleet's LM-head task wholesale is a far larger change
+  ## than a flag flip and trades away the argmax-only tail; not done here.
+  ##
+  ## Fleet's three demo.py buffer-size changes that accompany it are likewise
+  ## for flags we do not compile: lse&lowbar;dim1*2 and o&lowbar;acc&lowbar;dim1*2 feed
+  ## MPK&lowbar;ATTN&lowbar;SPLIT&lowbar;CHUNK's helper partials at offset +LSE&lowbar;S (fleet
+  ## allocates them unconditionally -- "unused when the flag is off"), and
+  ## counter&lowbar;size's trailing +128 feeds MPK&lowbar;ROUTER&lowbar;XCD&lowbar;FOLD. Neither flag
+  ## appears in our build script. The first two thirds of fleet's counter&lowbar;size
+  ## -- 768 + 128*NUM&lowbar;REQS + 272 -- we DO already reserve, as the chunk-barrier
+  ## and layer-barrier regions in COUNTER&lowbar;REGIONS.
+  ##
+  ## That +128 is a live trap rather than a curiosity, so it is now a
+  ## generation-time error instead of a comment: XCD&lowbar;FOLD's
+  ## FULL&lowbar;LAYER&lowbar;OPROJ&lowbar;XCD&lowbar;READY&lowbar;SLOT(1) = 48*16 + 128 + 272 is int 1168 =
+  ## cache line 73, which is exactly where our own SLOT&lowbar;QKV&lowbar;BARRIER&lowbar;NEW
+  ## starts. Both headers are already on our include path, so adding that flag
+  ## to extra&lowbar;defines below would alias two barriers onto one line and neither
+  ## could complete -- as wrong tokens, not as a build error. See
+  ## check&lowbar;counter&lowbar;region&lowbar;collisions() in fleet&lowbar;mk&lowbar;generate.py.
+  ##
   ## Since this tree moved under fleet (as vllm&lowbar;integration/), header&lowbar;dir names
   ## its OWN grandparent. It is still an absolute path rather than a derived one
   ## because it is interpolated into the emitted build script, which
