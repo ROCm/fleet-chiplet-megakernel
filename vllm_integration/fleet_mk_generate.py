@@ -1658,6 +1658,74 @@ def emit_oproj_kmajor_import(cfg: ModelConfig) -> str:
     return ",\n    shuffle_oproj_workgroups_kmajor"
 
 
+def emit_w13_kmajor_shuffle(cfg: ModelConfig) -> str:
+    """The host half of MPK_W13_KMAJOR_RECYCLE, derived from the same YAML
+    entry -- exactly the arrangement emit_oproj_kmajor_shuffle exists for, and
+    for the same reason: a one-sided setting is silently wrong logits, not a
+    build error.
+
+    The kernel-side static_asserts are `W13_OUTPUT_PER_WG == 128` and a
+    K128-aligned reduction. Assert both here so a mismatch is a
+    generation-time error naming the YAML key, not a compile error inside a
+    2000-line header.
+
+    Upstream additionally #errors this flag against MPK_W13_T1_SPLIT_LDS_STAGE
+    (the recycle path REPLACES the split-stage path). That would be a build
+    failure rather than silent corruption, but it costs a two-minute compile to
+    discover, so it is checked here too.
+    """
+    if "MPK_W13_KMAJOR_RECYCLE" not in cfg.extra_defines:
+        return ""
+    if cfg.w13_output_per_wg != 128:
+        raise ValueError(
+            f"MPK_W13_KMAJOR_RECYCLE needs w13_output_per_wg=128, got "
+            f"{cfg.w13_output_per_wg}; the kernel-side static_assert "
+            f"`W13_OUTPUT_PER_WG == 128 && NUM_WARPS == 4` says the same")
+    # The reduction is the PADDED hidden size -- the driver's HIDDEN&#95;SIZE,
+    # which is what the emitted call passes. cfg.hidden_size is the unpadded
+    # 2880 and is NOT K128-aligned, so checking that one would reject a
+    # configuration the kernel accepts.
+    if cfg.padded_hidden_size % 128 != 0:
+        raise ValueError(
+            f"MPK_W13_KMAJOR_RECYCLE needs a K128-aligned reduction, but "
+            f"padded_hidden_size={cfg.padded_hidden_size} is not a multiple "
+            f"of 128")
+    # The kernel hard-codes the fragment-wait schedule for 23 K128 iterations
+    # (`static_assert(W13_MFMA_ITERS == 23, "re-audit canonical fragment waits
+    # when W13 K changes")`). A different K builds, but the waits would be
+    # wrong -- so fail here, where the error can name the YAML key.
+    if cfg.padded_hidden_size // 128 != 23:
+        raise ValueError(
+            f"MPK_W13_KMAJOR_RECYCLE's fragment-wait schedule is written for "
+            f"W13_MFMA_ITERS=23, but padded_hidden_size="
+            f"{cfg.padded_hidden_size} gives {cfg.padded_hidden_size // 128}; "
+            f"the kernel-side static_assert says re-audit the waits")
+    if "MPK_W13_T1_SPLIT_LDS_STAGE" in cfg.extra_defines:
+        raise ValueError(
+            "MPK_W13_KMAJOR_RECYCLE replaces the W13 tile-1 split-stage path; "
+            "remove MPK_W13_T1_SPLIT_LDS_STAGE from extra_defines (the header "
+            "#errors on the pair)")
+    return (
+        "        # MPK_W13_KMAJOR_RECYCLE is on: within each 16-row MFMA tile,\n"
+        "        # repack [row, k128, quarter, 16B] -> [k128, quarter, row, 16B]\n"
+        "        # so the recycle schedule retires lane-contiguous fragments.\n"
+        "        # A permutation, not a requantization -- bit-exact. The kernel\n"
+        "        # half is the -D flag; both come from one YAML entry because a\n"
+        "        # one-sided setting is silently wrong logits, not a build error.\n"
+        "        # K is passed explicitly: under split scales the wg_bytes\n"
+        "        # equation fleet solves has no solution (tools/check_w13_kmajor.py).\n"
+        "        gu_packed = shuffle_w13_workgroups_kmajor(\n"
+        "            gu_packed, W13_OPW, reduction=HIDDEN_SIZE)\n")
+
+
+def emit_w13_kmajor_import(cfg: ModelConfig) -> str:
+    """Import the shuffle only where it is used, so every other driver stays
+    byte-identical to what it was before this flag existed."""
+    if "MPK_W13_KMAJOR_RECYCLE" not in cfg.extra_defines:
+        return ""
+    return ",\n    shuffle_w13_workgroups_kmajor"
+
+
 def emit_header_root(cfg: ModelConfig) -> str:
     """The shell variable naming the megakernel header tree, plus its rationale.
 
@@ -4884,7 +4952,7 @@ from safetensors import safe_open
 # points build different slabs for the same kernel.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fleet_megakernel_vllm.mxfp4_pack import (  # noqa: E402
-    pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup{emit_oproj_kmajor_import(cfg)})
+    pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup{emit_oproj_kmajor_import(cfg)}{emit_w13_kmajor_import(cfg)})
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -5400,6 +5468,7 @@ def main():
         gu_packed = pack_mxfp4_workgroup(
             gu_blocks, gu_scales,
             section="data" if MOE_SPLIT_BUFFERS else "both", **gu_common)
+{emit_w13_kmajor_shuffle(cfg)}\
 {emit_weight_append(cfg, 'w13_weight_base')}
         moe_w13_scales.append(pack_mxfp4_workgroup(
             gu_blocks, gu_scales, section="scales", **gu_common)

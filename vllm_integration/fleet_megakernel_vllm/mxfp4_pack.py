@@ -385,3 +385,82 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
     data = data.permute(0, 2, 3, 1, 4).reshape(n_wgs, data_bytes)
     out = torch.cat([data, packed[:, data_bytes:]], dim=1).contiguous()
     return out.unsqueeze(0).contiguous() if squeezed else out
+
+
+def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
+                                  output_per_wg: int = 128,
+                                  reduction: int = None) -> torch.Tensor:
+    """Repack packed W13 workgroups into lane-contiguous K128 fragments.
+
+    The host half of ``-DMPK_W13_KMAJOR_RECYCLE``. Ported from fleet's
+    `demo/gpt_oss/demo.py` (`shuffle_w13_workgroups_kmajor`), which is the
+    definition of the layout that flag compiles the kernel to expect.
+
+    Within each 16-row MFMA tile the data prefix goes from
+    ``[row, k128, quarter, 16B]`` to ``[k128, quarter, row, 16B]``; scales stay
+    row-major. Same transform as the O-proj shuffle above, but applied per
+    16-row tile inside a 128-row workgroup rather than to the workgroup whole
+    -- W13 runs OPW=128, which is 8 tiles, and the recycle schedule retires one
+    tile's fragments at a time.
+
+    A permutation, not a requantization: every lane receives exactly the bytes
+    it received before, so results are bit-exact.
+
+    **Host and kernel must agree.** Applying this without
+    -DMPK_W13_KMAJOR_RECYCLE, or the reverse, is not a build error and not a
+    crash -- every lane reads a valid byte of the tile, just the wrong one. The
+    symptom is silently wrong logits. Which is why the driver's call site is
+    DERIVED from the flag being in build.extra_defines (see
+    emit_w13_kmajor_shuffle in fleet_mk_generate.py) rather than being a second
+    knob to remember.
+
+    Two divergences from fleet's copy, both because this tree has knobs fleet
+    does not:
+
+    * ``reduction`` is passed in rather than solved for from ``wg_bytes``.
+      Fleet can assume ``wg_bytes = OPW*(K/2 + K/32)`` because its scales are
+      always interleaved; under ``split_scales=True`` the data and scale
+      sections are separate allocations, so that equation has no solution and
+      the inferred K would be wrong. Passing it makes the caller state it.
+    * The reduction must be the FULL K, not a foreign row stride. With
+      ``FLEET_MK_MOE_K_STRIDE`` set, stored rows are wider than computed ones
+      and the k128 axis this permutes is the stored one -- which the kernel
+      does not index that way. Rejected rather than silently mis-permuted.
+    """
+    if packed.ndim != 3:
+        raise ValueError(
+            "expected rank-3 [experts, workgroups, bytes] W13 weights, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg != 128:
+        raise ValueError(
+            "MPK_W13_KMAJOR_RECYCLE requires W13_OPW=128 (got "
+            f"{output_per_wg}); the kernel-side static_assert says the same")
+
+    experts, workgroups, wg_bytes = packed.shape
+    if reduction is None:
+        # Fleet's inference, valid only for interleaved scales.
+        reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    if reduction % 128 != 0:
+        raise ValueError(
+            f"MPK_W13_KMAJOR_RECYCLE needs a K128-aligned reduction, got "
+            f"{reduction}")
+
+    data_bytes = output_per_wg * (reduction // 2)
+    if data_bytes > wg_bytes:
+        raise ValueError(
+            f"W13 record of {wg_bytes} B cannot hold {data_bytes} B of data "
+            f"for OPW={output_per_wg}, K={reduction} -- wrong reduction, or "
+            "this is a scales-only section")
+    scale_bytes = wg_bytes - data_bytes
+    if scale_bytes not in (0, output_per_wg * (reduction // 32)):
+        raise ValueError(
+            f"invalid W13 MXFP4 record width {wg_bytes} for OPW="
+            f"{output_per_wg}, K={reduction}: trailing {scale_bytes} B is "
+            "neither empty (split scales) nor one scale block per row")
+
+    tiles = output_per_wg // 16
+    data = packed[..., :data_bytes].reshape(
+        experts, workgroups, tiles, 16, reduction // 128, 4, 16)
+    data = data.permute(0, 1, 2, 4, 5, 3, 6).reshape(
+        experts, workgroups, data_bytes)
+    return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()

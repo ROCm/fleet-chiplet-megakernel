@@ -243,6 +243,61 @@ build:
   ##   ROUTER_DUAL_REDUCE      needs ROUTER_FUSED_DP
   ##   W13_PREQUANT            needs ROUTER_FUSED_DP, and batch 1
   ##   W13_T0_COUNTED_HANDOFF  needs W13_PREQUANT and W13_LINEAR_LOAD
+  ##   W13_KMAJOR_RECYCLE      needs W13_LDS_PREFETCH, W13_LINEAR_LOAD,
+  ##                           W13_T0_COUNTED_HANDOFF, W13_BIAS_PREFETCH, and
+  ##                           EXCLUDES W13_T1_SPLIT_LDS_STAGE (see below)
+  ##
+  ## MPK&lowbar;W13&lowbar;KMAJOR&lowbar;RECYCLE is the second host-coupled flag, with the same
+  ## failure mode as MPK&lowbar;OPROJ&lowbar;KMAJOR above: it rewrites the W13 tile's LDS
+  ## address arithmetic so one K128 fragment is the exact 64-lane x 16-byte
+  ## image at fragment*1024, which lets each fragment's tile-0 LDS slot be
+  ## recycled as soon as its MFMA has consumed the ping-ponged VGPR bank. The
+  ## host must repack to match, and a one-sided setting is silently wrong
+  ## logits, not a build error. So the host half is DERIVED from this entry --
+  ## emit&lowbar;w13&lowbar;kmajor&lowbar;shuffle puts the shuffle&lowbar;w13&lowbar;workgroups&lowbar;kmajor call in
+  ## the driver -- and the broken half-configuration cannot be expressed.
+  ##
+  ## MPK&lowbar;W13&lowbar;T1&lowbar;SPLIT&lowbar;LDS&lowbar;STAGE was REMOVED from this list by this change,
+  ## not lost. The recycle path replaces it, and the header #errors on the
+  ## pair (gang&lowbar;moe&lowbar;fused&lowbar;mxfp4&lowbar;mi300.cuh:92). Fleet resolves the same
+  ## conflict the same way rather than choosing between them --
+  ## persistent&lowbar;kernel.py:1341 emits the split-stage flag only
+  ## `and not &lowbar;opt("MPK&lowbar;W13&lowbar;KMAJOR&lowbar;RECYCLE")`.
+  ##
+  ## Kernel-side static&lowbar;asserts, all three re-checked at generation time so a
+  ## mismatch names the YAML key instead of failing inside a 4000-line header:
+  ## batch 1, W13&lowbar;OUTPUT&lowbar;PER&lowbar;WG == 128 with four waves, and
+  ## W13&lowbar;MFMA&lowbar;ITERS == 23 -- the fragment-wait schedule is hand-written for
+  ## 23 K128 iterations, so a different K would build and be wrong.
+  ##
+  ## The reduction the host permutes over is the PADDED hidden size (2944 =
+  ## 23 x 128), not the unpadded 2880, and not MOE&lowbar;K&lowbar;STRIDE. Our
+  ## shuffle&lowbar;w13&lowbar;workgroups&lowbar;kmajor takes it as an explicit argument and
+  ## REJECTS a foreign row stride, which is a deliberate divergence from
+  ## fleet's copy: fleet solves for K from wg&lowbar;bytes, and under split scales
+  ## that equation has no solution, so the inferred K would be silently wrong.
+  ## tools/check&lowbar;w13&lowbar;kmajor.py pins the transform with 11 properties -- most
+  ## importantly that it is a PERMUTATION (never a requantization) and that it
+  ## round-trips under the inverse, which is what catches a transposed axis.
+  ##
+  ## Measured, 4 interleaved rounds, DRIVER&lowbar;A/DRIVER&lowbar;B swapped with the .so
+  ## (mandatory for a host-coupled flag -- see the MPK&lowbar;OPROJ&lowbar;KMAJOR note
+  ## above for what swapping only the .so manufactures):
+  ##   splitstage  med 1.892 ms  best 1.878  spread 0.031
+  ##   kmajor      med 1.852 ms  best 1.835  spread 0.030
+  ##   -> -0.040 ms, "delta exceeds noise (improvement)". The sign held in all
+  ##      four rounds: every kmajor run beat every splitstage run. All eight
+  ##      runs tok1=35644, text coherent. Fleet's own number for the same flag
+  ##      is -0.05 ms (1.819 -> 1.765), so this reproduces upstream.
+  ##
+  ## The ISA says the change is real and lands where it should. Whole-binary
+  ## totals move +323 instructions, and ALL of it attributes to
+  ## gang&lowbar;moe&lowbar;fused&lowbar;mxfp4&lowbar;kernel&lowbar;mi300 (561 -> 2020 insns): the split-stage
+  ## path's out-of-line asm symbols (W13&lowbar;T1&lowbar;ACC&lowbar;2, W13&lowbar;T0&lowbar;ACC&lowbar;1,
+  ## PIPELINED&lowbar;W13&lowbar;T1&lowbar;2, W13&lowbar;T1&lowbar;TAIL&lowbar;B1&lowbar;2) DISAPPEAR and the recycle path
+  ## is inlined in their place. +60 ds&lowbar;read&lowbar;b128, +40 ds&lowbar;read&lowbar;u8, +19
+  ## v&lowbar;mfma&lowbar;scale&lowbar;f32&lowbar;16x16x128&lowbar;f8f6f4. Attribute per SYMBOL, never on
+  ## whole-binary counts -- tools/dump&lowbar;device&lowbar;asm.py --symbols.
   extra_defines:
     - MPK_ROUTER_FUSED_DP
     - MPK_ROUTER_DUAL_REDUCE
@@ -253,7 +308,7 @@ build:
     - MPK_W13_T0_MFMA_UNROLLED
     - MPK_W2_T0_MFMA_UNROLLED
     - MPK_W13_T1_EARLY_SCALE_LOAD
-    - MPK_W13_T1_SPLIT_LDS_STAGE
+    - MPK_W13_KMAJOR_RECYCLE
     - MPK_W13_BIAS_PREFETCH
     - MPK_W2_CONSUMER_GATE
     - MPK_W2_ONLY_ARRIVE
