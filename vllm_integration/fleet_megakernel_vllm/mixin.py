@@ -310,6 +310,11 @@ class FleetMKModelMixin:
                                sync=False, token_id=token_id)
         self._fleet_mk_fused_logits = S.is_moe
         # Slice off the MoE padding so the returned width matches vLLM's lm_head.
+        if self.fleet_mk.use_kernel_argmax:
+            # The greedy sampler consumes buf_argmax_out, not hidden states.
+            # Returning a one-element placeholder avoids cloning 2880 bf16
+            # values and makes vLLM's logits_indices gather trivial.
+            return self._fleet_mk_buffers.buf_logits[:input_ids.shape[0], :1]
         hs = self._fleet_mk_buffers.buf_lm_norm_scratch[:input_ids.shape[0], :S.hidden_size]
         return hs.clone()
 
@@ -334,6 +339,14 @@ class FleetMKModelMixin:
         self._fleet_mk_fused_logits = False
         S = self._fleet_mk_spec
         n = hidden_states.shape[0]
+        if self.fleet_mk.use_kernel_argmax:
+            # vLLM passes this object unchanged to Sampler.forward.  The payload
+            # is intentionally one element: greedy.py consumes the attached
+            # device token and never reads logits.  Unsupported sampler features
+            # fail there with a precise error instead of using a bogus row.
+            tagged = self._fleet_mk_buffers.buf_logits[:n, :1]
+            tagged._fleet_mk_argmax = self._fleet_mk_buffers.buf_argmax_out
+            return tagged
         return self._fleet_mk_buffers.buf_logits[:n, :S.vocab_size]
 
     # ── helpers ──────────────────────────────────────────────────────────────

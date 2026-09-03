@@ -20,6 +20,10 @@ Writes the raw chrome trace to /tmp/fleet_megakernel_vllm_trace.json for Perfett
 import os
 import time
 
+# Device events live in the engine process. Keep profiling in-process or the
+# parent profiler sees only IPC and reports a false zero-GPU result.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 import torch
 from torch.profiler import ProfilerActivity, profile
 from vllm import LLM, SamplingParams
@@ -51,21 +55,30 @@ def main():
     # Graph capture must be OFF: fleet_mk cannot be captured today (the .item()
     # host syncs in mixin.forward), and a captured graph would also collapse the
     # per-kernel attribution this script exists to produce.
-    llm_kwargs = dict(model=model, max_num_seqs=1, enforce_eager=True,
-                      max_model_len=2048, dtype="bfloat16")
+    llm_kwargs = dict(
+        model=model, max_num_seqs=1, enforce_eager=True,
+        max_model_len=2048, dtype="bfloat16",
+        gpu_memory_utilization=float(os.environ.get("FLEET_MK_GPU_MEM_UTIL", "0.9")),
+    )
     if fleet_mk_on:
         os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
         os.environ.setdefault("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "1")
         llm_kwargs["block_size"] = int(
             os.environ.get("FLEET_MK_BLOCK_SIZE", str(_fleet_mk_page_size(model))))
         llm_kwargs["disable_hybrid_kv_cache_manager"] = True
+        try:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        except ImportError:
+            pass
+        else:
+            llm_kwargs["attention_backend"] = AttentionBackendEnum.CUSTOM
 
     llm = LLM(**llm_kwargs)
     tok = llm.get_tokenizer()
     text = tok.apply_chat_template([{"role": "user", "content": prompt}],
                                    tokenize=False, add_generation_prompt=True)
     sp = SamplingParams(temperature=0.0, max_tokens=n_tokens,
-                        min_tokens=n_tokens, ignore_eos=True, seed=0)
+                        ignore_eos=True, seed=0)
 
     def run(n):
         """Profile one generate() of n tokens -> (wall_ms, {kernel: device_ms}).
@@ -75,11 +88,12 @@ def main():
         `wvSplitK_hf_sml_<...>`), and both carry device time -- summing all of
         them double-counts every kernel behind a custom op.
         """
-        sp_n = SamplingParams(temperature=0.0, max_tokens=n, min_tokens=n,
+        sp_n = SamplingParams(temperature=0.0, max_tokens=n,
                               ignore_eos=True, seed=0)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                     acc_events=True) as prof:
             llm.generate([text], sp_n, use_tqdm=False)
         torch.cuda.synchronize()
         wall = (time.perf_counter() - t0) * 1000.0

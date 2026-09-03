@@ -61,8 +61,9 @@ cd vllm_integration
 export FLEET_MK_MODEL=/path/to/gpt-oss-120b   # local weights
 PY=/path/to/venv-vllm027/bin/python3
 
-# greedy generate (prefill = stock vLLM, decode = Fleet MK)
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0 \
+# greedy generate (prefill = stock vLLM, decode + argmax = Fleet MK)
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_GREEDY_ARGMAX=1 \
+  FLEET_MK_TEMP=0 \
   $PY -m fleet_megakernel_vllm.harness
 
 # stock vLLM baseline (same backend/block size knobs, plugin off)
@@ -71,7 +72,8 @@ HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS= \
 
 # decode latency (prefill-cancelling 8 vs 64/128 tokens)
 # BENCH_EAGER=1 is required at 120B; graph capture hits a host sync in mixin.forward
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk BENCH_EAGER=1 \
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_GREEDY_ARGMAX=1 \
+  BENCH_EAGER=1 \
   $PY -m fleet_megakernel_vllm.bench
 ```
 
@@ -86,6 +88,7 @@ Useful env:
 | `FLEET_MK_GPU_MEM_UTIL` | 0.9 | KV init fails if this over-commits free VRAM |
 | `FLEET_MK_BLOCK_SIZE` | spec `page_size` (16) | must match the `.so` |
 | `FLEET_MK_SO` | `generated/gpt_oss_120b.so` | pin a specific kernel |
+| `FLEET_MK_GREEDY_ARGMAX` | unset | set to `1` to consume Fleet's in-kernel argmax directly |
 | `BENCH_EAGER` | 0 in `bench.py` | **set to 1** for 120B |
 | `BENCH_SHORT` / `BENCH_LONG` / `BENCH_REPS` | 8 / 128 / 3 | |
 
@@ -109,10 +112,17 @@ Engine log must show:
 Greedy first token on the default prompt is **35644**. Coherent analysis-channel
 text follows. Do not judge bit-identical repeats: MoE W2 uses float atomics.
 
-Measured 2026-09-03, gfx950 GPU 0, vLLM 0.27.1, `BENCH_EAGER=1`, 8 vs 64 tokens
-(one rep): **2.032 ms/token** through vLLM. Standalone `demo_gpt_oss_120b.py` on
-the same kernel is ~1.88 ms/token; the extra is vLLM scheduler + sampler, not a
-second KV copy.
+Measured 2026-09-03, gfx950 GPU 0, vLLM 0.27.1, `BENCH_EAGER=1`,
+`FLEET_MK_GREEDY_ARGMAX=1`, 8 vs 64 tokens (best of five):
+**1.983 ms/token** through vLLM, up from 2.032 ms/token. The matching optimized
+megakernel measures **1.792 ms/device iteration**; upstream native Fleet was
+**1.794 ms/token wall time** on this host. The remaining ~0.19 ms is vLLM
+scheduler, launch, and synchronization overhead—not a second sampler or KV copy.
+
+The direct argmax path is deliberately limited to batch-size-one plain greedy
+requests. Logprobs, penalties, token masks/biases, `min_tokens`, speculative
+decoding, and thinking-budget processing require vLLM's general logits sampler;
+unset `FLEET_MK_GREEDY_ARGMAX` for those requests.
 
 ## Counter contract (why a Titan-era plugin hang)
 

@@ -425,7 +425,8 @@ build:
     - MPK_W13_T0_MFMA_UNROLLED
     - MPK_W2_T0_MFMA_UNROLLED
     - MPK_W13_T1_EARLY_SCALE_LOAD
-    - MPK_W13_T1_SPLIT_LDS_STAGE
+    - MPK_W13_KMAJOR_RECYCLE
+    - MPK_W13_T1_BIAS_EARLY
     - MPK_W13_BIAS_PREFETCH
     - MPK_W2_CONSUMER_GATE
     - MPK_W2_ONLY_ARRIVE
@@ -435,6 +436,8 @@ build:
     - MPK_OPROJ_NO_WB
     - MPK_OPROJ_KMAJOR
     - MPK_ONE_NORM_WRITER
+    # Native Fleet LM-head weights: contiguous K128 fragments per 16-row tile.
+    - MPK_LM_HEAD_KMAJOR
     - MPK_LEAN_ARRIVE
     - MPK_QKV_LDS_NORM
     - MPK_QKV_PREFETCH_SCALES
@@ -445,6 +448,10 @@ build:
     - MPK_MERGE_KV_OUTER
     - MPK_ATTN_SLICE_RELEASE
     - MPK_SYS_POLL_LOAD=2
+    # Native Fleet 9d478ea: selection-ordered expert routing, with each expert
+    # pinned to an XCD pair. Measured in this wrapper at 1.878 -> 1.835 ms/token.
+    - MPK_MOE_XCD_PAIR
+    - MPK_EARLY_ROUTING
 
 measured:
   ## Search results, not derivations. Each carries the alternative that was tried

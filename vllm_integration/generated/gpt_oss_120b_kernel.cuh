@@ -550,17 +550,26 @@ gpt_oss_120b_lmhead_gemm_argmax(
         for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
             int wave_tile = warp_id + tile_iter * NUM_WAVES;
             int w_row = wave_tile * 16 + col;
-            int const row_data_base = w_row * (HIDDEN_SIZE / 2);
             int const row_scale_base = w_row * LM_NUM_BLOCKS_32;
+#ifdef MPK_LM_HEAD_KMAJOR
+            constexpr int LM_TILE_DATA = 16 * (HIDDEN_SIZE / 2);
+            constexpr int LM_K_STRIDE = 16 * (K_PER_MFMA / 2);
+            uint8_t const *tile_data = wg_data + wave_tile * LM_TILE_DATA;
+            int const data_lane_offset = lane_id * 16;
+#define FLEET_MK_LM_W_FRAG(KI) (*((const kernel::i32x8_t *)(tile_data + data_lane_offset + (KI) * LM_K_STRIDE)))
+#else
+            int const row_data_base = w_row * (HIDDEN_SIZE / 2);
+#define FLEET_MK_LM_W_FRAG(KI) (*((const kernel::i32x8_t *)(wg_data + row_data_base + (KI) * 64 + g * 16)))
+#endif
 
             kernel::f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
-            kernel::i32x8_t a0 = *(const kernel::i32x8_t *)(wg_data + row_data_base + 0 * 64 + g * 16);
+            kernel::i32x8_t a0 = FLEET_MK_LM_W_FRAG(0);
             int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
-            kernel::i32x8_t a1 = *(const kernel::i32x8_t *)(wg_data + row_data_base + 1 * 64 + g * 16);
+            kernel::i32x8_t a1 = FLEET_MK_LM_W_FRAG(1);
             int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
-            kernel::i32x8_t a2 = *(const kernel::i32x8_t *)(wg_data + row_data_base + 2 * 64 + g * 16);
+            kernel::i32x8_t a2 = FLEET_MK_LM_W_FRAG(2);
             int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
-            kernel::i32x8_t a3 = *(const kernel::i32x8_t *)(wg_data + row_data_base + 3 * 64 + g * 16);
+            kernel::i32x8_t a3 = FLEET_MK_LM_W_FRAG(3);
             int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
 
             #pragma unroll 1
@@ -572,7 +581,7 @@ gpt_oss_120b_lmhead_gemm_argmax(
                 }
                 if (ki + 4 < MFMA_ITERS) {
                     int kt = (ki + 4) * K_PER_MFMA;
-                    a0 = *(const kernel::i32x8_t *)(wg_data + row_data_base + kt / 2 + g * 16);
+                    a0 = FLEET_MK_LM_W_FRAG(ki + 4);
                     sa0 = (int)wg_scales[row_scale_base + kt / 32 + g];
                 }
                 {
@@ -582,7 +591,7 @@ gpt_oss_120b_lmhead_gemm_argmax(
                 }
                 if (ki + 5 < MFMA_ITERS) {
                     int kt = (ki + 5) * K_PER_MFMA;
-                    a1 = *(const kernel::i32x8_t *)(wg_data + row_data_base + kt / 2 + g * 16);
+                    a1 = FLEET_MK_LM_W_FRAG(ki + 5);
                     sa1 = (int)wg_scales[row_scale_base + kt / 32 + g];
                 }
                 {
@@ -592,7 +601,7 @@ gpt_oss_120b_lmhead_gemm_argmax(
                 }
                 if (ki + 6 < MFMA_ITERS) {
                     int kt = (ki + 6) * K_PER_MFMA;
-                    a2 = *(const kernel::i32x8_t *)(wg_data + row_data_base + kt / 2 + g * 16);
+                    a2 = FLEET_MK_LM_W_FRAG(ki + 6);
                     sa2 = (int)wg_scales[row_scale_base + kt / 32 + g];
                 }
                 if (ki + 3 < MFMA_ITERS) {
@@ -602,10 +611,12 @@ gpt_oss_120b_lmhead_gemm_argmax(
                 }
                 if (ki + 7 < MFMA_ITERS) {
                     int kt = (ki + 7) * K_PER_MFMA;
-                    a3 = *(const kernel::i32x8_t *)(wg_data + row_data_base + kt / 2 + g * 16);
+                    a3 = FLEET_MK_LM_W_FRAG(ki + 7);
                     sa3 = (int)wg_scales[row_scale_base + kt / 32 + g];
                 }
             }
+
+#undef FLEET_MK_LM_W_FRAG
 
             // Argmax epilogue
             if (col == 0) {

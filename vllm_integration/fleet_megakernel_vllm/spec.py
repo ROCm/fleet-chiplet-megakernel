@@ -301,6 +301,11 @@ def _moe_spec(cfg, config_stem, so_path):
         # build.extra_defines list that emits the -D, so the plugin cannot
         # disagree with the binary it is about to load.
         "oproj_kmajor": "MPK_OPROJ_KMAJOR" in cfg.extra_defines,
+        # Same host/kernel layout contract for W13. Both standalone and vLLM
+        # packers derive this from the YAML flag so a one-sided configuration
+        # cannot silently read valid bytes in the wrong lane order.
+        "w13_kmajor": "MPK_W13_KMAJOR_RECYCLE" in cfg.extra_defines,
+        "lm_head_kmajor": "MPK_LM_HEAD_KMAJOR" in cfg.extra_defines,
     }
 
     stem = cfg.name_clean

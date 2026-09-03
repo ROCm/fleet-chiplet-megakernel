@@ -12,7 +12,13 @@ one model is served.
 def register():
     from vllm import ModelRegistry
 
+    from .greedy import install_greedy_argmax_fastpath
     from .model import FleetMKQwen3ForCausalLM, _make_gptoss_class
+
+    # Inactive unless compute_logits returns a tensor tagged with Fleet's
+    # device-side argmax (FLEET_MK_GREEDY_ARGMAX=1).  Keeping the hook installed
+    # lets unsupported/random requests fall through to vLLM unchanged.
+    install_greedy_argmax_fastpath()
 
     # vLLM 0.26+ moved the stock ROCm aiter KV pool to a packed layout that
     # fleet_mk's flat view cannot alias. Registering FleetMKAttentionBackend restores

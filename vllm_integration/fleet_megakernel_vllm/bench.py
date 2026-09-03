@@ -50,8 +50,11 @@ def _custom_attention_backend():
 
 
 def _time_generate(llm, text, n_tokens):
+    # ignore_eos already guarantees n_tokens outputs.  min_tokens=n_tokens
+    # was redundant and installs an argmax-changing EOS mask, which correctly
+    # makes Fleet's device-side greedy fast path reject the request.
     sp = SamplingParams(temperature=0.0, max_tokens=n_tokens,
-                        min_tokens=n_tokens, ignore_eos=True, seed=0)
+                        ignore_eos=True, seed=0)
     t0 = time.perf_counter()
     out = llm.generate([text], sp, use_tqdm=False)
     dt = time.perf_counter() - t0

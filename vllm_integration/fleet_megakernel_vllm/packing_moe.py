@@ -195,8 +195,20 @@ def pack_moe_layer(*, w_q, w_k, w_v, q_bias, k_bias, v_bias, w_o, o_bias,
     # fleet_megakernel_vllm/moe_layout.py for why each knob exists, and
     # tools/check_alias_equivalence.py for the proof that the aliased bytes are
     # the bytes fleet_mk would have packed.
-    out.append(_moe_data(pack, layout, "w13", gate_up_blocks, gate_up_scales,
-                         foreign=foreign_w13))                  # [8]
+    w13_data = _moe_data(pack, layout, "w13", gate_up_blocks,
+                          gate_up_scales, foreign=foreign_w13)
+    if S.gemm.get("w13_kmajor"):
+        # MPK_W13_KMAJOR_RECYCLE changes the lane order inside each W13 tile.
+        # A foreign vLLM slab is row-major and cannot be transformed in place;
+        # reject aliasing rather than materializing a hidden ~60 GiB copy.
+        if foreign_w13 is not None:
+            raise ValueError(
+                "MPK_W13_KMAJOR_RECYCLE is incompatible with "
+                "FLEET_MK_MOE_ALIAS_VLLM=1; disable aliasing or the flag")
+        from .mxfp4_pack import shuffle_w13_workgroups_kmajor
+        w13_data = shuffle_w13_workgroups_kmajor(
+            w13_data, output_per_wg=w13_opw, reduction=PH)
+    out.append(w13_data)                                       # [8]
     out.append(_moe_data(pack, layout, "w2", down_blocks, down_scales,
                          foreign=foreign_w2))                   # [9]
     # Scale sections, kept OUT of `out` -- see the docstring: `out` is indexed by
@@ -235,6 +247,9 @@ def pack_lm_head_moe(lm_head_weight, spec, packers):
                     target_cols=PH)
     blocks, scales = quantize(padded)
     packed = pack(blocks, scales, output_per_wg=64).squeeze(0)
+    if spec.gemm.get("lm_head_kmajor"):
+        from .mxfp4_pack import shuffle_lm_head_record_kmajor
+        packed = shuffle_lm_head_record_kmajor(packed, output_per_wg=64)
     zero_bias = torch.zeros(1, spec.padded_vocab_size, dtype=torch.bfloat16,
                             device=lm_head_weight.device)
     return packed, zero_bias

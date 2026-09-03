@@ -387,6 +387,28 @@ def shuffle_oproj_workgroups_kmajor(packed: torch.Tensor,
     return out.unsqueeze(0).contiguous() if squeezed else out
 
 
+def shuffle_lm_head_record_kmajor(packed: torch.Tensor,
+                                  output_per_wg: int = 64) -> torch.Tensor:
+    """Repack LM-head records into lane-contiguous K128 fragments per tile."""
+    if packed.ndim != 2:
+        raise ValueError(
+            "expected rank-2 [workgroups, bytes] LM-head weights, got "
+            f"{tuple(packed.shape)}")
+    if output_per_wg % 16:
+        raise ValueError("LM-head K-major layout requires 16-row MFMA tiles")
+    n_wgs, wg_bytes = packed.shape
+    tiles = output_per_wg // 16
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(
+            f"invalid LM-head MXFP4 record width {wg_bytes} for OPW={output_per_wg}")
+    data = packed[:, :data_bytes].reshape(
+        n_wgs, tiles, 16, reduction // 128, 4, 16)
+    data = data.permute(0, 1, 3, 4, 2, 5).reshape(n_wgs, data_bytes)
+    return torch.cat((data, packed[:, data_bytes:]), dim=1).contiguous()
+
+
 def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
                                   output_per_wg: int = 128,
                                   reduction: int = None) -> torch.Tensor:

@@ -372,6 +372,11 @@ class FleetMKDecoder:
         if spec.is_moe:
             self.buf_decode_ctrl = torch.zeros(
                 48, dtype=torch.uint8, device=buffers.device)
+        # Plain greedy requests can consume the token Fleet already selects in
+        # its LM-head epilogue.  In that mode there is no reason to materialize
+        # 201216 bf16 logits for vLLM to convert and argmax again.
+        self.use_kernel_argmax = (
+            spec.is_moe and os.environ.get("FLEET_MK_GREEDY_ARGMAX") == "1")
 
         self.attn_scale = (1.0 / math.sqrt(spec.head_dim)) * 1.44269504088896340736
 
@@ -447,8 +452,11 @@ class FleetMKDecoder:
         # to one is visibly a change to the other. A short or transposed list here
         # is stack corruption, not a clean error -- hence the length assert.
         if S.is_moe:
-            # Precedes timing_buf in the C signature -- see spec.extra_launch_args.
-            args.append(b.buf_logits.data_ptr())       # logits_output
+            # The kernel always computes argmax.  Materialize the full logit row
+            # only when vLLM needs its general sampler; plain greedy consumes
+            # buf_argmax_out directly through greedy.py.
+            args.append(0 if self.use_kernel_argmax
+                        else b.buf_logits.data_ptr())   # logits_output
         args.append(b.buf_timing.data_ptr())          # timing_buf
         if S.is_moe:
             args.append(self.embed_weight.data_ptr())  # embed_weight

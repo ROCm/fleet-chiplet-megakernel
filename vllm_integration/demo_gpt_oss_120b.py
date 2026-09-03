@@ -33,7 +33,9 @@ from safetensors import safe_open
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fleet_megakernel_vllm.mxfp4_pack import (  # noqa: E402
     pad_weight_1d, pad_weight_2d, quantize_bf16_to_mxfp4, pack_mxfp4_workgroup,
-    shuffle_oproj_workgroups_kmajor)
+    shuffle_oproj_workgroups_kmajor,
+    shuffle_w13_workgroups_kmajor,
+    shuffle_lm_head_record_kmajor)
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -668,6 +670,16 @@ def main():
         gu_packed = pack_mxfp4_workgroup(
             gu_blocks, gu_scales,
             section="data" if MOE_SPLIT_BUFFERS else "both", **gu_common)
+        # MPK_W13_KMAJOR_RECYCLE is on: within each 16-row MFMA tile,
+        # repack [row, k128, quarter, 16B] -> [k128, quarter, row, 16B]
+        # so the recycle schedule retires lane-contiguous fragments.
+        # A permutation, not a requantization -- bit-exact. The kernel
+        # half is the -D flag; both come from one YAML entry because a
+        # one-sided setting is silently wrong logits, not a build error.
+        # K is passed explicitly: under split scales the wg_bytes
+        # equation fleet solves has no solution (tools/check_w13_kmajor.py).
+        gu_packed = shuffle_w13_workgroups_kmajor(
+            gu_packed, W13_OPW, reduction=HIDDEN_SIZE)
         weight_tensors.append(gu_packed)  # [9] w13_weight [E, w13_n_wgs, wg_bytes]
         moe_w13_scales.append(pack_mxfp4_workgroup(
             gu_blocks, gu_scales, section="scales", **gu_common)
@@ -764,6 +776,8 @@ def main():
     lm_head_packed = pack_mxfp4_workgroup(
         lm_blocks, lm_scales, output_per_wg=OUTPUT_PER_WG,
     ).squeeze(0)
+    lm_head_packed = shuffle_lm_head_record_kmajor(
+        lm_head_packed, output_per_wg=OUTPUT_PER_WG)
     print(f"LM head MXFP4: {lm_head_weight.shape} -> {lm_head_packed.shape}")
     lm_head_zero_bias = torch.zeros(1, PADDED_VOCAB_SIZE, dtype=torch.bfloat16, device="cuda")
 
