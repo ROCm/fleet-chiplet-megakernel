@@ -62,6 +62,29 @@ leaving the megakernel. `--ignore-eos` forces every request to the full
 Do **not** read `Decode avg` at B>1 — see [Batching](#batching) for what to
 measure instead.
 
+### Run decode inside vLLM (GPT-OSS 120B)
+
+Prefill stays on stock vLLM; each decode token is one Fleet MK megakernel launch
+with zero-copy KV. Verified on **vLLM 0.27.1** (Python 3.12 venv, torch 2.11,
+CUSTOM attention backend, `block_size=16`, `enforce_eager`). Do not use system
+python if it still has vLLM 0.11.1.
+
+```bash
+cd vllm_integration
+/path/to/venv-vllm027/bin/python3 -m pip install -e fleet_megakernel_vllm \
+  --no-deps --no-build-isolation
+
+export FLEET_MK_MODEL=/path/to/gpt-oss-120b
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0 \
+  /path/to/venv-vllm027/bin/python3 -m fleet_megakernel_vllm.harness
+
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk BENCH_EAGER=1 \
+  /path/to/venv-vllm027/bin/python3 -m fleet_megakernel_vllm.bench
+```
+
+Full versions, env vars, and the Titan-vs-Fleet counter-contract note:
+[`vllm_integration/fleet_megakernel_vllm/RUN.md`](vllm_integration/fleet_megakernel_vllm/RUN.md).
+
 ### Decode latency vs context length
 
 ![decode latency vs context](docs/img/seqlen_sweep.svg)

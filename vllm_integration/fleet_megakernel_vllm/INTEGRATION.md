@@ -281,27 +281,37 @@ to engine startup) and that attention matches the stock layout numerically.
 
 ## 6. Running it
 
-Install the plugin once so vLLM can discover the entry point (it is not on
-`sys.path` by default, and without this `VLLM_PLUGINS=fleet_mk` silently does nothing —
-you get stock vLLM and a plausible-looking result):
+The operational checklist (versions, venv, env vars, hang recovery) lives in
+[`RUN.md`](RUN.md). Summary:
+
+Install the plugin into the **vLLM 0.27.1** interpreter so the `fleet_mk` entry
+point is discoverable (`VLLM_PLUGINS=fleet_mk` silently no-ops otherwise — you
+get stock vLLM and a plausible-looking result):
 
 ```bash
-python3 -m pip install -e fleet_megakernel_vllm --no-deps --no-build-isolation
+# 0.27.1 venv, not system python (which may still be 0.11.1)
+/path/to/venv-vllm027/bin/python3 -m pip install -e fleet_megakernel_vllm \
+  --no-deps --no-build-isolation
 # verify:
-python3 -c "import importlib.metadata as m; print([e.value for e in m.entry_points(group='vllm.general_plugins')])"
+/path/to/venv-vllm027/bin/python3 -c "import importlib.metadata as m; print([e.name for e in m.entry_points(group='vllm.general_plugins')])"
 ```
 
 ```bash
-export FLEET_MK_MODEL=/home/claudeuser/models/gpt-oss-120b
+cd vllm_integration
+export FLEET_MK_MODEL=/path/to/gpt-oss-120b
+PY=/path/to/venv-vllm027/bin/python3
 # stock baseline
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=  python3 -m fleet_megakernel_vllm.harness
-# fleet_mk decode (greedy parity)
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0 python3 -m fleet_megakernel_vllm.harness
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=  $PY -m fleet_megakernel_vllm.harness
+# fleet_mk decode (greedy). Prefill is stock vLLM; decode is the megakernel.
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0 $PY -m fleet_megakernel_vllm.harness
 # sampler (two seeds diverge at temp>0)
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0.8 FLEET_MK_SEED=0 python3 -m fleet_megakernel_vllm.harness
-# latency benchmark
-HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk python3 -m fleet_megakernel_vllm.bench
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_TEMP=0.8 FLEET_MK_SEED=0 $PY -m fleet_megakernel_vllm.harness
+# latency: BENCH_EAGER=1 is required at 120B (graph capture hits a host sync)
+HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk BENCH_EAGER=1 $PY -m fleet_megakernel_vllm.bench
 ```
+
+`tools/run_vllm_arm.sh fleet_mk 32 180` wraps the harness, kills orphan
+`VLLM::EngineCore` children, and polls VRAM before the next arm.
 
 Comparing two configurations (page size, quant, backend) — capture several runs of
 *each* build, then:
@@ -494,3 +504,18 @@ redundant bf16 `lm_head` — **landed** (§8.2) and was worth 0.290 ms on GPT-OS
 inside the 0.4–0.6 ms estimated. It does not apply to the dense path, whose kernel
 has no `logits_output` in its ABI, and it would not close the dense gap anyway:
 porting the fused pipeline to the dense kernel is the change that would.
+
+## 8.3 Fleet kernel + vLLM plugin (2026-09-03)
+
+The 2.921 ms/token number in section 8 was Titan-under-vLLM, before this tree
+switched the kernel body to fleet's headers. After that move the plugin still
+used Titan's per-layer counter blocks. Prefill (stock) succeeded; the **first**
+megakernel decode hung (GPU 100%, `kfd_wait_on_events`) — layer 2 waiting for
+`expected=2` with `observed=1`.
+
+The standalone driver had already been updated to fleet's contract (one shared
+monotonic counter block, MoE barrier 160 ints/expert, no per-step zero). The
+plugin now matches that driver. Greedy tok1=35644, coherent text, vLLM **0.27.1**,
+`BENCH_EAGER=1`, 8 vs 64 tokens: **2.032 ms/token** through vLLM (standalone
+driver on the same `.so` is ~1.88 ms/token).
+

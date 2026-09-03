@@ -185,8 +185,12 @@ class FleetMKBuffers:
         n_exp = S.num_experts
         top_k = S.num_experts_per_tok
 
-        # f32 residual accumulator (layer 0's QKV resadd reads it -> must start 0).
-        self.buf_workspace_f32 = torch.zeros(bs, pw, dtype=torch.float32, device=dev)
+        # f32 residual accumulator. Fleet's W2 epilogue writes
+        # (b * MOE_WS_SLOTS + slot) * HIDDEN, with MOE_WS_SLOTS == top_k, so this
+        # must be top_k slabs wide -- a single hidden-width buffer is an
+        # unchecked overrun. Starts zero; the kernel owns it after that.
+        self.buf_workspace_f32 = torch.zeros(
+            bs, top_k * pw, dtype=torch.float32, device=dev)
         # Per-layer attention-block residual (layers 1+ read this as their residual).
         self.buf_attn_proj_out = z(bs, pw)
         # QKV's ResAdd+RMSNorm output. Distinct from the residual buffers on
@@ -201,10 +205,12 @@ class FleetMKBuffers:
         self.buf_swiglu_out = z(bs, top_k, pw)
         # Router logits scratch (bf16; ptr table offsets it by 2 bytes/expert per XCD).
         self.buf_logits_scratch = z(bs, n_exp)
-        # Per-expert barrier, one cache line each -- matches the kernel's
-        # MOE_BARRIER_INTS = 16 * NUM_EXPERTS. (The QKV barrier is NOT here; it
-        # lives inside each layer's counter block. See build_ptr_table_moe.)
-        self.buf_moe_barrier = torch.zeros(16 * n_exp, dtype=torch.int32, device=dev)
+        # Per-expert barrier. Fleet indexes MOE_BAR_STRIDE = 10 * 16 ints per
+        # expert (8 per-XCD release flags + arrival on line 8). 16 ints/expert
+        # aliases experts into each other and puts the arrival counter off the
+        # allocation. NOT zeroed between decode steps: W13->W2 expected is
+        # layer_idx + 1 on a counter fleet never resets. Matches demo.py.
+        self.buf_moe_barrier = torch.zeros(160 * n_exp, dtype=torch.int32, device=dev)
 
     def set_kv_aliases(self, k_tensors, v_tensors):
         """Point the per-layer K/V caches at externally-owned tensors (vLLM's KV).
@@ -408,12 +414,12 @@ class FleetMKDecoder:
             # Layer 0 reads its residual from residual_a; the embedding vector
             # arrives already padded to padded_hidden_size (dense: pw == hidden).
             b.buf_residual_a.copy_(embed_vec.reshape(1, S.padded_hidden_size))
-        b.rank_counter_slice.zero_()
-        if S.is_moe:
-            # layer 0's QKV resadd reads workspace_f32 (must be 0); moe_barrier's
-            # release values collide across the layer_idx wrap, so re-zero each step.
-            b.buf_workspace_f32.zero_()
-            b.buf_moe_barrier.zero_()
+        # Do NOT zero rank_counter, per-layer counters, moe_barrier, or
+        # workspace_f32 between steps. Titan's kernel (titan_phases.cuh) reused
+        # per-layer slots and needed a reset; fleet's barriers are monotonic
+        # (demo.py: "NO need to zero between iterations"). Zeroing rank_counter
+        # pins decode_iter at 0 so task_layer_idx restarts and later tokens
+        # pre-satisfy barriers. Zeroing moe_barrier hangs W13->W2 at layer 1.
 
         num_pages_used = (cur_pos + page_size) // page_size
         self.kv_indptr[0] = 0

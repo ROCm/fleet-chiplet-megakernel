@@ -310,12 +310,14 @@ def build_ptr_table_moe(spec, weight_ptrs_host, buffers, moe_scale_ptrs=None):
             router_b_xcd = router_b + xcd * router_experts_per_xcd * 2
             logits_xcd = b.buf_logits_scratch.data_ptr() + xcd * router_experts_per_xcd * 2
 
-            counter_ptr = b.buf_counter.data_ptr() + li * S.counters_per_layer * 4
-            # The QKV barrier is not a standalone buffer -- it is a cache line
-            # WITHIN this layer's counter block, so each layer gets its own and
-            # the kernel's monotonic arrival counts stay per-layer. Pointing it
-            # at a shared 16-int buffer instead would make all 36 layers share
-            # one arrival count: no crash, wrong sync.
+            # ONE block shared by every layer -- NOT `+ li * counters_per_layer`.
+            # That per-layer stride was correct for titan's own barriers
+            # (titan_phases.cuh), which zeroed and reused slots. Fleet's layer
+            # body derives expected = task_layer_idx + 1 against counters that
+            # are never reset, and the standalone demo already passes the same
+            # pointer at every layer. Per-layer zeroed blocks hang on the
+            # FIRST decode: layer 2 waits for expected=2 with observed=1.
+            counter_ptr = b.buf_counter.data_ptr()
             qkv_barrier_ptr = counter_ptr + S.slot_qkv_barrier * 4
 
             # MoE residual scheme: layer 0 reads residual_a; layers 1+ read
