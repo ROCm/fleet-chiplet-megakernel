@@ -355,10 +355,12 @@ def _moe_spec(cfg, config_stem, so_path):
         ptrs_out=_moe_ptrs_out,
         ptrs_extra=1,
         counters_per_layer=cfg.counters_per_layer,
-        # 16 decode-iter + (1 + num_xcds)*16 embed barrier + 20*16 ILB slack,
-        # matching demo_gpt_oss_120b.py. The ILB slack is always allocated so a
-        # FLEET_MK_ILB_TIMING build needs no Python change; it costs 1.3 KB.
-        counter_tail_ints=16 + (1 + cfg.num_xcds) * 16 + 20 * 16,
+        # Decode-iter + embed barrier + ILB diagnostic slack + the persistent
+        # loop's end-of-step barrier. Keep this synchronized with
+        # fleet_mk_generate.TRAILING_COUNTERS; an omitted region is an unchecked
+        # atomic past the allocation and hangs multi-token decode.
+        counter_tail_ints=(16 + (1 + cfg.num_xcds) * 16 + 20 * 16
+                           + (1 + cfg.num_xcds) * 16),
         slot_qkv_barrier=_qkv_barrier_slot(),
         timing_slots_per_layer=14,
         timing_tail_slots=4,

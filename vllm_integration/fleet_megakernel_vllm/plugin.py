@@ -14,11 +14,13 @@ def register():
 
     from .greedy import install_greedy_argmax_fastpath
     from .model import FleetMKQwen3ForCausalLM, _make_gptoss_class
+    from .persistent_scheduler import install_persistent_scheduler_hooks
 
     # Inactive unless compute_logits returns a tensor tagged with Fleet's
     # device-side argmax (FLEET_MK_GREEDY_ARGMAX=1).  Keeping the hook installed
     # lets unsupported/random requests fall through to vLLM unchanged.
     install_greedy_argmax_fastpath()
+    install_persistent_scheduler_hooks()
 
     # vLLM 0.26+ moved the stock ROCm aiter KV pool to a packed layout that
     # fleet_mk's flat view cannot alias. Registering FleetMKAttentionBackend restores

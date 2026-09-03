@@ -80,6 +80,9 @@ def main():
             os.environ.get("FLEET_MK_GPU_MEM_UTIL", "0.9")),
     )
     if fleet_mk_on:
+        if int(os.environ.get("FLEET_MK_PERSIST", "1")) > 1:
+            # vLLM's async output path hard-codes one sampled token per step.
+            llm_kwargs["async_scheduling"] = False
         # Select the aiter FA backend on V1/ROCm (gfx9): it writes KV via
         # reshape_and_cache_flash (non-reordered) in fleet_mk's layout. This is chosen
         # by the AITER + AITER_MHA flags, NOT VLLM_ATTENTION_BACKEND (that string

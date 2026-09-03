@@ -377,6 +377,14 @@ class FleetMKDecoder:
         # 201216 bf16 logits for vLLM to convert and argmax again.
         self.use_kernel_argmax = (
             spec.is_moe and os.environ.get("FLEET_MK_GREEDY_ARGMAX") == "1")
+        self.persist_n = (
+            max(1, int(os.environ.get("FLEET_MK_PERSIST", "1")))
+            if self.use_kernel_argmax else 1)
+        self.last_chunk_n = 1
+        self.decode_epoch = 0
+        if spec.is_moe and self.persist_n > 1:
+            self.buf_tokens_out = torch.zeros(
+                self.persist_n, dtype=torch.int32, device=buffers.device)
 
         self.attn_scale = (1.0 / math.sqrt(spec.head_dim)) * 1.44269504088896340736
 
@@ -386,6 +394,14 @@ class FleetMKDecoder:
         self.kv_indptr = torch.zeros(2, dtype=torch.int32, device=dev)
         self.kv_indices = torch.zeros(buffers.max_num_pages, dtype=torch.int32, device=dev)
         self.kv_last_page_len = torch.zeros(1, dtype=torch.int32, device=dev)
+        if spec.is_moe and self.persist_n > 1:
+            ctrl_i32 = self.buf_decode_ctrl.view(torch.int32)
+            ctrl_i64 = self.buf_decode_ctrl.view(torch.int64)
+            ctrl_i32[2] = -1
+            ctrl_i64[2] = self.kv_indptr.data_ptr()
+            ctrl_i64[3] = self.kv_last_page_len.data_ptr()
+            ctrl_i64[4] = self.buf_tokens_out.data_ptr()
+            ctrl_i64[5] = 0
 
         # Optional per-step megakernel timing (FLEET_MK_PROFILE=1).
         self._prof_start = torch.cuda.Event(enable_timing=True)
@@ -426,7 +442,13 @@ class FleetMKDecoder:
         # pins decode_iter at 0 so task_layer_idx restarts and later tokens
         # pre-satisfy barriers. Zeroing moe_barrier hangs W13->W2 at layer 1.
 
-        num_pages_used = (cur_pos + page_size) // page_size
+        # Do not cross a paged-KV block inside one launch. The in-kernel
+        # metadata advance is safe within a page; changing kv_indptr at a page
+        # boundary races readers in other workgroups.
+        chunk_n = min(self.persist_n, page_size - (cur_pos % page_size))
+        self.last_chunk_n = chunk_n
+        last_pos = cur_pos + chunk_n - 1
+        num_pages_used = (last_pos + page_size) // page_size
         self.kv_indptr[0] = 0
         self.kv_indptr[1] = num_pages_used
         if block_table is None:
@@ -436,6 +458,11 @@ class FleetMKDecoder:
             self.kv_indices[:num_pages_used].copy_(
                 block_table[:num_pages_used].to(torch.int32))
         self.kv_last_page_len[0] = (cur_pos % page_size) + 1
+        if S.is_moe and self.persist_n > 1:
+            ctrl_i32 = self.buf_decode_ctrl.view(torch.int32)
+            ctrl_i32[0] = chunk_n
+            ctrl_i32[1] = cur_pos
+            ctrl_i32[3] = self.decode_epoch + 1
 
         args = [
             1, self.attn_scale,
@@ -470,6 +497,7 @@ class FleetMKDecoder:
         if profile:
             self._prof_start.record(stream)
         self.launch(*args)
+        self.decode_epoch += chunk_n
         if profile:
             # Pure GPU time of the megakernel launch, isolated from vLLM per-step
             # overhead (lm_head + sampler + scheduler). Forces a per-step sync.

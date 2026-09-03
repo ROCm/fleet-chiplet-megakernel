@@ -66,10 +66,17 @@ def install_greedy_argmax_fastpath():
             raise RuntimeError(
                 "Fleet MK argmax fast path currently supports batch size 1 only")
 
-        # Token IDs fit in 32 bits. Reinterpret the low half of Fleet's int64
-        # output instead of launching a D2D cast kernel after every decode.
-        # gfx950 is little-endian, so element zero is the token ID.
-        sampled = argmax.view(torch.int32)[:1].reshape(1, 1)
+        # For a persistent chunk Fleet writes the first N-1 tokens into the
+        # prefix buffer and leaves the final token in argmax_output.
+        count = int(getattr(logits, "_fleet_mk_token_count", 1))
+        prefix = getattr(logits, "_fleet_mk_token_prefix", None)
+        last = argmax.view(torch.int32)[:1]
+        if count > 1:
+            if prefix is None or prefix.numel() < count - 1:
+                raise RuntimeError("Fleet MK persistent token buffer is missing")
+            sampled = torch.cat((prefix[:count - 1], last)).reshape(1, count)
+        else:
+            sampled = last.reshape(1, 1)
         return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
     Sampler.forward = forward

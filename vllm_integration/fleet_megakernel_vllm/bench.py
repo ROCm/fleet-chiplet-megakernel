@@ -91,6 +91,8 @@ def main():
             os.environ.get("FLEET_MK_GPU_MEM_UTIL", "0.9")),
     )
     if fleet_mk_on:
+        if int(os.environ.get("FLEET_MK_PERSIST", "1")) > 1:
+            llm_kwargs["async_scheduling"] = False
         # The two AITER env vars are set at module import (vLLM reads them before
         # this runs). Only the vLLM-constructor settings belong here.
         llm_kwargs["block_size"] = int(

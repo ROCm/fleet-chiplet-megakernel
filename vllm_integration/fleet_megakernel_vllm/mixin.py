@@ -346,6 +346,10 @@ class FleetMKModelMixin:
             # fail there with a precise error instead of using a bogus row.
             tagged = self._fleet_mk_buffers.buf_logits[:n, :1]
             tagged._fleet_mk_argmax = self._fleet_mk_buffers.buf_argmax_out
+            tagged._fleet_mk_token_prefix = (
+                self.fleet_mk.buf_tokens_out
+                if self.fleet_mk.persist_n > 1 else None)
+            tagged._fleet_mk_token_count = self.fleet_mk.last_chunk_n
             return tagged
         return self._fleet_mk_buffers.buf_logits[:n, :S.vocab_size]
 
