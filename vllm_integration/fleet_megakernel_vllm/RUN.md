@@ -16,13 +16,27 @@ Native Fleet uses 248 workers plus eight scheduler blocks and keeps the offline
 decode loop inside one persistent DAG launch, so this wrapper and native Fleet
 are not the same kernel behind different Python front ends.
 
-With page-aligned 16-token chunks the wrapper measures **1.879 ms/token**
-end-to-end through vLLM. Native Fleet on this host measures **1.665 ms/device
-iteration** and **1.768 ms/token wall time** (steady-state decode min 1.665,
-median 1.681, unchanged from 256 to 512 max-seq-length). The wrapper is
-therefore 12.9% above native device time and 6.3% above native wall time: the
-persistent chunk amortizes launch and scheduler overhead, but the
-kernel-architecture gap remains open.
+With 64-token chunks the wrapper measures **1.868 ms/token** end-to-end through
+vLLM. Compared at the same decode span (439 new tokens from a 73-token prompt,
+512 max-seq-length), the numbers attribute the gap completely:
+
+| path | device | wall |
+|---|---|---|
+| native Fleet | 1.670 ms | 1.768 ms |
+| this wrapper, standalone | 1.851 ms | 1.867 ms |
+| this wrapper, through vLLM (`PERSIST=64`) | — | 1.868 ms |
+
+vLLM therefore costs about **1 us/token** once chunks amortize the engine step:
+the integration is no longer the bottleneck. The whole residual is the wrapper
+kernel, which is 0.181 ms/token (10.8%) slower than native and degrades faster
+with sequence length. Comparing at unequal lengths is what makes this look like
+vLLM overhead -- the same kernel measures 1.760 ms/token device over 96 new
+tokens and 1.851 ms over 439.
+
+Chunk size past 16 buys little (1.887 ms at 16, 1.884 at 32, 1.868 at 64)
+precisely because the remaining cost is per-token device time, not per-launch
+overhead. Closing the rest requires the native `PersistentKernel`, not tuning
+here.
 
 Correctness of the chunked path is gated on content, not token equality, the
 way the rest of this repo gates GPT-OSS. `demo/gpt_oss/compare_tokens.py`
@@ -114,8 +128,13 @@ HIP_VISIBLE_DEVICES=0 VLLM_PLUGINS=fleet_mk FLEET_MK_GREEDY_ARGMAX=1 \
 
 Persistent chunks require plain greedy sampling and synchronous vLLM
 scheduling. `harness.py` and `bench.py` disable async scheduling automatically.
-Chunks stop at every 16-token KV page boundary; crossing a page inside one
-launch is not safe.
+
+Chunks may span KV pages. That needs two distinct page counts: `kv_indptr`
+carries only the first iteration's count, because the kernel re-derives it from
+`pos` each iteration, while `kv_indices` must be pre-filled for every page the
+chunk will reach, because the kernel bumps the count but never fills the table.
+Publishing the chunk-end count in `kv_indptr` makes iteration 0 attend over
+pages nothing has written yet, which yields fluent but wrong text.
 
 Useful env:
 
@@ -129,7 +148,7 @@ Useful env:
 | `FLEET_MK_BLOCK_SIZE` | spec `page_size` (16) | must match the `.so` |
 | `FLEET_MK_SO` | `generated/gpt_oss_120b.so` | pin a specific kernel |
 | `FLEET_MK_GREEDY_ARGMAX` | unset | set to `1` to consume Fleet's in-kernel argmax directly |
-| `FLEET_MK_PERSIST` | 1 | greedy tokens per launch; use 16 (automatically page-aligned) |
+| `FLEET_MK_PERSIST` | 1 | greedy tokens per launch; 64 is the measured best |
 | `BENCH_EAGER` | 0 in `bench.py` | **set to 1** for 120B |
 | `BENCH_SHORT` / `BENCH_LONG` / `BENCH_REPS` | 8 / 128 / 3 | |
 

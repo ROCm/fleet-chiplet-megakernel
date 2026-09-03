@@ -442,21 +442,30 @@ class FleetMKDecoder:
         # pins decode_iter at 0 so task_layer_idx restarts and later tokens
         # pre-satisfy barriers. Zeroing moe_barrier hangs W13->W2 at layer 1.
 
-        # Do not cross a paged-KV block inside one launch. The in-kernel
-        # metadata advance is safe within a page; changing kv_indptr at a page
-        # boundary races readers in other workgroups.
-        chunk_n = min(self.persist_n, page_size - (cur_pos % page_size))
+        # A chunk may span KV pages, which needs two different page counts.
+        # Conflating them is what corrupted multi-page chunks: kv_indptr
+        # describes only the FIRST iteration, because the kernel re-derives it
+        # from `pos` on every later one, whereas kv_indices must already cover
+        # every page the chunk will reach, because the kernel bumps the count
+        # but never fills the table. Publishing the chunk-end count up front
+        # made iteration 0 attend over pages nothing had written yet.
+        chunk_n = self.persist_n
         self.last_chunk_n = chunk_n
         last_pos = cur_pos + chunk_n - 1
-        num_pages_used = (last_pos + page_size) // page_size
+        num_pages_first = (cur_pos + page_size) // page_size
+        num_pages_chunk = (last_pos + page_size) // page_size
         self.kv_indptr[0] = 0
-        self.kv_indptr[1] = num_pages_used
+        self.kv_indptr[1] = num_pages_first
         if block_table is None:
-            for p in range(num_pages_used):
+            for p in range(num_pages_chunk):
                 self.kv_indices[p] = p
         else:
-            self.kv_indices[:num_pages_used].copy_(
-                block_table[:num_pages_used].to(torch.int32))
+            assert block_table.numel() >= num_pages_chunk, (
+                f"block table holds {block_table.numel()} pages but a chunk "
+                f"ending at position {last_pos} needs {num_pages_chunk}; "
+                f"raise the scheduler's lookahead")
+            self.kv_indices[:num_pages_chunk].copy_(
+                block_table[:num_pages_chunk].to(torch.int32))
         self.kv_last_page_len[0] = (cur_pos % page_size) + 1
         if S.is_moe and self.persist_n > 1:
             ctrl_i32 = self.buf_decode_ctrl.view(torch.int32)
