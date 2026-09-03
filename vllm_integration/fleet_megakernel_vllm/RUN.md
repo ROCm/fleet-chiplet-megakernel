@@ -6,6 +6,23 @@ megakernel launch that reads and writes vLLM's paged KV cache zero-copy.
 Maintained model: **GPT-OSS 120B** (MoE). Dense Qwen3-8B is registered but is
 not the path these numbers come from.
 
+## Scope of this integration
+
+`fleet_megakernel_vllm` currently wraps the older Titan-style sequential
+36-layer kernel: 240 workers, no persistent DAG scheduler, and one HIP launch
+per output token. It uses Fleet's GEMM/MoE headers and optimizations, but it is
+not the native Fleet `PersistentKernel` used by `demo/gpt_oss/demo.py`.
+
+Native Fleet's measured 1.683 ms device iteration uses 248 workers plus eight
+scheduler blocks and keeps the offline decode loop inside one persistent DAG
+launch. Therefore 1.792 ms for this wrapper and 1.683 ms for native Fleet are
+not measurements of the same kernel behind different Python front ends.
+
+The path toward native performance is a separate native integration: allocate
+vLLM's split KV layout, bind it into the real `PersistentKernel`, and run native
+online decode. Further tuning of this wrapper cannot recover the DAG scheduler
+or fused-layer overlap.
+
 ## Versions (verified 2026-09-03)
 
 | Piece | Version / pin |
@@ -114,10 +131,12 @@ text follows. Do not judge bit-identical repeats: MoE W2 uses float atomics.
 
 Measured 2026-09-03, gfx950 GPU 0, vLLM 0.27.1, `BENCH_EAGER=1`,
 `FLEET_MK_GREEDY_ARGMAX=1`, 8 vs 64 tokens (best of five):
-**1.983 ms/token** through vLLM, up from 2.032 ms/token. The matching optimized
-megakernel measures **1.792 ms/device iteration**; upstream native Fleet was
-**1.794 ms/token wall time** on this host. The remaining ~0.19 ms is vLLM
-scheduler, launch, and synchronization overhead—not a second sampler or KV copy.
+**1.983 ms/token** through vLLM, up from 2.032 ms/token. The optimized
+Titan-style wrapper kernel measures **1.792 ms/device iteration**. Native Fleet
+measured **1.683 ms/device iteration** and **1.794 ms/token wall time** on this
+host. Of the ~0.30 ms device-to-vLLM gap, about 0.11 ms is the different kernel
+control plane and about 0.19 ms is per-token vLLM launch/synchronization—not a
+second sampler or KV copy.
 
 The direct argmax path is deliberately limited to batch-size-one plain greedy
 requests. Logprobs, penalties, token masks/biases, `min_tokens`, speculative
