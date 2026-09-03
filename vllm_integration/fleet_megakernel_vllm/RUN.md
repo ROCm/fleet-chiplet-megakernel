@@ -24,12 +24,21 @@ therefore 12.9% above native device time and 6.3% above native wall time: the
 persistent chunk amortizes launch and scheduler overhead, but the
 kernel-architecture gap remains open.
 
-Correctness of the chunked path is only partly established. Its first eight
-tokens match stock vLLM exactly and 64-token output is coherent, but a
-token-for-token `FLEET_MK_PERSIST=1` versus `=16` control over a full generation
-has not been run. Unaligned chunks silently produced wrong tokens while still
-reading as fluent prose, so treat multi-token chunks as provisional until that
-control exists.
+Correctness of the chunked path is gated on content, not token equality, the
+way the rest of this repo gates GPT-OSS. `demo/gpt_oss/compare_tokens.py`
+rejects exact match as a criterion because MoE W2 float atomics reorder the
+reduction and flip near-tie logits; correct 2-GPU runs there agree for only 3 to
+66 tokens. Measured here, the single-step path diverges from *itself* run to run
+at token 34 and the chunked path at token 26, so token equality cannot
+discriminate a bug from noise and must not be used as a gate.
+
+`FLEET_MK_PERSIST=1` and `=16` both pass the four-prompt content gate from
+`demo/gpt_oss/run_correctness_suite.sh` (paris / scatter / prime / stack+queue)
+at 256 new tokens. Separately, the native kernel passes
+`tests/ci-tests/test_gpt_oss_perplexity.py`: mpk 33.48 against torch 36.04 on a
+512-token WikiText-2 slice, ratio 0.929 against a 3.5 ceiling. That perplexity
+run is prefill-only teacher forcing, so it validates kernel numerics, not the
+decode chunking.
 
 ## Versions (verified 2026-09-03)
 
