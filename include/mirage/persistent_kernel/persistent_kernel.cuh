@@ -2235,7 +2235,12 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   (void)cudaFuncSetAttribute(persistent_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              MAX_DYNAMIC_SHARED_MEMORY_SIZE);
-  // Create worker and scheduler streams
+  // Create worker and scheduler streams. Destroy the pair from a previous init:
+  // leaked streams exhaust HIP's hardware queues and deadlock the next launch.
+  if (global_runtime_config.worker_stream != nullptr) {
+    (void)cudaStreamDestroy(global_runtime_config.worker_stream);
+    (void)cudaStreamDestroy(global_runtime_config.scheduler_stream);
+  }
   (void)cudaStreamCreateWithFlags(&global_runtime_config.worker_stream,
                                   cudaStreamNonBlocking);
   (void)cudaStreamCreateWithFlags(&global_runtime_config.scheduler_stream,
@@ -2405,6 +2410,8 @@ extern "C" void finalize_persistent_kernel() {
   (void)cudaEventDestroy(global_runtime_config.scheduler_done_event);
   (void)cudaStreamDestroy(global_runtime_config.worker_stream);
   (void)cudaStreamDestroy(global_runtime_config.scheduler_stream);
+  global_runtime_config.worker_stream = nullptr;
+  global_runtime_config.scheduler_stream = nullptr;
 }
 
 // Copy event timing data to a host buffer provided by Python
