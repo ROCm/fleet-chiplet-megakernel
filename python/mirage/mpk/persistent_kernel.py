@@ -325,7 +325,10 @@ def get_compile_command(
             cc,
             "-x", "hip",
             file_name,
-            "-O2",  # -O3 causes LLVM AMDGPU register allocator to hang on large fused kernels
+            os.environ.get("MPK_HIP_OPT", "-O3"),  # default -O3; MPK_HIP_OPT=-O2 restores the old path
+            # Measured 2026-09-21 on gfx950 gpt-oss-120b: -O3 compiles and is token-identical
+            # across 3 reps (1.686/1.680/1.716 ms). The previous -O2 pin was leftover from an
+            # allocator hang that no longer reproduces on this kernel.
             "--save-temps",  # TEMP: dump assembly for v_mov analysis
             # Omit -lineinfo for ROCm: hipcc forwards it to ld.lld which treats it as -l lineinfo
             f"-I{py_include_dir}",
