@@ -26,6 +26,64 @@
 
 namespace kernel {
 
+#ifdef MPK_TOPK_DPP_REDUCE
+// Reduce a 16-lane row to lane zero with DPP instead of ds_bpermute.
+//
+// __shfl_xor lowers to ds_bpermute_b32, which increments LGKM, so every
+// dependent consumer has to drain lgkmcnt before it can use the result. DPP
+// moves travel between lanes through the VALU and touch neither LGKM nor
+// VMCNT, which takes the reduction off that counter entirely.
+//
+// `s_nop 1` before every DPP move covers the two-wait-state VALU-to-DPP source
+// hazard. `bound_ctrl:1` returns 0 for out-of-range lanes, which is why ONLY
+// lane 0 holds a valid result: its sources (lanes 8, 4, 2, 1) are all in-range,
+// while high lanes read past the row. Every caller must broadcast from lane 0.
+__device__ __forceinline__ float topk_dpp_row_max_to_lane_zero(float value) {
+  float peer;
+  asm volatile("s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:8 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_max_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:4 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_max_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:2 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_max_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:1 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_max_f32 %0, %0, %1"
+               : "+v"(value), "=&v"(peer));
+  return value;
+}
+
+__device__ __forceinline__ float topk_dpp_row_sum_to_lane_zero(float value) {
+  float peer;
+  asm volatile("s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:8 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_add_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:4 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_add_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:2 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_add_f32 %0, %0, %1\n"
+               "s_nop 1\n"
+               "v_mov_b32_dpp %1, %0 row_shl:1 row_mask:0xf bank_mask:0xf "
+               "bound_ctrl:1\n"
+               "v_add_f32 %0, %0, %1"
+               : "+v"(value), "=&v"(peer));
+  return value;
+}
+#endif
+
+
 static constexpr int MI300_WARP_SIZE = 64; // AMD wavefront size
 
 // Fused TopK softmax kernel for AMD MI300/MI350.
@@ -93,10 +151,28 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       // land after a later layer has written the same address. Here the
       // consequence is worse than a perturbed weight -- a dropped routing
       // index silently removes a token from an expert's MFMA column set.
+#ifdef MPK_TOPK_NO_ROUTING_CLEAR
+            // unreachable. The winner store and `s_hit[local_expert] = 1` sit in one
+      // block below, and the compaction keys on s_hit, so an expert reaches
+      // active_expert_ids IFF its row was written this layer -- MoE never reads
+      // a cleared entry.
+      //
+      // Only sound at stride 1. Above that a hit expert may be selected by one
+      // row and not another, and the MoE decode ballots over all BATCH_SIZE
+      // lanes, so a stale nonzero row would compact a token that does not
+      // exist into an MFMA column. Batch > 1 keeps the clear.
+      if (routing_row_stride != 1) {
+        for (int row = 0; row < routing_row_stride; ++row) {
+          st_wt_u32((void *)&routing_indices[expert * routing_row_stride + row],
+                    0u);
+        }
+      }
+#else
       for (int row = 0; row < routing_row_stride; ++row) {
         st_wt_u32((void *)&routing_indices[expert * routing_row_stride + row],
                   0u);
       }
+#endif
     }
   }
   for (int e = threadIdx.x; e < NUM_EXPERTS; e += blockDim.x) {
@@ -185,10 +261,26 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
     for (int ii = 1; ii < VPT; ++ii) {
       thread_max = fmaxf(thread_max, row_chunk[ii]);
     }
+#ifdef MPK_TOPK_DPP_REDUCE
+    // A DPP row is exactly 16 lanes, so the ladder row_shl 8/4/2/1 is the whole
+    // reduction only at a 16-lane row. This ships ON, so any other width falls
+    // back to the butterfly rather than failing the build.
+    if constexpr (THREADS_PER_ROW == 16) {
+      thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
+      // Valid in lane 0 only (bound_ctrl:1) -- broadcast before any lane reads it.
+      thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+    } else {
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
+        thread_max = fmaxf(thread_max, other);
+      }
+    }
+#else
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
       float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
       thread_max = fmaxf(thread_max, other);
     }
+#endif
 
     // Softmax
     float row_sum = 0.f;
@@ -197,9 +289,20 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
                                              1.4426950408889634f);
       row_sum += row_chunk[ii];
     }
+#ifdef MPK_TOPK_DPP_REDUCE
+    if constexpr (THREADS_PER_ROW == 16) {
+      row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
+      row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+    } else {
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
+      }
+    }
+#else
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
       row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
     }
+#endif
     float const inv_sum = 1.f / row_sum;
     for (int ii = 0; ii < VPT; ++ii) {
       row_chunk[ii] *= inv_sum;

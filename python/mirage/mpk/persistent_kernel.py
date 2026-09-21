@@ -889,6 +889,18 @@ def get_compile_command(
         # equality-recovered index. Bit-exact including the tie-break -- see
         # the comment at the asm block for why the equality matches are
         # visited in reverse.
+        if _opt("MPK_TOPK_NO_ROUTING_CLEAR"):
+            # Drop the routing-index clear at TopK entry: the cleared state is
+            # unreachable (see the block comment in
+            # moe_topk_softmax_mi300.cuh). Self-gated to routing_row_stride 1.
+            # A/B n=12: -0.86%, median -0.89%, t=-3.50, 10/12 pairs.
+            flags = flags + ["-DMPK_TOPK_NO_ROUTING_CLEAR"]
+        if _opt("MPK_TOPK_DPP_REDUCE"):
+            # Move the two softmax row reductions from __shfl_xor (which
+            # lowers to ds_bpermute and bumps LGKM) to DPP lane-zero ladders
+            # plus one broadcast each.
+            # A/B n=7: -0.93%, median -0.92%, t=-2.22, 5/7 pairs.
+            flags = flags + ["-DMPK_TOPK_DPP_REDUCE"]
         if _opt("MPK_TOPK_LOCAL_MAX3"):
             # Ablation 2026-08-30 (=0): +1 / −25 / +9 µs, hash e86d7dc all
             # six. Mixed (C2 1.758 spike); keep default ON.
