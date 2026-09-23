@@ -546,3 +546,26 @@ __device__ __forceinline__ unsigned long long int
                        unsigned long long int val) {
   return atomicCAS(addr, cmp, val);
 }
+
+#ifdef MPK_LOCAL_TOPK
+// MPK_LOCAL_TOPK (bs=1, 128 experts, XCD-pair MoE map): each router tile
+// publishes its logit as one epoch-tagged word, (tag << 16) | bf16 bits, and
+// every workgroup rebuilds the routing at the Phase 7b gate instead of waiting
+// for a serial TopK completer.
+//
+// The 128 tag words live at this int offset in the oproj_topk_counters block
+// (demo.py grows the block to MPK_LTK_TAG_SLOT + 128 under the flag), and
+// routing_ready sits at 10 * 16 in the same block.
+constexpr int MPK_LTK_TAG_SLOT = 2048;
+constexpr int MPK_LTK_ROUTING_REL = MPK_LTK_TAG_SLOT - 10 * 16;
+// Never 0, so the zero-initialized block cannot satisfy a poll, and
+// consecutive layers always differ.
+__device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {
+  return 1u + (unsigned)epoch % 65535u;
+}
+// Selection-order picks and renormalized weights: what the completer carries
+// to XCD pair k in its u64 record, and what it writes to topk_weight[k].
+__shared__ int s_ltk_sel[8];
+__shared__ float s_ltk_w[8];
+__shared__ unsigned short s_ltk_logit[128];
+#endif

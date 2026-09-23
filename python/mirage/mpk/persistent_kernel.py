@@ -1645,7 +1645,13 @@ def get_compile_command(
             # A/B 2026-08-31 GPU 3, hash 96a92716 all six:
             # C 1.711/1.703/1.704 vs V 1.647/1.621/1.658
             # (−64 / −82 / −46 µs). Keep default ON (bs=1).
-            flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) == 1:
+                # No serial TopK completer and no early records: every
+                # workgroup rebuilds routing from epoch-tagged router
+                # logits and the XCD pair takes its pick from LDS (bs=1).
+                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_LOCAL_TOPK"]
+            else:
+                flags = flags + ["-DMPK_MOE_XCD_PAIR", "-DMPK_EARLY_ROUTING"]
         elif int(os.environ.get("MPK_EARLY_ROUTING", "0")) == 1:
             # TESTED AND NOT ADOPTED (race + loss). A/B 2026-08-31:
             # C 1.711/1.712/1.704 vs V 1.728/1.713/1.732, hashes
@@ -1654,6 +1660,9 @@ def get_compile_command(
             # first-selected expert; also d_routing[carried] can miss the
             # pick-time st_wt. Do not default-on. Use MPK_MOE_XCD_PAIR.
             flags = flags + ["-DMPK_EARLY_ROUTING"]
+        if int(os.environ.get("MPK_TERM_RECHECK", "0")) == 1:
+            # Re-test terminate after the iteration-boundary wait.
+            flags = flags + ["-DMPK_TERM_RECHECK"]
         # The same transform on the LM head's g-group argmax: two `__shfl_xor`
         # steps carrying a (value, index) pair become one interleaved
         # permlane16_swap / permlane32_swap chain. Four ds_bpermute and two
@@ -1931,6 +1940,12 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_MOE_INNER_TIMING"]
+        if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
+        if int(os.environ.get("MPK_QKV_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_INLINE"]
+        if int(os.environ.get("MPK_QKV_POS_PREFETCH", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_POS_PREFETCH"]
         if int(os.environ.get("MPK_SUBPHASE_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_ENABLE_SUBPHASE_TIMING"]
         if int(os.environ.get("MPK_MOE_SUBPHASE", "0")) == 1:

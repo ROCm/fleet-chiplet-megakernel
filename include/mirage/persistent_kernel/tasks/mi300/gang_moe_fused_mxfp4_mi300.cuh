@@ -616,10 +616,10 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
   int const lane_id = tid & 63;
   int const col = lane_id & 15;
   int const g = lane_id >> 4;
-#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING)
-#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING (carried expert in tile_idx[15:8])"
+#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING) && !defined(MPK_LOCAL_TOPK)
+#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING or MPK_LOCAL_TOPK (carried expert in tile_idx[15:8])"
 #endif
-#ifdef MPK_EARLY_ROUTING
+#if defined(MPK_EARLY_ROUTING) || defined(MPK_LOCAL_TOPK)
   int const carried_expert_id = (tile_idx >> 8) - 1;
   tile_idx &= 0xff;
 #endif
@@ -4816,11 +4816,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
         float const *rw_ptr = &d_routing_weight[my_tok * NUM_TOPK + topk_slot];
         unsigned short const *bias_ptr =
             &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+#ifdef MPK_LOCAL_TOPK
+        (void)rw_ptr;
+        pf_rw = s_ltk_w[topk_slot];
+        asm volatile("global_load_dwordx2 %0, %1, off"
+                     : "=&v"(pf_bias)
+                     : "v"(bias_ptr)
+                     : "memory");
+#else
         asm volatile("global_load_dword %0, %2, off\n"
                      "global_load_dwordx2 %1, %3, off"
                      : "=&v"(pf_rw), "=&v"(pf_bias)
                      : "v"(rw_ptr), "v"(bias_ptr)
                      : "memory");
+#endif
       }
       asm volatile("" ::: "memory");
 
@@ -5678,11 +5687,20 @@ __device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
               &d_routing_weight[my_tok * NUM_TOPK + topk_slot];
           unsigned short const *bias_ptr =
               &d_w2_bias[expert_id * W2_OUTPUT_SIZE + out_n_base];
+#ifdef MPK_LOCAL_TOPK
+          (void)rw_ptr;
+          pf_rw = s_ltk_w[topk_slot];
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=&v"(pf_bias)
+                       : "v"(bias_ptr)
+                       : "memory");
+#else
           asm volatile("global_load_dword %0, %2, off\n"
                        "global_load_dwordx2 %1, %3, off"
                        : "=&v"(pf_rw), "=&v"(pf_bias)
                        : "v"(rw_ptr), "v"(bias_ptr)
                        : "memory");
+#endif
         }
         asm volatile("" ::: "memory");
 

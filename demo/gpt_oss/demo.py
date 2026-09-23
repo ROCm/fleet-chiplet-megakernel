@@ -2197,6 +2197,10 @@ if __name__ == "__main__":
             # +128 ints: 8 per-XCD O-proj slice-ready flags (MPK_ROUTER_XCD_FOLD).
             # See FULL_LAYER_OPROJ_XCD_READY_SLOT in gang_full_layer_fused_mi300.cuh.
             counter_size = 768 + 128 * args.max_num_batched_requests + 272 + 128
+            if os.environ.get("MPK_LOCAL_TOPK", "0") == "1":
+                # +128 ints: epoch-tagged router logits at MPK_LTK_TAG_SLOT
+                # (mpk_atoms.cuh).
+                counter_size = max(counter_size, 2048 + 128)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count

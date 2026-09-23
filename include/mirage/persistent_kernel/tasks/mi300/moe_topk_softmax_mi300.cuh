@@ -591,4 +591,193 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 #endif
 }
 
+
+#ifdef MPK_LOCAL_TOPK
+// Every workgroup rebuilds this layer's routing from the 128 epoch-tagged
+// router logits. The row arithmetic is topk_softmax_mi300_task_impl's for one
+// row, line for line -- 16 lanes x 8 contiguous columns, the same max / exp2 /
+// sum reductions, the same asm argmax and tie-break, the same
+// renormalization -- so every workgroup reproduces the completer's picks and
+// weights bit for bit.
+template <int NUM_EXPERTS, int K>
+__device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
+  static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: s_ltk_* sized for 128");
+  static_assert(K <= 8, "MPK_LOCAL_TOPK: topk_vals holds 8");
+  constexpr int VPT = 8;
+  constexpr int THREADS_PER_ROW = NUM_EXPERTS / VPT;
+  static_assert(THREADS_PER_ROW == 16, "one 16-lane row");
+  int const tid = threadIdx.x;
+  unsigned const want = mpk_ltk_tag(expected);
+  if (tid < 64) {
+    // One wave reads all 128 words, two per lane, at the same system scope as
+    // the routing_ready poll this replaces. Each word is a single
+    // write-through store, so a matching tag carries its own logit.
+    unsigned long long v;
+    while (true) {
+      v = ld_sys_u64((void *)(tags + 2 * tid));
+      bool const ok = (((unsigned)(v >> 16)) & 0xFFFFu) == want &&
+                      (((unsigned)(v >> 48)) & 0xFFFFu) == want;
+      if (__all(ok)) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    s_ltk_logit[2 * tid] = (unsigned short)(v & 0xFFFFu);
+    s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
+  }
+  __syncthreads();
+  if (tid < THREADS_PER_ROW) {
+    float row_chunk[VPT];
+    for (int e = 0; e < VPT; ++e) {
+      // bf16 -> f32 is exact: the bf16 bits are the float's top half.
+      row_chunk[e] =
+          __uint_as_float(((unsigned)s_ltk_logit[tid * VPT + e]) << 16);
+    }
+    float thread_max = row_chunk[0];
+    for (int ii = 1; ii < VPT; ++ii) {
+      thread_max = fmaxf(thread_max, row_chunk[ii]);
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
+    thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
+      thread_max = fmaxf(thread_max, other);
+    }
+#endif
+    float row_sum = 0.f;
+    for (int ii = 0; ii < VPT; ++ii) {
+      row_chunk[ii] = __builtin_amdgcn_exp2f((row_chunk[ii] - thread_max) *
+                                             1.4426950408889634f);
+      row_sum += row_chunk[ii];
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
+    row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
+    }
+#endif
+    float const inv_sum = 1.f / row_sum;
+    for (int ii = 0; ii < VPT; ++ii) {
+      row_chunk[ii] *= inv_sum;
+    }
+    int const start_col = tid * VPT;
+    float row_sum_for_renorm = 0.f;
+    float topk_vals[8];
+    int col[VPT];
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
+      col[i] = start_col + i;
+    }
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      float max_val;
+      int expert;
+#ifdef MPK_TOPK_LOCAL_MAX3
+      float _lmax0, _lmax1;
+      asm volatile("v_max3_f32 %[m0], %[r0], %[r1], %[r2]\n"
+                   "v_max3_f32 %[m1], %[r3], %[r4], %[r5]\n"
+                   "v_max3_f32 %[mv], %[m0], %[m1], %[r6]\n"
+                   "v_max_f32 %[mv], %[mv], %[r7]\n"
+                   "v_mov_b32 %[ex], %[c7]\n"
+                   "v_cmp_eq_f32 vcc, %[r6], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c6], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r5], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c5], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r4], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c4], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r3], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c3], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r2], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c2], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r1], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c1], vcc\n"
+                   "v_cmp_eq_f32 vcc, %[r0], %[mv]\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c0], vcc\n"
+                   : [mv] "=&v"(max_val),
+                     [ex] "=&v"(expert),
+                     [m0] "=&v"(_lmax0),
+                     [m1] "=&v"(_lmax1)
+                   : [r0] "v"(row_chunk[0]), [r1] "v"(row_chunk[1]),
+                     [r2] "v"(row_chunk[2]), [r3] "v"(row_chunk[3]),
+                     [r4] "v"(row_chunk[4]), [r5] "v"(row_chunk[5]),
+                     [r6] "v"(row_chunk[6]), [r7] "v"(row_chunk[7]),
+                     [c0] "v"(col[0]), [c1] "v"(col[1]), [c2] "v"(col[2]),
+                     [c3] "v"(col[3]), [c4] "v"(col[4]), [c5] "v"(col[5]),
+                     [c6] "v"(col[6]), [c7] "v"(col[7])
+                   : "vcc");
+#else
+      asm volatile("v_mov_b32 %[mv], %[r0]\n"
+                   "v_mov_b32 %[ex], %[c0]\n"
+                   "v_cmp_gt_f32 vcc, %[r1], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r1], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c1], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r2], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r2], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c2], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r3], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r3], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c3], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r4], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r4], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c4], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r5], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r5], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c5], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r6], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r6], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c6], vcc\n"
+                   "v_cmp_gt_f32 vcc, %[r7], %[mv]\n"
+                   "v_cndmask_b32 %[mv], %[mv], %[r7], vcc\n"
+                   "v_cndmask_b32 %[ex], %[ex], %[c7], vcc\n"
+                   : [mv] "=&v"(max_val), [ex] "=&v"(expert)
+                   : [r0] "v"(row_chunk[0]), [r1] "v"(row_chunk[1]),
+                     [r2] "v"(row_chunk[2]), [r3] "v"(row_chunk[3]),
+                     [r4] "v"(row_chunk[4]), [r5] "v"(row_chunk[5]),
+                     [r6] "v"(row_chunk[6]), [r7] "v"(row_chunk[7]),
+                     [c0] "v"(col[0]), [c1] "v"(col[1]), [c2] "v"(col[2]),
+                     [c3] "v"(col[3]), [c4] "v"(col[4]), [c5] "v"(col[5]),
+                     [c6] "v"(col[6]), [c7] "v"(col[7])
+                   : "vcc");
+#endif
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
+        int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
+        asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
+                     "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
+                     "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
+                     : [mv] "+v"(max_val), [ex] "+v"(expert)
+                     : [om] "v"(other_max), [oe] "v"(other_expert)
+                     : "vcc");
+      }
+      if (tid == 0) {
+        topk_vals[k_idx] = max_val;
+        row_sum_for_renorm += max_val;
+        s_ltk_sel[k_idx] = expert;
+      }
+      if (k_idx + 1 < K) {
+        float const neg_inf = -10000.f;
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+          asm volatile("v_cmp_eq_u32 vcc, %[ex], %[ci]\n"
+                       "v_cndmask_b32 %[rc], %[rc], %[ni], vcc\n"
+                       : [rc] "+v"(row_chunk[i])
+                       : [ex] "v"(expert), [ci] "v"(col[i]), [ni] "v"(neg_inf)
+                       : "vcc");
+        }
+      }
+    }
+    if (tid == 0) {
+      float inv = 1.f / row_sum_for_renorm;
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        s_ltk_w[k_idx] = topk_vals[k_idx] * inv;
+      }
+    }
+  }
+  __syncthreads();
+}
+#endif
+
 } // namespace kernel

@@ -51,6 +51,24 @@ __device__ int g_subphase_active;
 __device__ unsigned long long g_subphase_scratch[8];
 #endif
 
+#ifdef MPK_QKV_SUBSTAMPS
+// Per-worker boundary times inside the Phase 1 QKV kernel for the last
+// armed layer: entry, slab pass consumed, RMSNorm, FP8 quant, MFMA, end.
+__device__ unsigned long long g_qkvsub[1024 * 8];
+#define MPK_QKVSUB(k)                                                  \
+  do {                                                                 \
+    if (threadIdx.x == 0) {                                            \
+      asm volatile("" ::: "memory");                                    \
+      g_qkvsub[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                    \
+    }                                                                  \
+  } while (0)
+#else
+#define MPK_QKVSUB(k) \
+  do {             \
+  } while (0)
+#endif
+
 #ifdef MPK_DRAIN_STATS
 // Phase 9 barrier segment attribution: how much of the layer-boundary wait is
 // store drain (s_waitcnt vmcnt(0)) vs rendezvous vs spinning on other XCDs.
@@ -1598,6 +1616,15 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
           }
           __builtin_amdgcn_s_sleep(1);
         }
+#ifdef MPK_TERM_RECHECK
+        // The terminate path bumps precomp_iter_ready to release parked
+        // workers, so a wait that bump satisfies leaves the loop without
+        // reading precomp_terminate. Test it once more before loading an
+        // iteration that will never be produced.
+        if (__atomic_load_n(config.precomp_terminate, __ATOMIC_RELAXED)) {
+          pc_terminated = 1;
+        }
+#endif
       }
       __syncthreads();
       if (pc_terminated) {
@@ -3760,6 +3787,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                        g_phase_span[w * MPK_PHASE_SLOT_COUNT + s] / n);
               }
               printf("\n");
+              // Raw s_memrealtime ticks (10 ns) of each slot boundary for the
+              // last armed layer: a one-layer snapshot of every worker.
+              printf("[PHASETS] w=%d", w);
+              for (int s = 0; s < MPK_PHASE_SLOT_COUNT; s++) {
+                printf(" %llu", g_phase_ts[w * MPK_PHASE_SLOT_COUNT + s]);
+              }
+              printf("\n");
+#ifdef MPK_QKV_SUBSTAMPS
+              printf("[QKVSUB] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_qkvsub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
             }
           }
 #endif

@@ -2366,7 +2366,11 @@ template <int BATCH_SIZE,
           int HEAD_DIM,
           int NUM_Q_PER_KV,
           int PAGE_SIZE>
+#ifdef MPK_QKV_INLINE
+__device__ __forceinline__ void
+#else
 __device__ __noinline__ void
+#endif
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
         void *workspace_f32_ptr,  // [batch, REDUCTION_SIZE] f32 (read + zero)
         void const *residual_ptr, // [batch, REDUCTION_SIZE] bf16
@@ -2474,6 +2478,18 @@ __device__ __noinline__ void
   int const col = lane_id & 15;
   int const g = lane_id >> 4;
 
+  MPK_QKVSUB(0);
+#if defined(MPK_QKV_POS_PREFETCH) && MPK_MAX_NUM_BATCHED_REQUESTS == 1
+  // One request: its KV position metadata depends on nothing this kernel
+  // computes, so load it here and let the slab pass cover the latency.
+  int const pf_qo0 = qo_indptr[0];
+  int const pf_qo1 = qo_indptr[1];
+  int const pf_kv0 = kv_indptr[0];
+  int const pf_kv1 = kv_indptr[1];
+  int const pf_lpl = kv_last_page_len[0];
+  int pf_gp = 0;
+  int pf_page = 0;
+#endif
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0,
                      _sp_t3b = 0, _sp_t4 = 0;
@@ -2742,6 +2758,7 @@ __device__ __noinline__ void
         }
       }
 
+      MPK_QKVSUB(1);
       // ── Pass 2's norm weights, issued here rather than at their use ──────
       //
       // The RMSNorm weights are immutable and pass 2 cannot consume them until
@@ -2850,9 +2867,21 @@ __device__ __noinline__ void
       }
     }
   }
+#if defined(MPK_QKV_POS_PREFETCH) && MPK_MAX_NUM_BATCHED_REQUESTS == 1
+  // compute_pos(0) for the only request (request_id stays 0), with the
+  // page lookup issued now so it retires behind RMSNorm and the quant.
+  {
+    int const num_pages = pf_kv1 - pf_kv0;
+    int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
+    int const num_new_tokens = pf_qo1 - pf_qo0;
+    pf_gp = global_seq_len - num_new_tokens + (tok_row_base - pf_qo0);
+  }
+  pf_page = kv_indices[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
   __syncthreads();
 
+  MPK_QKVSUB(2);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
     _sp_t1 = __builtin_amdgcn_s_memrealtime();
@@ -2996,7 +3025,12 @@ __device__ __noinline__ void
   };
 
   if constexpr (TOK_ROWS == 1) {
+#if defined(MPK_QKV_POS_PREFETCH) && MPK_MAX_NUM_BATCHED_REQUESTS == 1
+    _priv_global_pos[0] = pf_gp;
+    _priv_dst_idx[0] = pf_page * PAGE_SIZE + pf_gp % PAGE_SIZE;
+#else
     compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+#endif
     s_global_pos = _priv_global_pos;
     s_dst_idx = _priv_dst_idx;
   } else {
@@ -3011,6 +3045,7 @@ __device__ __noinline__ void
     s_dst_idx = s_pos_tbl + MFMA_N;
   }
 
+  MPK_QKVSUB(3);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
     _sp_t3 = __builtin_amdgcn_s_memrealtime();
@@ -3487,6 +3522,7 @@ __device__ __noinline__ void
       }
 #endif
 
+      MPK_QKVSUB(4);
       // ── Fused KV_UPD epilogue (N-axis packed) ──────────────────────────
       // Position metadata is per token and already in s_global_pos /
       // s_dst_idx. RoPE scratch aliases the token region, which is dead now
@@ -3634,6 +3670,7 @@ __device__ __noinline__ void
   // slots have no active token, write nothing, and own no (token, slot) pair,
   // so they cannot leave a hole.
 
+  MPK_QKVSUB(5);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
   if (_sp_rec) {
     _sp_t4 = __builtin_amdgcn_s_memrealtime();

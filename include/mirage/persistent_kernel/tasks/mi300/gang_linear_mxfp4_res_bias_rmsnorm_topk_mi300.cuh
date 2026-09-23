@@ -456,6 +456,11 @@ __device__ __attribute__((noinline)) void
   // tile_idx = xcd_id * tiles_per_xcd + local_tile
   int xcd_id = tile_idx / tiles_per_xcd;
   int local_tile = tile_idx % tiles_per_xcd;
+#ifdef MPK_LOCAL_TOPK
+  // This router tile's epoch-tagged logit, published at the TopK barrier
+  // once every wave's stores have drained.
+  unsigned ltk_word = 0u;
+#endif
   int xcd_output_col_offset = xcd_id * n_wgs_per_xcd * OUTPUT_PER_WG;
 
   // ════════════════════════════════════════════════════════════════════════
@@ -2203,6 +2208,12 @@ oproj_barrier :
           s += __bfloat162float(d_rbias[local_tile]);
         }
         bf16 bval = __float2bfloat16(s);
+#ifdef MPK_LOCAL_TOPK
+        if (b == 0) {
+          ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
+                     (unsigned)__builtin_bit_cast(unsigned short, bval);
+        }
+#endif
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
                   *reinterpret_cast<unsigned short *>(&bval));
 #endif
@@ -2530,6 +2541,12 @@ oproj_barrier :
           s += __bfloat162float(d_rbias[local_tile]);
         }
         bf16 bval = __float2bfloat16(s);
+#ifdef MPK_LOCAL_TOPK
+        if (b == 0) {
+          ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
+                     (unsigned)__builtin_bit_cast(unsigned short, bval);
+        }
+#endif
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
                   *reinterpret_cast<unsigned short *>(&bval));
       }
@@ -2574,6 +2591,26 @@ topk_barrier :
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
   __syncthreads();
 
+#ifdef MPK_LOCAL_TOPK
+#if defined(MPK_EARLY_ROUTING) || !defined(MPK_MOE_XCD_PAIR)
+#error "MPK_LOCAL_TOPK replaces EARLY_ROUTING and is wired for the MOE_XCD_PAIR map"
+#endif
+  static_assert(BATCH_SIZE == 1, "MPK_LOCAL_TOPK is bs=1");
+  static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: 128 tag words");
+  // No rendezvous and no serial completer: publish this tile's tagged
+  // logit. The drain above retired every wave's stores, including this
+  // XCD's norm row and pre-quantized row -- which MPK_ROUTER_FUSED_DP
+  // writes AFTER the logit -- so a consumer that has seen all 128 tags
+  // also sees them. The expert index undoes the logits pre-offset exactly
+  // as topk_noinline does (hardware XCC id * NUM_EXPERTS / 8).
+  if (tid == 0) {
+    st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
+                                         gang_rmsnorm_topk_detail::get_xcd_id() *
+                                             (NUM_EXPERTS / 8) +
+                                         local_tile],
+              ltk_word);
+  }
+#else
   __shared__ int s_topk_done;
   if (tid == 0) {
     s_topk_done = atomicAdd(topk_counter, 1) + 1;
@@ -2763,6 +2800,7 @@ topk_barrier :
     }
 #endif
   }
+#endif // MPK_LOCAL_TOPK
 
 done :
 #ifdef MPK_ENABLE_SUBPHASE_TIMING

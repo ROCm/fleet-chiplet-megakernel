@@ -501,6 +501,7 @@ __device__ __noinline__ void
   // per-rank bands line up across runs.
   int const _pslot_w = xcd_id * workers_per_xcd + xcd_rank;
   MPK_PHASE_MARK(_pslot_w, 0);
+  MPK_QKVSUB(6);
 
 #ifdef MPK_INTERLAYER_SPLIT
   // Gated on the same arm as the phase slots, so these three segments are
@@ -580,7 +581,7 @@ __device__ __noinline__ void
   int const routing_expected = layer_counter + 1;
   int const attn_release_expected = layer_counter + 1;
   int const qkv_epoch_expected = layer_counter + 1;
-#ifdef MPK_EARLY_ROUTING
+#if defined(MPK_EARLY_ROUTING) || defined(MPK_LOCAL_TOPK)
   // Packed into MoE tile_idx[15:8] as expert_id+1. 0 means "no early expert".
   int routed_expert0 = 0;
 #endif
@@ -641,6 +642,7 @@ __device__ __noinline__ void
 #else
     int const qkv_tile = qkv_attn_rank;
 #endif
+    MPK_QKVSUB(7);
     gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel<QKV_BATCH_SIZE,
                                                           QKV_OUTPUT_PER_WG,
                                                           QKV_REDUCTION_SIZE,
@@ -1562,7 +1564,14 @@ __device__ __noinline__ void
   MPK_TW_SUB(75, routing_expected);
   MPK_WS_PHASE(75, qkv_epoch_expected, xcd_id);
   {
-#ifdef MPK_EARLY_ROUTING
+#if defined(MPK_LOCAL_TOPK)
+    // No routing_ready poll: rebuild this layer's routing from the 128
+    // epoch-tagged router logits, then take this XCD pair's pick -- the
+    // same selection-order entry the completer's u64 record carries.
+    mpk_local_topk<128, 4>(oproj_counters_base + MPK_LTK_TAG_SLOT,
+                           routing_expected);
+    routed_expert0 = s_ltk_sel[xcd_id >> 1];
+#elif defined(MPK_EARLY_ROUTING)
     MPK_WS_WAIT_BEGIN(75, routing_expected);
     int _obs;
     int _spins = 0;
@@ -1680,8 +1689,8 @@ __device__ __noinline__ void
     __builtin_amdgcn_s_sleep(127);
   }
 #endif
-#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING)
-#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING (Phase 7b u64 wait)"
+#if defined(MPK_MOE_XCD_PAIR) && !defined(MPK_EARLY_ROUTING) && !defined(MPK_LOCAL_TOPK)
+#error "MPK_MOE_XCD_PAIR requires MPK_EARLY_ROUTING or MPK_LOCAL_TOPK (Phase 7b)"
 #endif
 #ifdef MPK_MOE_XCD_PAIR
   // Two packed tiles per rank 0..22: W13 (bit7=0) then W2 (bit7=1). Ranks
