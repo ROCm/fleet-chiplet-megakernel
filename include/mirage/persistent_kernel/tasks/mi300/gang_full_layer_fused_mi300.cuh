@@ -177,7 +177,7 @@ __device__ __noinline__ void
   //  [6] topk_weight      [7] routing_indices   [8] active_expert_ids
   //  [9] moe_routing_weight [10] moe_workspace_f32
 
-  MPK_ILSUB(6, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+  MPK_ILSTAMP(6, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_INTERLAYER_SPLIT
   unsigned long long _il_entry = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -503,7 +503,7 @@ __device__ __noinline__ void
   int const _pslot_w = xcd_id * workers_per_xcd + xcd_rank;
   MPK_PHASE_MARK(_pslot_w, 0);
   MPK_QKVSUB(6);
-  MPK_ILSUB(7, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+  MPK_ILSTAMP(7, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_ILSUB
   if (tid == 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
     g_ilsub[blockIdx.x * 12 + 10] = (unsigned long long)(_pslot_w + 1);
@@ -2492,7 +2492,7 @@ __device__ __noinline__ void
     // what makes the release visible to the whole block.
     __syncthreads();
     MPK_PHASE_MARK(_pslot_w, 10);
-    MPK_ILSUB(8, s_ilsub_ml == MPK_ILSUB_L0);
+    MPK_ILSTAMP(8, s_ilsub_ml == MPK_ILSUB_L0);
 
 #if defined(MPK_PREFETCH_NEXT_QKV) && defined(MPK_QKV_PF_WAVE_SPLIT)
     // Wave 0's deferred quarter of the staged tile. It has to be issued here,
@@ -2592,7 +2592,7 @@ __device__ __noinline__ void
   }
 #endif
   MPK_PHASE_MARK(_pslot_w, 11);
-  MPK_ILSUB(9, s_ilsub_ml == MPK_ILSUB_L0);
+  MPK_ILSTAMP(9, s_ilsub_ml == MPK_ILSUB_L0);
   MPK_TW_SUB(90, tile_idx);
   MPK_WS_PHASE(90, qkv_epoch_expected, xcd_id);
 }

@@ -77,7 +77,7 @@ __device__ unsigned long long g_qkvsub[1024 * 8];
 #endif
 __device__ unsigned long long g_ilsub[1024 * 12];
 __shared__ int s_ilsub_ml;
-#define MPK_ILSUB(k, cond)                                            \
+#define MPK_ILSTAMP(k, cond)                                            \
   do {                                                                \
     if (threadIdx.x == 0 && (cond)) {                                 \
       asm volatile("" ::: "memory");                                   \
@@ -86,7 +86,7 @@ __shared__ int s_ilsub_ml;
     }                                                                 \
   } while (0)
 #else
-#define MPK_ILSUB(k, cond) \
+#define MPK_ILSTAMP(k, cond) \
   do {                  \
   } while (0)
 #endif
@@ -2449,7 +2449,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             }
 #endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
-              MPK_ILSUB(2, ml == MPK_ILSUB_L0 + 1);
+              MPK_ILSTAMP(2, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -2538,7 +2538,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   __syncthreads();
               }
 
-              MPK_ILSUB(3, ml == MPK_ILSUB_L0 + 1);
+              MPK_ILSTAMP(3, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_PREFETCH_NEXT_QKV
               // Publish the NEXT layer's QKV weight pointer so the fused task
               // can start its HBM->LDS weight DMA during the Phase 9 barrier
@@ -2624,7 +2624,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 #endif
-              MPK_ILSUB(4, ml == MPK_ILSUB_L0 + 1);
+              MPK_ILSTAMP(4, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               // The inter-layer prologue: the ml_input_table / ml_output_table
               // copy plus the two __syncthreads that publish it. This runs
@@ -2694,7 +2694,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
               }
               __syncthreads();
-              MPK_ILSUB(5, ml == MPK_ILSUB_L0 + 1);
+              MPK_ILSTAMP(5, ml == MPK_ILSUB_L0 + 1);
 
               // Execute this layer
               int my_tiles = 0;
@@ -2727,7 +2727,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               if (threadIdx.x == 0) {
                 gang_tiles_executed = my_tiles;
               }
-              MPK_ILSUB(0, ml == MPK_ILSUB_L0);
+              MPK_ILSTAMP(0, ml == MPK_ILSUB_L0);
 
               // Inter-layer sync: threadfence_gpu flushes L2 write buffer so
               // next layer's buffer_inv + QKV epoch barrier sees fresh data.
@@ -2754,7 +2754,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
                 __syncthreads();
               }
-              MPK_ILSUB(1, ml == MPK_ILSUB_L0);
+              MPK_ILSTAMP(1, ml == MPK_ILSUB_L0);
             }
 
             // Deferred event signal: after compaction, layer 0's trigger_event
