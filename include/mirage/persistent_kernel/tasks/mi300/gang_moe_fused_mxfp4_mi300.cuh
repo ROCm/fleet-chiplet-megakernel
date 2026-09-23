@@ -351,7 +351,12 @@ template <int BATCH_SIZE,
           int NUM_TOPK,
           int W13_OUTPUT_PER_WG,
           int W2_OUTPUT_PER_WG>
-__device__ __noinline__ void gang_moe_fused_mxfp4_kernel_mi300(
+#if defined(MPK_SUBKERNEL_INLINE) || defined(MPK_MOE_INLINE)
+__device__ __forceinline__ void
+#else
+__device__ __noinline__ void
+#endif
+gang_moe_fused_mxfp4_kernel_mi300(
     void const *input_ptr,          // [batch, hidden] BF16
     void const *gate_up_weight_ptr, // [E, W13_WGS, wg_bytes] MXFP4 (interleaved
                                     // gate/up)

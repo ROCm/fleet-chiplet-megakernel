@@ -284,7 +284,11 @@ template <int BATCH_SIZE,
           int ACTUAL_HIDDEN_DIM,
           int NUM_EXPERTS,
           int K>
+#if defined(MPK_SUBKERNEL_INLINE) || defined(MPK_OPROJ_INLINE)
+__device__ __forceinline__ void
+#else
 __device__ __attribute__((noinline)) void
+#endif
     gang_linear_mxfp4_res_bias_rmsnorm_topk_kernel(
         // O-PROJ inputs
         void const *input_ptr,    // input_ptrs[0]
@@ -461,6 +465,17 @@ __device__ __attribute__((noinline)) void
   // This router tile's epoch-tagged logit, published at the TopK barrier
   // once every wave's stores have drained.
   unsigned ltk_word = 0u;
+#endif
+#ifdef MPK_LTK_EARLY_TAG
+#if !(defined(MPK_LOCAL_TOPK) && defined(MPK_ROUTER_FUSED_DP) && \
+      defined(MPK_W13_PREQUANT) && defined(MPK_ONE_NORM_WRITER))
+#error "MPK_LTK_EARLY_TAG is wired for LOCAL_TOPK + ROUTER_FUSED_DP + W13_PREQUANT + ONE_NORM_WRITER"
+#endif
+  // >= 0: this tile writes that share of the normed row and releases it.
+  int ltk_norm_slot = -1;
+#define MPK_NORMROW_SC " sc0 sc1"
+#else
+#define MPK_NORMROW_SC ""
 #endif
   int xcd_output_col_offset = xcd_id * n_wgs_per_xcd * OUTPUT_PER_WG;
 
@@ -1668,14 +1683,6 @@ oproj_barrier :
                      : "v"(w_base_pf + byte_off)
                      : "memory");
       }
-#ifdef MPK_ROUTER_BIAS_PF
-      if (router_bias_ptr) {
-        asm volatile("global_load_ushort %0, %1, off sc0 nt"
-                     : "=v"(rbias_pf)
-                     : "v"((char const *)router_bias_ptr + local_tile * 2)
-                     : "memory");
-      }
-#endif
     }
 
     // All threads poll per-XCD release flag independently.
@@ -1938,6 +1945,15 @@ oproj_barrier :
     //
     // At BATCH_SIZE == 1 the bound is a compile-time 1 and the loop vanishes.
     int const n_tok_router = BATCH_SIZE == 1 ? 1 : batch_count;
+#ifdef MPK_ROUTER_BIAS_PF
+    // Ahead of the pass-1 hidden loads: vmcnt retires in order, so their
+    // counted waits still cover them, and it lands before tid 0 needs it.
+    asm volatile("global_load_ushort %0, %1, off"
+                 : "=v"(rbias_pf)
+                 : "v"(d_rbias ? (char const *)(d_rbias + local_tile)
+                                 : (char const *)d_gamma)
+                 : "memory");
+#endif
 
     for (int b = 0; b < n_tok_router; b++) {
       char const *h_base =
@@ -2165,6 +2181,7 @@ oproj_barrier :
       }
 #endif
 
+      MPK_ILSTAMP(26, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #if defined(MPK_ROUTER_FUSED_DP) && defined(MPK_ROUTER_DUAL_REDUCE)
       // Both partials are complete here, so they reduce together through one
       // interleaved permlane/DPP chain rather than two shuffle butterflies.
@@ -2199,6 +2216,7 @@ oproj_barrier :
 #endif
       }
       __syncthreads();
+      MPK_ILSTAMP(27, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
       float irms;
       if (tid == 0) {
@@ -2230,6 +2248,15 @@ oproj_barrier :
         if (b == 0) {
           ltk_word = (mpk_ltk_tag(layer_epoch) << 16) |
                      (unsigned)__builtin_bit_cast(unsigned short, bval);
+#ifdef MPK_LTK_EARLY_TAG
+          // The tag carries only the logit; the normed row has its own flag.
+          MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+          st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
+                                               gang_rmsnorm_topk_detail::get_xcd_id() *
+                                                   (NUM_EXPERTS / 8) +
+                                               local_tile],
+                    ltk_word);
+#endif
         }
 #endif
 #if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
@@ -2286,6 +2313,11 @@ oproj_barrier :
       bool const router_norm_writer =
           pq_split ? (local_tile < MAX_ITERS) : (local_tile == 0);
       int const pq_my_iter = pq_split ? local_tile : -1;
+#ifdef MPK_LTK_EARLY_TAG
+      if (router_norm_writer) {
+        ltk_norm_slot = pq_split ? local_tile : 0;
+      }
+#endif
 #elif defined(MPK_ONE_NORM_WRITER)
       bool const router_norm_writer = (local_tile == 0);
 #ifdef MPK_W13_PREQUANT
@@ -2460,12 +2492,12 @@ oproj_barrier :
               router_norm_writer;
 #endif
           if (pq_store) {
-            asm volatile("global_store_dword %0, %1, off" ::"v"(n_base +
+            asm volatile("global_store_dword %0, %1, off" MPK_NORMROW_SC ::"v"(n_base +
                                                                 i_cur_q * 4),
                          "v"(pk_bits)
                          : "memory");
             if ((lane & 31) == 0) {
-              asm volatile("global_store_byte %0, %1, off" ::"v"(
+              asm volatile("global_store_byte %0, %1, off" MPK_NORMROW_SC ::"v"(
                                n_base + output_stride + scale_block),
                            "v"((unsigned)se)
                            : "memory");
@@ -2526,7 +2558,7 @@ oproj_barrier :
       if (router_norm_writer && (pq_my_iter <= 0)) {
         int const pad_dw = (output_stride - ACTUAL_HIDDEN_DIM) / 4;
         if ((int)tid < pad_dw) {
-          asm volatile("global_store_dword %0, %1, off" ::"v"(
+          asm volatile("global_store_dword %0, %1, off" MPK_NORMROW_SC ::"v"(
                            n_base + ACTUAL_HIDDEN_DIM + (int)tid * 4),
                        "v"(0u)
                        : "memory");
@@ -2625,6 +2657,19 @@ topk_barrier :
   // writes AFTER the logit -- so a consumer that has seen all 128 tags
   // also sees them. The expert index undoes the logits pre-offset exactly
   // as topk_noinline does (hardware XCC id * NUM_EXPERTS / 8).
+#ifdef MPK_LTK_EARLY_TAG
+  // Tag already out. The drain above retired this tile's write-through row
+  // stores; the flag is read only through this XCD's L2 (sc1 poll).
+  MPK_ILSTAMP(28, ltk_norm_slot >= 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1);
+  if (tid == 0 && ltk_norm_slot >= 0) {
+    asm volatile("global_store_dword %0, %1, off" ::"v"(
+                     &routing_ready_ptr[MPK_LTK_NORM_REL +
+                                        gang_rmsnorm_topk_detail::get_xcd_id() * 32 +
+                                        ltk_norm_slot]),
+                 "v"(mpk_ltk_tag(layer_epoch))
+                 : "memory");
+  }
+#else
   MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   if (tid == 0) {
     st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
@@ -2633,6 +2678,7 @@ topk_barrier :
                                          local_tile],
               ltk_word);
   }
+#endif
 #else
   __shared__ int s_topk_done;
   if (tid == 0) {

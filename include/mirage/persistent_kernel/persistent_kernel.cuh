@@ -75,7 +75,7 @@ __device__ unsigned long long g_qkvsub[1024 * 8];
 #ifndef MPK_ILSUB_L0
 #define MPK_ILSUB_L0 20
 #endif
-__device__ unsigned long long g_ilsub[1024 * 24];
+__device__ unsigned long long g_ilsub[1024 * 32];
 #ifdef MPK_ILPER
 __device__ unsigned long long g_ilper[1024 * 128];
 #endif
@@ -84,7 +84,7 @@ __shared__ int s_ilsub_ml;
   do {                                                                \
     if (threadIdx.x == 0 && (cond)) {                                 \
       asm volatile("" ::: "memory");                                   \
-      g_ilsub[blockIdx.x * 24 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      g_ilsub[blockIdx.x * 32 + (k)] = __builtin_amdgcn_s_memrealtime(); \
       asm volatile("" ::: "memory");                                   \
     }                                                                 \
   } while (0)
@@ -3908,21 +3908,21 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #endif
 #ifdef MPK_ILSUB
           for (int w = 0; w < 1024; w++) {
-            if (g_ilsub[w * 24 + 10] == 0) {
+            if (g_ilsub[w * 32 + 10] == 0) {
               continue;
             }
             printf("[ILSUB] b=%d", w);
-            for (int s = 0; s < 24; s++) {
-              printf(" %llu", g_ilsub[w * 24 + s]);
+            for (int s = 0; s < 32; s++) {
+              printf(" %llu", g_ilsub[w * 32 + s]);
             }
             printf("\n");
           }
 #ifdef MPK_ILPER
           for (int w = 0; w < 1024; w++) {
-            if (g_ilsub[w * 24 + 10] == 0) {
+            if (g_ilsub[w * 32 + 10] == 0) {
               continue;
             }
-            printf("[ILPER] b=%d %llu", w, g_ilsub[w * 24 + 10]);
+            printf("[ILPER] b=%d %llu", w, g_ilsub[w * 32 + 10]);
             for (int s = 0; s < 36; s++) {
               printf(" %llu", g_ilper[w * 128 + s]);
             }

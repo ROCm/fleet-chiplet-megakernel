@@ -1584,8 +1584,17 @@ __device__ __noinline__ void
     // No routing_ready poll: rebuild this layer's routing from the 128
     // epoch-tagged router logits, then take this XCD pair's pick -- the
     // same selection-order entry the completer's u64 record carries.
+#ifdef MPK_LTK_EARLY_TAG
+    // Writers per XCD: the router's pq_split election (MAX_ITERS tiles).
+    constexpr int ltk_row_iters = (ACTUAL_HIDDEN_DIM / 4 + 255) / 256;
+    mpk_local_topk<128, 4>(oproj_counters_base + MPK_LTK_TAG_SLOT,
+                           routing_expected,
+                           oproj_counters_base + MPK_LTK_NORM_SLOT + xcd_id * 32,
+                           router_tile_n >= ltk_row_iters ? ltk_row_iters : 1);
+#else
     mpk_local_topk<128, 4>(oproj_counters_base + MPK_LTK_TAG_SLOT,
                            routing_expected);
+#endif
     routed_expert0 = s_ltk_sel[xcd_id >> 1];
 #elif defined(MPK_EARLY_ROUTING)
     MPK_WS_WAIT_BEGIN(75, routing_expected);

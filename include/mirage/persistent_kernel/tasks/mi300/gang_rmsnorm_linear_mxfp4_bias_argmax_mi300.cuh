@@ -166,7 +166,12 @@ template <int BATCH_SIZE,
           int OUTPUT_PER_WG,
           int REDUCTION_SIZE,
           int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE>
-__device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
+#ifdef MPK_LMHEAD_INLINE
+__device__ __forceinline__ void
+#else
+__device__ __noinline__ void
+#endif
+gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     void const *norm_input_ptr,
     void const *norm_weight_ptr,
     void *norm_output_ptr,

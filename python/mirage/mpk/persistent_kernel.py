@@ -1952,6 +1952,20 @@ def get_compile_command(
             flags = flags + ["-DMPK_FUSED_INLINE"]
         if int(os.environ.get("MPK_ROUTER_BIAS_PF", "0")) == 1:
             flags = flags + ["-DMPK_ROUTER_BIAS_PF"]
+        if int(os.environ.get("MPK_LTK_EARLY_TAG", "0")) == 1:
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) != 1:
+                raise RuntimeError("MPK_LTK_EARLY_TAG requires MPK_LOCAL_TOPK=1")
+            flags = flags + ["-DMPK_LTK_EARLY_TAG"]
+        if int(os.environ.get("MPK_SUBKERNEL_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_SUBKERNEL_INLINE"]
+        if int(os.environ.get("MPK_LTK_POLL_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_POLL_SC1"]
+        if int(os.environ.get("MPK_LMHEAD_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_LMHEAD_INLINE"]
+        if int(os.environ.get("MPK_OPROJ_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_INLINE"]
+        if int(os.environ.get("MPK_MOE_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_INLINE"]
         if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
             flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
         if int(os.environ.get("MPK_ILSUB", "0")) == 1:

@@ -558,6 +558,13 @@ __device__ __forceinline__ unsigned long long int
 // routing_ready sits at 10 * 16 in the same block.
 constexpr int MPK_LTK_TAG_SLOT = 2048;
 constexpr int MPK_LTK_ROUTING_REL = MPK_LTK_TAG_SLOT - 10 * 16;
+#ifdef MPK_LTK_EARLY_TAG
+// One 128 B line per hardware XCD after the tags: normed-row writer t sets
+// word t to mpk_ltk_tag(epoch) once its write-through row stores drained.
+// demo.py grows the block to MPK_LTK_NORM_SLOT + 8 * 32 under the flag.
+constexpr int MPK_LTK_NORM_SLOT = MPK_LTK_TAG_SLOT + 128;
+constexpr int MPK_LTK_NORM_REL = MPK_LTK_NORM_SLOT - 10 * 16;
+#endif
 // Never 0, so the zero-initialized block cannot satisfy a poll, and
 // consecutive layers always differ.
 __device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {

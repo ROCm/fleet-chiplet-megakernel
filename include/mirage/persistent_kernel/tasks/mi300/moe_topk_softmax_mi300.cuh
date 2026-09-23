@@ -600,7 +600,9 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 // renormalization -- so every workgroup reproduces the completer's picks and
 // weights bit for bit.
 template <int NUM_EXPERTS, int K>
-__device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
+__device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
+                                               int const *norm_flags = nullptr,
+                                               int n_norm = 0) {
   static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: s_ltk_* sized for 128");
   static_assert(K <= 8, "MPK_LOCAL_TOPK: topk_vals holds 8");
   constexpr int VPT = 8;
@@ -613,20 +615,68 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
     // the routing_ready poll this replaces. Each word is a single
     // write-through store, so a matching tag carries its own logit.
     unsigned long long v;
+#ifdef MPK_ILSUB
+    unsigned long long ilsub_miss = 0, ilsub_iters = 0;
+#endif
     while (true) {
+#ifdef MPK_LTK_POLL_SC1
+      asm volatile("global_load_dwordx2 %0, %1, off sc1\n\ts_waitcnt vmcnt(0)"
+                   : "=v"(v)
+                   : "v"(tags + 2 * tid)
+                   : "memory");
+#else
       v = ld_sys_u64((void *)(tags + 2 * tid));
+#endif
       bool const ok = (((unsigned)(v >> 16)) & 0xFFFFu) == want &&
                       (((unsigned)(v >> 48)) & 0xFFFFu) == want;
+#ifdef MPK_ILSUB
+      unsigned long long const ilsub_m = __ballot(!ok);
+      ilsub_iters++;
+      if (ilsub_m) {
+        ilsub_miss = ilsub_m;
+      }
+#endif
       if (__all(ok)) {
         break;
       }
       __builtin_amdgcn_s_sleep(1);
     }
     MPK_ILSTAMP(18, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_ILSUB
+    // 30: lanes (tag pairs 2l, 2l+1) still missing on the last failed poll;
+    // 31: poll iterations.
+    if (tid == 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
+      g_ilsub[blockIdx.x * 32 + 30] = ilsub_miss;
+      g_ilsub[blockIdx.x * 32 + 31] = ilsub_iters;
+    }
+#endif
     s_ltk_logit[2 * tid] = (unsigned short)(v & 0xFFFFu);
     s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
   }
   __syncthreads();
+#ifdef MPK_LTK_EARLY_TAG
+  if (n_norm > 0 && tid >= 64 && tid < 128) {
+    // Wave 1 waits for this XCD's normed row while wave 0 runs the TopK.
+    int const w = tid - 64 < n_norm ? tid - 64 : n_norm - 1;
+    unsigned f;
+    while (true) {
+      asm volatile("global_load_dword %0, %1, off sc1\n\ts_waitcnt vmcnt(0)"
+                   : "=v"(f)
+                   : "v"(norm_flags + w)
+                   : "memory");
+      if (__all(f == want)) {
+        break;
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+#ifdef MPK_ILSUB
+    if (tid == 64 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
+      g_ilsub[blockIdx.x * 32 + 29] = __builtin_amdgcn_s_memrealtime();
+    }
+#endif
+  }
+#endif
+  MPK_ILSTAMP(24, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   if (tid < THREADS_PER_ROW) {
     float row_chunk[VPT];
     for (int e = 0; e < VPT; ++e) {
@@ -673,6 +723,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
     for (int ii = 0; ii < VPT; ++ii) {
       row_chunk[ii] *= inv_sum;
     }
+    MPK_ILSTAMP(25, s_ilsub_ml == MPK_ILSUB_L0 + 1);
     int const start_col = tid * VPT;
     float row_sum_for_renorm = 0.f;
     float topk_vals[8];

@@ -2201,6 +2201,9 @@ if __name__ == "__main__":
                 # +128 ints: epoch-tagged router logits at MPK_LTK_TAG_SLOT
                 # (mpk_atoms.cuh).
                 counter_size = max(counter_size, 2048 + 128)
+                if os.environ.get("MPK_LTK_EARLY_TAG", "0") == "1":
+                    # +8 x 32 ints: per-XCD normed-row ready words (MPK_LTK_NORM_SLOT).
+                    counter_size = max(counter_size, 2048 + 128 + 8 * 32)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
