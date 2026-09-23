@@ -1946,6 +1946,12 @@ def get_compile_command(
             # Intermittent multi-second stalls: the per-iteration qo_indptr[1]
             # cache can go stale (fleet_best.sh record 114). Kept for reference.
             raise RuntimeError("MPK_IL_FAST is disabled: intermittent stalls")
+        if int(os.environ.get("MPK_LTK_NO_LOGIT_STORE", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_NO_LOGIT_STORE"]
+        if int(os.environ.get("MPK_FUSED_INLINE", "0")) == 1:
+            flags = flags + ["-DMPK_FUSED_INLINE"]
+        if int(os.environ.get("MPK_ROUTER_BIAS_PF", "0")) == 1:
+            flags = flags + ["-DMPK_ROUTER_BIAS_PF"]
         if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
             flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
         if int(os.environ.get("MPK_ILSUB", "0")) == 1:
@@ -6144,6 +6150,31 @@ class PersistentKernel:
             if _n == 0:
                 raise RuntimeError("MPK_IL_FAST: no fused-layer call found")
             print(f"MPK_IL_FAST: {_n} fused-layer calls read qo_len from LDS")
+        if int(os.environ.get("MPK_FUSED_INLINE", "0")) == 1:
+            # ml-loop-only copy of the dispatch whose fused-layer calls inline.
+            _hdr = "__device__ __forceinline__\nvoid _execute_gang_task(TaskDesc const* task_desc,"
+            _i = cuda_code.find(_hdr)
+            if _i < 0:
+                raise RuntimeError("MPK_FUSED_INLINE: _execute_gang_task definition not found")
+            _j, _depth = cuda_code.find("{", _i), 0
+            while True:
+                _c = cuda_code[_j]
+                if _c == "{":
+                    _depth += 1
+                elif _c == "}":
+                    _depth -= 1
+                    if _depth == 0:
+                        break
+                _j += 1
+            _ml = cuda_code[_i:_j + 1].replace(
+                "void _execute_gang_task(", "void _execute_gang_task_ml(", 1).replace(
+                "kernel::gang_full_layer_fused_kernel_mi300<",
+                "kernel::gang_full_layer_fused_kernel_mi300_inl<")
+            _n = _ml.count("gang_full_layer_fused_kernel_mi300_inl<")
+            if _n == 0:
+                raise RuntimeError("MPK_FUSED_INLINE: no fused-layer call in the dispatch")
+            cuda_code = cuda_code[:_j + 1] + "\n\n" + _ml + cuda_code[_j + 1:]
+            print(f"MPK_FUSED_INLINE: ml dispatch with {_n} inlined fused-layer calls")
         with open(cuda_code_path, "w") as f:
             f.write(cuda_code + HARD_CODE)
 

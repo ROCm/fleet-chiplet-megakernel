@@ -1448,6 +1448,9 @@ oproj_barrier :
 
   i32x2_pf_t g_pf_buf[MAX_ITERS_PF];
   i32x2_pf_t w_pf_buf[MAX_ITERS_PF];
+#ifdef MPK_ROUTER_BIAS_PF
+  unsigned rbias_pf = 0;
+#endif
 
   {
     // Mechanism C: single global arrive + per-XCD release flags.
@@ -1665,6 +1668,14 @@ oproj_barrier :
                      : "v"(w_base_pf + byte_off)
                      : "memory");
       }
+#ifdef MPK_ROUTER_BIAS_PF
+      if (router_bias_ptr) {
+        asm volatile("global_load_ushort %0, %1, off sc0 nt"
+                     : "=v"(rbias_pf)
+                     : "v"((char const *)router_bias_ptr + local_tile * 2)
+                     : "memory");
+      }
+#endif
     }
 
     // All threads poll per-XCD release flag independently.
@@ -2208,7 +2219,11 @@ oproj_barrier :
         }
         s *= irms_t0;
         if (d_rbias) {
+#ifdef MPK_ROUTER_BIAS_PF
+          s += __uint_as_float(rbias_pf << 16);
+#else
           s += __bfloat162float(d_rbias[local_tile]);
+#endif
         }
         bf16 bval = __float2bfloat16(s);
 #ifdef MPK_LOCAL_TOPK
@@ -2217,8 +2232,10 @@ oproj_barrier :
                      (unsigned)__builtin_bit_cast(unsigned short, bval);
         }
 #endif
+#if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
                   *reinterpret_cast<unsigned short *>(&bval));
+#endif
 #endif
         red[0] = irms_t0;
       }
@@ -2550,8 +2567,10 @@ oproj_barrier :
                      (unsigned)__builtin_bit_cast(unsigned short, bval);
         }
 #endif
+#if !(defined(MPK_LOCAL_TOPK) && defined(MPK_LTK_NO_LOGIT_STORE))
         st_wt_u16(&d_logits[(int64_t)b * NUM_EXPERTS + local_tile],
                   *reinterpret_cast<unsigned short *>(&bval));
+#endif
       }
 #endif // !MPK_ROUTER_FUSED_DP
 

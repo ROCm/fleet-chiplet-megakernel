@@ -755,6 +755,13 @@ __device__ __forceinline__ void
     _execute_gang_task(TaskDesc const *task_desc,
                        RuntimeConfig const &runtime_config,
                        int tile_idx);
+#ifdef MPK_FUSED_INLINE
+// Generated next to _execute_gang_task; its fused-layer calls inline.
+__device__ __forceinline__ void
+    _execute_gang_task_ml(TaskDesc const *task_desc,
+                          RuntimeConfig const &runtime_config,
+                          int tile_idx);
+#endif
 
 // Helper: check if a task type is a gang task
 __device__ __host__ __forceinline__ bool is_gang_task_type(TaskType t) {
@@ -2767,7 +2774,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   b[1] = 200; // phase: inside gang tile execution
                 }
 #endif
+#ifdef MPK_FUSED_INLINE
+                _execute_gang_task_ml(task_desc, config, ml_n_tile_start + t);
+#else
                 _execute_gang_task(task_desc, config, ml_n_tile_start + t);
+#endif
                 my_tiles++;
               }
               if (threadIdx.x == 0) {
