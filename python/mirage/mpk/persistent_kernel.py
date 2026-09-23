@@ -1940,10 +1940,20 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_INNER_TIMING"]
         if int(os.environ.get("MPK_MOE_INNER_TIMING", "0")) == 1:
             flags = flags + ["-DMPK_MOE_INNER_TIMING"]
+        if int(os.environ.get("MPK_LTK_DPP", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_DPP"]
+        if int(os.environ.get("MPK_IL_FAST", "0")) == 1:
+            # Intermittent multi-second stalls: the per-iteration qo_indptr[1]
+            # cache can go stale (fleet_best.sh record 114). Kept for reference.
+            raise RuntimeError("MPK_IL_FAST is disabled: intermittent stalls")
         if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
             flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
         if int(os.environ.get("MPK_ILSUB", "0")) == 1:
             flags = flags + ["-DMPK_ILSUB"]
+        if int(os.environ.get("MPK_ILPER", "0")) == 1:
+            flags = flags + ["-DMPK_ILPER"]
+        if os.environ.get("MPK_ILSUB_L0"):
+            flags = flags + ["-DMPK_ILSUB_L0=%d" % int(os.environ["MPK_ILSUB_L0"])]
         if int(os.environ.get("MPK_QKV_INLINE", "0")) == 1:
             flags = flags + ["-DMPK_QKV_INLINE"]
         if int(os.environ.get("MPK_QKV_POS_PREFETCH", "0")) == 1:
@@ -6113,8 +6123,29 @@ class PersistentKernel:
         #     with open(json_file_path, "w") as f:
         #         json.dump(fused_graph, f)
 
+        cuda_code = results["cuda_code"]
+        if int(os.environ.get("MPK_IL_FAST", "0")) == 1:
+            # The fused-layer dispatch reloads qo_indptr[1] before every
+            # layer call; read the per-iteration LDS copy instead.
+            _key = "kernel::gang_full_layer_fused_kernel_mi300<"
+            _arg = "runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],"
+            _parts, _pos, _n = [], 0, 0
+            while True:
+                _i = cuda_code.find(_key, _pos)
+                if _i < 0:
+                    break
+                _j = cuda_code.find(_arg, _i)
+                _k = cuda_code.find(_key, _i + len(_key))
+                if _j < 0 or (_k >= 0 and _j > _k):
+                    raise RuntimeError("MPK_IL_FAST: fused-layer call without the qo_indptr argument")
+                _parts += [cuda_code[_pos:_j], "mpk_ml_qo_len(),"]
+                _pos, _n = _j + len(_arg), _n + 1
+            cuda_code = "".join(_parts) + cuda_code[_pos:]
+            if _n == 0:
+                raise RuntimeError("MPK_IL_FAST: no fused-layer call found")
+            print(f"MPK_IL_FAST: {_n} fused-layer calls read qo_len from LDS")
         with open(cuda_code_path, "w") as f:
-            f.write(results["cuda_code"] + HARD_CODE)
+            f.write(cuda_code + HARD_CODE)
 
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)

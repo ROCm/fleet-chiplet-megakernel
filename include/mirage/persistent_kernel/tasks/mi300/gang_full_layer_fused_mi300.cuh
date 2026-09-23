@@ -506,7 +506,7 @@ __device__ __noinline__ void
   MPK_ILSTAMP(7, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_ILSUB
   if (tid == 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
-    g_ilsub[blockIdx.x * 12 + 10] = (unsigned long long)(_pslot_w + 1);
+    g_ilsub[blockIdx.x * 24 + 10] = (unsigned long long)(_pslot_w + 1);
   }
 #endif
 
@@ -702,6 +702,7 @@ __device__ __noinline__ void
 #endif
   } // end Phase 1: QKV GEMM
   MPK_PHASE_MARK(_pslot_w, 1);
+  MPK_ILSTAMP(11, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 2: QKV barrier — epoch-based
@@ -1215,6 +1216,7 @@ __device__ __noinline__ void
   // spin-wait rather than serializing ahead of it.
   MPK_PHASE_MARK(_pslot_w, 3);
   MPK_PHASE_MARK(_pslot_w, 4);
+  MPK_ILSTAMP(12, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 6: Cross-XCD attention barrier + O-proj weight DMA
@@ -1421,6 +1423,7 @@ __device__ __noinline__ void
   unsigned long long _fused_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_PHASE_MARK(_pslot_w, 5);
+  MPK_ILSTAMP(13, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 7: O-proj + RMSNorm + Router + TopK
@@ -1485,6 +1488,7 @@ __device__ __noinline__ void
     }
   }
   MPK_PHASE_MARK(_pslot_w, 6);
+  MPK_ILSTAMP(14, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 7a': O-proj barrier for the workers that skipped Phase 7
@@ -1681,6 +1685,12 @@ __device__ __noinline__ void
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_PHASE_MARK(_pslot_w, 7);
+#ifdef MPK_ILPER
+    if (tid == 0 && s_ilsub_ml >= 0 && s_ilsub_ml < 64) {
+      g_ilper[blockIdx.x * 128 + 0 + s_ilsub_ml] = __builtin_amdgcn_s_memrealtime();
+    }
+#endif
+  MPK_ILSTAMP(15, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 8: MoE (W13+SwiGLU+W2)
@@ -1757,6 +1767,7 @@ __device__ __noinline__ void
     );
   }
   MPK_PHASE_MARK(_pslot_w, 8);
+  MPK_ILSTAMP(16, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 9: Layer-boundary GLOBAL barrier
@@ -2492,6 +2503,12 @@ __device__ __noinline__ void
     // what makes the release visible to the whole block.
     __syncthreads();
     MPK_PHASE_MARK(_pslot_w, 10);
+#ifdef MPK_ILPER
+    if (tid == 0 && s_ilsub_ml >= 0 && s_ilsub_ml < 64) {
+      g_ilper[blockIdx.x * 128 + 64 + s_ilsub_ml] = __builtin_amdgcn_s_memrealtime();
+    }
+#endif
+    MPK_ILSTAMP(17, s_ilsub_ml == MPK_ILSUB_L0 + 1);
     MPK_ILSTAMP(8, s_ilsub_ml == MPK_ILSUB_L0);
 
 #if defined(MPK_PREFETCH_NEXT_QKV) && defined(MPK_QKV_PF_WAVE_SPLIT)

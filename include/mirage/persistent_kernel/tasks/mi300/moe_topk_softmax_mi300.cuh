@@ -622,6 +622,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
       }
       __builtin_amdgcn_s_sleep(1);
     }
+    MPK_ILSTAMP(18, s_ilsub_ml == MPK_ILSUB_L0 + 1);
     s_ltk_logit[2 * tid] = (unsigned short)(v & 0xFFFFu);
     s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
   }
@@ -639,7 +640,11 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
     }
 #ifdef MPK_TOPK_DPP_REDUCE
     thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
+#ifdef MPK_LTK_DPP
+    thread_max = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(thread_max)));
+#else
     thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#endif
 #else
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
       float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
@@ -654,7 +659,11 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
     }
 #ifdef MPK_TOPK_DPP_REDUCE
     row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
+#ifdef MPK_LTK_DPP
+    row_sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(row_sum)));
+#else
     row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#endif
 #else
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
       row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
@@ -742,6 +751,38 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
                      [c6] "v"(col[6]), [c7] "v"(col[7])
                    : "vcc");
 #endif
+#ifdef MPK_LTK_DPP
+      {
+        // xor 8 = row_ror:8; xor 4 = row_shl:4 for lanes with bit 2 clear, row_shr:4
+        // for the rest; xor 2 / xor 1 = quad_perm [2,3,0,1] / [1,0,3,2].
+        bool const ltk_hi4 = (tid & 4) != 0;
+#define MPK_LTK_STEP(OM, OE)                                              \
+        do {                                                                    \
+          float const other_max = __int_as_float(OM);                           \
+          int const other_expert = (OE);                                        \
+          asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"                        \
+                       "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"                \
+                       "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"                \
+                       : [mv] "+v"(max_val), [ex] "+v"(expert)                  \
+                       : [om] "v"(other_max), [oe] "v"(other_expert)            \
+                       : "vcc");                                                 \
+        } while (0)
+        MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x128, 0xF, 0xF, false),
+                     __builtin_amdgcn_update_dpp(0, expert, 0x128, 0xF, 0xF, false));
+        {
+          int const mv_lo = __builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x104, 0xF, 0xF, false);
+          int const mv_hi = __builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x114, 0xF, 0xF, false);
+          int const ex_lo = __builtin_amdgcn_update_dpp(0, expert, 0x104, 0xF, 0xF, false);
+          int const ex_hi = __builtin_amdgcn_update_dpp(0, expert, 0x114, 0xF, 0xF, false);
+          MPK_LTK_STEP(ltk_hi4 ? mv_hi : mv_lo, ltk_hi4 ? ex_hi : ex_lo);
+        }
+        MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x4E, 0xF, 0xF, false),
+                     __builtin_amdgcn_update_dpp(0, expert, 0x4E, 0xF, 0xF, false));
+        MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0xB1, 0xF, 0xF, false),
+                     __builtin_amdgcn_update_dpp(0, expert, 0xB1, 0xF, 0xF, false));
+#undef MPK_LTK_STEP
+      }
+#else
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
         int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
@@ -752,6 +793,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
                      : [om] "v"(other_max), [oe] "v"(other_expert)
                      : "vcc");
       }
+#endif
       if (tid == 0) {
         topk_vals[k_idx] = max_val;
         row_sum_for_renorm += max_val;
@@ -776,6 +818,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected) {
       }
     }
   }
+  MPK_ILSTAMP(19, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   __syncthreads();
 }
 #endif

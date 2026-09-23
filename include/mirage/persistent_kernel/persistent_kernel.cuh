@@ -75,13 +75,16 @@ __device__ unsigned long long g_qkvsub[1024 * 8];
 #ifndef MPK_ILSUB_L0
 #define MPK_ILSUB_L0 20
 #endif
-__device__ unsigned long long g_ilsub[1024 * 12];
+__device__ unsigned long long g_ilsub[1024 * 24];
+#ifdef MPK_ILPER
+__device__ unsigned long long g_ilper[1024 * 128];
+#endif
 __shared__ int s_ilsub_ml;
 #define MPK_ILSTAMP(k, cond)                                            \
   do {                                                                \
     if (threadIdx.x == 0 && (cond)) {                                 \
       asm volatile("" ::: "memory");                                   \
-      g_ilsub[blockIdx.x * 12 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      g_ilsub[blockIdx.x * 24 + (k)] = __builtin_amdgcn_s_memrealtime(); \
       asm volatile("" ::: "memory");                                   \
     }                                                                 \
   } while (0)
@@ -89,6 +92,25 @@ __shared__ int s_ilsub_ml;
 #define MPK_ILSTAMP(k, cond) \
   do {                  \
   } while (0)
+#endif
+
+#ifdef MPK_IL_FAST
+// Per-iteration copies of values the inter-layer window used to load from
+// global memory every layer. See the ml-loop prologue.
+// One 16-byte-aligned block whose size is a multiple of 16: the dynamic LDS
+// region starts right after static LDS, and an 8-byte-aligned end measured
+// the whole kernel ~2x slower (misaligned 16-byte LDS traffic).
+struct alignas(16) MpkIlFastLds {
+  int qo_len[4];
+  int variant[64];
+  void *qkvw[64];
+};
+static_assert(sizeof(MpkIlFastLds) % 16 == 0, "keep static LDS 16-byte sized");
+__shared__ MpkIlFastLds s_ilf;
+#define s_ml_qo_len (s_ilf.qo_len[0])
+#define s_ml_variant (s_ilf.variant)
+#define s_ml_qkvw (s_ilf.qkvw)
+__device__ __forceinline__ int mpk_ml_qo_len() { return s_ml_qo_len; }
 #endif
 
 #ifdef MPK_DRAIN_STATS
@@ -2448,6 +2470,22 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
             }
 #endif
+#ifdef MPK_IL_FAST
+            if (config.ml_num_layers > 64) {
+              __builtin_trap();
+            }
+            if (threadIdx.x == 0) {
+              s_ml_qo_len = config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+            }
+            if ((int)threadIdx.x < config.ml_num_layers) {
+              s_ml_variant[threadIdx.x] = config.ml_variant_ids[threadIdx.x];
+              s_ml_qkvw[threadIdx.x] = config.ml_input_table
+                  [(xcd_id * config.ml_num_layers + (int)threadIdx.x) *
+                       MAX_INPUTS_PER_TASK +
+                   4];
+            }
+            __syncthreads();
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
               MPK_ILSTAMP(2, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
@@ -2513,7 +2551,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   }
                 }
                 if (threadIdx.x == 0) {
+#ifdef MPK_IL_FAST
+                  task_desc->variant_id = s_ml_variant[ml];
+#else
                   task_desc->variant_id = config.ml_variant_ids[ml];
+#endif
                 }
 #ifdef MPK_DRAIN_STATS
                 // Before the first __syncthreads: isolates the table read from
@@ -2600,7 +2642,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   // be suppressed -- same "null on the last layer" rule as the
                   // non-prefetch path, for the same reason.
                   task_desc->input_ptrs[24] =
+#ifdef MPK_IL_FAST
+                      (ml + 1 < config.ml_num_layers) ? s_ml_qkvw[ml + 1] : nullptr;
+#else
                       (ml + 1 < config.ml_num_layers) ? _pf_in : nullptr;
+#endif
                   // _pf_cur is this layer's slot 4, held from before the
                   // re-issue, so this needs no read of input_ptrs[4] and
                   // therefore no rendezvous with the thread that wrote it.
@@ -3851,15 +3897,30 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #endif
 #ifdef MPK_ILSUB
           for (int w = 0; w < 1024; w++) {
-            if (g_ilsub[w * 12 + 10] == 0) {
+            if (g_ilsub[w * 24 + 10] == 0) {
               continue;
             }
             printf("[ILSUB] b=%d", w);
-            for (int s = 0; s < 11; s++) {
-              printf(" %llu", g_ilsub[w * 12 + s]);
+            for (int s = 0; s < 24; s++) {
+              printf(" %llu", g_ilsub[w * 24 + s]);
             }
             printf("\n");
           }
+#ifdef MPK_ILPER
+          for (int w = 0; w < 1024; w++) {
+            if (g_ilsub[w * 24 + 10] == 0) {
+              continue;
+            }
+            printf("[ILPER] b=%d %llu", w, g_ilsub[w * 24 + 10]);
+            for (int s = 0; s < 36; s++) {
+              printf(" %llu", g_ilper[w * 128 + s]);
+            }
+            for (int s = 0; s < 36; s++) {
+              printf(" %llu", g_ilper[w * 128 + 64 + s]);
+            }
+            printf("\n");
+          }
+#endif
 #endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
           // Raw timestamps: scratch[0]=entry, [1]=before_lds,

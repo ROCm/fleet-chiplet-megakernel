@@ -448,6 +448,7 @@ __device__ __attribute__((noinline)) void
   unsigned long long _op_t0 = __builtin_amdgcn_s_memrealtime();
   unsigned long long _op_t1 = _op_t0, _op_t2 = _op_t0, _op_t3 = _op_t0;
 #endif
+  MPK_ILSTAMP(23, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   int batch_count =
       (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
@@ -1428,6 +1429,7 @@ oproj_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t1 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_ILSTAMP(21, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   // Drain BEFORE the rendezvous, not after. `s_waitcnt` is a per-wave
   // guarantee: run after __syncthreads it only retires wave 0's stores, and
   // tid 0 then publishes an arrival advertising output that waves 1..3 may
@@ -1837,6 +1839,7 @@ oproj_barrier :
 #ifdef MPK_OPROJ_INNER_TIMING
   _op_t2 = __builtin_amdgcn_s_memrealtime();
 #endif
+  MPK_ILSTAMP(22, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ════════════════════════════════════════════════════════════════════════
   // PHASE 3: RMSNorm + Router GEMV
@@ -2603,6 +2606,7 @@ topk_barrier :
   // writes AFTER the logit -- so a consumer that has seen all 128 tags
   // also sees them. The expert index undoes the logits pre-offset exactly
   // as topk_noinline does (hardware XCC id * NUM_EXPERTS / 8).
+  MPK_ILSTAMP(20, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   if (tid == 0) {
     st_wt_u32((void *)&routing_ready_ptr[MPK_LTK_ROUTING_REL +
                                          gang_rmsnorm_topk_detail::get_xcd_id() *
