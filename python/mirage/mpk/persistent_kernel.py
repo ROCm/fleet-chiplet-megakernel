@@ -1942,6 +1942,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_MOE_INNER_TIMING"]
         if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
             flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
+        if int(os.environ.get("MPK_ILSUB", "0")) == 1:
+            flags = flags + ["-DMPK_ILSUB"]
         if int(os.environ.get("MPK_QKV_INLINE", "0")) == 1:
             flags = flags + ["-DMPK_QKV_INLINE"]
         if int(os.environ.get("MPK_QKV_POS_PREFETCH", "0")) == 1:

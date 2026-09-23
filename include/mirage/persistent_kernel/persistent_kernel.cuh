@@ -69,6 +69,28 @@ __device__ unsigned long long g_qkvsub[1024 * 8];
   } while (0)
 #endif
 
+#ifdef MPK_ILSUB
+// Inter-layer path timestamps for the transition MPK_ILSUB_L0 -> L0 + 1;
+// see ilsub_patch.py for the stamp map.
+#ifndef MPK_ILSUB_L0
+#define MPK_ILSUB_L0 20
+#endif
+__device__ unsigned long long g_ilsub[1024 * 12];
+__shared__ int s_ilsub_ml;
+#define MPK_ILSUB(k, cond)                                            \
+  do {                                                                \
+    if (threadIdx.x == 0 && (cond)) {                                 \
+      asm volatile("" ::: "memory");                                   \
+      g_ilsub[blockIdx.x * 12 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                   \
+    }                                                                 \
+  } while (0)
+#else
+#define MPK_ILSUB(k, cond) \
+  do {                  \
+  } while (0)
+#endif
+
 #ifdef MPK_DRAIN_STATS
 // Phase 9 barrier segment attribution: how much of the layer-boundary wait is
 // store drain (s_waitcnt vmcnt(0)) vs rendezvous vs spinning on other XCDs.
@@ -2427,6 +2449,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             }
 #endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
+              MPK_ILSUB(2, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               unsigned long long _mlt0 = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -2515,6 +2538,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   __syncthreads();
               }
 
+              MPK_ILSUB(3, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_PREFETCH_NEXT_QKV
               // Publish the NEXT layer's QKV weight pointer so the fused task
               // can start its HBM->LDS weight DMA during the Phase 9 barrier
@@ -2600,6 +2624,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               }
               __syncthreads();
 #endif
+              MPK_ILSUB(4, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS
               // The inter-layer prologue: the ml_input_table / ml_output_table
               // copy plus the two __syncthreads that publish it. This runs
@@ -2664,8 +2689,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               if (threadIdx.x == 0) {
                 task_desc->task_metadata._linear_reserved =
                     (int32_t)((pc_iter - 1) * config.ml_num_layers + ml);
+#ifdef MPK_ILSUB
+                s_ilsub_ml = ml;
+#endif
               }
               __syncthreads();
+              MPK_ILSUB(5, ml == MPK_ILSUB_L0 + 1);
 
               // Execute this layer
               int my_tiles = 0;
@@ -2698,6 +2727,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               if (threadIdx.x == 0) {
                 gang_tiles_executed = my_tiles;
               }
+              MPK_ILSUB(0, ml == MPK_ILSUB_L0);
 
               // Inter-layer sync: threadfence_gpu flushes L2 write buffer so
               // next layer's buffer_inv + QKV epoch barrier sees fresh data.
@@ -2724,6 +2754,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #endif
                 __syncthreads();
               }
+              MPK_ILSUB(1, ml == MPK_ILSUB_L0);
             }
 
             // Deferred event signal: after compaction, layer 0's trigger_event
@@ -3816,6 +3847,18 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                    g_il_binv_sum / n,
                    g_il_post_sum / n,
                    (g_il_fnpre_sum + g_il_binv_sum + g_il_post_sum) / n);
+          }
+#endif
+#ifdef MPK_ILSUB
+          for (int w = 0; w < 1024; w++) {
+            if (g_ilsub[w * 12 + 10] == 0) {
+              continue;
+            }
+            printf("[ILSUB] b=%d", w);
+            for (int s = 0; s < 11; s++) {
+              printf(" %llu", g_ilsub[w * 12 + s]);
+            }
+            printf("\n");
           }
 #endif
 #ifdef MPK_ENABLE_MOE_SUBPHASE
