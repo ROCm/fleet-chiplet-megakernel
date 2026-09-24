@@ -642,7 +642,43 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
 #ifdef MPK_ILSUB
     unsigned long long ilsub_miss = 0, ilsub_iters = 0;
 #endif
+#if defined(MPK_POLL_PIPE) && !defined(MPK_LTK_POLL_SC1)
+    {
+      // Two samples in flight, half a round trip apart.
+      unsigned long long *tp = reinterpret_cast<unsigned long long *>(
+          const_cast<int *>(tags) + 2 * tid);
+      auto ltk_ready = [&](unsigned long long x) {
+        return (((unsigned)(x >> 16)) & 0xFFFFu) == want &&
+               (((unsigned)(x >> 48)) & 0xFFFFu) == want;
+      };
+      unsigned long long va =
+          __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __builtin_amdgcn_s_sleep(8);
+      unsigned long long vb =
+          __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      while (true) {
+#ifdef MPK_ILSUB
+        ilsub_iters++;
+#endif
+        if (__all(ltk_ready(va))) {
+          v = va;
+          break;
+        }
+        va = __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#ifdef MPK_ILSUB
+        ilsub_iters++;
+#endif
+        if (__all(ltk_ready(vb))) {
+          v = vb;
+          break;
+        }
+        vb = __hip_atomic_load(tp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+    }
+    while (false) {
+#else
     while (true) {
+#endif
 #ifdef MPK_LTK_POLL_SC1
       asm volatile("global_load_dwordx2 %0, %1, off sc1\n\ts_waitcnt vmcnt(0)"
                    : "=v"(v)
@@ -704,6 +740,60 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
 #ifdef MPK_LTK_SEL64
   float ltk_m = 0.f, ltk_i = 0.f;
 #endif
+#ifdef MPK_LTK_SELLOGIT
+#ifdef MPK_LTK_SEL64
+#error "MPK_LTK_SELLOGIT replaces the 16-lane softmax that MPK_LTK_SEL64 builds on"
+#endif
+  if (tid >= 128 && tid < 128 + THREADS_PER_ROW) {
+    // The original softmax statistics, on wave 2's first row.
+    int const sl = tid - 128;
+    float row_chunk[VPT];
+    for (int e = 0; e < VPT; ++e) {
+      row_chunk[e] =
+          __uint_as_float(((unsigned)s_ltk_logit[sl * VPT + e]) << 16);
+    }
+    float thread_max = row_chunk[0];
+    for (int ii = 1; ii < VPT; ++ii) {
+      thread_max = fmaxf(thread_max, row_chunk[ii]);
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    thread_max = topk_dpp_row_max_to_lane_zero(thread_max);
+#ifdef MPK_LTK_DPP
+    thread_max = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(thread_max)));
+#else
+    thread_max = __shfl(thread_max, 0, THREADS_PER_ROW);
+#endif
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      float other = __shfl_xor(thread_max, mask, THREADS_PER_ROW);
+      thread_max = fmaxf(thread_max, other);
+    }
+#endif
+    float row_sum = 0.f;
+    for (int ii = 0; ii < VPT; ++ii) {
+      row_chunk[ii] = __builtin_amdgcn_exp2f((row_chunk[ii] - thread_max) *
+                                             1.4426950408889634f);
+      row_sum += row_chunk[ii];
+    }
+#ifdef MPK_TOPK_DPP_REDUCE
+    row_sum = topk_dpp_row_sum_to_lane_zero(row_sum);
+#ifdef MPK_LTK_DPP
+    row_sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(row_sum)));
+#else
+    row_sum = __shfl(row_sum, 0, THREADS_PER_ROW);
+#endif
+#else
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      row_sum += __shfl_xor(row_sum, mask, THREADS_PER_ROW);
+    }
+#endif
+    float const inv_sum = 1.f / row_sum;
+    if (sl == 0) {
+      s_ltk_w[4] = thread_max;
+      s_ltk_w[5] = inv_sum;
+    }
+  }
+#endif
   if (tid < THREADS_PER_ROW) {
     float row_chunk[VPT];
     for (int e = 0; e < VPT; ++e) {
@@ -711,6 +801,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
       row_chunk[e] =
           __uint_as_float(((unsigned)s_ltk_logit[tid * VPT + e]) << 16);
     }
+#ifndef MPK_LTK_SELLOGIT
     float thread_max = row_chunk[0];
     for (int ii = 1; ii < VPT; ++ii) {
       thread_max = fmaxf(thread_max, row_chunk[ii]);
@@ -750,6 +841,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
     for (int ii = 0; ii < VPT; ++ii) {
       row_chunk[ii] *= inv_sum;
     }
+#endif
     MPK_ILSTAMP(25, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_LTK_SEL64
     ltk_m = thread_max;
@@ -882,7 +974,11 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
         s_ltk_sel[k_idx] = expert;
       }
       if (k_idx + 1 < K) {
+#ifdef MPK_LTK_SELLOGIT
+        float const neg_inf = __int_as_float(0xff800000);
+#else
         float const neg_inf = -10000.f;
+#endif
 #pragma unroll
         for (int i = 0; i < VPT; ++i) {
           asm volatile("v_cmp_eq_u32 vcc, %[ex], %[ci]\n"
@@ -893,12 +989,21 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
         }
       }
     }
+#ifdef MPK_LTK_SELLOGIT
+    (void)row_sum_for_renorm;
+    if (tid == 0) {
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        s_ltk_w[k_idx] = topk_vals[k_idx];
+      }
+    }
+#else
     if (tid == 0) {
       float inv = 1.f / row_sum_for_renorm;
       for (int k_idx = 0; k_idx < K; ++k_idx) {
         s_ltk_w[k_idx] = topk_vals[k_idx] * inv;
       }
     }
+#endif
 #endif
   }
 #ifdef MPK_LTK_SEL64
@@ -965,6 +1070,25 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
 #endif
   MPK_ILSTAMP(19, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   __syncthreads();
+#ifdef MPK_LTK_SELLOGIT
+  if (tid == 128) {
+    // Read only by W2, behind the MoE's own barriers.
+    float const m = s_ltk_w[4];
+    float const inv_sum = s_ltk_w[5];
+    float p[K];
+    float row_sum_for_renorm = 0.f;
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      p[k_idx] = __builtin_amdgcn_exp2f((s_ltk_w[k_idx] - m) *
+                                        1.4426950408889634f);
+      p[k_idx] *= inv_sum;
+      row_sum_for_renorm += p[k_idx];
+    }
+    float const inv = 1.f / row_sum_for_renorm;
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      s_ltk_w[k_idx] = p[k_idx] * inv;
+    }
+  }
+#endif
 }
 #endif
 

@@ -875,6 +875,41 @@ def get_compile_command(
             flags = flags + ["-DMPK_EMBED_WIDE"]
         if int(os.environ.get("MPK_EMBED_PIPE", "0")) == 1:
             flags = flags + ["-DMPK_EMBED_PIPE"]
+        if int(os.environ.get("MPK_W2SUB", "0")) == 1:
+            flags = flags + ["-DMPK_W2SUB"]
+        if int(os.environ.get("MPK_QKV_PF_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_EARLY"]
+        if int(os.environ.get("MPK_LTK_SELLOGIT", "0")) == 1:
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) != 1:
+                raise RuntimeError("MPK_LTK_SELLOGIT requires MPK_LOCAL_TOPK=1")
+            flags = flags + ["-DMPK_LTK_SELLOGIT"]
+        if int(os.environ.get("MPK_MOE_W2_REMAP", "0")) == 1:
+            if int(os.environ.get("MPK_MOE_XCD_PAIR", "1")) != 1:
+                raise RuntimeError("MPK_MOE_W2_REMAP needs MPK_MOE_XCD_PAIR")
+            flags = flags + ["-DMPK_MOE_W2_REMAP"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP_DELAY_US", "0")) > 0:
+                flags = flags + [
+                    "-DMPK_MOE_W2_REMAP_DELAY_US="
+                    + str(int(os.environ["MPK_MOE_W2_REMAP_DELAY_US"]))
+                ]
+        _w2warm = int(os.environ.get("MPK_W2_L2_WARM", "0"))
+        if _w2warm in (1, 2, 3):
+            flags = flags + ["-DMPK_W2_L2_WARM"]
+        if int(os.environ.get("MPK_W2_WARM_NT", "0")) == 1:
+            flags = flags + ["-DMPK_W2_WARM_NT"]
+        if _w2warm == 3 or int(os.environ.get("MPK_W2_DMA_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_W2_DMA_SC1"]
+        if _w2warm == 1 or int(os.environ.get("MPK_W2_PLAIN_DMA", "0")) == 1:
+            flags = flags + ["-DMPK_W2_PLAIN_DMA"]
+        if int(os.environ.get("MPK_W2_L2_WARM_DELAY_US", "0")) > 0:
+            flags = flags + [
+                "-DMPK_W2_L2_WARM_DELAY_US="
+                + str(int(os.environ["MPK_W2_L2_WARM_DELAY_US"]))
+            ]
+        if int(os.environ.get("MPK_P9_DEFER", "0")) == 1:
+            flags = flags + ["-DMPK_P9_DEFER"]
+        if int(os.environ.get("MPK_POLL_PIPE", "0")) == 1:
+            flags = flags + ["-DMPK_POLL_PIPE"]
         if int(os.environ.get("MPK_LM_STAMPS", "0")) == 1:
             flags = flags + ["-DMPK_LM_STAMPS"]
         if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:

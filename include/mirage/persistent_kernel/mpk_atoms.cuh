@@ -123,6 +123,50 @@ __device__ __forceinline__ int ld_sys_s32(int *addr) {
 #endif
 }
 
+#ifdef MPK_POLL_PIPE
+// Waits until *p >= target with two system-scope loads in flight, issued
+// about half a round trip apart, so a release is seen up to half a trip
+// sooner than with one load per trip. The first check is not delayed: the
+// first load's round trip is longer than the stagger.
+__device__ __forceinline__ void mpk_poll_ge_s32(int *p, int target) {
+  int a = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __builtin_amdgcn_s_sleep(10);
+  int b = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  while (true) {
+    if (a >= target) {
+      return;
+    }
+    a = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (b >= target) {
+      return;
+    }
+    b = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
+// Same for two monotonic flags that must both reach `target`: each sample
+// reads both, and two samples are in flight.
+__device__ __forceinline__ void mpk_poll_ge2_s32(int *p0, int *p1, int target) {
+  int a0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  int a1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __builtin_amdgcn_s_sleep(10);
+  int b0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  int b1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  while (true) {
+    if (a0 >= target && a1 >= target) {
+      return;
+    }
+    a0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    a1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (b0 >= target && b1 >= target) {
+      return;
+    }
+    b0 = __hip_atomic_load(p0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    b1 = __hip_atomic_load(p1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+#endif
+
 __device__ __forceinline__ unsigned long long ld_sys_u64(void *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) &&                                         \
     (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))

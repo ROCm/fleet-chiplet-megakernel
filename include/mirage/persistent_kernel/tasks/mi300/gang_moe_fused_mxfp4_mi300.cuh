@@ -4435,7 +4435,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
       s_tok_scales +
       (TOK_ROWS == 1 ? 0 : (tok_active ? col : 0) * W2_SC_STRIDE);
 
-  MOE_DBG_SUBPHASE(3000);
+  MOE_DBG_SUBPHASE(3000); MPK_W2STAMP(0);
   MPK_WS_MARK(8300, global_tile); // W2 entry
   // Weight pointers — depend only on expert_id/wg_idx, available before barrier
   uint8_t const *expert_weight =
@@ -4473,7 +4473,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
                 "W2 LDS weight tiles exceed MI350X LDS budget");
   uint8_t *lds_w2_base = (uint8_t *)_fused_smem + LDS_W2_OFF;
 
-  MOE_DBG_SUBPHASE(3001);
+  MOE_DBG_SUBPHASE(3001); MPK_W2STAMP(1);
   // All threads independently read layer_idx from LDS (uniform value).
   // Eliminates shared variable and __syncthreads broadcast.
   // Indexed by *slot*, not expert_id: the id comes from the shared mask and
@@ -4493,6 +4493,17 @@ gang_moe_fused_mxfp4_kernel_mi300(
   // Issue W2 weight buffer_load_lds BEFORE barrier poll — HBM loads fly
   // during barrier wait (~3us overlap instead of serial).
   // Single inline asm block to prevent compiler vmcnt serialization.
+#if defined(MPK_W2_DMA_SC1)
+// Device scope: bypasses L1 like nt, but L2 stays HIT_LRU, so a line
+// MPK_W2_L2_WARM pulled into L2 is a hit.
+#define MPK_W2_DMA_MOD "sc1"
+#elif defined(MPK_W2_PLAIN_DMA)
+// Plain W2 weight DMA, so a line MPK_W2_L2_WARM pulled into L2 is a hit;
+// an nt load drops a cached line and refetches it.
+#define MPK_W2_DMA_MOD ""
+#else
+#define MPK_W2_DMA_MOD "sc0 nt"
+#endif
 #ifdef MPK_W2_LINEAR_LOAD
   // Linear per-wave tile load, same transform as the W13 T0 site above and
   // for the same reason: W2's geometry is identical (W2_K == W13_K == 2880,
@@ -4517,11 +4528,11 @@ gang_moe_fused_mxfp4_kernel_mi300(
         "s_nop 4\n"
         "s_mov_b32 m0, %[lds_base]\n"
         "s_nop 0\n"
-        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen sc0 nt lds\n"
+        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen " MPK_W2_DMA_MOD " lds\n"
         ".rept 22\n"
         "s_addk_i32 m0, 0x400\n"
         "v_add_u32_e32 %[voff], 0x400, %[voff]\n"
-        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen sc0 nt lds\n"
+        "buffer_load_dwordx4 %[voff], %[rsrc], 0 offen " MPK_W2_DMA_MOD " lds\n"
         ".endr\n"
         : [voff] "+v"(w2_voff)
         : [rsrc] "s"(w2_rsrc), [lds_base] "s"(lds_w2_t0_base)
@@ -4546,53 +4557,53 @@ gang_moe_fused_mxfp4_kernel_mi300(
       }
     }
     asm volatile("s_mov_b32 m0, %[m0]\n  buffer_load_dwordx4 %[v0],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m1]\n  buffer_load_dwordx4 %[v1],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m2]\n  buffer_load_dwordx4 %[v2],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m3]\n  buffer_load_dwordx4 %[v3],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m4]\n  buffer_load_dwordx4 %[v4],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m5]\n  buffer_load_dwordx4 %[v5],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m6]\n  buffer_load_dwordx4 %[v6],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m7]\n  buffer_load_dwordx4 %[v7],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m8]\n  buffer_load_dwordx4 %[v8],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m9]\n  buffer_load_dwordx4 %[v9],  %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m10]\n buffer_load_dwordx4 %[v10], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m11]\n buffer_load_dwordx4 %[v11], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m12]\n buffer_load_dwordx4 %[v12], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m13]\n buffer_load_dwordx4 %[v13], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m14]\n buffer_load_dwordx4 %[v14], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m15]\n buffer_load_dwordx4 %[v15], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m16]\n buffer_load_dwordx4 %[v16], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m17]\n buffer_load_dwordx4 %[v17], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m18]\n buffer_load_dwordx4 %[v18], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m19]\n buffer_load_dwordx4 %[v19], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m20]\n buffer_load_dwordx4 %[v20], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m21]\n buffer_load_dwordx4 %[v21], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m22]\n buffer_load_dwordx4 %[v22], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  "s_mov_b32 m0, %[m23]\n buffer_load_dwordx4 %[v23], %[rsrc], "
-                 "0 offen sc0 nt lds\n"
+                 "0 offen " MPK_W2_DMA_MOD " lds\n"
                  :
                  : [rsrc] "s"(w2_rsrc),
                    [v0] "v"(w2v[0]),
@@ -4686,8 +4697,13 @@ gang_moe_fused_mxfp4_kernel_mi300(
                 &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE])) <
            W13_TILES * expected) {
 #else
+#ifdef MPK_POLL_PIPE
+    mpk_poll_ge_s32(&d_barrier[base + xcd_id * MOE_BAR_LINE], expected);
+    while (false) {
+#else
     while ((_obs = MPK_LD_GATE2(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
            expected) {
+#endif
 #endif
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
@@ -4727,7 +4743,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
     // block can be split across the barrier.
     MPK_WS_WAVE_EXIT(warp_id);
   }
-  MOE_DBG_SUBPHASE(3002);
+  MOE_DBG_SUBPHASE(3002); MPK_W2STAMP(2);
   MPK_WS_MARK(8302, global_tile); // W2: cleared W13->W2 barrier
 #ifdef MPK_MOE_INNER_TIMING
   unsigned long long _mt2 = __builtin_amdgcn_s_memrealtime();
@@ -4737,7 +4753,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
 
   // FP8 quant of SwiGLU output — writes to LDS[0..W2_K+scales]
   // buffer_load_lds writes to LDS[W2_OFF..] — no conflict, both in flight.
-  MOE_DBG_SUBPHASE(3003);
+  MOE_DBG_SUBPHASE(3003); MPK_W2STAMP(3);
   MPK_WS_MARK(8303, global_tile); // W2: FP8 quant of SwiGLU output
   {
     if constexpr (PACK_N && !SINGLE_TOK) {
@@ -4764,7 +4780,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
 
   // Drain ALL pending HBM loads: buffer_load_lds (weight) + scale loads
   // Weight loads were issued before barrier poll, should be done by now.
-  MOE_DBG_SUBPHASE(3004);
+  MOE_DBG_SUBPHASE(3004); MPK_W2STAMP(4);
   MPK_WS_MARK(8304, global_tile); // W2: drain HBM loads
   asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #ifndef MPK_W2_SCALE_OVERLAP
@@ -4792,7 +4808,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
 #if 0 // W2 timestamp disabled — near asm block
     g_subphase_scratch[6] = __builtin_amdgcn_s_memrealtime();
 #endif
-  MOE_DBG_SUBPHASE(3005);
+  MOE_DBG_SUBPHASE(3005); MPK_W2STAMP(5);
   MPK_WS_MARK(8305, global_tile); // W2: MFMA loop
   // LDS-based MFMA loop: weights already in LDS, compiler pipelines ds_reads.
   // Assembly shows lgkmcnt(7)/lgkmcnt(1) interleaving — much better than
@@ -5443,7 +5459,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
       }
 #endif
 
-      MOE_DBG_SUBPHASE(3006);
+      MOE_DBG_SUBPHASE(3006); MPK_W2STAMP(6);
       MPK_WS_MARK(8306, global_tile); // W2: epilogue
 #ifdef MPK_W2_T1_DURING_EPI
       if (W2_TILES_PER_WAVE > 1) {

@@ -678,11 +678,15 @@ __device__ __attribute__((noinline)) void
         __builtin_amdgcn_s_sleep(1);
       } while (true);
 #else
+#ifdef MPK_POLL_PIPE
+      mpk_poll_ge2_s32(rel0, rel1, layer_epoch);
+#else
       while (ld_sys_s32(rel0) < layer_epoch || ld_sys_s32(rel1) < layer_epoch) {
 #ifndef MPK_SLICE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif
       }
+#endif
 #endif
       // Cross-XCD acquire, per wave, placed at this wave's observation. The
       // caller's Phase 6 `buffer_inv` runs before any flag has been seen on
@@ -1788,8 +1792,14 @@ oproj_barrier :
                  : MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
                        oproj_release_expected) {
 #else
+#ifdef MPK_POLL_PIPE
+      mpk_poll_ge_s32(&hier_barrier[xcd_id * HIER_STRIDE],
+                      oproj_release_expected);
+      while (false) {
+#else
       while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
+#endif
 #endif
         __builtin_amdgcn_s_sleep(1);
       }

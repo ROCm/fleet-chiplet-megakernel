@@ -69,6 +69,22 @@ __device__ unsigned long long g_qkvsub[1024 * 8];
   } while (0)
 #endif
 
+#ifdef MPK_W2SUB
+__device__ unsigned long long g_w2sub[1024 * 8];
+#define MPK_W2STAMP(k)                                                 \
+  do {                                                                 \
+    if (threadIdx.x == 0) {                                            \
+      asm volatile("" ::: "memory");                                    \
+      g_w2sub[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                    \
+    }                                                                  \
+  } while (0)
+#else
+#define MPK_W2STAMP(k) \
+  do {             \
+  } while (0)
+#endif
+
 #ifdef MPK_ILSUB
 // Inter-layer path timestamps for the transition MPK_ILSUB_L0 -> L0 + 1;
 // see ilsub_patch.py for the stamp map.
@@ -3972,6 +3988,13 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[QKVSUB] w=%d", w);
               for (int s = 0; s < 8; s++) {
                 printf(" %llu", g_qkvsub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
+#ifdef MPK_W2SUB
+              printf("[W2SUB] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_w2sub[w * 8 + s]);
               }
               printf("\n");
 #endif

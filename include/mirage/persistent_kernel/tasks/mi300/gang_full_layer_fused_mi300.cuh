@@ -78,6 +78,28 @@ static constexpr int FULL_LAYER_LAYER_BARRIER_SLOT(int num_reqs) {
 // each, immediately above the layer-barrier region. demo.py counter_size
 // adds 128 ints for this. Local-last of 23 O-proj tiles publishes its XCD
 // here so the router can FMA that 368-col slice before the other XCDs land.
+#ifdef MPK_P9_DEFER
+#if !defined(MPK_P9_POLL_GLOBAL2) || !defined(MPK_LEAN_ARRIVE) || \
+    !defined(MPK_PREFETCH_NEXT_QKV) || !defined(MPK_W2_CONSUMER_GATE) || \
+    defined(MPK_NO_LAYER_BARRIER)
+#error "MPK_P9_DEFER is wired for P9_POLL_GLOBAL2 + LEAN_ARRIVE + PREFETCH_NEXT_QKV + W2_CONSUMER_GATE"
+#endif
+// The layer-gate target carried from one layer's Phase 9 to the next layer's
+// entry. It lives in the alignment padding after task_metadata in the task's
+// shared-memory TaskDesc slot, which the ml loop never writes between layers
+// (it rewrites only the pointer arrays, variant_id and _linear_reserved).
+__device__ __forceinline__ int *mpk_p9_word(void *const *input_ptrs) {
+  using TD = mirage::runtime::TaskDesc;
+  constexpr size_t kWord = offsetof(TD, task_metadata) +
+                           sizeof(mirage::runtime::FullTaskDesc::TaskMetadata);
+  static_assert(kWord + sizeof(int) <= sizeof(TD),
+                "TaskDesc has no padding word after task_metadata");
+  char *td = reinterpret_cast<char *>(const_cast<void **>(input_ptrs)) -
+             offsetof(TD, input_ptrs);
+  return reinterpret_cast<int *>(td + kWord);
+}
+#endif
+
 static constexpr int FULL_LAYER_OPROJ_XCD_READY_SLOT(int num_reqs) {
   return FULL_LAYER_LAYER_BARRIER_SLOT(num_reqs) + 272;
 }
@@ -640,6 +662,27 @@ __device__ __noinline__ void
           qkv_epoch_expected;
     }
   }
+#ifdef MPK_P9_DEFER
+  // The previous layer's gate. input_ptrs[25] is non-null exactly when a
+  // previous layer of this task ran, i.e. when the word was written.
+  if (tid == 0 && input_ptrs[25] != nullptr) {
+    int const p9_target = *mpk_p9_word(input_ptrs);
+    if (p9_target > 0) {
+      int *const p9_global =
+          oproj_counters_base + FULL_LAYER_LAYER_BARRIER_SLOT(NUM_REQS) + 8 * 16;
+#ifdef MPK_POLL_PIPE
+      mpk_poll_ge_s32(p9_global, p9_target);
+#else
+      while (MPK_LD_GATE(p9_global) < p9_target) {
+#ifndef MPK_LAYER_GATE_BUSY_POLL
+        __builtin_amdgcn_s_sleep(1);
+#endif
+      }
+#endif
+      asm volatile("buffer_inv sc1" ::: "memory");
+    }
+  }
+#endif
   __syncthreads();
 
   // ══════════════════════════════════════════════════════════════════
@@ -1748,18 +1791,102 @@ __device__ __noinline__ void
   // Two packed tiles per rank 0..22: W13 (bit7=0) then W2 (bit7=1). Ranks
   // 23..30 have no pair-map work; they still join Phase 9.
   constexpr int kMoePairRanks = 23;
+#ifdef MPK_MOE_W2_REMAP
+#ifdef MPK_W2_L2_WARM
+#error "MPK_MOE_W2_REMAP gives ranks 23..30 W2 groups; MPK_W2_L2_WARM uses them as warmers"
+#endif
+  // Ranks 0..7: W13 only. Ranks 8..22: W13 then W2. Ranks 23..30: W2 group
+  // (rank - 23) only, entered right after the TopK.
+  constexpr int kW2Moved = 8;
+  bool const moe_w2_mover = xcd_rank >= kMoePairRanks &&
+                            xcd_rank < kMoePairRanks + kW2Moved;
+  int const moe_begin = xcd_rank < kMoePairRanks ? 0 : 1;
+  int const moe_end = xcd_rank < kW2Moved         ? 1
+                      : xcd_rank < kMoePairRanks ? 2
+                      : moe_w2_mover             ? 2
+                                                 : 1;
+  int const moe_phase =
+      xcd_rank < kMoePairRanks ? xcd_rank : xcd_rank - kMoePairRanks;
+#else
   int const moe_begin = 0;
   int const moe_end = (xcd_rank < kMoePairRanks) ? 2 : 0;
+  int const moe_phase = xcd_rank;
+#endif
   int const moe_step = 1;
 #else
   int const moe_begin = xcd_rank;
   int const moe_end = moe_total_tiles_per_xcd;
   int const moe_step = workers_per_xcd;
 #endif
+#ifdef MPK_W2_L2_WARM
+#ifndef MPK_MOE_XCD_PAIR
+#error "MPK_W2_L2_WARM is wired for the MPK_MOE_XCD_PAIR tile map"
+#endif
+#ifdef MPK_W2_WARM_NT
+#define MPK_W2_WARM_MOD "sc0 nt"
+#else
+#define MPK_W2_WARM_MOD ""
+#endif
+  if (xcd_rank >= kMoePairRanks) {
+    // This XCD's MoE ranks stream W2 groups (xcd_id & 1) * 23 + [0, 23) of
+    // the expert routed to this XCD pair; each idle rank touches every 128 B
+    // line of an eighth of that range so their W2 weight DMA hits this XCD's
+    // L2. Same group geometry as gang_moe_fused_mxfp4_kernel_mi300's W2.
+    constexpr int kW2Wg = MOE_W2_OUTPUT_PER_WG * (MOE_INTERMEDIATE_SIZE / 2) +
+                          MOE_W2_OUTPUT_PER_WG * (MOE_INTERMEDIATE_SIZE / 32);
+    constexpr int64_t kW2Expert =
+        static_cast<int64_t>(MOE_HIDDEN_SIZE / MOE_W2_OUTPUT_PER_WG) * kW2Wg;
+    constexpr int kWarmers = 8;
+    constexpr int kSpan = kMoePairRanks * kW2Wg;
+    constexpr int kShare = (kSpan + kWarmers - 1) / kWarmers;
+    static_assert((kShare + 256 * 128 - 1) / (256 * 128) == 9,
+                  "the warm sequence below hardcodes .rept 8");
+    int const warm_j = xcd_rank - kMoePairRanks;
+    if (warm_j < kWarmers) {
+#if defined(MPK_W2_L2_WARM_DELAY_US) && MPK_W2_L2_WARM_DELAY_US > 0
+      unsigned long long const warm_t0 = __builtin_amdgcn_s_memrealtime();
+      while (__builtin_amdgcn_s_memrealtime() - warm_t0 <
+             100ull * MPK_W2_L2_WARM_DELAY_US) {
+        __builtin_amdgcn_s_sleep(8);
+      }
+#endif
+      int const warm_lo = warm_j * kShare;
+      int const warm_n = warm_lo + kShare <= kSpan ? kShare : kSpan - warm_lo;
+      uint8_t const *warm_base =
+          static_cast<uint8_t const *>(input_ptrs[18]) +
+          static_cast<int64_t>(routed_expert0) * kW2Expert +
+          static_cast<int64_t>((xcd_id & 1) * kMoePairRanks) * kW2Wg + warm_lo;
+      // Out-of-range offsets read zero (num_records = warm_n).
+      i32x4_t const warm_rsrc =
+          make_w_buffer_rsrc(warm_base, static_cast<uint32_t>(warm_n));
+      uint32_t warm_voff = static_cast<uint32_t>(tid) * 128u;
+      unsigned warm_sink;
+      asm volatile("buffer_load_dword %[d], %[voff], %[rsrc], 0 offen " MPK_W2_WARM_MOD "\n"
+                   ".rept 8\n"
+                   "v_add_u32_e32 %[voff], 0x8000, %[voff]\n"
+                   "buffer_load_dword %[d], %[voff], %[rsrc], 0 offen " MPK_W2_WARM_MOD "\n"
+                   ".endr\n"
+                   "s_waitcnt vmcnt(0)\n"
+                   : [d] "=&v"(warm_sink), [voff] "+v"(warm_voff)
+                   : [rsrc] "s"(warm_rsrc)
+                   : "memory");
+    }
+  }
+#endif
   for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
 #ifdef MPK_MOE_XCD_PAIR
     int const moe_t =
-        xcd_rank | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+        moe_phase | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+#if defined(MPK_MOE_W2_REMAP) && defined(MPK_MOE_W2_REMAP_DELAY_US) && \
+    MPK_MOE_W2_REMAP_DELAY_US > 0
+    if (moe_w2_mover) {
+      unsigned long long const w2d_t0 = __builtin_amdgcn_s_memrealtime();
+      while (__builtin_amdgcn_s_memrealtime() - w2d_t0 <
+             100ull * MPK_MOE_W2_REMAP_DELAY_US) {
+        __builtin_amdgcn_s_sleep(8);
+      }
+    }
+#endif
 #else
     int const moe_t = moe_i;
 #endif
@@ -1800,6 +1927,9 @@ __device__ __noinline__ void
                                                             routing_expected
 #endif
     );
+    if (moe_i == 1) {
+      MPK_W2STAMP(7);
+    }
   }
   MPK_PHASE_MARK(_pslot_w, 8);
   MPK_ILSTAMP(16, s_ilsub_ml == MPK_ILSUB_L0 + 1);
@@ -1955,7 +2085,12 @@ __device__ __noinline__ void
     int const n_w2_arrivers = n_w2_workers_per_xcd < workers_per_xcd
                                   ? n_w2_workers_per_xcd
                                   : workers_per_xcd;
-#if !defined(MPK_W2_CONSUMER_GATE)
+#if defined(MPK_MOE_W2_REMAP)
+    // W2 producers are ranks 8..30 and the gate waiters ranks 0..9: the
+    // union is everybody.
+    int const arrivers_per_xcd = workers_per_xcd;
+    bool const MPK_LAYER_GATE_ARRIVES = true;
+#elif !defined(MPK_W2_CONSUMER_GATE)
     // JOINS is `true` here, so the union is everybody.
     int const arrivers_per_xcd = workers_per_xcd;
     bool const MPK_LAYER_GATE_ARRIVES = true;
@@ -2036,6 +2171,28 @@ __device__ __noinline__ void
     unsigned long long _dr1 = __builtin_amdgcn_s_memrealtime();
 #endif
     __syncthreads();
+#if defined(MPK_PREFETCH_NEXT_QKV) && defined(MPK_QKV_PF_EARLY)
+#if defined(MPK_QKV_PF_WAVE_SPLIT) || defined(MPK_QKV_KSPLIT) || \
+    defined(MPK_DRAIN_OVERLAP)
+#error "MPK_QKV_PF_EARLY is wired for the unsplit prefetch behind the drain"
+#endif
+    // The next layer's QKV tile, staged before the arrival rather than after
+    // it. Waves 1..3 issue all four stripes (wave 1 also wave 0's), so wave 0,
+    // whose lane 0 runs the arrival atomics and their vmcnt(0) waits, has none
+    // of the DMA outstanding.
+    if (input_ptrs[24] != nullptr && qkv_does_qkv && tid >= 64) {
+      qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                               QKV_OUTPUT_PER_WG,
+                               QKV_REDUCTION_SIZE>(
+          input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank, 0, -1, tid >> 6);
+      if ((tid >> 6) == 1) {
+        qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                                 QKV_OUTPUT_PER_WG,
+                                 QKV_REDUCTION_SIZE>(
+            input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank, 0, -1, 0);
+      }
+    }
+#endif
 #ifdef MPK_DRAIN_STATS
     unsigned long long _dr2 = __builtin_amdgcn_s_memrealtime();
 #endif
@@ -2327,6 +2484,9 @@ __device__ __noinline__ void
     // across the iteration boundary.
     if (input_ptrs[24] != nullptr &&
         qkv_does_qkv
+#ifdef MPK_QKV_PF_EARLY
+        && false
+#endif
 #ifdef MPK_QKV_PF_WAVE_SPLIT
         // ── Keep the poller's wave out of the pre-gate DMA ─────────────────
         //
@@ -2426,12 +2586,24 @@ __device__ __noinline__ void
     // like-for-like wait span: the pre-gate half is release-publishing work,
     // not waiting, so folding it in overstates the gate.
     MPK_PHASE_MARK(_pslot_w, 9);
+#ifdef MPK_P9_DEFER
+    if (tid == 0) {
+      *mpk_p9_word(input_ptrs) = MPK_LAYER_GATE_JOINS ? s_layer_rel_prev + 8 : 0;
+    }
+    if (false) {
+#else
     if (tid == 0 && MPK_LAYER_GATE_JOINS) {
+#endif
 #if defined(MPK_P9_POLL_GLOBAL) || defined(MPK_P9_POLL_GLOBAL2)
 #ifndef MPK_LEAN_ARRIVE
 #error "MPK_P9_POLL_GLOBAL relies on MPK_LEAN_ARRIVE's s_layer_rel_prev = 8 * layers done"
 #endif
+#ifdef MPK_POLL_PIPE
+      mpk_poll_ge_s32(layer_global, s_layer_rel_prev + 8);
+      while (false) {
+#else
       while (MPK_LD_GATE(layer_global) < s_layer_rel_prev + 8) {
+#endif
 #else
       while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
 #endif

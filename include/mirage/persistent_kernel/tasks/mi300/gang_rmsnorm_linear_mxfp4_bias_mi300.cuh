@@ -154,12 +154,16 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
                                                          int n_wgs_per_xcd,
                                                          int tile_idx,
                                                          int k_iter0 = 0,
-                                                         int k_niters = -1) {
+                                                         int k_niters = -1,
+                                                         int stripe = -1) {
   using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
   extern __shared__ char _rnlm_smem[];
 
   int const tid = threadIdx.x;
   int const warp_id = tid >> 6;
+  // Which wave's 1 KiB stripes to issue; by default the caller's own.
+  int const sw = stripe >= 0 ? stripe : warp_id;
+  int const stid = sw * 64 + (tid & 63);
   int const wg_idx = tile_idx % n_wgs_per_xcd;
 
   uint8_t const *W = (uint8_t const *)weight_ptr;
@@ -170,7 +174,7 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
   auto *lds_warp_base =
       (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
                                                      G::W_OFF +
-                                                     warp_id * 1024);
+                                                     sw * 1024);
   constexpr int ROW_BYTES = REDUCTION_SIZE / 2;
   int const k_byte0 = k_iter0 * 64;
   int const k_byte1 = k_niters < 0 ? ROW_BYTES : (k_iter0 + k_niters) * 64;
@@ -181,7 +185,7 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
   for (int t = 0; t < G::NUM_WAVES; t++) {
 #pragma unroll
     for (int j = 0; j < G::LPT; j++) {
-      int idx = tid + j * 256;
+      int idx = stid + j * 256;
       int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
       int const off_in_row = (clamped * 16) % ROW_BYTES;
       if (off_in_row < k_byte0 || off_in_row >= k_byte1) {
@@ -206,9 +210,9 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
     // HBM round trip serialized behind the first. Only waves 0-1 participate:
     // TILE_SCALE is 16*NUM_BLOCKS_32 bytes, well under the 2 KiB two waves
     // move, and every lane past that would just re-fetch the clamped tail.
-    if (warp_id < 2) {
+    if (sw < 2) {
       constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
-      int const vector = warp_id * 64 + (tid & 63);
+      int const vector = sw * 64 + (tid & 63);
       int const clamped = vector < SCALE_VECTORS ? vector : SCALE_VECTORS - 1;
       uint32_t voff = wg_voff + static_cast<uint32_t>(G::WG_DATA_BYTES) +
                       static_cast<uint32_t>(t * G::TILE_SCALE) +
