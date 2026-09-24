@@ -1604,10 +1604,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
     int tmpl_len = config.precomp_xcd_template_len[tmpl_flat];
     size_t *tmpl_src =
         config.precomp_xcd_template + tmpl_flat * config.precomp_max_tpw;
+#ifdef MPK_EMB_FIRST
+    // The graph-begin marker carries no data: run the embedding it gates
+    // first on this worker; its wait on the marker is skipped at dispatch.
+    bool const pc_swap =
+        tmpl_len >= 2 && tmpl_src[0] == 1 &&
+        config.all_tasks[tmpl_src[1]].task_type == TASK_EMBEDDING;
+    for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
+      pc_my_queue[pc_swap && i < 2 ? 1 - i : i] = tmpl_src[i];
+    }
+#else
     // Parallel copy: each thread copies a chunk
     for (int i = threadIdx.x; i < tmpl_len; i += blockDim.x) {
       pc_my_queue[i] = tmpl_src[i];
     }
+#endif
     __syncthreads();
     if (threadIdx.x == 0) {
       config.precomp_queue_len[worker_id] = tmpl_len;
@@ -1619,6 +1630,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
       pc_has_begin = (tmpl_len > 0 && tmpl_src[0] == 1)
                          ? 1
                          : 0; // position 1 = begin_task_graph
+#ifdef MPK_EMB_FIRST
+      if (pc_swap) {
+        pc_has_begin = 2; // embedding moved ahead of the marker
+      }
+#endif
       if (worker_id < 8) {
         printf("[PC_INIT] worker=%d xcd=%d rank=%d tmpl_len=%d\n",
                worker_id,
@@ -1887,6 +1903,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                          (int)get_task_position_index(task_ids[queue_pos]),
                          __ATOMIC_RELAXED);
       }
+#endif
+#ifdef MPK_EMB_FIRST
+      if (pc_has_begin == 2 && task_desc->task_type == TASK_EMBEDDING) {
+        // Its only dependency is the graph-begin marker, now queued behind
+        // it. Keep the acquire the wait would have ended with.
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+      } else
 #endif
       if (task_desc->dependent_event != EVENT_INVALID_ID) {
         EventId event_id = task_desc->dependent_event;

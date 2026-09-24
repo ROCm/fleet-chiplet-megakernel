@@ -875,6 +875,24 @@ def get_compile_command(
             flags = flags + ["-DMPK_EMBED_WIDE"]
         if int(os.environ.get("MPK_EMBED_PIPE", "0")) == 1:
             flags = flags + ["-DMPK_EMBED_PIPE"]
+        if int(os.environ.get("MPK_LM_STAMPS", "0")) == 1:
+            flags = flags + ["-DMPK_LM_STAMPS"]
+        if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:
+            flags = flags + ["-DMPK_EMB_FIRST"]
+        if int(os.environ.get("MPK_LM_RESADD", "0")) == 1:
+            flags = flags + ["-DMPK_LM_RESADD"]
+        if int(os.environ.get("MPK_LTK_SEL64", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_SEL64"]
+        if int(os.environ.get("MPK_LM_NORM_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_LM_NORM_LDS"]
+        if int(os.environ.get("MPK_ARGMAX_IDX_PF", "0")) == 1:
+            flags = flags + ["-DMPK_ARGMAX_IDX_PF"]
+        if int(os.environ.get("MPK_EVT_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_EVT_FAST"]
+        if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:
+            flags = flags + ["-DMPK_EMB_FIRST"]
+        if int(os.environ.get("MPK_LM_RESADD", "0")) == 1:
+            flags = flags + ["-DMPK_LM_RESADD"]
         if int(os.environ.get("MPK_LTK_SEL64", "0")) == 1:
             flags = flags + ["-DMPK_LTK_SEL64"]
         if int(os.environ.get("MPK_LM_NORM_LDS", "0")) == 1:

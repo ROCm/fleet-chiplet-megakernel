@@ -2266,6 +2266,12 @@ if __name__ == "__main__":
         # slots of its own row in fixed order. See moe_ws_layout.cuh, whose
         # MOE_WS_SLOTS must equal num_experts_per_tok.
         moe_workspace_f32 = make_tensor("moe_workspace_f32", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE), torch_dtype=torch.float32)
+        # MPK_LM_RESADD: the LM head adds the last layer's MoE slabs to the
+        # residual itself, so layer 0 reads a workspace that is always zero
+        # instead of one the final residual-add task clears.
+        _lm_resadd = os.environ.get("MPK_LM_RESADD", "0") == "1"
+        moe_ws_zero = (make_tensor("moe_ws_zero", (bs, num_experts_per_tok * PADDED_HIDDEN_SIZE),
+                                   torch_dtype=torch.float32) if _lm_resadd else None)
         mlp_weighted_sum_out = make_tensor("mlp_weighted_sum_out", (bs, PADDED_HIDDEN_SIZE))
         mlp_final = make_tensor("mlp_final", (bs, PADDED_HIDDEN_SIZE))
         # Argmax — fused into LM head GEMM (type 218, norm-once):
@@ -2662,7 +2668,7 @@ if __name__ == "__main__":
                     else:
                         mpk.gang_full_layer_fused_layer(
                             # QKV+Attn inputs
-                            workspace_f32=moe_workspace_f32,
+                            workspace_f32=(moe_ws_zero if (_lm_resadd and i == 0) else moe_workspace_f32),
                             residual=x,
                             norm_weight_pre=w_norm,
                             norm_scratch_pre=rmsnorm_out,
@@ -2720,7 +2726,7 @@ if __name__ == "__main__":
                         )
                     x = attn_proj_out
                     # Last layer needs explicit residual add (f32→bf16)
-                    if i == num_layers - 1 and not fused_tail_done:
+                    if i == num_layers - 1 and not fused_tail_done and not _lm_resadd:
                         mpk.moe_residual_add_f32_layer(
                             workspace_f32=moe_workspace_f32,
                             residual=x,
@@ -3164,6 +3170,7 @@ if __name__ == "__main__":
             # Fused LM head GEMM + argmax (type 218): each tile writes
             # per-tile (max_val, rel_idx) instead of logits to HBM.
             # Eliminates 393KB logits write + 393KB logits read.
+            assert not (_lm_resadd and ppl_logits is not None), "MPK_LM_RESADD carries the workspace in the logits slot"
             mpk.gang_rmsnorm_linear_mxfp4_bias_argmax_layer(
                 norm_input=x,
                 norm_weight=w_norm,
@@ -3176,7 +3183,7 @@ if __name__ == "__main__":
                 output_per_wg=lm_head_output_per_wg,
                 output_stride=vocab_size,
                 block_dim=(256, 1, 1),
-                ppl_logits=ppl_logits,
+                ppl_logits=(moe_workspace_f32 if _lm_resadd else ppl_logits),
             )
             mpk.argmax_reduce_layer(
                 input=(argmax_part_value, argmax_part_index),

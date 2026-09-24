@@ -272,6 +272,22 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
                 "each K128 fragment must be one 64-lane 16-byte request");
 #endif
 
+#ifdef MPK_LM_RESADD
+#ifdef MPK_LM_NORM_LDS
+  constexpr int LM_RESADD_OFF =
+      LM_NORM_OFF + ((BATCH_SIZE * REDUCTION_SIZE * 2 + 15) / 16) * 16;
+#else
+  constexpr int LM_RESADD_OFF = ((QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES +
+                                  2 * QKV_SCALE_PIPELINE_BYTES + 15) /
+                                 16) *
+                                16;
+#endif
+  static_assert(LM_RESADD_OFF + BATCH_SIZE * REDUCTION_SIZE * 2 <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                "MPK_LM_RESADD: the residual rows exceed the LDS budget");
+  static_assert(REDUCTION_SIZE % 4 == 0, "MPK_LM_RESADD works in float4");
+#endif
   uint8_t const *W = (uint8_t const *)weight_ptr;
   unsigned short const *d_bias = (unsigned short const *)bias_ptr;
 
@@ -304,6 +320,11 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   // the pointer already points at this XCD's worker slice while the row
   // stride is still the full worker count.
   int const argmax_row_stride = workers_per_xcd * 8;
+#ifdef MPK_LM_STAMPS
+  unsigned long long lmst[20];
+  int lmst_n = 0;
+  if (lmst_n < 20) lmst[lmst_n++] = __builtin_amdgcn_s_memrealtime();
+#endif
 
   // ── Step 1: RMSNorm ─────────────────────────────────────────────────────
   // DO NOT add a __syncthreads() to this loop body. Measured at bs=2: without
@@ -313,9 +334,57 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   // (BATCH_SIZE), so it is the barrier and not the trip count.
   // rmsnorm_inline_amd already ends with its own cross-wave barrier pair; an
   // extra one here is what breaks it.
+#ifdef MPK_LM_RESADD
+  // Final residual add, done here instead of in its own task: norm_input is
+  // the residual and logits_out_ptr carries the MoE f32 workspace. Same loop
+  // shape, slot order and rounding as moe_residual_add_f32_mi300, so the row
+  // is bit-identical to that task's output. Staged in LDS for the RMSNorm.
+  // The worker's dependency check already ran an agent-scope acquire.
+  float const *lm_ws = static_cast<float const *>(logits_out_ptr);
+  logits_out_ptr = nullptr;
+  unsigned short *lm_x =
+      (unsigned short *)((uint8_t *)_rnlm_smem + LM_RESADD_OFF);
   for (int b = 0; b < batch_count; b++) {
+    float const *ws_row = lm_ws + (b * 4) * REDUCTION_SIZE;
+    unsigned short const *res_row =
+        (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
+    for (int off = tid * 4; off < REDUCTION_SIZE; off += 256 * 4) {
+      float4 ws4;
+      __builtin_memcpy(&ws4, ws_row + off, 16);
+#pragma unroll
+      for (int s = 1; s < 4; s++) {
+        float4 slot4;
+        __builtin_memcpy(&slot4, ws_row + s * REDUCTION_SIZE + off, 16);
+        ws4.x += slot4.x;
+        ws4.y += slot4.y;
+        ws4.z += slot4.z;
+        ws4.w += slot4.w;
+      }
+      uint2 res_packed;
+      __builtin_memcpy(&res_packed, res_row + off, 8);
+      float const s0 = ws4.x + __uint_as_float((res_packed.x & 0xFFFFu) << 16);
+      float const s1 = ws4.y + __uint_as_float(res_packed.x & 0xFFFF0000u);
+      float const s2 = ws4.z + __uint_as_float((res_packed.y & 0xFFFFu) << 16);
+      float const s3 = ws4.w + __uint_as_float(res_packed.y & 0xFFFF0000u);
+      auto f2bf16 = [](float f) -> unsigned {
+        unsigned const u = __float_as_uint(f);
+        return (u + (((u >> 16) & 1u) + 0x7FFFu)) >> 16;
+      };
+      uint2 out_packed;
+      out_packed.x = f2bf16(s0) | (f2bf16(s1) << 16);
+      out_packed.y = f2bf16(s2) | (f2bf16(s3) << 16);
+      __builtin_memcpy(lm_x + b * REDUCTION_SIZE + off, &out_packed, 8);
+    }
+  }
+  __syncthreads();
+#endif
+  for (int b = 0; b < batch_count; b++) {
+#ifdef MPK_LM_RESADD
+    unsigned short const *row_in = lm_x + b * REDUCTION_SIZE;
+#else
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + (long long)b * REDUCTION_SIZE;
+#endif
 #ifdef MPK_LM_NORM_LDS
     unsigned short *row_out = (unsigned short *)((uint8_t *)_rnlm_smem + LM_NORM_OFF) + b * REDUCTION_SIZE;
 #else
@@ -326,6 +395,9 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
         row_in, norm_weight_ptr, row_out);
   }
 
+#ifdef MPK_LM_STAMPS
+  if (lmst_n < 20) lmst[lmst_n++] = __builtin_amdgcn_s_memrealtime();
+#endif
   // SRD for weight buffer (hoisted outside every loop)
   uint32_t qkv_buf_range = static_cast<uint32_t>(n_wgs_per_xcd) * WG_BYTES;
   i32x4_t qkv_rsrc = make_w_buffer_rsrc(W, qkv_buf_range);
@@ -488,6 +560,9 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
 
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#ifdef MPK_LM_STAMPS
+    if (lmst_n < 20) lmst[lmst_n++] = __builtin_amdgcn_s_memrealtime();
+#endif
 
       // Issue group-zero scales from HBM via VGPR. Later groups use the
       // ping-pong direct-to-LDS scale buffers filled below.
@@ -788,6 +863,15 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     } // end tile loop
 
     // ── Reduce within the wave, across g only ───────────────────────────
+#ifdef MPK_LM_STAMPS
+    if (tid == 0 && worker_rank == 0 && step == 1060) {
+      unsigned long long const lmst_end = __builtin_amdgcn_s_memrealtime();
+      printf("[LMST] p=%d n=%d %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+             "%llu %llu %llu %llu %llu %llu %llu %llu end=%llu\n",
+             partition_index, lmst_n, lmst_n > 1 ? lmst[1] - lmst[0] : 0ull, lmst_n > 2 ? lmst[2] - lmst[0] : 0ull, lmst_n > 3 ? lmst[3] - lmst[0] : 0ull, lmst_n > 4 ? lmst[4] - lmst[0] : 0ull, lmst_n > 5 ? lmst[5] - lmst[0] : 0ull, lmst_n > 6 ? lmst[6] - lmst[0] : 0ull, lmst_n > 7 ? lmst[7] - lmst[0] : 0ull, lmst_n > 8 ? lmst[8] - lmst[0] : 0ull, lmst_n > 9 ? lmst[9] - lmst[0] : 0ull, lmst_n > 10 ? lmst[10] - lmst[0] : 0ull, lmst_n > 11 ? lmst[11] - lmst[0] : 0ull, lmst_n > 12 ? lmst[12] - lmst[0] : 0ull, lmst_n > 13 ? lmst[13] - lmst[0] : 0ull, lmst_n > 14 ? lmst[14] - lmst[0] : 0ull, lmst_n > 15 ? lmst[15] - lmst[0] : 0ull, lmst_n > 16 ? lmst[16] - lmst[0] : 0ull, lmst_n > 17 ? lmst[17] - lmst[0] : 0ull,
+             lmst_end - lmst[0]);
+    }
+#endif
     // NOT the full 64-lane butterfly: lanes differing in `col` hold different
     // tokens, so mixing them would return one token's argmax for all 16.
     // XOR on bits 4 and 5 walks the 4 g-groups and leaves `col` alone.
