@@ -1534,7 +1534,19 @@ oproj_barrier :
     // value. Zero means "not the releaser", which is unambiguous because a
     // real epoch is >= 1.
     int oproj_rel_epoch = 0;
+#ifdef MPK_OPROJ_TILE_FLAGS
+    bool const mpk_tf = layer_epoch > 0;
+    if (tid == 0 && mpk_tf) {
+#ifndef MPK_OPROJ_NO_WB
+      threadfence_gpu();
+#endif
+      st_wt_u32((void *)&hier_barrier[MPK_OPROJ_TILE_FLAG_SLOT + tile_idx],
+                (unsigned)layer_epoch);
+    }
+    if (tid == 0 && !mpk_tf) {
+#else
     if (tid == 0) {
+#endif
       // GPU-scope release fence before the arrival.
       //
       // atom_add_release_gpu_s32 is not a release on AMD -- its own definition
@@ -1713,6 +1725,14 @@ oproj_barrier :
 
     // All threads poll per-XCD release flag independently.
     // ld_nt coalesces across waves, so no extra HBM traffic.
+#ifdef MPK_OPROJ_TILE_FLAGS
+    if (mpk_tf) {
+      if (tid < 64) {
+        mpk_oproj_tile_flag_poll(&hier_barrier[MPK_OPROJ_TILE_FLAG_SLOT],
+                                 total_oproj_tiles, oproj_release_expected);
+      }
+    } else
+#endif
 #ifdef MPK_OPROJ_ARRIVE_ONLY
     // ── TESTED AND REJECTED: incorrect. Kept for the reasoning. ──────────
     //

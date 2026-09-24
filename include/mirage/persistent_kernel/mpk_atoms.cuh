@@ -620,3 +620,45 @@ __shared__ int s_ltk_sel[8];
 __shared__ float s_ltk_w[8];
 __shared__ unsigned short s_ltk_logit[128];
 #endif
+
+#ifdef MPK_OPROJ_TILE_FLAGS
+#if defined(MPK_OPROJ_ARRIVE_ONLY) || defined(MPK_ROUTER_XCD_FOLD)
+#error "MPK_OPROJ_TILE_FLAGS replaces the O-proj release that these flags modify"
+#endif
+// One ready word per O-proj tile (the layer epoch), after the LTK tag and
+// normed-row words. demo.py grows the block to MPK_OPROJ_TILE_FLAG_SLOT + 256
+// under the flag.
+constexpr int MPK_OPROJ_TILE_FLAG_SLOT = 2048 + 128 + 8 * 32;
+// Called by one full wave. Each lane checks up to three words per trip, all
+// three loads in flight together.
+__device__ __forceinline__ void mpk_oproj_tile_flag_poll(int *flags, int n,
+                                                         int expected) {
+  int const lane = threadIdx.x & 63;
+  if (n > 192) {
+    for (int j = lane; j < n; j += 64) {
+      while (ld_sys_s32(flags + j) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    return;
+  }
+  int *const p0 = flags + (lane < n ? lane : 0);
+  int *const p1 = flags + (lane + 64 < n ? lane + 64 : 0);
+  int *const p2 = flags + (lane + 128 < n ? lane + 128 : 0);
+  while (true) {
+    int a, b, c;
+    asm volatile("global_load_dword %0, %3, off sc0 sc1\n"
+                 "global_load_dword %1, %4, off sc0 sc1\n"
+                 "global_load_dword %2, %5, off sc0 sc1\n"
+                 "s_waitcnt vmcnt(0)"
+                 : "=&v"(a), "=&v"(b), "=&v"(c)
+                 : "v"(p0), "v"(p1), "v"(p2)
+                 : "memory");
+    bool const ok = a >= expected && b >= expected && c >= expected;
+    if (__builtin_amdgcn_ballot_w64(!ok) == 0) {
+      break;
+    }
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+#endif

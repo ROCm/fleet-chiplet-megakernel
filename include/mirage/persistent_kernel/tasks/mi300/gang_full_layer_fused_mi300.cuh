@@ -100,6 +100,15 @@ __device__ __forceinline__ int *mpk_p9_word(void *const *input_ptrs) {
 }
 #endif
 
+#ifdef MPK_ATTN_Q_EPOCH
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_ATTN_SPLIT_CHUNK) || \
+    defined(MPK_QKV_EPOCH_POLL_SC1) || !defined(MPK_QKV_EPOCH_PRODUCER_DRAIN)
+#error "MPK_ATTN_Q_EPOCH is wired for the unsplit QKV/attention and the drained epoch"
+#endif
+// Per-XCD Q-only arrival lines, then per-XCD Q release lines, 16 ints each,
+// after the LTK and O-proj tile-flag words (demo.py grows the block).
+static constexpr int MPK_ATTN_QEPOCH_SLOT = 2048 + 128 + 8 * 32 + 256;
+#endif
 static constexpr int FULL_LAYER_OPROJ_XCD_READY_SLOT(int num_reqs) {
   return FULL_LAYER_LAYER_BARRIER_SLOT(num_reqs) + 272;
 }
@@ -571,6 +580,10 @@ __device__ __noinline__ void
   int *oproj_counters_base = static_cast<int *>(input_ptrs[16]);
   int *attn_global = oproj_counters_base + FULL_LAYER_ATTN_GLOBAL_COUNTER_SLOT;
   int *qkv_epoch = oproj_counters_base + FULL_LAYER_QKV_EPOCH_SLOT;
+#ifdef MPK_ATTN_Q_EPOCH
+  int *const mpk_qe_count = oproj_counters_base + MPK_ATTN_QEPOCH_SLOT;
+  int *const mpk_qe_rel = mpk_qe_count + 8 * 16;
+#endif
   int *chunk_barrier = oproj_counters_base + FULL_LAYER_CHUNK_BARRIER_SLOT;
   int *routing_ready = oproj_counters_base + 10 * 16;
   int *attn_release = oproj_counters_base + FULL_LAYER_ATTN_XCD_RELEASE_SLOT;
@@ -679,7 +692,11 @@ __device__ __noinline__ void
 #endif
       }
 #endif
+#ifdef MPK_P9_DEFER_INV_L1
+      asm volatile("buffer_inv sc0" ::: "memory");
+#else
       asm volatile("buffer_inv sc1" ::: "memory");
+#endif
     }
   }
 #endif
@@ -736,6 +753,16 @@ __device__ __noinline__ void
         // ends of the hand-off can disagree, and a mismatch here would be
         // silent wrong numerics rather than a fault.
         /*weights_preloaded=*/input_ptrs[25] == input_ptrs[4]
+#ifdef MPK_QKV_PF_SKIP_W2
+#if !defined(MPK_MOE_W2_REMAP) || defined(MPK_ROTATE_QKV_ATTN_RANKS) || \
+    defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_PF_WAVE_SPLIT) ||          \
+    defined(MPK_QKV_PF_EARLY)
+#error "MPK_QKV_PF_SKIP_W2 is wired for MPK_MOE_W2_REMAP's rank map, unrotated and unsplit"
+#endif
+            // Ranks >= 8 run a W2 group under MPK_MOE_W2_REMAP and do not
+            // stage at Phase 9 (the same test guards the prefetch there).
+            && xcd_rank < 8
+#endif
 #else
         /*weights_preloaded=*/false
 #endif
@@ -780,6 +807,17 @@ __device__ __noinline__ void
 #endif
   {
     __shared__ int s_prev;
+#ifdef MPK_ATTN_Q_EPOCH
+    // Issued ahead of the producer drain so its vmcnt(0) covers the latency.
+    int mpk_qe_kv0 = 0, mpk_qe_kv1 = 0, mpk_qe_lpl = 0;
+    if constexpr (SLIDING_WINDOW == 0 && NUM_REQS == 1) {
+      if (tid == 0 && qkv_attn_rank < ATTN_PARTICIPANTS) {
+        mpk_qe_kv0 = kv_indptr[attn_req];
+        mpk_qe_kv1 = kv_indptr[attn_req + 1];
+        mpk_qe_lpl = kv_last_page_len[attn_req];
+      }
+    }
+#endif
 #ifdef MPK_QKV_EPOCH_PRODUCER_DRAIN
     // Publish this workgroup's Q/K/V stores into this XCD's L2 before the
     // arrival atomic. Same intra-XCD pattern as the Phase 4 chunk barrier:
@@ -798,8 +836,24 @@ __device__ __noinline__ void
       // atomic out to the device coherency point was buying visibility to
       // nobody. `sc0` keeps them in this XCD's L2 where every participant
       // already is.
+#ifdef MPK_ATTN_Q_EPOCH
+    }
+    // Lane 0 arrives on the full counter and, for a Q tile, lane 1 on the
+    // Q-only counter, in one instruction.
+    if (tid == 0 || (tid == 1 && qkv_attn_rank < NUM_Q_PER_KV)) {
+      int *const mpk_qe_a = tid == 0
+                                ? &static_cast<int *>(input_ptrs[7])[xcd_id]
+                                : &mpk_qe_count[xcd_id * 16];
+      int const mpk_qe_p = MPK_XCD_LOCAL_ATOM_ADD(mpk_qe_a, 1);
+      if (tid == 0) {
+        s_prev = mpk_qe_p;
+      } else if ((mpk_qe_p % NUM_Q_PER_KV) == NUM_Q_PER_KV - 1) {
+        MPK_XCD_LOCAL_ATOM_ADD(&mpk_qe_rel[xcd_id * 16], 1);
+      }
+#else
       s_prev = MPK_XCD_LOCAL_ATOM_ADD(
           &static_cast<int *>(input_ptrs[7])[xcd_id], 1);
+#endif
     }
     __syncthreads();
 
@@ -817,6 +871,21 @@ __device__ __noinline__ void
     if (tid == 0) {
       int _obs;
       int _spins = 0;
+      int *mpk_qe_poll = &qkv_epoch[xcd_id * 16];
+#ifdef MPK_ATTN_Q_EPOCH
+      if constexpr (SLIDING_WINDOW == 0 && NUM_REQS == 1) {
+        if (qkv_attn_rank < ATTN_PARTICIPANTS) {
+          // The attention call's partition: 16-token tiles over seqlen_k,
+          // ceil(ntiles / NUM_KV_CHUNKS) tiles per chunk.
+          int const sk = (mpk_qe_kv1 - mpk_qe_kv0 - 1) * PAGE_SIZE + mpk_qe_lpl;
+          int const nt = (sk + 15) / 16;
+          int const tpc = (nt + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+          if (nt > 0 && attn_chunk != (nt - 1) / tpc) {
+            mpk_qe_poll = &mpk_qe_rel[xcd_id * 16];
+          }
+        }
+      }
+#endif
 #ifdef MPK_QKV_EPOCH_POLL_SC1
       auto qkv_epoch_ld = [&]() {
         int v;
@@ -828,8 +897,8 @@ __device__ __noinline__ void
       };
       while ((_obs = qkv_epoch_ld()) < qkv_epoch_expected) {
 #else
-      while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
-                                     __ATOMIC_RELAXED)) < qkv_epoch_expected) {
+      while ((_obs = __atomic_load_n(mpk_qe_poll, __ATOMIC_RELAXED)) <
+             qkv_epoch_expected) {
 #endif
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
@@ -1617,7 +1686,13 @@ __device__ __noinline__ void
 #ifndef MPK_NO_OPROJ_SKIP_GATE
   if (!does_oproj) {
     int *oproj_hier = static_cast<int *>(input_ptrs[16]);
-#ifdef MPK_OPROJ_POLL_GLOBAL
+#ifdef MPK_OPROJ_TILE_FLAGS
+    if (tid < 64) {
+      mpk_oproj_tile_flag_poll(&oproj_hier[MPK_OPROJ_TILE_FLAG_SLOT],
+                               total_oproj_tiles, qkv_epoch_expected);
+    }
+    __syncthreads();
+#elif defined(MPK_OPROJ_POLL_GLOBAL)
     if (tid == 0) {
       while (MPK_LD_GATE2(&oproj_hier[8 * 16]) < 8 * qkv_epoch_expected) {
         __builtin_amdgcn_s_sleep(1);
@@ -2484,6 +2559,9 @@ __device__ __noinline__ void
     // across the iteration boundary.
     if (input_ptrs[24] != nullptr &&
         qkv_does_qkv
+#ifdef MPK_QKV_PF_SKIP_W2
+        && xcd_rank < 8
+#endif
 #ifdef MPK_QKV_PF_EARLY
         && false
 #endif

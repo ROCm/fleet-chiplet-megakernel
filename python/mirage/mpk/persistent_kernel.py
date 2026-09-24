@@ -910,6 +910,16 @@ def get_compile_command(
             flags = flags + ["-DMPK_P9_DEFER"]
         if int(os.environ.get("MPK_POLL_PIPE", "0")) == 1:
             flags = flags + ["-DMPK_POLL_PIPE"]
+        if int(os.environ.get("MPK_ATTN_Q_EPOCH", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_Q_EPOCH"]
+        if int(os.environ.get("MPK_P9_DEFER_INV_L1", "0")) == 1:
+            flags = flags + ["-DMPK_P9_DEFER_INV_L1"]
+        if int(os.environ.get("MPK_MOE_BAR_NO_REFRESH", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_BAR_NO_REFRESH"]
+        if int(os.environ.get("MPK_QKV_PF_SKIP_W2", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_SKIP_W2"]
+        if int(os.environ.get("MPK_OPROJ_TILE_FLAGS", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_TILE_FLAGS"]
         if int(os.environ.get("MPK_LM_STAMPS", "0")) == 1:
             flags = flags + ["-DMPK_LM_STAMPS"]
         if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:

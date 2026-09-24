@@ -2204,6 +2204,12 @@ if __name__ == "__main__":
                 if os.environ.get("MPK_LTK_EARLY_TAG", "0") == "1":
                     # +8 x 32 ints: per-XCD normed-row ready words (MPK_LTK_NORM_SLOT).
                     counter_size = max(counter_size, 2048 + 128 + 8 * 32)
+            if os.environ.get("MPK_OPROJ_TILE_FLAGS", "0") == "1":
+                # +256 ints: per-tile O-proj ready words (MPK_OPROJ_TILE_FLAG_SLOT).
+                counter_size = max(counter_size, 2048 + 128 + 8 * 32 + 256)
+            if os.environ.get("MPK_ATTN_Q_EPOCH", "0") == "1":
+                # +256 ints: per-XCD Q-only arrival and release lines (MPK_ATTN_QEPOCH_SLOT).
+                counter_size = max(counter_size, 2048 + 128 + 8 * 32 + 256 + 256)
             oproj_topk_counters = make_tensor("oproj_topk_counters", (counter_size,), torch_dtype=torch.int32)
         # Hierarchical barrier for fused QKV+Attention kernel [16 int32]:
         # [0..7]: per-XCD QKV arrival counters, [8]: global leader count
