@@ -760,7 +760,11 @@ __device__ __forceinline__ void
 __device__ __forceinline__ void
     _execute_gang_task_ml(TaskDesc const *task_desc,
                           RuntimeConfig const &runtime_config,
+#ifdef MPK_IL_CACHE2
+                          int tile_idx, int ml_qo_len);
+#else
                           int tile_idx);
+#endif
 #endif
 
 // Helper: check if a task type is a gang task
@@ -2461,11 +2465,24 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             void *_pf_in = nullptr;
             void *_pf_out = nullptr;
             void *_pf_cur = nullptr;
+#ifdef MPK_IL_CACHE2
+#if !defined(MPK_FUSED_INLINE)
+#error "MPK_IL_CACHE2 needs MPK_FUSED_INLINE (the ml-only dispatch carries qo_len)"
+#endif
+            int _pf_var = 0;      // variant id of layer ml+1, read during layer ml
+            int _pf_var_cur = 0;
+            int ml_qo_len = 0;    // qo_indptr_buffer[1], read at layer 0
+#endif
             bool const _pf_ok =
                 (blockDim.x >= (unsigned)MAX_INPUTS_PER_TASK) &&
                 config.ml_num_layers > 1;
             if (_pf_ok) {
               int _pf_base = (xcd_id * config.ml_num_layers + 1);
+#ifdef MPK_IL_CACHE2
+              if (threadIdx.x == 0) {
+                _pf_var = config.ml_variant_ids[1];
+              }
+#endif
               if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
                 _pf_in = config.ml_input_table[_pf_base * MAX_INPUTS_PER_TASK +
                                                threadIdx.x];
@@ -2531,6 +2548,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   // out of the task descriptor.
                   _pf_cur = _pf_in;
                   int _nl = ml + 1;
+#ifdef MPK_IL_CACHE2
+                  if (threadIdx.x == 0) {
+                    _pf_var_cur = _pf_var;
+                    if (_nl < config.ml_num_layers) {
+                      _pf_var = config.ml_variant_ids[_nl];
+                    }
+                  }
+#endif
                   if (_nl < config.ml_num_layers) {
                     int _nb = (xcd_id * config.ml_num_layers + _nl);
                     if ((int)threadIdx.x < MAX_INPUTS_PER_TASK) {
@@ -2560,6 +2585,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                 if (threadIdx.x == 0) {
 #ifdef MPK_IL_FAST
                   task_desc->variant_id = s_ml_variant[ml];
+#elif defined(MPK_IL_CACHE2)
+                  task_desc->variant_id =
+                      _pf_ok ? _pf_var_cur : config.ml_variant_ids[ml];
 #else
                   task_desc->variant_id = config.ml_variant_ids[ml];
 #endif
@@ -2774,7 +2802,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                   b[1] = 200; // phase: inside gang tile execution
                 }
 #endif
-#ifdef MPK_FUSED_INLINE
+#if defined(MPK_FUSED_INLINE) && defined(MPK_IL_CACHE2)
+                if (ml == 0) {
+                  ml_qo_len = config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+                }
+                _execute_gang_task_ml(task_desc, config, ml_n_tile_start + t, ml_qo_len);
+#elif defined(MPK_FUSED_INLINE)
                 _execute_gang_task_ml(task_desc, config, ml_n_tile_start + t);
 #else
                 _execute_gang_task(task_desc, config, ml_n_tile_start + t);
@@ -3283,6 +3316,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         assert(gpu_id == config.my_gpu_id);
         // Case 1: Trigger a local non-nvshmem event
         int num_triggers = config.all_event_num_triggers[event_index];
+#ifdef MPK_EVT_FAST
+        // Read-only and host-built: issued with the counter metadata so its
+        // latency overlaps theirs instead of following both atomics.
+        EventDesc const evt_fast_desc = config.all_events[event_index];
+#endif
         EventCounter count = 0;
         bool event_fired = false;
 
@@ -3314,6 +3352,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                                       ? gang_tiles_executed
                                       : 1;
 #endif
+#ifdef MPK_EVT_FAST
+            EventCounter needed_local =
+                static_cast<EventCounter>(xcd_threshold) *
+                get_task_iteration_num(task_ids[queue_pos]);
+            // A sole contributor on its XCD is always the last one; the
+            // returning L2 atomic would only confirm it.
+            EventCounter local_count =
+                (xcd_threshold == 1 && event_increment == 1)
+                    ? needed_local
+                    : atom_add_local_u64(
+                          reinterpret_cast<unsigned long long int *>(
+                              &config.xcd_local_event_counters[xcd_slot]),
+                          event_increment) +
+                          event_increment;
+#else
             EventCounter local_count =
                 atom_add_local_u64(
                     reinterpret_cast<unsigned long long int *>(
@@ -3323,9 +3376,15 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             EventCounter needed_local =
                 static_cast<EventCounter>(xcd_threshold) *
                 get_task_iteration_num(task_ids[queue_pos]);
+#endif
 
             if (local_count == needed_local) {
               // Last worker/task on this XCD — flush + signal global
+#ifdef MPK_EVT_FAST
+              // The graph-begin marker writes no data, so it has nothing to
+              // publish.
+              if (task_desc->task_type != TASK_BEGIN_TASK_GRAPH)
+#endif
               threadfence_gpu();
               // Gang: flush 1 (one task done). Non-gang: flush xcd_threshold.
               int flush_amount =
@@ -3413,7 +3472,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
 #ifdef MPK_ENABLE_PROFILING
           PROFILER_EVENT_START(TASK_SCHD_EVENTS, task_counter);
 #endif
+#ifdef MPK_EVT_FAST
+          EventDesc event_desc = evt_fast_desc;
+#else
           EventDesc event_desc = config.all_events[event_index];
+#endif
           if (event_desc.event_type == EVENT_EMPTY) {
             // Do nothing for empty event
           }

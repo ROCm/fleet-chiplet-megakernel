@@ -4337,8 +4337,18 @@ gang_moe_fused_mxfp4_kernel_mi300(
       // the per-XCD slots of one expert held *different* epochs, which is
       // impossible if the eight stores from one producer all survived.
       // COUNTER_OFF puts the counter on the next line.
+#ifdef MPK_MOE_POLL_COUNTER
+      // The W2 waves poll this counter itself; nobody needs the old value,
+      // and 0 keeps the release branch below from firing.
+      asm volatile("flat_atomic_add %0, %1 sc1" ::"v"(
+                       &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE]),
+                   "v"(1)
+                   : "memory");
+      int const prev_global = 0;
+#else
       int prev_global = atom_add_release_gpu_s32(
           &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE], 1);
+#endif
       // Exact only if every tile counted by W13_TILES arrives here. Under
       // packing W13_TILES == W13_WGS and no tile returns between the decode
       // and this line, so it is. The pre-packing decode had a token axis and
@@ -4671,8 +4681,14 @@ gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
+#ifdef MPK_MOE_POLL_COUNTER
+    while ((_obs = MPK_LD_GATE2(
+                &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE])) <
+           W13_TILES * expected) {
+#else
     while ((_obs = MPK_LD_GATE2(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
            expected) {
+#endif
       MPK_WS_WAIT_TICK(_obs, _spins);
       // Refresh the discriminating values on the same cadence as the tick:
       // the raw arrival counter (whether it sits on a multiple of W13_TILES

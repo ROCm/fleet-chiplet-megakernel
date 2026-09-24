@@ -1463,6 +1463,9 @@ oproj_barrier :
 
   i32x2_pf_t g_pf_buf[MAX_ITERS_PF];
   i32x2_pf_t w_pf_buf[MAX_ITERS_PF];
+#ifdef MPK_ROUTER_BIAS_PF3
+  unsigned rbias_pf3 = 0;
+#endif
 #ifdef MPK_ROUTER_BIAS_PF
   unsigned rbias_pf = 0;
 #endif
@@ -1633,10 +1636,21 @@ oproj_barrier :
                   (unsigned)oproj_release_expected);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
-        int const prev_global =
-            atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
-        if ((prev_global % 8) == 7) {
-          oproj_rel_epoch = oproj_release_expected;
+#ifdef MPK_OPROJ_POLL_GLOBAL
+        if (layer_epoch > 0) {
+          // The gates poll this counter itself; nobody needs the old value.
+          asm volatile("flat_atomic_add %0, %1 sc1" ::"v"(
+                           &hier_barrier[8 * HIER_STRIDE]),
+                       "v"(1)
+                       : "memory");
+        } else
+#endif
+        {
+          int const prev_global =
+              atom_add_release_gpu_s32(&hier_barrier[8 * HIER_STRIDE], 1);
+          if ((prev_global % 8) == 7) {
+            oproj_rel_epoch = oproj_release_expected;
+          }
         }
       }
 #else
@@ -1683,6 +1697,14 @@ oproj_barrier :
                      : "v"(w_base_pf + byte_off)
                      : "memory");
       }
+#ifdef MPK_ROUTER_BIAS_PF3
+      {
+        unsigned short const *rb = router_bias_ptr
+            ? static_cast<unsigned short const *>(router_bias_ptr) + local_tile
+            : static_cast<unsigned short const *>(norm_weight_ptr);
+        rbias_pf3 = *rb;
+      }
+#endif
     }
 
     // All threads poll per-XCD release flag independently.
@@ -1756,8 +1778,19 @@ oproj_barrier :
     // other 255 threads do not need their own sc0 sc1 reads of this line.
     if (tid == 0)
 #endif
+#ifdef MPK_OPROJ_POLL_GLOBAL
+#ifndef MPK_OPROJ_TREE_BARRIER
+#error "MPK_OPROJ_POLL_GLOBAL relies on the tree barrier's 8 arrivals per layer"
+#endif
+      while (layer_epoch > 0
+                 ? MPK_LD_GATE2(&hier_barrier[8 * HIER_STRIDE]) <
+                       8 * oproj_release_expected
+                 : MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+                       oproj_release_expected) {
+#else
       while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
              oproj_release_expected) {
+#endif
         __builtin_amdgcn_s_sleep(1);
       }
   }
@@ -2237,7 +2270,9 @@ oproj_barrier :
         }
         s *= irms_t0;
         if (d_rbias) {
-#ifdef MPK_ROUTER_BIAS_PF
+#if defined(MPK_ROUTER_BIAS_PF3)
+          s += __uint_as_float(rbias_pf3 << 16);
+#elif defined(MPK_ROUTER_BIAS_PF)
           s += __uint_as_float(rbias_pf << 16);
 #else
           s += __bfloat162float(d_rbias[local_tile]);

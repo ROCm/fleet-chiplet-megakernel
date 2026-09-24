@@ -599,6 +599,30 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 // sum reductions, the same asm argmax and tie-break, the same
 // renormalization -- so every workgroup reproduces the completer's picks and
 // weights bit for bit.
+#ifdef MPK_LTK_SEL64
+// Wave-wide float max, broadcast from lane 63. Lanes a DPP step does not write
+// keep their own value, which max leaves unchanged.
+__device__ __forceinline__ float ltk_wave_max(float v) {
+  int x = __float_as_int(v);
+#define LTK_WMAX_STEP(CTRL, ROW_MASK)                                         \
+  x = __float_as_int(fmaxf(__int_as_float(x),                                 \
+                           __int_as_float(__builtin_amdgcn_update_dpp(         \
+                               x, x, CTRL, ROW_MASK, 0xF, false))))
+  LTK_WMAX_STEP(0xB1, 0xF);  // quad_perm [1,0,3,2]
+  LTK_WMAX_STEP(0x4E, 0xF);  // quad_perm [2,3,0,1]
+  LTK_WMAX_STEP(0x124, 0xF); // row_ror:4
+  LTK_WMAX_STEP(0x128, 0xF); // row_ror:8
+  LTK_WMAX_STEP(0x142, 0xA); // row_bcast:15 into rows 1 and 3
+  LTK_WMAX_STEP(0x143, 0xC); // row_bcast:31 into rows 2 and 3
+#undef LTK_WMAX_STEP
+  return __int_as_float(__builtin_amdgcn_readlane(x, 63));
+}
+
+__device__ __forceinline__ int ltk_bitrev4(int r) {
+  return ((r & 1) << 3) | ((r & 2) << 1) | ((r & 4) >> 1) | ((r & 8) >> 3);
+}
+#endif
+
 template <int NUM_EXPERTS, int K>
 __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
                                                int const *norm_flags = nullptr,
@@ -677,6 +701,9 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
   }
 #endif
   MPK_ILSTAMP(24, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_LTK_SEL64
+  float ltk_m = 0.f, ltk_i = 0.f;
+#endif
   if (tid < THREADS_PER_ROW) {
     float row_chunk[VPT];
     for (int e = 0; e < VPT; ++e) {
@@ -724,6 +751,10 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
       row_chunk[ii] *= inv_sum;
     }
     MPK_ILSTAMP(25, s_ilsub_ml == MPK_ILSUB_L0 + 1);
+#ifdef MPK_LTK_SEL64
+    ltk_m = thread_max;
+    ltk_i = inv_sum;
+#else
     int const start_col = tid * VPT;
     float row_sum_for_renorm = 0.f;
     float topk_vals[8];
@@ -868,7 +899,70 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
         s_ltk_w[k_idx] = topk_vals[k_idx] * inv;
       }
     }
+#endif
   }
+#ifdef MPK_LTK_SEL64
+  if (tid < 64) {
+    float const m =
+        __int_as_float(__builtin_amdgcn_readlane(__float_as_int(ltk_m), 0));
+    float const inv =
+        __int_as_float(__builtin_amdgcn_readlane(__float_as_int(ltk_i), 0));
+    int const e0 = 2 * tid;
+    float p0 = __builtin_amdgcn_exp2f(
+        (__uint_as_float(((unsigned)s_ltk_logit[e0]) << 16) - m) *
+        1.4426950408889634f);
+    float p1 = __builtin_amdgcn_exp2f(
+        (__uint_as_float(((unsigned)s_ltk_logit[e0 + 1]) << 16) - m) *
+        1.4426950408889634f);
+    p0 *= inv;
+    p1 *= inv;
+    float row_sum_for_renorm = 0.f;
+    float topk_vals[8];
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      bool const hi = p1 > p0;
+      float const lmax = hi ? p1 : p0;
+      int const lexp = hi ? e0 + 1 : e0;
+      float const gmax = ltk_wave_max(lmax);
+      bool const tied = lmax == gmax;
+      unsigned long long const tmask = __ballot(tied);
+      int jsel;
+      if ((tmask & (tmask - 1)) == 0) {
+        jsel = __builtin_ctzll(tmask);
+      } else {
+        jsel = 0;
+        for (int r = 15; r >= 0; --r) {
+          int const g = ltk_bitrev4(r);
+          unsigned const bits = (unsigned)(tmask >> (4 * g)) & 0xFu;
+          if (bits) {
+            jsel = 4 * g + __builtin_ctz(bits);
+          }
+        }
+      }
+      int const sel = __builtin_amdgcn_readlane(lexp, jsel);
+      if (tid == 0) {
+        topk_vals[k_idx] = gmax;
+        row_sum_for_renorm += gmax;
+        s_ltk_sel[k_idx] = sel;
+      }
+      if (k_idx + 1 < K) {
+        unsigned const grp = (unsigned)(tmask >> (tid & ~3)) & 0xFu;
+        if (tied && (grp & ((1u << (tid & 3)) - 1u)) == 0u) {
+          if (hi) {
+            p1 = -10000.f;
+          } else {
+            p0 = -10000.f;
+          }
+        }
+      }
+    }
+    if (tid == 0) {
+      float const inv_r = 1.f / row_sum_for_renorm;
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        s_ltk_w[k_idx] = topk_vals[k_idx] * inv_r;
+      }
+    }
+  }
+#endif
   MPK_ILSTAMP(19, s_ilsub_ml == MPK_ILSUB_L0 + 1);
   __syncthreads();
 }

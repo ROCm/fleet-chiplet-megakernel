@@ -61,6 +61,46 @@ __device__ __forceinline__ void
              output_ptr);
     }
 #endif
+#ifdef MPK_EMBED_PIPE
+    // One round trip for the whole row: every lane issues all of its 16-byte
+    // loads before any store. The loops below have a runtime trip count
+    // (blockDim.x), so each trip waits for its own load before issuing the
+    // next. Needs 16-byte-aligned bases and at least PIPE_LANES threads; the
+    // worker block that runs this task is wider than the task's own 128.
+    constexpr int PIPE_VALS = 16 / sizeof(T);
+    constexpr int PIPE_LANES = 128;
+    constexpr int PIPE_NVEC = CHUNK_SIZE / PIPE_VALS;
+    constexpr int PIPE_PER_LANE = (PIPE_NVEC + PIPE_LANES - 1) / PIPE_LANES;
+    constexpr bool PIPE_SHAPE_OK = sizeof(T) * PIPE_VALS == 16 &&
+                                   CHUNK_SIZE % PIPE_VALS == 0 &&
+                                   OUTPUT_DIM_SIZE % PIPE_VALS == 0;
+    bool const pipe_aligned = ((reinterpret_cast<uintptr_t>(embedding) |
+                                reinterpret_cast<uintptr_t>(output)) &
+                               15u) == 0;
+    if (PIPE_SHAPE_OK && pipe_aligned && blockDim.x >= PIPE_LANES &&
+        wordIdx >= 0) {
+      uint4 const *__restrict__ src =
+          reinterpret_cast<uint4 const *>(embedding) +
+          wordIdx * (OUTPUT_DIM_SIZE / PIPE_VALS);
+      uint4 *__restrict__ dst = reinterpret_cast<uint4 *>(output) +
+                                batch_idx * (OUTPUT_DIM_SIZE / PIPE_VALS);
+      uint4 v[PIPE_PER_LANE];
+#pragma unroll
+      for (int k = 0; k < PIPE_PER_LANE; k++) {
+        int const i = threadIdx.x + k * blockDim.x;
+        if (i < PIPE_NVEC) {
+          v[k] = src[i];
+        }
+      }
+#pragma unroll
+      for (int k = 0; k < PIPE_PER_LANE; k++) {
+        int const i = threadIdx.x + k * blockDim.x;
+        if (i < PIPE_NVEC) {
+          dst[i] = v[k];
+        }
+      }
+    } else
+#endif
 #ifdef MPK_EMBED_WIDE
     // Copy 8 bytes per lane instead of one element. The scalar arm below moves
     // sizeof(T) bytes per lane per trip, so a 2944-wide bf16 row takes 23 trips

@@ -246,6 +246,19 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
                 "LM-head LDS exceeds the MI350X dynamic LDS budget");
   static_assert(TOK_ROW_STRIDE % 16 == 0,
                 "token row stride must keep the i32x4 B-operand loads aligned");
+#ifdef MPK_LM_NORM_LDS
+  // The normalized rows get their own block past the weight staging, so no
+  // region they share is live at the same time.
+  constexpr int LM_NORM_OFF = ((QKV_LDS_OFF + QKV_TILE_BYTES * NUM_WAVES +
+                                2 * QKV_SCALE_PIPELINE_BYTES + 15) /
+                               16) *
+                              16;
+  static_assert(NUM_BBLK == 1, "MPK_LM_NORM_LDS stages every batch row at once");
+  static_assert(LM_NORM_OFF + BATCH_SIZE * REDUCTION_SIZE * 2 <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                "MPK_LM_NORM_LDS: the normalized rows exceed the LDS budget");
+#endif
 #ifdef MPK_LM_HEAD_GROUP_PIPELINE
   static_assert(BATCH_SIZE == 1,
                 "MPK_LM_HEAD_GROUP_PIPELINE is batch-1 only");
@@ -303,8 +316,12 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
   for (int b = 0; b < batch_count; b++) {
     unsigned short const *row_in =
         (unsigned short const *)norm_input_ptr + (long long)b * REDUCTION_SIZE;
+#ifdef MPK_LM_NORM_LDS
+    unsigned short *row_out = (unsigned short *)((uint8_t *)_rnlm_smem + LM_NORM_OFF) + b * REDUCTION_SIZE;
+#else
     unsigned short *row_out =
         (unsigned short *)norm_output_ptr + (long long)b * REDUCTION_SIZE;
+#endif
     gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
         row_in, norm_weight_ptr, row_out);
   }
@@ -339,7 +356,11 @@ gang_rmsnorm_linear_mxfp4_bias_argmax_kernel(
     // ── Step 2: FP8 quant of this block's token rows ──────────────────────
     _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE,
                              TOK_ROW_STRIDE, SC_STRIDE>(
+#ifdef MPK_LM_NORM_LDS
+        (unsigned short const *)(unsigned short *)((uint8_t *)_rnlm_smem + LM_NORM_OFF), REDUCTION_SIZE, bblk * MFMA_N,
+#else
         (unsigned short const *)norm_output_ptr, REDUCTION_SIZE, bblk * MFMA_N,
+#endif
         TOK_ROWS, s_tok_fp8, s_tok_scales);
 
     // Each lane owns exactly one token (N column `col`), so the running

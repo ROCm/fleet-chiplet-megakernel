@@ -173,7 +173,7 @@ def export_to_perfetto_trace(
             tag, num_blocks, num_groups
         )
 
-        event = event_name_list[event_idx] + f"_{event_no}"
+        event = event_name_list.get(event_idx, f"TASK_{event_idx}") + f"_{event_no}"
         tid = tid_map[(block_idx, group_idx)]
 
         if (block_idx, group_idx, event_idx) in track_map:

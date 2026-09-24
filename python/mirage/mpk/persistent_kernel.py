@@ -873,6 +873,16 @@ def get_compile_command(
         # removes were never the thing being waited on.
         if int(os.environ.get("MPK_EMBED_WIDE", "0")) == 1:
             flags = flags + ["-DMPK_EMBED_WIDE"]
+        if int(os.environ.get("MPK_EMBED_PIPE", "0")) == 1:
+            flags = flags + ["-DMPK_EMBED_PIPE"]
+        if int(os.environ.get("MPK_LTK_SEL64", "0")) == 1:
+            flags = flags + ["-DMPK_LTK_SEL64"]
+        if int(os.environ.get("MPK_LM_NORM_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_LM_NORM_LDS"]
+        if int(os.environ.get("MPK_ARGMAX_IDX_PF", "0")) == 1:
+            flags = flags + ["-DMPK_ARGMAX_IDX_PF"]
+        if int(os.environ.get("MPK_EVT_FAST", "0")) == 1:
+            flags = flags + ["-DMPK_EVT_FAST"]
         # Keep the QKV RMSNorm result in LDS instead of round-tripping it
         # through the global norm scratch. Every block computes the same norm
         # and reads it back itself, so the write carried no information
@@ -1966,6 +1976,20 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_INLINE"]
         if int(os.environ.get("MPK_MOE_INLINE", "0")) == 1:
             flags = flags + ["-DMPK_MOE_INLINE"]
+        if int(os.environ.get("MPK_ROUTER_BIAS_PF3", "0")) == 1:
+            flags = flags + ["-DMPK_ROUTER_BIAS_PF3"]
+        if int(os.environ.get("MPK_IL_CACHE2", "0")) == 1:
+            flags = flags + ["-DMPK_IL_CACHE2"]
+        if int(os.environ.get("MPK_P9_POLL_GLOBAL", "0")) == 1:
+            flags = flags + ["-DMPK_P9_POLL_GLOBAL"]
+        if int(os.environ.get("MPK_OPROJ_POLL_GLOBAL", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_POLL_GLOBAL"]
+        if int(os.environ.get("MPK_MOE_POLL_COUNTER", "0")) == 1:
+            flags = flags + ["-DMPK_MOE_POLL_COUNTER"]
+        if int(os.environ.get("MPK_QKV_EPOCH_POLL_SC1", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_POLL_SC1"]
+        if int(os.environ.get("MPK_P9_POLL_GLOBAL2", "0")) == 1:
+            flags = flags + ["-DMPK_P9_POLL_GLOBAL2"]
         if int(os.environ.get("MPK_QKV_SUBSTAMPS", "0")) == 1:
             flags = flags + ["-DMPK_QKV_SUBSTAMPS"]
         if int(os.environ.get("MPK_ILSUB", "0")) == 1:
@@ -6184,6 +6208,10 @@ class PersistentKernel:
                 "void _execute_gang_task(", "void _execute_gang_task_ml(", 1).replace(
                 "kernel::gang_full_layer_fused_kernel_mi300<",
                 "kernel::gang_full_layer_fused_kernel_mi300_inl<")
+            if int(os.environ.get("MPK_IL_CACHE2", "0")) == 1:
+                _ml = _ml.replace("int tile_idx) {", "int tile_idx, int ml_qo_len) {", 1)
+                _ml = _ml.replace(
+                    "runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]", "ml_qo_len")
             _n = _ml.count("gang_full_layer_fused_kernel_mi300_inl<")
             if _n == 0:
                 raise RuntimeError("MPK_FUSED_INLINE: no fused-layer call in the dispatch")
@@ -6403,13 +6431,13 @@ class PersistentKernel:
             else:
                 trace_name = f"mirage_{self.mpi_rank}.perfetto-trace"
 
-            export_to_perfetto_trace(
-                self.profiler_tensor, trace_name
-            )
             # Also save raw profiler tensor for programmatic analysis
             raw_path = trace_name.replace(".perfetto-trace", ".pt")
             torch.save(self.profiler_tensor.cpu(), raw_path)
             print(f"Saved raw profiler tensor to {raw_path}")
+            export_to_perfetto_trace(
+                self.profiler_tensor, trace_name
+            )
 
     def __del__(self):
         if not self.__finalized__:

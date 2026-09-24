@@ -511,7 +511,7 @@ __device__ __noinline__ void
   MPK_ILSTAMP(7, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_ILSUB
   if (tid == 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
-    g_ilsub[blockIdx.x * 24 + 10] = (unsigned long long)(_pslot_w + 1);
+    g_ilsub[blockIdx.x * 32 + 10] = (unsigned long long)(_pslot_w + 1);
   }
 #endif
 
@@ -774,8 +774,20 @@ __device__ __noinline__ void
     if (tid == 0) {
       int _obs;
       int _spins = 0;
+#ifdef MPK_QKV_EPOCH_POLL_SC1
+      auto qkv_epoch_ld = [&]() {
+        int v;
+        asm volatile("global_load_dword %0, %1, off sc1\n\ts_waitcnt vmcnt(0)"
+                     : "=v"(v)
+                     : "v"(&qkv_epoch[xcd_id * 16])
+                     : "memory");
+        return v;
+      };
+      while ((_obs = qkv_epoch_ld()) < qkv_epoch_expected) {
+#else
       while ((_obs = __atomic_load_n(&qkv_epoch[xcd_id * 16],
                                      __ATOMIC_RELAXED)) < qkv_epoch_expected) {
+#endif
         MPK_WS_WAIT_TICK(_obs, _spins);
         _spins++;
         __builtin_amdgcn_s_sleep(1);
@@ -1562,11 +1574,20 @@ __device__ __noinline__ void
 #ifndef MPK_NO_OPROJ_SKIP_GATE
   if (!does_oproj) {
     int *oproj_hier = static_cast<int *>(input_ptrs[16]);
+#ifdef MPK_OPROJ_POLL_GLOBAL
+    if (tid == 0) {
+      while (MPK_LD_GATE2(&oproj_hier[8 * 16]) < 8 * qkv_epoch_expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+#else
     while (MPK_LD_GATE2(&oproj_hier[xcd_id * 16]) < qkv_epoch_expected) {
 #ifndef MPK_OPROJ_SKIP_GATE_BUSY_POLL
       __builtin_amdgcn_s_sleep(1);
 #endif
     }
+#endif
   }
 #endif
 
@@ -2183,12 +2204,25 @@ __device__ __noinline__ void
       s_was_last_local = lean_is_last_local;
 #endif
       if (lean_is_last_local) {
+#if defined(MPK_P9_POLL_GLOBAL2)
+        // Same gate as P9_POLL_GLOBAL, but the original returning atomic.
+        (void)atom_add_release_gpu_s32(layer_global, 1);
+        int const global_expected = 0;
+        bool const is_last_global = false;
+#elif defined(MPK_P9_POLL_GLOBAL)
+        // The gate polls layer_global itself, so nobody needs the old value.
+        asm volatile("flat_atomic_add %0, %1 sc1" ::"v"(layer_global), "v"(1)
+                     : "memory");
+        int const global_expected = 0;
+        bool const is_last_global = false;
+#else
         int global_prev = atom_add_release_gpu_s32(layer_global, 1);
         // Same identity one level up: the counter takes 8 arrivals per layer,
         // so the last XCD is the one whose pre-increment value is 7 mod 8 and
         // the release it publishes is its post-increment value.
         int global_expected = global_prev + 1;
         bool const is_last_global = (global_prev & 7) == 7;
+#endif
 #else
 #ifdef MPK_DRAIN_STATS
       s_was_last_local = (local_prev == local_expected - 1);
@@ -2393,7 +2427,14 @@ __device__ __noinline__ void
     // not waiting, so folding it in overstates the gate.
     MPK_PHASE_MARK(_pslot_w, 9);
     if (tid == 0 && MPK_LAYER_GATE_JOINS) {
+#if defined(MPK_P9_POLL_GLOBAL) || defined(MPK_P9_POLL_GLOBAL2)
+#ifndef MPK_LEAN_ARRIVE
+#error "MPK_P9_POLL_GLOBAL relies on MPK_LEAN_ARRIVE's s_layer_rel_prev = 8 * layers done"
+#endif
+      while (MPK_LD_GATE(layer_global) < s_layer_rel_prev + 8) {
+#else
       while (MPK_LD_GATE(&layer_release[xcd_id * 16]) <= s_layer_rel_prev) {
+#endif
 #ifndef MPK_LAYER_GATE_BUSY_POLL
         __builtin_amdgcn_s_sleep(1);
 #endif

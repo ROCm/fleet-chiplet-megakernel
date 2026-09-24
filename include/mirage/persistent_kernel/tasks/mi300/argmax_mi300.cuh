@@ -155,11 +155,19 @@ __device__ __forceinline__ void
 #pragma unroll
     for (int i = tidx; i < NUM_PARTIAL_TASKS; i += blockDim.x) {
       T current_val = partial_vals[i + batch_idx * NUM_PARTIAL_TASKS];
+#ifdef MPK_ARGMAX_IDX_PF
+      long long const current_idx =
+          partial_idxs[i + batch_idx * NUM_PARTIAL_TASKS];
+#endif
       if (current_val > local_max) {
         local_max = current_val;
         // Higher 32 bits for chunk_index (i), lower 32 for relative_index
+#ifdef MPK_ARGMAX_IDX_PF
+        local_packed_idx = ((long long)i << 32) | current_idx;
+#else
         local_packed_idx = ((long long)i << 32) |
                            partial_idxs[i + batch_idx * NUM_PARTIAL_TASKS];
+#endif
       }
     }
 
