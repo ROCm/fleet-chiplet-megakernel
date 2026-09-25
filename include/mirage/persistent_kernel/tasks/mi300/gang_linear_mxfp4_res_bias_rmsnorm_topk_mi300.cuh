@@ -665,6 +665,51 @@ __device__ __attribute__((noinline)) void
       asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
       __builtin_amdgcn_wave_barrier();
 #else
+#ifdef MPK_OPROJ_DATA_POLL
+#if defined(MPK_SLICE_DUAL_POLL) || defined(MPK_POLL_PIPE) ||                  \
+    defined(MPK_OPROJ_POLL_BEFORE_DRAIN) || !defined(MPK_ATTN_SLICE_RELEASE)
+#error "MPK_OPROJ_DATA_POLL replaces the default two-slice release poll"
+#endif
+      // attn_out holds 0xFFFFFFFF in every word until this layer's merge
+      // overwrites it. Lanes 0 and 32 poll the first word of their slice,
+      // then every lane loads its 32 bytes, retrying while any word still
+      // holds the reset value.
+      i32x4_t v0, v1;
+      {
+        int const dp_lane = tid & 63;
+        uint32_t const *dp_ptr = (uint32_t const *)(A + base);
+        while (true) {
+          uint32_t dp_w = 0u;
+          if ((dp_lane & 31) == 0) {
+            asm volatile("global_load_dword %0, %1, off sc0 sc1\n"
+                         "s_waitcnt vmcnt(0)"
+                         : "=v"(dp_w)
+                         : "v"(dp_ptr)
+                         : "memory");
+          }
+          if (__builtin_amdgcn_ballot_w64((dp_lane & 31) == 0 &&
+                                          dp_w == 0xFFFFFFFFu) == 0) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        while (true) {
+          asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1\n"
+                       "global_load_dwordx4 %1, %2, off offset:16 sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(v0), "=&v"(v1)
+                       : "v"(dp_ptr)
+                       : "memory");
+          bool const dp_stale = v0[0] == -1 || v0[1] == -1 || v0[2] == -1 ||
+                                v0[3] == -1 || v1[0] == -1 || v1[1] == -1 ||
+                                v1[2] == -1 || v1[3] == -1;
+          if (__builtin_amdgcn_ballot_w64(dp_stale) == 0) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+#else
 #ifdef MPK_SLICE_DUAL_POLL
       // Wave w waits on XCDs 2w and 2w+1. The serial form issues load-wait
       // twice, so a miss always pays two coherency round trips even though
@@ -703,6 +748,7 @@ __device__ __attribute__((noinline)) void
       i32x4_t const *src = (i32x4_t const *)(A + base);
       i32x4_t v0 = src[0];
       i32x4_t v1 = src[1];
+#endif // MPK_OPROJ_DATA_POLL
 
       float vals[ELEMENTS_PER_THREAD];
       float amax = 0.0f;

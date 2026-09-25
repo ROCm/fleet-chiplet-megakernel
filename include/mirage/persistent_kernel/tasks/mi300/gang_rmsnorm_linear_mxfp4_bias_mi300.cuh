@@ -165,7 +165,7 @@ __device__ int g_qkv_kpart_tok_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
 // `k_iter0` / `k_niters` select a K-range inside the tile (one MFMA iter =
 // 64 B of packed FP4 per row). k_niters < 0 means the full K, which is the
 // non-split default.
-template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE, int AUX = 3>
 __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
                                                          int n_wgs_per_xcd,
                                                          int tile_idx,
@@ -217,7 +217,7 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
                            lds_warp_base +
                        t * G::TILE_BYTES + j * 4096);
       __llvm_amdgcn_raw_buffer_load_lds(
-          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, AUX);
     }
 #ifdef MPK_QKV_PREFETCH_SCALES
     // Stage this tile's block scales straight to LDS as well, so Phase B has
@@ -239,10 +239,38 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
                            lds_warp_base +
                        t * G::TILE_BYTES + G::TILE_DATA_PADDED);
       __llvm_amdgcn_raw_buffer_load_lds(
-          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, AUX);
     }
 #endif
   }
+}
+
+// MPK_QKV_KV_L2WARM: pull one QKV workgroup record (weights + scales) into L2
+// with plain loads, so a later qkv_prefetch_weights_lds<..., /*AUX=*/0> hits
+// L2. Waits for its own loads before returning (one dummy destination).
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+__device__ __forceinline__ void qkv_warm_weights_l2(void const *weight_ptr,
+                                                    int n_wgs_per_xcd,
+                                                    int tile_idx) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  static_assert(G::WG_BYTES <= 25 * 4096,
+                "qkv_warm_weights_l2 covers 25 x 4 KiB per record");
+  int const wg_idx = tile_idx % n_wgs_per_xcd;
+  i32x4_t const rsrc = make_w_buffer_rsrc(
+      (uint8_t const *)weight_ptr,
+      static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
+  uint32_t voff = static_cast<uint32_t>(wg_idx) * G::WG_BYTES +
+                  static_cast<uint32_t>(threadIdx.x) * 16u;
+  unsigned sink;
+  asm volatile("buffer_load_dword %[d], %[v], %[r], 0 offen\n"
+               ".rept 24\n"
+               "v_add_u32_e32 %[v], 0x1000, %[v]\n"
+               "buffer_load_dword %[d], %[v], %[r], 0 offen\n"
+               ".endr\n"
+               "s_waitcnt vmcnt(0)"
+               : [d] "=&v"(sink), [v] "+v"(voff)
+               : [r] "s"(rsrc)
+               : "memory");
 }
 
 // MPK_KV_SPREAD: stage the 16-row K or V block that Q tile q carries as its

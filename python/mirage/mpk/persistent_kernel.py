@@ -549,6 +549,10 @@ def get_compile_command(
             flags = flags + ["-DMPK_ATTN_O_VEC_STORE"]
         if int(os.environ.get("MPK_ATTN_META_EARLY", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_META_EARLY"]
+        if int(os.environ.get("MPK_QKV_KV_L2WARM", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_KV_L2WARM"]
+        if int(os.environ.get("MPK_OPROJ_DATA_POLL", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_DATA_POLL"]
         if int(os.environ.get("MPK_MERGE_META_PRE", "0")) == 1:
             flags = flags + ["-DMPK_MERGE_META_PRE"]
         if int(os.environ.get("MPK_QKV_KV_RANK_SWAP", "0")) > 0:

@@ -2158,6 +2158,10 @@ if __name__ == "__main__":
             verify_tensors["ck_fmha_q_workspace"] = ck_fmha_q_ws_tensor
 
         attn_out = make_tensor("attn_out", (bs, num_local_q_heads * head_dim))
+        if os.environ.get("MPK_OPROJ_DATA_POLL", "0") == "1":
+            # The O-proj polls attn_out for data: every word holds 0xFFFFFFFF
+            # until the layer's merge writes it.
+            _tensor_refs["attn_out"].view(torch.int16).fill_(-1)
         # When CK_FMHA_NUM_KV_CHUNKS > 1 the decode kernel writes per-chunk float
         # partials into ck_fmha_o_acc; merge step combines them into attn_out.
         if use_split_attn_chunks or fuse_full_layer:

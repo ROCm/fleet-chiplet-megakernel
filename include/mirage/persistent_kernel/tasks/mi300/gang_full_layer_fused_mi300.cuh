@@ -2136,6 +2136,24 @@ __device__ __noinline__ void
   unsigned long long _fused_t3 = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_PHASE_MARK(_pslot_w, 7);
+#ifdef MPK_OPROJ_DATA_POLL
+  // The routing this worker just waited on was published after the O-proj
+  // phase-2 barrier, so every O-proj tile has loaded this layer's attn_out:
+  // put this XCD's slice back to the value the next layer's O-proj polls
+  // for. The Phase 9 arrival orders these stores before the next layer.
+  static_assert(NUM_Q_PER_KV * HEAD_DIM == 512,
+                "MPK_OPROJ_DATA_POLL resets 1 KiB of bf16 per XCD");
+  if (xcd_rank == 0 && tid < 64) {
+    typedef int __attribute__((ext_vector_type(4))) dp_i32x4_t;
+    char *const dp_rst = reinterpret_cast<char *>(output_ptrs[4]) +
+                         static_cast<size_t>(xcd_id) * 1024 + tid * 16;
+    dp_i32x4_t const dp_ones = {-1, -1, -1, -1};
+    asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1"
+                 :
+                 : "v"(dp_rst), "v"(dp_ones)
+                 : "memory");
+  }
+#endif
 #ifdef MPK_ILPER
     if (tid == 0 && s_ilsub_ml >= 0 && s_ilsub_ml < 64) {
       g_ilper[blockIdx.x * 128 + 0 + s_ilsub_ml] = __builtin_amdgcn_s_memrealtime();
@@ -2324,6 +2342,15 @@ __device__ __noinline__ void
     if (moe_w2_mover) {
 #endif
       unsigned long long const w2d_t0 = __builtin_amdgcn_s_memrealtime();
+#ifdef MPK_QKV_KV_L2WARM
+      // The K/V QKV ranks pull next layer's weight record into L2 while they
+      // wait; their Phase 9 prefetch then reads it with a plain DMA.
+      if (qkv_does_qkv && input_ptrs[24] != nullptr) {
+        qkv_warm_weights_l2<QKV_BATCH_SIZE, QKV_OUTPUT_PER_WG,
+                            QKV_REDUCTION_SIZE>(
+            input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
+      }
+#endif
       while (__builtin_amdgcn_s_memrealtime() - w2d_t0 <
              100ull * MPK_MOE_W2_REMAP_DELAY_US) {
         __builtin_amdgcn_s_sleep(8);
@@ -2971,6 +2998,15 @@ __device__ __noinline__ void
           qkv_k_iter0,
           qkv_k_niters);
 #else
+#ifdef MPK_QKV_KV_L2WARM
+      if (qkv_attn_rank >= 8) {
+        qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
+                                 QKV_OUTPUT_PER_WG,
+                                 QKV_REDUCTION_SIZE,
+                                 /*AUX=*/0>(
+            input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
+      } else
+#endif
       qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
                                QKV_OUTPUT_PER_WG,
                                QKV_REDUCTION_SIZE>(
