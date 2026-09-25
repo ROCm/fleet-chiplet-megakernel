@@ -534,6 +534,33 @@ def shuffle_w13_workgroups_kmajor(packed: torch.Tensor,
     return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()
 
 
+def shuffle_w2_workgroups_kmajor(packed: torch.Tensor,
+                                 output_per_wg: int = 64) -> torch.Tensor:
+    """MPK_W2_KWIN: W2 (down_proj) records into lane-contiguous K128 fragments.
+
+    Within each 16-row tile the data prefix goes from
+    ``[row, k128, quarter, byte]`` to ``[k128, quarter, row, byte]``, so 1 KiB
+    fragment k of a wave's tile is MFMA K-step k. Scales stay row-major.
+    A permutation, bit-exact.
+    """
+    if packed.ndim != 3:
+        raise ValueError(
+            f"expected [experts, workgroups, bytes] W2 weights, got {tuple(packed.shape)}")
+    experts, workgroups, wg_bytes = packed.shape
+    reduction = (wg_bytes * 32) // (output_per_wg * 17)
+    data_bytes = output_per_wg * (reduction // 2)
+    if reduction % 128 != 0 or output_per_wg % 16 != 0 or \
+            data_bytes + output_per_wg * (reduction // 32) != wg_bytes:
+        raise ValueError(
+            f"invalid W2 MXFP4 record width {wg_bytes} for {output_per_wg} rows")
+    tiles = output_per_wg // 16
+    data = packed[..., :data_bytes].reshape(
+        experts, workgroups, tiles, 16, reduction // 128, 4, 16)
+    data = data.permute(0, 1, 2, 4, 5, 3, 6).reshape(
+        experts, workgroups, data_bytes)
+    return torch.cat((data, packed[..., data_bytes:]), dim=-1).contiguous()
+
+
 def shuffle_lm_head_record_kmajor(packed: torch.Tensor,
                                   output_per_wg: int = 64) -> torch.Tensor:
     """Repack packed LM-head workgroups into lane-native K128 fragments.
@@ -2369,6 +2396,9 @@ if __name__ == "__main__":
                 target_out_dim=PADDED_HIDDEN_SIZE,
                 target_num_blocks=w2_target_num_blocks,
             )
+            if os.environ.get("MPK_W2_KWIN") is not None:
+                dp_packed = shuffle_w2_workgroups_kmajor(
+                    dp_packed, output_per_wg=w2_output_per_wg)
             moe_down_proj_weights.append(dp_packed)
 
             # Biases: pad to padded dimensions (2D for gang kernel)

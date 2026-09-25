@@ -158,6 +158,25 @@ __device__ __forceinline__ void
 // o layout:    same indexing * HEAD_DIM + d
 // output layout: output[token * NUM_QO_GROUPS * QO_PER_KV * HEAD_DIM
 //                       + kv_head * QO_PER_KV * HEAD_DIM + head * HEAD_DIM + d]
+// MPK_MERGE_META_PRE: the sink merge_splitkv_ck_fmha would load for this
+// thread's first token, fetched ahead of the merge.
+template <int NUM_QO_HEADS_PER_KV>
+__device__ __forceinline__ float merge_splitkv_sink_log2(void const *sinks_ptr,
+                                                         int kv_head_idx) {
+#if defined(MPK_MERGE_WIDE_DIM)
+  constexpr int THREADS_PER_TOKEN = 16;
+#else
+  constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
+#endif
+  int const head_idx =
+      (int)(threadIdx.x / THREADS_PER_TOKEN) % NUM_QO_HEADS_PER_KV;
+  __hip_bfloat16 const *d_sinks =
+      reinterpret_cast<__hip_bfloat16 const *>(sinks_ptr);
+  return static_cast<float>(
+             d_sinks[kv_head_idx * NUM_QO_HEADS_PER_KV + head_idx]) *
+         1.44269504088896340736f;
+}
+
 template <typename T,
           int NUM_QO_HEADS_PER_KV,
           int NUM_QO_GROUPS,
@@ -165,7 +184,8 @@ template <typename T,
           int NUM_KV_CHUNKS,
           int KV_CHUNK_SIZE = 128,
           int PAGE_SIZE = 4096,
-          bool WRITE_THROUGH = false>
+          bool WRITE_THROUGH = false,
+          bool META_PRE = false>
 __device__ __forceinline__ void
     merge_splitkv_ck_fmha(float const *lse_ptr,
                           float const *o_ptr,
@@ -175,10 +195,15 @@ __device__ __forceinline__ void
                           int16_t request_id,
                           T *output_ptr,
                           int kv_head_idx,
-                          void const *sinks_ptr = nullptr) {
+                          void const *sinks_ptr = nullptr,
+                          int pre_q0 = 0,
+                          int pre_q1 = 0,
+                          float pre_sink_log2 = 0.0f) {
 
-  int const first_token_pos = qo_indptr_buffer_ptr[request_id];
-  int const last_token_pos = qo_indptr_buffer_ptr[request_id + 1];
+  int const first_token_pos =
+      META_PRE ? pre_q0 : qo_indptr_buffer_ptr[request_id];
+  int const last_token_pos =
+      META_PRE ? pre_q1 : qo_indptr_buffer_ptr[request_id + 1];
   if (first_token_pos == last_token_pos) {
     return;
   }
@@ -235,7 +260,9 @@ __device__ __forceinline__ void
 
     // Load this head's sink once (independent of dim).
     float sink_val_log2 = 0.0f;
-    if (sinks_ptr != nullptr) {
+    if (META_PRE && tok == group_id) {
+      sink_val_log2 = pre_sink_log2;
+    } else if (sinks_ptr != nullptr) {
       sink_val_log2 =
           static_cast<float>(
               d_sinks[kv_head_idx * NUM_QO_HEADS_PER_KV + head_idx]) *

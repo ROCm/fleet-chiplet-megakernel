@@ -958,6 +958,18 @@ __device__ __noinline__ void
 #endif
   }
 #endif
+#ifdef MPK_MERGE_META_PRE
+#ifndef MPK_ATTN_META_EARLY
+#error "MPK_MERGE_META_PRE uses the MPK_ATTN_META_EARLY request metadata"
+#endif
+  // The merge's sink, fetched with the rest of the attention metadata so the
+  // merge issues its lse/o_acc loads without waiting for it first.
+  float am_sink_log2 = 0.0f;
+  if (HAS_SINKS && qkv_attn_rank < ATTN_PARTICIPANTS) {
+    am_sink_log2 =
+        merge_splitkv_sink_log2<NUM_Q_PER_KV>(input_ptrs[6], xcd_id);
+  }
+#endif
 #ifdef MPK_ATTN_PTR_EARLY
   // The attention call's pointer arguments live in the task descriptor. Read
   // here, they stay in registers; read after the epoch's buffer_inv (a memory
@@ -1414,7 +1426,12 @@ __device__ __noinline__ void
                               NUM_KV_CHUNKS,
                               128,
                               4096,
+#ifdef MPK_MERGE_META_PRE
+                              /*WRITE_THROUGH=*/true,
+                              /*META_PRE=*/true>(
+#else
                               /*WRITE_THROUGH=*/true>(
+#endif
             reinterpret_cast<float const *>(input_ptrs[8]),  // lse_acc
             reinterpret_cast<float const *>(input_ptrs[23]), // o_acc_f32
             qo_indptr,
@@ -1424,7 +1441,14 @@ __device__ __noinline__ void
             reinterpret_cast<__hip_bfloat16 *>(
                 output_ptrs[4]), // attn_out (bf16)
             /*kv_head_idx=*/xcd_id,
-            HAS_SINKS ? input_ptrs[6] : nullptr); // sinks applied here
+            HAS_SINKS ? input_ptrs[6] : nullptr // sinks applied here
+#ifdef MPK_MERGE_META_PRE
+            ,
+            am_q0,
+            am_q1,
+            am_sink_log2
+#endif
+        );
 
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
         _merge_done = __builtin_amdgcn_s_memrealtime();
@@ -2276,7 +2300,8 @@ __device__ __noinline__ void
 #ifdef MPK_MOE_XCD_PAIR
 #if defined(MPK_MOE_W2_REMAP3)
     int const moe_t = (moe_i == 0 ? mr3_w13_phase : mr3_w2_phase) |
-                      (moe_i << 7) | ((routed_expert0 + 1) << 8);
+                      (moe_i << 7) | ((routed_expert0 + 1) << 8) |
+                      MPK_W2K_MOVER_BIT(moe_i == 1 && moe_w2_mover);
 #elif defined(MPK_MOE_W2_REMAP2)
     int const moe_t =
         moe_i == 2

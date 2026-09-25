@@ -549,6 +549,8 @@ def get_compile_command(
             flags = flags + ["-DMPK_ATTN_O_VEC_STORE"]
         if int(os.environ.get("MPK_ATTN_META_EARLY", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_META_EARLY"]
+        if int(os.environ.get("MPK_MERGE_META_PRE", "0")) == 1:
+            flags = flags + ["-DMPK_MERGE_META_PRE"]
         if int(os.environ.get("MPK_QKV_KV_RANK_SWAP", "0")) > 0:
             flags = flags + ["-DMPK_QKV_KV_RANK_SWAP="
                              + str(int(os.environ["MPK_QKV_KV_RANK_SWAP"]))]
@@ -2050,6 +2052,18 @@ def get_compile_command(
             # Kept as a separate knob rather than folded into
             # MPK_W13_LINEAR_LOAD, which is a win on its own.
             flags = flags + ["-DMPK_W2_LINEAR_LOAD"]
+        if os.environ.get("MPK_W2_KWIN") is not None:
+            _kw = int(os.environ["MPK_W2_KWIN"])
+            assert 0 <= _kw <= 23, "MPK_W2_KWIN is a W2 fragment count 0..23"
+            flags = flags + [f"-DMPK_W2_KWIN={_kw}",
+                             f"-DMPK_W2_KWIN_TAIL={23 - _kw}"]
+        if int(os.environ.get("MPK_W2_GATHER_NO_NT", "0")) == 1:
+            flags = flags + ["-DMPK_W2_GATHER_NO_NT"]
+        if os.environ.get("MPK_W2_KWIN_MOVER") is not None:
+            _kwm = int(os.environ["MPK_W2_KWIN_MOVER"])
+            assert 0 <= _kwm <= 23, "MPK_W2_KWIN_MOVER is a W2 fragment count 0..23"
+            flags = flags + [f"-DMPK_W2_KWIN_MOVER={_kwm}",
+                             f"-DMPK_W2_KWIN_MOVER_TAIL={23 - _kwm}"]
         if int(os.environ.get("MPK_W2_T1_LINEAR_LOAD", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed). Linear 23-chunk W2 T1 reload.
             # Hash e86d7dc all six. A/B +7 / −29 / −4 µs. Only pair 2 >10 µs
