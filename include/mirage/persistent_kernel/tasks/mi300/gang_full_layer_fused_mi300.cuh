@@ -41,6 +41,24 @@
 
 namespace kernel {
 
+#ifdef MPK_ATTSUB_SLIDING
+#define MPK_ATSTAMP_L(k)          \
+  do {                            \
+    if (SLIDING_WINDOW > 0) {     \
+      MPK_ATSTAMP(k);             \
+    }                             \
+  } while (0)
+#define MPK_ATVALUE_L(k, v)       \
+  do {                            \
+    if (SLIDING_WINDOW > 0) {     \
+      MPK_ATVALUE(k, v);          \
+    }                             \
+  } while (0)
+#else
+#define MPK_ATSTAMP_L(k) MPK_ATSTAMP(k)
+#define MPK_ATVALUE_L(k, v) MPK_ATVALUE(k, v)
+#endif
+
 static constexpr int FULL_LAYER_ATTN_GLOBAL_COUNTER_SLOT = 19 * 16;
 static constexpr int FULL_LAYER_QKV_EPOCH_SLOT = 20 * 16;
 static constexpr int FULL_LAYER_ATTN_XCD_RELEASE_SLOT = 36 * 16;
@@ -140,6 +158,95 @@ static constexpr int FULL_LAYER_OPROJ_XCD_READY_SLOT(int num_reqs) {
 #else
 #define MPK_XCD_LOCAL_ATOM_ADD(addr, val)                                      \
   atom_add_release_gpu_s32((addr), (val))
+#endif
+
+#ifdef MPK_ATTN_KV_EARLY
+// Issue this wave's share of a full-attention chunk's past K/V as raw bf16
+// LDS DMAs into its staging region (see __attn_wave_local_scan_hd64). Same
+// chunk / wave / tile split as paged_attention_minimal_decode_hd64 and the
+// scan; the newest token's tile is skipped (it is written by this layer's
+// QKV). Tiles are 16 tokens x 128 B; lane l of a dwordx4 DMA moves token
+// 8j + l/8, dims (l%8)*8.., landing at M0 + 16 l = [token][dim] rows.
+template <int PAGE_SIZE, int HEAD_DIM, int NUM_KV_CHUNKS, int KV_CACHE_STRIDE,
+          int TPW>
+__device__ __noinline__ void mpk_attn_stage_kv_hd64(char const *k_base,
+                                                    char const *v_base,
+                                                    int const *kv_indices,
+                                                    int k0,
+                                                    int k1,
+                                                    int lpl,
+                                                    int chunk) {
+  constexpr int KV_TILE = 16;
+  static_assert(HEAD_DIM == 64, "128 B token rows");
+  static_assert(MPK_ATTN_STAGE_OFF + 4 * TPW * 4096 <= 140 * 1024,
+                "MPK_ATTN_KV_EARLY staging does not fit this max sequence");
+  int const num_pages = k1 - k0;
+  if (num_pages <= 0) {
+    return;
+  }
+  int const seqlen_k = (num_pages - 1) * PAGE_SIZE + lpl;
+  int const ntiles = (seqlen_k + KV_TILE - 1) / KV_TILE;
+  int const tpc = (ntiles + NUM_KV_CHUNKS - 1) / NUM_KV_CHUNKS;
+  int const c_first = chunk * tpc;
+  int c_last = c_first + tpc;
+  if (c_last > ntiles) {
+    c_last = ntiles;
+  }
+  int const nt = c_last - c_first;
+  if (nt < MPK_ATTN_WAVE_LOCAL_MIN_TILES) {
+    return;
+  }
+  int const wave_id = threadIdx.x >> 6;
+  int const lane = threadIdx.x & 63;
+  int const tpw = (nt + 3) / 4;
+  int const w_first = wave_id * tpw;
+  if (w_first >= nt) {
+    return;
+  }
+  int w_last = w_first + tpw;
+  if (w_last > nt) {
+    w_last = nt;
+  }
+  int const newest_rel = (c_last == ntiles) ? nt - 1 : -1;
+  extern __shared__ char mpk_stage_smem[];
+#ifdef MPK_ATTN_KV_EARLY2
+  auto *const stg = (__attribute__((address_space(3))) char *)(
+      mpk_stage_smem + MPK_ATTN_STAGE2_OFF + w_first * 4096);
+#else
+  auto *const stg = (__attribute__((address_space(3))) char *)(
+      mpk_stage_smem + MPK_ATTN_STAGE_OFF + wave_id * (TPW * 4096));
+#endif
+  int const voff0 = (lane >> 3) * KV_CACHE_STRIDE * 2 + (lane & 7) * 16;
+  for (int t = 0; t < w_last - w_first; t++) {
+    if (w_first + t == newest_rel) {
+      continue;
+    }
+    int const tok0 = (c_first + w_first + t) * KV_TILE;
+    int const pid = __builtin_amdgcn_readfirstlane(
+        kv_indices[k0 + tok0 / PAGE_SIZE]);
+    long const toff = (static_cast<long>(pid) * PAGE_SIZE * KV_CACHE_STRIDE +
+                       static_cast<long>(tok0 % PAGE_SIZE) * KV_CACHE_STRIDE) *
+                      2;
+    i32x4_t const krs =
+        make_w_buffer_rsrc(k_base + toff, KV_TILE * KV_CACHE_STRIDE * 2);
+    i32x4_t const vrs =
+        make_w_buffer_rsrc(v_base + toff, KV_TILE * KV_CACHE_STRIDE * 2);
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+      int const voff = voff0 + 8 * j * KV_CACHE_STRIDE * 2;
+      __llvm_amdgcn_raw_buffer_load_lds(
+          krs,
+          (__attribute__((address_space(3))) uint32_t *)(stg + t * 4096 +
+                                                          j * 1024),
+          16, voff, 0, 0, 0);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          vrs,
+          (__attribute__((address_space(3))) uint32_t *)(stg + t * 4096 +
+                                                          2048 + j * 1024),
+          16, voff, 0, 0, 0);
+    }
+  }
+}
 #endif
 
 template <int QKV_BATCH_SIZE,
@@ -289,6 +396,21 @@ __device__ __noinline__ void
                           : 0;
 #endif
   int const qkv_attn_rank = (xcd_rank + qkv_rot) % workers_per_xcd;
+#elif defined(MPK_QKV_KV_RANK_SWAP)
+#if defined(MPK_QKV_PF_SKIP_W2) || defined(MPK_ABLATE_KV_TILES) || \
+    defined(MPK_KV_SPREAD) || defined(MPK_QKV_KSPLIT) || defined(MPK_ATTN_SPLIT_CHUNK)
+#error "MPK_QKV_KV_RANK_SWAP is wired for the plain ten-tile QKV rank map"
+#endif
+  // K/V tiles (qkv_attn_rank 8, 9) on physical ranks R, R+1: movers that
+  // finish their W2 group early and stage the K/V weights before the gate.
+  // Physical ranks 8-9 take the movers' former qkv_attn_rank.
+  constexpr int kKvR = MPK_QKV_KV_RANK_SWAP;
+  static_assert(kKvR >= 10 && kKvR + 1 < 31, "MPK_QKV_KV_RANK_SWAP: R, R+1 must be non-QKV ranks");
+  int const qkv_attn_rank = xcd_rank == 8          ? kKvR
+                            : xcd_rank == 9        ? kKvR + 1
+                            : xcd_rank == kKvR     ? 8
+                            : xcd_rank == kKvR + 1 ? 9
+                                                   : xcd_rank;
 #else
   int const qkv_attn_rank = xcd_rank;
 #endif
@@ -378,8 +500,20 @@ __device__ __noinline__ void
   constexpr int QKV_MFMA_ITERS = QKV_REDUCTION_SIZE / 128;
   constexpr int QKV_K_LO = (QKV_MFMA_ITERS + 1) / 2;
 #else
+#ifdef MPK_KV_SPREAD
+#if defined(MPK_ABLATE_KV_TILES) || defined(MPK_QKV_PF_SKIP_W2) ||            \
+    defined(MPK_QKV_PF_EARLY) || defined(MPK_QKV_PF_WAVE_SPLIT) ||             \
+    defined(MPK_ATTN_Q_EPOCH) || defined(MPK_ROTATE_QKV_ATTN_RANKS)
+#error "MPK_KV_SPREAD: K/V ride on the Q ranks; incompatible with this QKV rank map"
+#endif
+  // K and V run as a second MFMA chain on the NUM_Q_PER_KV Q tiles, so the
+  // two K/V ranks (which also carry a W2 group) produce no QKV.
+  bool const qkv_does_qkv = qkv_attn_rank < NUM_Q_PER_KV;
+  int const qkv_work_slots = NUM_Q_PER_KV;
+#else
   bool const qkv_does_qkv = qkv_attn_rank < total_qkv_tiles_per_xcd;
   int const qkv_work_slots = total_qkv_tiles_per_xcd;
+#endif
 #endif
 
   // Layer-boundary ACQUIRE for moe_workspace_f32. Plain `buffer_inv` (vL1
@@ -706,7 +840,14 @@ __device__ __noinline__ void
   // Phase 1: QKV GEMM
   // ══════════════════════════════════════════════════════════════════
   MPK_TW_SUB(10, xcd_rank);
+#ifdef MPK_ABLATE_KV_TILES
+#ifndef MPK_QKV_PF_SKIP_W2
+#error "MPK_ABLATE_KV_TILES needs MPK_QKV_PF_SKIP_W2"
+#endif
+  if (qkv_does_qkv && xcd_rank < 8) {
+#else
   if (qkv_does_qkv) {
+#endif
 #ifdef MPK_QKV_KSPLIT
     int const qkv_k_part = qkv_does_k1 ? 1 : 0;
     int const qkv_tile =
@@ -798,6 +939,38 @@ __device__ __noinline__ void
   // fires when it matches the number of workers that actually arrive -- so
   // this constant and the guard below must stay in agreement.
   // ══════════════════════════════════════════════════════════════════
+#ifdef MPK_ATTN_META_EARLY
+#ifdef MPK_ATTN_SPLIT_CHUNK
+#error "MPK_ATTN_META_EARLY is wired for the unsplit attention call"
+#endif
+  // The attention call's request metadata does not depend on this layer's
+  // QKV; fetched here, it lands during the epoch wait.
+  int am_q0 = 0, am_q1 = 0, am_k0 = 0, am_k1 = 0, am_lpl = 0;
+  int am_pid0 = 0;
+  if (qkv_attn_rank < ATTN_PARTICIPANTS) {
+    am_q0 = qo_indptr[attn_req];
+    am_q1 = qo_indptr[attn_req + 1];
+    am_k0 = kv_indptr[attn_req];
+    am_k1 = kv_indptr[attn_req + 1];
+    am_lpl = kv_last_page_len[attn_req];
+#ifdef MPK_ATTN_SL_OVERLAP
+    am_pid0 = kv_indices[am_k0];
+#endif
+  }
+#endif
+#ifdef MPK_ATTN_PTR_EARLY
+  // The attention call's pointer arguments live in the task descriptor. Read
+  // here, they stay in registers; read after the epoch's buffer_inv (a memory
+  // clobber) they cost a round trip before the call.
+  auto const am_p_q = output_ptrs[3];
+  auto const am_p_k = output_ptrs[1];
+  auto const am_p_v = output_ptrs[2];
+  auto const am_p_o = input_ptrs[23];
+  auto const am_p_lse = input_ptrs[8];
+#define MPK_AMP(expr, early) (early)
+#else
+#define MPK_AMP(expr, early) (expr)
+#endif
   MPK_TW_SUB(20, qkv_epoch_expected);
   MPK_WS_PHASE(20, qkv_epoch_expected, xcd_id);
 #ifdef MPK_QKV_KSPLIT
@@ -815,6 +988,33 @@ __device__ __noinline__ void
         mpk_qe_kv0 = kv_indptr[attn_req];
         mpk_qe_kv1 = kv_indptr[attn_req + 1];
         mpk_qe_lpl = kv_last_page_len[attn_req];
+      }
+    }
+#endif
+#ifdef MPK_ATTN_KV_EARLY2
+#if !defined(MPK_ATTN_KV_EARLY) || !defined(MPK_QKV_SLAB_LDS) || \
+    !defined(MPK_QKV_EPOCH_PRODUCER_DRAIN)
+#error "MPK_ATTN_KV_EARLY2 needs MPK_ATTN_KV_EARLY, MPK_QKV_SLAB_LDS and the producer drain"
+#endif
+    static_assert(MPK_ATTN_STAGE2_OFF +
+                          MPK_ATTN_STAGED_TPC(MAX_SEQ_LEN, NUM_KV_CHUNKS) * 4096 <=
+                      155600,
+                  "MPK_ATTN_KV_EARLY2 staging would reach the layer word");
+    // Past K/V for this rank's chunk, issued as soon as QKV returns: the
+    // producer drain below absorbs it, well before ranks 8-9 set the epoch.
+    if constexpr (SLIDING_WINDOW == 0 && NUM_REQS == 1) {
+      if (qkv_attn_rank < ATTN_PARTICIPANTS) {
+        mpk_attn_stage_kv_hd64<PAGE_SIZE, HEAD_DIM, NUM_KV_CHUNKS,
+                               KV_CACHE_STRIDE,
+                               MPK_ATTN_STAGED_TPW(MAX_SEQ_LEN,
+                                                   NUM_KV_CHUNKS)>(
+            reinterpret_cast<char const *>(
+                reinterpret_cast<__hip_bfloat16 const *>(output_ptrs[1]) +
+                static_cast<size_t>(xcd_id) * HEAD_DIM),
+            reinterpret_cast<char const *>(
+                reinterpret_cast<__hip_bfloat16 const *>(output_ptrs[2]) +
+                static_cast<size_t>(xcd_id) * HEAD_DIM),
+            kv_indices, am_k0, am_k1, am_lpl, attn_chunk);
       }
     }
 #endif
@@ -867,11 +1067,50 @@ __device__ __noinline__ void
     // Every participant polls. The participant set is now exactly the workers
     // that need this barrier, so there is no longer a subset that arrives only
     // to carry ordering for someone else.
+#ifdef MPK_ATTN_KV_EARLY
+#ifndef MPK_ATTN_META_EARLY
+#error "MPK_ATTN_KV_EARLY needs MPK_ATTN_META_EARLY"
+#endif
+#ifdef MPK_ATTN_NO_WAVE_LOCAL
+#error "MPK_ATTN_KV_EARLY stages for the wave-local scan"
+#endif
+    // Past K/V for this rank's chunk, into LDS while the epoch is pending.
+    // Issued after the arrival so wave 0's arrival atomic does not wait on it.
+#ifndef MPK_ATTN_KV_EARLY2
+    if constexpr (SLIDING_WINDOW == 0 && NUM_REQS == 1) {
+      if (qkv_attn_rank < ATTN_PARTICIPANTS) {
+        mpk_attn_stage_kv_hd64<PAGE_SIZE, HEAD_DIM, NUM_KV_CHUNKS,
+                               KV_CACHE_STRIDE,
+                               MPK_ATTN_STAGED_TPW(MAX_SEQ_LEN,
+                                                   NUM_KV_CHUNKS)>(
+            reinterpret_cast<char const *>(
+                reinterpret_cast<__hip_bfloat16 const *>(output_ptrs[1]) +
+                static_cast<size_t>(xcd_id) * HEAD_DIM),
+            reinterpret_cast<char const *>(
+                reinterpret_cast<__hip_bfloat16 const *>(output_ptrs[2]) +
+                static_cast<size_t>(xcd_id) * HEAD_DIM),
+            kv_indices, am_k0, am_k1, am_lpl, attn_chunk);
+      }
+    }
+#endif
+#endif
     MPK_WS_WAIT_BEGIN(20, qkv_epoch_expected);
     if (tid == 0) {
       int _obs;
       int _spins = 0;
       int *mpk_qe_poll = &qkv_epoch[xcd_id * 16];
+#ifdef MPK_QKV_EPOCH_POLL_ARRIVE
+#if defined(MPK_ATTN_Q_EPOCH) || defined(MPK_QKV_EPOCH_POLL_SC1) || \
+    defined(MPK_QKV_KSPLIT) || defined(MPK_ATTN_SPLIT_CHUNK)
+#error "MPK_QKV_EPOCH_POLL_ARRIVE is wired for the single-counter epoch"
+#endif
+      // The arrival counter itself, up to this layer's full count: waiters
+      // see the last arrival when it lands, not after the last arriver's
+      // atomic returns and its bump lands.
+      int *const mpk_qa_ctr = &static_cast<int *>(input_ptrs[7])[xcd_id];
+      int const mpk_qa_target =
+          (s_prev / qkv_epoch_participants + 1) * qkv_epoch_participants;
+#endif
 #ifdef MPK_ATTN_Q_EPOCH
       if constexpr (SLIDING_WINDOW == 0 && NUM_REQS == 1) {
         if (qkv_attn_rank < ATTN_PARTICIPANTS) {
@@ -896,6 +1135,11 @@ __device__ __noinline__ void
         return v;
       };
       while ((_obs = qkv_epoch_ld()) < qkv_epoch_expected) {
+#elif defined(MPK_QKV_EPOCH_POLL_ARRIVE)
+      _obs = 0;
+      while (s_prev + 1 != mpk_qa_target &&
+             (_obs = __atomic_load_n(mpk_qa_ctr, __ATOMIC_RELAXED)) <
+                 mpk_qa_target) {
 #else
       while ((_obs = __atomic_load_n(mpk_qe_poll, __ATOMIC_RELAXED)) <
              qkv_epoch_expected) {
@@ -943,6 +1187,7 @@ __device__ __noinline__ void
   _fused_t0b = __builtin_amdgcn_s_memrealtime();
 #endif
   MPK_PHASE_MARK(_pslot_w, 2);
+  MPK_ATSTAMP_L(0);
 
   // ══════════════════════════════════════════════════════════════════
   // Phase 3: Parallel attention chunks
@@ -961,9 +1206,9 @@ __device__ __noinline__ void
     if (qkv_attn_rank < ATTN_PARTICIPANTS) {
       int kv_chunk_idx = attn_chunk;
       using bf16_t = __hip_bfloat16;
-      void const *offset_k = reinterpret_cast<bf16_t const *>(output_ptrs[1]) +
+      void const *offset_k = reinterpret_cast<bf16_t const *>(MPK_AMP(output_ptrs[1], am_p_k)) +
                              static_cast<size_t>(xcd_id) * HEAD_DIM;
-      void const *offset_v = reinterpret_cast<bf16_t const *>(output_ptrs[2]) +
+      void const *offset_v = reinterpret_cast<bf16_t const *>(MPK_AMP(output_ptrs[2], am_p_v)) +
                              static_cast<size_t>(xcd_id) * HEAD_DIM;
 
       // Write float32 partials to o_acc_f32 (input_ptrs[23])
@@ -981,12 +1226,21 @@ __device__ __noinline__ void
                                             Q_WORKSPACE_STRIDE,
                                             KV_CACHE_STRIDE,
                                             NUM_KV_HEADS,
-                                            DECODE_ONLY>(
-          output_ptrs[3], // q_workspace
+                                            DECODE_ONLY
+#ifdef MPK_ATTN_META_EARLY
+                                            ,
+                                            true
+#ifdef MPK_ATTN_KV_EARLY
+                                            ,
+                                            SLIDING_WINDOW == 0
+#endif
+#endif
+                                            >(
+          MPK_AMP(output_ptrs[3], am_p_q), // q_workspace
           const_cast<void *>(offset_k),
           const_cast<void *>(offset_v),
-          input_ptrs[23], // o_acc_f32 (float32 partials)
-          input_ptrs[8],  // lse_acc
+          MPK_AMP(input_ptrs[23], am_p_o), // o_acc_f32 (float32 partials)
+          MPK_AMP(input_ptrs[8], am_p_lse), // lse_acc
           qo_indptr,
           kv_indptr,
           kv_indices,
@@ -996,7 +1250,21 @@ __device__ __noinline__ void
           kv_chunk_idx,
           attn_scale,
           SLIDING_WINDOW,
-          nullptr); // no sinks per-chunk
+          nullptr // no sinks per-chunk
+#ifdef MPK_ATTN_META_EARLY
+          ,
+          /*split_part=*/0,
+          am_q0,
+          am_q1,
+          am_k0,
+          am_k1,
+          am_lpl
+#ifdef MPK_ATTN_SL_OVERLAP
+          ,
+          am_pid0
+#endif
+#endif
+      );
 #ifdef MPK_ATTN_SETPRIO
       asm volatile("s_setprio 0");
 #endif
@@ -1040,6 +1308,7 @@ __device__ __noinline__ void
       // Phase 4: Chunk barrier — last-chunk-worker runs merge
       // ══════════════════════════════════════════════════════════════════
       MPK_TW_SUB(40, kv_chunk_idx);
+      MPK_ATSTAMP_L(1);
       MPK_WS_PHASE(40, qkv_epoch_expected, xcd_id);
       // Flush this chunk's o_acc/lse_acc partials before arriving.
       //
@@ -1110,6 +1379,8 @@ __device__ __noinline__ void
             &chunk_barrier[(xcd_id * NUM_REQS + attn_req) * 16], 1);
       }
       __syncthreads();
+      MPK_ATSTAMP_L(2);
+      MPK_ATVALUE_L(6, s_chunk_prev % NUM_KV_CHUNKS);
 
       if ((s_chunk_prev % NUM_KV_CHUNKS) == NUM_KV_CHUNKS - 1) {
         // Last chunk worker: run merge (no reset needed — modular check)
@@ -1158,6 +1429,7 @@ __device__ __noinline__ void
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
         _merge_done = __builtin_amdgcn_s_memrealtime();
 #endif
+        MPK_ATSTAMP_L(3);
         // Wait for all write-through stores from merge to complete.
         //
         // The __syncthreads() is load-bearing and was missing. merge's st_wt
@@ -1175,6 +1447,7 @@ __device__ __noinline__ void
         // QKV work, i.e. wg_idx >= total_qkv_tiles_per_xcd.
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __syncthreads();
+        MPK_ATSTAMP_L(4);
         // TESTED AND NOT ADOPTED: the lane-parallel release fan-out that pays
         // off at the Phase 9 and O-proj barriers (readfirstlane the epoch out
         // of tid 0, then `if (tid < 8) st_wt_u32`) measures 2.047 here against
@@ -1345,6 +1618,7 @@ __device__ __noinline__ void
   // spin-wait rather than serializing ahead of it.
   MPK_PHASE_MARK(_pslot_w, 3);
   MPK_PHASE_MARK(_pslot_w, 4);
+  MPK_ATSTAMP_L(5);
   MPK_ILSTAMP(12, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 
   // ══════════════════════════════════════════════════════════════════
@@ -1870,18 +2144,68 @@ __device__ __noinline__ void
 #ifdef MPK_W2_L2_WARM
 #error "MPK_MOE_W2_REMAP gives ranks 23..30 W2 groups; MPK_W2_L2_WARM uses them as warmers"
 #endif
+#if defined(MPK_MOE_W2_REMAP2) && (defined(MPK_QKV_PF_SKIP_W2) || defined(MPK_ABLATE_KV_TILES))
+#error "MPK_MOE_W2_REMAP2 leaves ranks 8 and 9 W13-only; the skip-W2 prefetch arms assume they run W2"
+#endif
   // Ranks 0..7: W13 only. Ranks 8..22: W13 then W2. Ranks 23..30: W2 group
   // (rank - 23) only, entered right after the TopK.
   constexpr int kW2Moved = 8;
+#ifdef MPK_MOE_W2_REMAP3
+#if defined(MPK_MOE_W2_REMAP2) || defined(MPK_QKV_PF_SKIP_W2) || \
+    defined(MPK_ABLATE_KV_TILES) || defined(MPK_W2_L2_WARM)
+#error "MPK_MOE_W2_REMAP3 replaces the REMAP rank map; incompatible with this flag"
+#endif
+  // Ranks 0-7: W13 tile r. Ranks 8-9: W2 group r only, entered with the
+  // movers' delay. Ranks 10-22: W13 tile r + W2 group r. Ranks R, R+1
+  // (MPK_MOE_W2_REMAP3_R0): W13 tile 8 / 9 + W2 group r-23. Other ranks
+  // 23-30: W2 group r-23 (delayed).
+#ifndef MPK_MOE_W2_REMAP3_R0
+#define MPK_MOE_W2_REMAP3_R0 23
+#endif
+  constexpr int kMr3R0 = MPK_MOE_W2_REMAP3_R0;
+  static_assert(kMr3R0 >= kMoePairRanks && kMr3R0 + 1 < kMoePairRanks + kW2Moved,
+                "MPK_MOE_W2_REMAP3_R0 must name two of ranks 23-30");
+  bool const mr3_w13_mover = xcd_rank == kMr3R0 || xcd_rank == kMr3R0 + 1;
+  bool const mr3_w2_only =
+      xcd_rank == 8 || xcd_rank == 9 ||
+      (xcd_rank >= kMoePairRanks && xcd_rank < kMoePairRanks + kW2Moved &&
+       !mr3_w13_mover);
+#ifdef MPK_MOE_W2_REMAP3_NODELAY89
+  // Only the movers take the entry delay; ranks 8-9 start at once.
+  bool const moe_w2_mover = mr3_w2_only && xcd_rank >= kMoePairRanks;
+#else
+  bool const moe_w2_mover = mr3_w2_only;
+#endif
+  bool const mr3_w13 =
+      (xcd_rank < kMoePairRanks && !mr3_w2_only) || mr3_w13_mover;
+  bool const mr3_w2 = xcd_rank >= 8 && xcd_rank < kMoePairRanks + kW2Moved;
+  int const moe_begin = mr3_w13 ? 0 : 1;
+  int const moe_end = mr3_w2 ? 2 : 1;
+  int const mr3_w13_phase = mr3_w13_mover ? 8 + (xcd_rank - kMr3R0) : xcd_rank;
+  int const mr3_w2_phase =
+      xcd_rank < kMoePairRanks ? xcd_rank : xcd_rank - kMoePairRanks;
+#else
   bool const moe_w2_mover = xcd_rank >= kMoePairRanks &&
                             xcd_rank < kMoePairRanks + kW2Moved;
   int const moe_begin = xcd_rank < kMoePairRanks ? 0 : 1;
+#ifdef MPK_MOE_W2_REMAP2
+  // Ranks 8 and 9 hand W2 groups 8 and 9 to movers 23 and 24, which run them
+  // after their own group; every QKV rank is then W13-only.
+  constexpr int kW2Extra = 2;
+  int const moe_end =
+      xcd_rank < kW2Moved + kW2Extra ? 1
+      : xcd_rank < kMoePairRanks     ? 2
+      : moe_w2_mover ? (xcd_rank - kMoePairRanks < kW2Extra ? 3 : 2)
+                     : 1;
+#else
   int const moe_end = xcd_rank < kW2Moved         ? 1
                       : xcd_rank < kMoePairRanks ? 2
                       : moe_w2_mover             ? 2
                                                  : 1;
+#endif
   int const moe_phase =
       xcd_rank < kMoePairRanks ? xcd_rank : xcd_rank - kMoePairRanks;
+#endif
 #else
   int const moe_begin = 0;
   int const moe_end = (xcd_rank < kMoePairRanks) ? 2 : 0;
@@ -1950,11 +2274,30 @@ __device__ __noinline__ void
 #endif
   for (int moe_i = moe_begin; moe_i < moe_end; moe_i += moe_step) {
 #ifdef MPK_MOE_XCD_PAIR
+#if defined(MPK_MOE_W2_REMAP3)
+    int const moe_t = (moe_i == 0 ? mr3_w13_phase : mr3_w2_phase) |
+                      (moe_i << 7) | ((routed_expert0 + 1) << 8);
+#elif defined(MPK_MOE_W2_REMAP2)
+    int const moe_t =
+        moe_i == 2
+            ? (kW2Moved + xcd_rank - kMoePairRanks) | (1 << 7) |
+                  ((routed_expert0 + 1) << 8)
+            : moe_phase | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+#else
     int const moe_t =
         moe_phase | (moe_i << 7) | ((routed_expert0 + 1) << 8);
+#endif
 #if defined(MPK_MOE_W2_REMAP) && defined(MPK_MOE_W2_REMAP_DELAY_US) && \
     MPK_MOE_W2_REMAP_DELAY_US > 0
+#ifdef MPK_MOE_W2_REMAP2
+#ifdef MPK_MOE_W2_REMAP2_NODELAY
+    if (moe_w2_mover && moe_i == 1 && xcd_rank - kMoePairRanks >= kW2Extra) {
+#else
+    if (moe_w2_mover && moe_i == 1) {
+#endif
+#else
     if (moe_w2_mover) {
+#endif
       unsigned long long const w2d_t0 = __builtin_amdgcn_s_memrealtime();
       while (__builtin_amdgcn_s_memrealtime() - w2d_t0 <
              100ull * MPK_MOE_W2_REMAP_DELAY_US) {
@@ -2607,6 +2950,13 @@ __device__ __noinline__ void
                                QKV_OUTPUT_PER_WG,
                                QKV_REDUCTION_SIZE>(
           input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
+#ifdef MPK_KV_SPREAD
+      qkv_prefetch_kv_extra_lds<QKV_BATCH_SIZE,
+                                QKV_OUTPUT_PER_WG,
+                                QKV_REDUCTION_SIZE,
+                                NUM_Q_PER_KV>(
+          input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
+#endif
 #endif
     }
 #endif

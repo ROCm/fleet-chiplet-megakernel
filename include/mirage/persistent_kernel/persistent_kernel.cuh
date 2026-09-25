@@ -69,6 +69,54 @@ __device__ unsigned long long g_qkvsub[1024 * 8];
   } while (0)
 #endif
 
+#ifdef MPK_ATTSUB
+__device__ unsigned long long g_attsub[1024 * 8];
+#define MPK_ATSTAMP(k)                                                  \
+  do {                                                                  \
+    if (threadIdx.x == 0) {                                             \
+      asm volatile("" ::: "memory");                                     \
+      g_attsub[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                     \
+    }                                                                   \
+  } while (0)
+#define MPK_ATVALUE(k, v)                                               \
+  do {                                                                  \
+    if (threadIdx.x == 0) {                                             \
+      g_attsub[blockIdx.x * 8 + (k)] = (unsigned long long)(v);          \
+    }                                                                   \
+  } while (0)
+#else
+#define MPK_ATSTAMP(k) \
+  do {             \
+  } while (0)
+#define MPK_ATVALUE(k, v) \
+  do {                \
+  } while (0)
+#endif
+#ifdef MPK_ATTSCAN
+__device__ unsigned long long g_attscan[1024 * 8];
+#define MPK_ASSTAMP(k)                                                   \
+  do {                                                                   \
+    if (threadIdx.x == 0) {                                              \
+      asm volatile("" ::: "memory");                                      \
+      g_attscan[blockIdx.x * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); \
+      asm volatile("" ::: "memory");                                      \
+    }                                                                    \
+  } while (0)
+#define MPK_ASVALUE(k, v)                                                \
+  do {                                                                   \
+    if (threadIdx.x == 0) {                                              \
+      g_attscan[blockIdx.x * 8 + (k)] = (unsigned long long)(v);          \
+    }                                                                    \
+  } while (0)
+#else
+#define MPK_ASSTAMP(k) \
+  do {             \
+  } while (0)
+#define MPK_ASVALUE(k, v) \
+  do {                \
+  } while (0)
+#endif
 #ifdef MPK_W2SUB
 __device__ unsigned long long g_w2sub[1024 * 8];
 #define MPK_W2STAMP(k)                                                 \
@@ -2890,7 +2938,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             // points to the last layer's event (gates FUSE_TAIL). Signal via
             // the two-level path since this task is in the queue.
             if (threadIdx.x == 0) {
+#ifdef MPK_TASK_FENCE_DRAIN
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
               threadfence_gpu();
+#endif
               EventId ev_id = config.ml_trigger_events[0];
               size_t ev_idx = get_event_position_index(ev_id);
               int xcd_slot = xcd_id * config.num_events + (int)ev_idx;
@@ -2988,12 +3040,20 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                       static_cast<EventCounter>(xcd_thresh) *
                       get_task_iteration_num(task_ids[queue_pos]);
                   if (local_cnt == needed_local) {
+#ifdef MPK_TASK_FENCE_DRAIN
+                    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
                     threadfence_gpu();
+#endif
                     atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
                                              1);
                   }
                 } else {
+#ifdef MPK_TASK_FENCE_DRAIN
+                  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
                   threadfence_gpu();
+#endif
                   atom_add_release_gpu_u64(&config.all_event_counters[ev_idx],
                                            1);
                 }
@@ -3424,7 +3484,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               // publish.
               if (task_desc->task_type != TASK_BEGIN_TASK_GRAPH)
 #endif
+#ifdef MPK_TASK_FENCE_DRAIN
+              asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
               threadfence_gpu();
+#endif
               // Gang: flush 1 (one task done). Non-gang: flush xcd_threshold.
               int flush_amount =
                   is_gang_task_type(task_desc->task_type) ? 1 : xcd_threshold;
@@ -3448,7 +3512,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
               get_task_iteration_num(task_ids[queue_pos]);
 
           if (local_count == needed_local) {
+#ifdef MPK_TASK_FENCE_DRAIN
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
             threadfence_gpu();
+#endif
             count = atom_add_release_gpu_u64(
                 &config.all_event_counters[event_index], xcd_threshold);
             event_fired = (count + xcd_threshold) ==
@@ -3462,7 +3530,11 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
         {
           // Fallback: per-task fence + global atomic (NVIDIA, or uncounted
           // events)
+#ifdef MPK_TASK_FENCE_DRAIN
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#else
           threadfence_gpu();
+#endif
           count = atom_add_release_gpu_u64(
               &config.all_event_counters[event_index], 1);
           event_fired =
@@ -3988,6 +4060,20 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               printf("[QKVSUB] w=%d", w);
               for (int s = 0; s < 8; s++) {
                 printf(" %llu", g_qkvsub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
+#ifdef MPK_ATTSUB
+              printf("[ATTSUB] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_attsub[w * 8 + s]);
+              }
+              printf("\n");
+#endif
+#ifdef MPK_ATTSCAN
+              printf("[ATTSCAN] w=%d", w);
+              for (int s = 0; s < 8; s++) {
+                printf(" %llu", g_attscan[w * 8 + s]);
               }
               printf("\n");
 #endif

@@ -715,7 +715,9 @@ template <typename T,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE_T,
           int NUM_KV_HEADS_T,
-          bool DECODE_ONLY = false>
+          bool DECODE_ONLY = false,
+          bool META_PRE = false,
+          bool KV_STAGED = false>
 __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
     void const *q_workspace_ptr,
     void *paged_k_cache_ptr,
@@ -732,11 +734,20 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
     float scale_s,
     int sliding_window = 0,
     void const *sinks_ptr = nullptr,
-    int split_part = 0) {
+    int split_part = 0,
+    int pre_q0 = 0,
+    int pre_q1 = 0,
+    int pre_k0 = 0,
+    int pre_k1 = 0,
+    int pre_lpl = 0,
+    int pre_pid0 = 0) {
   (void)split_part;
   int const req = request_id;
-  const ck_tile::index_t query_start = qo_indptr_buffer_ptr[req];
-  const ck_tile::index_t query_end = qo_indptr_buffer_ptr[req + 1];
+  // META_PRE: the caller loaded the request metadata ahead of the QKV epoch.
+  const ck_tile::index_t query_start =
+      META_PRE ? pre_q0 : qo_indptr_buffer_ptr[req];
+  const ck_tile::index_t query_end =
+      META_PRE ? pre_q1 : qo_indptr_buffer_ptr[req + 1];
   if (query_start == query_end) {
     return;
   }
@@ -754,7 +765,9 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
                                           NUM_KV_CHUNKS,
                                           Q_WORKSPACE_STRIDE,
                                           KV_CACHE_STRIDE_T,
-                                          NUM_KV_HEADS_T>(
+                                          NUM_KV_HEADS_T,
+                                          META_PRE,
+                                          KV_STAGED>(
           q_workspace_ptr,
           paged_k_cache_ptr,
           paged_v_cache_ptr,
@@ -770,7 +783,12 @@ __device__ __forceinline__ void paged_attention_ck_fmha_split_kv_impl(
           scale_s,
           sliding_window,
           sinks_ptr,
-          split_part);
+          split_part,
+          query_start,
+          pre_k0,
+          pre_k1,
+          pre_lpl,
+          pre_pid0);
     } else {
       paged_attention_ck_fmha_decode<T,
                                      NUM_QO_PER_KV,

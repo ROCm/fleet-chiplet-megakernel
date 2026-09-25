@@ -1353,6 +1353,10 @@ if __name__ == "__main__":
             """Tokenize one prompt, applying the chat template if there is one."""
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
                 messages = [{"role": "user", "content": text}]
+                _fixed_date = os.environ.get("MPK_FIXED_DATE")
+                if _fixed_date and 'strftime_now("%Y-%m-%d")' in tokenizer.chat_template:
+                    tokenizer.chat_template = tokenizer.chat_template.replace(
+                        'strftime_now("%Y-%m-%d")', repr(_fixed_date))
                 formatted = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True)
                 enc = tokenizer([formatted], return_tensors="pt",
@@ -2470,10 +2474,29 @@ if __name__ == "__main__":
             )
             # Interleave Q/K/V by KV groups (same layout as shuffle_tensors)
             q_per_kv = num_local_q_heads // num_local_kv_heads
+            # MPK_KV_SPREAD: each K head's rows ordered so every 16-row block
+            # holds 8 RoPE pairs (d, d + head_dim/2); the kernel writes them
+            # back to their own dims.
+            kv_spread = int(os.environ.get("MPK_KV_SPREAD", "0")) == 1
+            # MPK_QKV_ROPE_REG: the same order for every Q head too, so each
+            # wave's 16 rows hold whole RoPE pairs.
+            rope_reg = int(os.environ.get("MPK_QKV_ROPE_REG", "0")) == 1
+            if rope_reg:
+                kv_spread = True
+            if kv_spread:
+                assert head_dim == 64 and q_per_kv == 8
+                k_perm = torch.tensor(
+                    [b * 8 + h * 32 + j for b in range(4) for h in range(2)
+                     for j in range(8)], device=w_k.device)
             qkv_chunks = []
             for g in range(num_local_kv_heads):
-                qkv_chunks.append(w_q[g*q_per_kv*head_dim:(g+1)*q_per_kv*head_dim])
-                qkv_chunks.append(w_k[g*head_dim:(g+1)*head_dim])
+                w_q_g = w_q[g*q_per_kv*head_dim:(g+1)*q_per_kv*head_dim]
+                if rope_reg:
+                    w_q_g = w_q_g.reshape(q_per_kv, head_dim, -1)[:, k_perm].reshape(
+                        q_per_kv * head_dim, -1)
+                qkv_chunks.append(w_q_g)
+                w_k_g = w_k[g*head_dim:(g+1)*head_dim]
+                qkv_chunks.append(w_k_g[k_perm] if kv_spread else w_k_g)
                 qkv_chunks.append(w_v[g*head_dim:(g+1)*head_dim])
             w_qkv_shuffled = torch.cat(qkv_chunks, dim=0).contiguous()
             qkv_out_size = w_qkv_shuffled.shape[0]  # fused_qkv_dim
@@ -2490,7 +2513,13 @@ if __name__ == "__main__":
             k_bias = layer.self_attn.k_proj.bias.data.to("cuda")
             v_bias = layer.self_attn.v_proj.bias.data.to("cuda")
             q_bias_grouped = q_bias.reshape(num_local_kv_heads, q_per_kv * head_dim)
+            if rope_reg:
+                q_bias_grouped = q_bias_grouped.reshape(
+                    num_local_kv_heads, q_per_kv, head_dim)[:, :, k_perm.to(q_bias_grouped.device)].reshape(
+                    num_local_kv_heads, q_per_kv * head_dim)
             k_bias_grouped = k_bias.reshape(num_local_kv_heads, head_dim)
+            if kv_spread:
+                k_bias_grouped = k_bias_grouped[:, k_perm.to(k_bias_grouped.device)]
             v_bias_grouped = v_bias.reshape(num_local_kv_heads, head_dim)
             qkv_bias = torch.cat([q_bias_grouped, k_bias_grouped, v_bias_grouped], dim=1)
             qkv_bias = qkv_bias.reshape(1, -1).contiguous()  # [1, fused_qkv_dim]

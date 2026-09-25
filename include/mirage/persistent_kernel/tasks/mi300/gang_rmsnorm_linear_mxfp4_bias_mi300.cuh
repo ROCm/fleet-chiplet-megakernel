@@ -123,6 +123,22 @@ struct QkvWeightLds {
   static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
 };
 
+#ifdef MPK_QKV_B_MASK
+#if defined(MPK_QKV_TSC_PTR_INCREMENT) || defined(MPK_QKV_DS_BEFORE_ADDR) || \
+    defined(MPK_QKV_MFMA_UNROLLED) || !defined(MPK_QKV_PF_BEFORE_WAIT)
+#error "MPK_QKV_B_MASK is wired for the PF_BEFORE_WAIT loop"
+#endif
+// Batch 1: only lanes (g, col == 0) feed a real column of the MFMA's B
+// operand, so the activation stripes and their scale are read by those four
+// lanes alone. Columns 1..15 then hold stale registers; every epilogue
+// discards them.
+#define MPK_QKV_B_MASK_ON                                                      \
+  "s_mov_b64 %[bsv], exec\n"                                                  \
+  "s_mov_b32 exec_lo, 0x10001\n"                                              \
+  "s_mov_b32 exec_hi, 0x10001\n"
+#define MPK_QKV_B_MASK_OFF "s_mov_b64 exec, %[bsv]\n"
+#endif
+
 #ifdef MPK_QKV_KSPLIT
 // 2-way K-split scratch: k_part 0 writes its 4 AccVGPR floats per thread,
 // k_part 1 adds them and runs the RoPE/KV epilogue. 8 XCDs × 32 tiles is
@@ -226,6 +242,63 @@ __device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
           rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
     }
 #endif
+  }
+}
+
+// MPK_KV_SPREAD: stage the 16-row K or V block that Q tile q carries as its
+// second MFMA chain into LDS slot NUM_WAVES, right after its four wave tiles.
+// Tile q takes block (q & 3) of tile NUM_Q_PER_KV + (q >> 2): K for q < 4, V
+// for q >= 4. Same stripe layout and scale placement as the four-tile DMA
+// above (MPK_QKV_PREFETCH_SCALES), so the MFMA addresses it the same way.
+// Does NOT wait.
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE,
+          int NUM_Q_PER_KV>
+__device__ __forceinline__ void qkv_prefetch_kv_extra_lds(
+    void const *weight_ptr, int n_wgs_per_xcd, int tile_idx) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  extern __shared__ char _rnlm_smem[];
+
+  int const tid = threadIdx.x;
+  int const warp_id = tid >> 6;
+  int const q = tile_idx % n_wgs_per_xcd;
+  int const src_wg = NUM_Q_PER_KV + (q >> 2);
+  int const src_blk = q & 3;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  i32x4_t rsrc = make_w_buffer_rsrc(
+      W, static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
+  uint32_t const wg_voff = static_cast<uint32_t>(src_wg) * G::WG_BYTES;
+  auto *lds_warp_base =
+      (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
+                                                     G::W_END +
+                                                     warp_id * 1024);
+#pragma unroll
+  for (int j = 0; j < G::LPT; j++) {
+    int idx = tid + j * 256;
+    int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
+    uint32_t voff =
+        wg_voff +
+        static_cast<uint32_t>(src_blk * G::TILE_ROWS * (REDUCTION_SIZE / 2)) +
+        static_cast<uint32_t>(clamped * 16);
+    auto *lds_dst = (__attribute__((address_space(3)))
+                     uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                                     lds_warp_base +
+                                 j * 4096);
+    __llvm_amdgcn_raw_buffer_load_lds(
+        rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+  }
+  if (warp_id < 2) {
+    constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
+    int const clamped = tid < SCALE_VECTORS ? tid : SCALE_VECTORS - 1;
+    uint32_t voff = wg_voff + static_cast<uint32_t>(G::WG_DATA_BYTES) +
+                    static_cast<uint32_t>(src_blk * G::TILE_SCALE) +
+                    static_cast<uint32_t>(clamped * 16);
+    auto *lds_dst = (__attribute__((address_space(3)))
+                     uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                                     lds_warp_base +
+                                 G::TILE_DATA_PADDED);
+    __llvm_amdgcn_raw_buffer_load_lds(
+        rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
   }
 }
 
@@ -2361,6 +2434,68 @@ __device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
 }
 
 // ── KVUpd variant: ResAddF32 + RMSNorm + MXFP4 + KV Cache Update ───────
+#ifdef MPK_QKV_EPI_PRELOAD
+// _kvupd_rope_epilogue_packed with its two loads supplied by the caller:
+// bias4_pre is this lane's bias[wg_idx*OPW + wave_tile*16 + g*4 .. +3] and
+// cos_pre/sin_pre are cos/sin[pos][tid] (read by threads tid < HEAD_DIM/2).
+template <int HEAD_DIM, int TOK_ROWS>
+__device__ __forceinline__ void _kvupd_rope_epilogue_packed_pre(
+    float const *acc, uint64_t bias4_pre, unsigned cos_pre, unsigned sin_pre,
+    int wave_tile, int g, int col, int tid, bool tok_active, int n_valid,
+    unsigned short *dst, int dst_stride, int tok_row_base, int head_offset,
+    unsigned short *s_rope) {
+  static_assert(TOK_ROWS == 1, "MPK_QKV_EPI_PRELOAD is the batch-1 epilogue");
+  if (tok_active) {
+    int d0 = wave_tile * 16 + g * 4;
+    unsigned short const *b4 = (unsigned short const *)&bias4_pre;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      unsigned bt = (unsigned)b4[i] << 16;
+      float bv;
+      __builtin_memcpy(&bv, &bt, 4);
+      s_rope[col * HEAD_DIM + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+    }
+  }
+  __syncthreads();
+  constexpr int HALF = HEAD_DIM / 2;
+  if (tid < HALF && n_valid > 0) {
+    int const d = tid;
+    unsigned short *row = s_rope;
+    unsigned v0_bits = (unsigned)row[d] << 16;
+    unsigned v1_bits = (unsigned)row[d + HALF] << 16;
+    float v0, v1;
+    __builtin_memcpy(&v0, &v0_bits, 4);
+    __builtin_memcpy(&v1, &v1_bits, 4);
+    unsigned c_bits = (cos_pre & 0xFFFFu) << 16;
+    unsigned s_bits = (sin_pre & 0xFFFFu) << 16;
+    float c, s;
+    __builtin_memcpy(&c, &c_bits, 4);
+    __builtin_memcpy(&s, &s_bits, 4);
+    row[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+    row[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+  }
+  __syncthreads();
+#ifdef MPK_ROPE_VEC_STORE
+  for (int idx = (int)tid * 4; idx < HEAD_DIM; idx += 256 * 4) {
+    if (n_valid <= 0) {
+      continue;
+    }
+    unsigned long long packed;
+    __builtin_memcpy(&packed, &s_rope[idx], 8);
+    st_wt_u64(&dst[(long long)tok_row_base * dst_stride + head_offset + idx],
+              packed);
+  }
+#else
+  for (int idx = tid; idx < HEAD_DIM; idx += 256) {
+    if (n_valid <= 0) {
+      continue;
+    }
+    dst[(long long)tok_row_base * dst_stride + head_offset + idx] = s_rope[idx];
+  }
+#endif
+}
+#endif
+
 // Replaces gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_kernel for layers
 // 1+.
 template <int BATCH_SIZE,
@@ -2573,7 +2708,28 @@ __device__ __noinline__ void
   // wall clock is the honest ceiling for hiding this DMA perfectly.
   // Measured 2.422 vs 2.486/2.491 ms at B=1 seq512: 64 us, 2.6%.
 #ifndef MPK_ABLATE_QKV_DMA
+#ifdef MPK_QKV_DMA_IN_SLAB
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_ABLATE_WS_FOLD) || \
+    defined(MPK_QKV_KSPLIT_SHARED_NORM) || !defined(MPK_QKV_PF_SKIP_W2)
+#error "MPK_QKV_DMA_IN_SLAB is wired for the unsplit kernel with MPK_QKV_PF_SKIP_W2"
+#endif
+  // Batch 1: the weight DMA is issued inside the slab pass instead, after the
+  // slab loads and before their use.
+  bool const mpk_slab_dma = !weights_preloaded && BATCH_SIZE == 1;
+  if (!weights_preloaded && !mpk_slab_dma) {
+#elif defined(MPK_QKV_WDMA_AFTER_SLAB)
+#if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_PF_SKIP_W2) || \
+    !defined(MPK_QKV_RED_LDS_BAR) || defined(MPK_QKV_KSPLIT) || \
+    defined(MPK_KV_SPREAD)
+#error "MPK_QKV_WDMA_AFTER_SLAB needs MPK_QKV_SLAB_LDS, MPK_QKV_PF_SKIP_W2 and MPK_QKV_RED_LDS_BAR"
+#endif
+  // Batch 1: issued after the slab pass instead (see the SLAB_LDS block), so
+  // the slab loads do not retire behind it.
+  bool const mpk_wdma_late = !weights_preloaded && BATCH_SIZE == 1;
+  if (!weights_preloaded && !mpk_wdma_late) {
+#else
   if (!weights_preloaded) {
+#endif
     qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
         weight_ptr,
         n_wgs_per_xcd,
@@ -2584,6 +2740,13 @@ __device__ __noinline__ void
         nki
 #endif
     );
+#ifdef MPK_KV_SPREAD
+    if (tile_idx % n_wgs_per_xcd < NUM_Q_PER_KV) {
+      qkv_prefetch_kv_extra_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE,
+                                NUM_Q_PER_KV>(weight_ptr, n_wgs_per_xcd,
+                                              tile_idx);
+    }
+#endif
   }
 #endif
 
@@ -2670,7 +2833,389 @@ __device__ __noinline__ void
             (__attribute__((address_space(1))) unsigned short const *)(
                 d_residual + b * REDUCTION_SIZE);
         unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
+#ifdef MPK_QKV_GAMMA_LDS
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_GAMMA_EARLY)
+#error "MPK_QKV_GAMMA_LDS uses LDS slot NUM_WAVES and replaces the register prefetch"
+#endif
+        {
+          constexpr int GV = (REDUCTION_SIZE * 2) / 16;
+          static_assert((REDUCTION_SIZE * 2) % 16 == 0 &&
+                            G::W_END + ((GV + 255) / 256) * 4096 <=
+                                149 * 1024,
+                        "MPK_QKV_GAMMA_LDS: norm weight must fit LDS slot NUM_WAVES");
+          i32x4_t const g_rsrc =
+              make_w_buffer_rsrc(d_norm_w, REDUCTION_SIZE * 2);
+#ifdef MPK_QKV_GAMMA_NORMREG
+#if !defined(MPK_QKV_LDS_NORM) || MPK_MAX_NUM_BATCHED_TOKENS != 1
+#error "MPK_QKV_GAMMA_NORMREG stages the weight in the one-row LDS norm block"
+#endif
+          auto *g_lds = (__attribute__((address_space(3))) uint32_t *)(
+              (uint8_t *)s_norm_out + (tid >> 6) * 1024);
+#else
+          auto *g_lds = (__attribute__((address_space(3))) uint32_t *)(
+              (uint8_t *)_rnlm_smem + G::W_END + (tid >> 6) * 1024);
+#endif
+#pragma unroll
+          for (int j = 0; j < (GV + 255) / 256; j++) {
+            int const gi = tid + j * 256;
+            int const gc = gi < GV ? gi : GV - 1;
+#ifdef MPK_QKV_GAMMA_NORMREG
+            if (gi < GV)
+#endif
+            __llvm_amdgcn_raw_buffer_load_lds(
+                g_rsrc,
+                (__attribute__((address_space(3))) uint32_t *)(
+                    (uint8_t __attribute__((address_space(3))) *)g_lds +
+                    j * 4096),
+                16, gc * 16, 0, 0, 0);
+          }
+        }
+#endif
 
+#ifdef MPK_QKV_LDS_POISON_HI
+        {
+          typedef unsigned _pz_u32x4 __attribute__((ext_vector_type(4)));
+          for (int o = MPK_QKV_LDS_POISON_LO + tid * 16;
+               o < MPK_QKV_LDS_POISON_HI; o += 256 * 16)
+            *(__attribute__((address_space(3))) _pz_u32x4 *)(
+                (uint8_t *)_rnlm_smem + G::W_END + o) =
+                _pz_u32x4{0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+        }
+#endif
+#ifdef MPK_QKV_DMA_IN_SLAB
+        if (mpk_slab_dma) {
+          // Phase A: every slab and residual load of this row.
+          _gl_f32x4 mpk_ws[_MAX_ITERS][MOE_WS_SLOTS];
+          _gl_u32x2 mpk_rv[_MAX_ITERS];
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; ++it) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE) {
+#pragma unroll
+              for (int s = 0; s < MOE_WS_SLOTS; s++) {
+                mpk_ws[it][s] =
+                    *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                        ws_base + s * REDUCTION_SIZE + off);
+              }
+              mpk_rv[it] =
+                  *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+                      res_base + off);
+            }
+          }
+          asm volatile("" ::: "memory");
+          qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+              weight_ptr, n_wgs_per_xcd, tile_idx);
+          asm volatile("" ::: "memory");
+          // Phase B: the loop body below, same operations in the same order.
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; ++it) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE) {
+              float4 ws4;
+              ws4.x = mpk_ws[it][0][0];
+              ws4.y = mpk_ws[it][0][1];
+              ws4.z = mpk_ws[it][0][2];
+              ws4.w = mpk_ws[it][0][3];
+#pragma unroll
+              for (int s = 1; s < MOE_WS_SLOTS; s++) {
+                float4 slot4;
+                slot4.x = mpk_ws[it][s][0];
+                slot4.y = mpk_ws[it][s][1];
+                slot4.z = mpk_ws[it][s][2];
+                slot4.w = mpk_ws[it][s][3];
+                ws4.x += slot4.x;
+                ws4.y += slot4.y;
+                ws4.z += slot4.z;
+                ws4.w += slot4.w;
+              }
+              uint2 res_packed;
+              res_packed.x = mpk_rv[it][0];
+              res_packed.y = mpk_rv[it][1];
+              unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+              unsigned r1 = res_packed.x & 0xFFFF0000u;
+              unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+              unsigned r3 = res_packed.y & 0xFFFF0000u;
+              float rv0, rv1, rv2, rv3;
+              __builtin_memcpy(&rv0, &r0, 4);
+              __builtin_memcpy(&rv1, &r1, 4);
+              __builtin_memcpy(&rv2, &r2, 4);
+              __builtin_memcpy(&rv3, &r3, 4);
+              float s0 = ws4.x + rv0;
+              float s1 = ws4.y + rv1;
+              float s2 = ws4.z + rv2;
+              float s3 = ws4.w + rv3;
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+              s_cache[n_cached + 0] = s0;
+              s_cache[n_cached + 1] = s1;
+              s_cache[n_cached + 2] = s2;
+              s_cache[n_cached + 3] = s3;
+              n_cached += _VEC;
+              unsigned short o0 = _gang_float_to_bf16(s0);
+              unsigned short o1 = _gang_float_to_bf16(s1);
+              unsigned short o2 = _gang_float_to_bf16(s2);
+              unsigned short o3 = _gang_float_to_bf16(s3);
+              uint2 out_packed;
+              out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+              out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+              __builtin_memcpy(xout_base + off, &out_packed, 8);
+            }
+          }
+        } else {
+#endif
+#ifdef MPK_QKV_SLAB_HOIST
+#if defined(MPK_QKV_DMA_IN_SLAB) || defined(MPK_ABLATE_WS_FOLD)
+#error "MPK_QKV_SLAB_HOIST replaces the plain slab loop"
+#endif
+        _gl_f32x4 hs_ws[_MAX_ITERS][MOE_WS_SLOTS];
+        _gl_u32x2 hs_rv[_MAX_ITERS];
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; ++it) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+#pragma unroll
+            for (int s = 0; s < MOE_WS_SLOTS; s++) {
+              hs_ws[it][s] =
+                  *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                      ws_base + s * REDUCTION_SIZE + off);
+            }
+            hs_rv[it] = *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+                res_base + off);
+          }
+        }
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; ++it) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+            float4 ws4;
+            ws4.x = hs_ws[it][0][0];
+            ws4.y = hs_ws[it][0][1];
+            ws4.z = hs_ws[it][0][2];
+            ws4.w = hs_ws[it][0][3];
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+              ws4.x += hs_ws[it][s][0];
+              ws4.y += hs_ws[it][s][1];
+              ws4.z += hs_ws[it][s][2];
+              ws4.w += hs_ws[it][s][3];
+            }
+            uint2 res_packed;
+            res_packed.x = hs_rv[it][0];
+            res_packed.y = hs_rv[it][1];
+            unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+            unsigned r1 = res_packed.x & 0xFFFF0000u;
+            unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+            unsigned r3 = res_packed.y & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            __builtin_memcpy(xout_base + off, &out_packed, 8);
+          }
+        }
+#elif defined(MPK_QKV_SLAB_LDS)
+#if defined(MPK_QKV_DMA_IN_SLAB) || defined(MPK_ABLATE_WS_FOLD) || \
+    defined(MPK_KV_SPREAD)
+#error "MPK_QKV_SLAB_LDS replaces the plain slab loop and stages above G::W_END"
+#endif
+        // Every thread reads back only the LDS its own lane DMA'd (16 B of
+        // each workspace vector, 4 B of each residual half), so the wave's
+        // own vmcnt(0) below is the only ordering needed.
+        // Diagnostics: MPK_QKV_SLAB_LDS_SHADOW issues the DMAs but folds from
+        // ordinary loads; MPK_QKV_SLAB_LDS_AUX sets the DMAs' cache policy
+        // (17 = sc0 sc1).
+#ifndef MPK_QKV_SLAB_LDS_AUX
+#define MPK_QKV_SLAB_LDS_AUX 0
+#endif
+        {
+          static_assert(_MAX_ITERS == 3 && 2 * BLOCK_VEC <= REDUCTION_SIZE,
+                        "MPK_QKV_SLAB_LDS is laid out for three iterations");
+#if defined(MPK_QKV_GAMMA_LDS) && !defined(MPK_QKV_GAMMA_NORMREG)
+          constexpr int SL_WS = G::W_END + 8192;
+#else
+          constexpr int SL_WS = G::W_END;
+#endif
+          constexpr int SL_RES = SL_WS + 2 * MOE_WS_SLOTS * 4096;
+          static_assert(SL_RES + 4096 <=
+                            mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                        "MPK_QKV_SLAB_LDS: staging must fit above the QKV weights");
+          i32x4_t const ws_rsrc = make_w_buffer_rsrc(
+              (void const *)(d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE)),
+              MOE_WS_SLOTS * REDUCTION_SIZE * 4);
+          i32x4_t const res_rsrc = make_w_buffer_rsrc(
+              (void const *)(d_residual + b * REDUCTION_SIZE),
+              REDUCTION_SIZE * 2);
+          uint8_t *const sl_wave = (uint8_t *)_rnlm_smem + (tid >> 6) * 1024;
+#ifndef MPK_QKV_SLAB_LDS_NODMA
+#pragma unroll
+          for (int it = 1; it < 3; ++it) {
+#pragma unroll
+            for (int s = 0; s < MOE_WS_SLOTS; s++) {
+              __llvm_amdgcn_raw_buffer_load_lds(
+                  ws_rsrc,
+                  (__attribute__((address_space(3))) uint32_t *)(
+                      sl_wave + SL_WS + ((it - 1) * MOE_WS_SLOTS + s) * 4096),
+                  16, tid * 16, (s * REDUCTION_SIZE + it * BLOCK_VEC) * 4, 0,
+                  MPK_QKV_SLAB_LDS_AUX);
+            }
+          }
+          uint8_t *const sl_wave4 = (uint8_t *)_rnlm_smem + (tid >> 6) * 256;
+#pragma unroll
+          for (int h = 0; h < 4; ++h) {
+            __llvm_amdgcn_raw_buffer_load_lds(
+                res_rsrc,
+                (__attribute__((address_space(3))) uint32_t *)(
+                    sl_wave4 + SL_RES + h * 1024),
+                4, tid * 8, ((h >> 1) + 1) * BLOCK_VEC * 2 + (h & 1) * 4, 0,
+                MPK_QKV_SLAB_LDS_AUX);
+          }
+#endif
+          uint8_t const *const sl_ws =
+              (uint8_t const *)_rnlm_smem + SL_WS + tid * 16;
+          uint8_t const *const sl_res =
+              (uint8_t const *)_rnlm_smem + SL_RES + tid * 4;
+#pragma unroll
+          for (int it = 0; it < 3; ++it) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (it < 2 || off < REDUCTION_SIZE) {
+              float4 ws4;
+              uint2 res_packed;
+#if defined(MPK_QKV_SLAB_LDS_SHADOW) || defined(MPK_QKV_SLAB_LDS_NODMA)
+              bool const sl_from_lds = false;
+#else
+              bool const sl_from_lds = it > 0;
+#endif
+              if (!sl_from_lds) {
+                _gl_f32x4 const ws_v =
+                    *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                        ws_base + off);
+                ws4.x = ws_v[0];
+                ws4.y = ws_v[1];
+                ws4.z = ws_v[2];
+                ws4.w = ws_v[3];
+#pragma unroll
+                for (int s = 1; s < MOE_WS_SLOTS; s++) {
+                  _gl_f32x4 const sv =
+                      *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                          ws_base + s * REDUCTION_SIZE + off);
+                  float4 slot4;
+                  slot4.x = sv[0];
+                  slot4.y = sv[1];
+                  slot4.z = sv[2];
+                  slot4.w = sv[3];
+                  ws4.x += slot4.x;
+                  ws4.y += slot4.y;
+                  ws4.z += slot4.z;
+                  ws4.w += slot4.w;
+                }
+                _gl_u32x2 const rv_v =
+                    *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+                        res_base + off);
+                res_packed.x = rv_v[0];
+                res_packed.y = rv_v[1];
+              } else {
+                _gl_f32x4 const ws_v =
+                    *(__attribute__((address_space(3))) _gl_f32x4 const *)(
+                        sl_ws + (it - 1) * MOE_WS_SLOTS * 4096);
+                ws4.x = ws_v[0];
+                ws4.y = ws_v[1];
+                ws4.z = ws_v[2];
+                ws4.w = ws_v[3];
+#pragma unroll
+                for (int s = 1; s < MOE_WS_SLOTS; s++) {
+                  _gl_f32x4 const sv =
+                      *(__attribute__((address_space(3))) _gl_f32x4 const *)(
+                          sl_ws + ((it - 1) * MOE_WS_SLOTS + s) * 4096);
+                  float4 slot4;
+                  slot4.x = sv[0];
+                  slot4.y = sv[1];
+                  slot4.z = sv[2];
+                  slot4.w = sv[3];
+                  ws4.x += slot4.x;
+                  ws4.y += slot4.y;
+                  ws4.z += slot4.z;
+                  ws4.w += slot4.w;
+                }
+                res_packed.x =
+                    *(__attribute__((address_space(3))) unsigned const *)(
+                        sl_res + (it - 1) * 2048);
+                res_packed.y =
+                    *(__attribute__((address_space(3))) unsigned const *)(
+                        sl_res + (it - 1) * 2048 + 1024);
+              }
+              unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+              unsigned r1 = res_packed.x & 0xFFFF0000u;
+              unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+              unsigned r3 = res_packed.y & 0xFFFF0000u;
+              float rv0, rv1, rv2, rv3;
+              __builtin_memcpy(&rv0, &r0, 4);
+              __builtin_memcpy(&rv1, &r1, 4);
+              __builtin_memcpy(&rv2, &r2, 4);
+              __builtin_memcpy(&rv3, &r3, 4);
+              float s0 = ws4.x + rv0;
+              float s1 = ws4.y + rv1;
+              float s2 = ws4.z + rv2;
+              float s3 = ws4.w + rv3;
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+              s_cache[n_cached + 0] = s0;
+              s_cache[n_cached + 1] = s1;
+              s_cache[n_cached + 2] = s2;
+              s_cache[n_cached + 3] = s3;
+              n_cached += _VEC;
+              unsigned short o0 = _gang_float_to_bf16(s0);
+              unsigned short o1 = _gang_float_to_bf16(s1);
+              unsigned short o2 = _gang_float_to_bf16(s2);
+              unsigned short o3 = _gang_float_to_bf16(s3);
+              _gl_u32x2 ov;
+              ov[0] = (unsigned)o0 | ((unsigned)o1 << 16);
+              ov[1] = (unsigned)o2 | ((unsigned)o3 << 16);
+              // The staged LDS lines must have landed before iteration 1
+              // reads them; waiting here, ahead of this store, keeps the store
+              // ack out of that wait.
+              if (it == 0) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#ifdef MPK_QKV_SLAB_LDS_FLATSTORE
+              __builtin_memcpy(xout_base + off, &ov, 8);
+#else
+              *(__attribute__((address_space(1))) _gl_u32x2 *)(xout_base +
+                                                               off) = ov;
+#endif
+            }
+          }
+#ifdef MPK_QKV_WDMA_AFTER_SLAB
+          if (mpk_wdma_late) {
+            qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+                weight_ptr, n_wgs_per_xcd, tile_idx);
+          }
+#endif
+        }
+#else
 #pragma unroll
         for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
           // Sum the MoE expert contributions here, in fixed slot order, rather
@@ -2760,6 +3305,10 @@ __device__ __noinline__ void
           out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
           __builtin_memcpy(xout_base + off, &out_packed, 8);
         }
+#endif  // MPK_QKV_SLAB_HOIST
+#ifdef MPK_QKV_DMA_IN_SLAB
+        }
+#endif
       }
 
       MPK_QKVSUB(1);
@@ -2779,6 +3328,7 @@ __device__ __noinline__ void
       // `s_waitcnt lgkmcnt(0)` in the reduction (there is one, for the LDS
       // s_red write) would drain these too and collapse the overlap this
       // exists to create. GLOBAL touches vmcnt only.
+#ifndef MPK_QKV_GAMMA_LDS
 #pragma unroll
       for (int iter = 0; iter < _MAX_ITERS; ++iter) {
         int const off = tid * _VEC + iter * _BLOCK_VEC;
@@ -2791,6 +3341,7 @@ __device__ __noinline__ void
           prefetched_norm_weights[iter] = value;
         }
       }
+#endif
 
       #ifdef MPK_RMSNORM_DPP_REDUCE
       // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
@@ -2807,11 +3358,26 @@ __device__ __noinline__ void
       float *s_red = (float *)_rnlm_smem;
       int _wave_id = tid >> 6;
       int _lane_id = tid & 63;
+#ifdef MPK_QKV_RED_LDS_BAR
+#if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_GAMMA_LDS) || \
+    !defined(MPK_QKV_LDS_NORM)
+#error "MPK_QKV_RED_LDS_BAR needs MPK_QKV_SLAB_LDS, MPK_QKV_GAMMA_LDS and MPK_QKV_LDS_NORM"
+#endif
+      constexpr int _num_waves = 4;
+      static_assert(_BLOCK_VEC == 256 * _VEC, "256-thread worker block");
+#else
       int _num_waves = blockDim.x >> 6;
+#endif
       if (_lane_id == 0) {
         s_red[_wave_id] = ssq;
       }
+#ifdef MPK_QKV_RED_LDS_BAR
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+      __builtin_amdgcn_s_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
       __syncthreads();
+#endif
 
       float rms_rcp;
       if (_wave_id == 0) {
@@ -2823,7 +3389,13 @@ __device__ __noinline__ void
           s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
         }
       }
+#ifdef MPK_QKV_RED_LDS_BAR
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+      __builtin_amdgcn_s_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
       __syncthreads();
+#endif
       rms_rcp = s_red[0];
 
       // Pass 2: Apply norm weight using CACHED sums (no re-read of x_out)
@@ -2857,7 +3429,18 @@ __device__ __noinline__ void
           // verified in the disassembly -- look for a vmcnt(0) between the
           // global_load_dwordx2 block and this loop before trusting a number
           // from this path.
+#ifdef MPK_QKV_GAMMA_LDS
+          // DMA'd before the slab pass; the two barriers since drained it.
+          uint64_t wv;
+#ifdef MPK_QKV_GAMMA_NORMREG
+          __builtin_memcpy(&wv, &out[off], 8);
+#else
+          __builtin_memcpy(&wv, (uint8_t *)_rnlm_smem + G::W_END + off * 2, 8);
+#endif
+          (void)wi;
+#else
           uint64_t wv = prefetched_norm_weights[wi++];
+#endif
           bf16 const *wa = (bf16 const *)&wv;
           bf16 ov[VEC];
 #pragma unroll
@@ -2880,10 +3463,25 @@ __device__ __noinline__ void
     int const num_new_tokens = pf_qo1 - pf_qo0;
     pf_gp = global_seq_len - num_new_tokens + (tok_row_base - pf_qo0);
   }
+#ifndef MPK_QKV_PF_PAGE_LATE
   pf_page = kv_indices[pf_kv0 + pf_gp / PAGE_SIZE];
 #endif
+#endif
+#ifdef MPK_QKV_RED_LDS_BAR
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
   __syncthreads();
+#endif
+#if defined(MPK_QKV_PF_PAGE_LATE) && defined(MPK_QKV_POS_PREFETCH) && \
+    MPK_MAX_NUM_BATCHED_REQUESTS == 1
+  // GLOBAL, and after the barrier: as a FLAT load before it, the barrier's
+  // lgkmcnt(0) drained it. Here it retires behind the quant.
+  pf_page = ((__attribute__((address_space(1))) int const *)
+                 kv_indices)[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
 
   MPK_QKVSUB(2);
 #ifdef MPK_ENABLE_SUBPHASE_TIMING
@@ -3092,8 +3690,20 @@ __device__ __noinline__ void
 #error "MPK_QKV_SKIP_B1_WAIT requires MPK_QKV_PF_BEFORE_WAIT"
 #endif
 
+#ifdef MPK_ABLATE_KV_EXTRA
+#ifndef MPK_ABLATE_KV_TILES
+#error "MPK_ABLATE_KV_EXTRA needs MPK_ABLATE_KV_TILES"
+#endif
+    int const _abl_extra = (wg_idx < NUM_Q_PER_KV) ? 1 : 0;
+    for (int tile_iter = 0; tile_iter < TILES_PER_WAVE + _abl_extra;
+         tile_iter++) {
+      int wave_tile =
+          warp_id +
+          (tile_iter >= _abl_extra ? tile_iter - _abl_extra : 0) * NUM_WAVES;
+#else
     for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
       int wave_tile = warp_id + tile_iter * NUM_WAVES;
+#endif
 
       uint8_t *lds_wd = lds_qkv_base + warp_id * QKV_TILE_BYTES;
       uint8_t *lds_ws = lds_wd + QKV_TILE_DATA_PADDED;
@@ -3104,9 +3714,70 @@ __device__ __noinline__ void
       // Token layout: stride +0x80 per iter (128 bytes)
       // Token scale: stride +1 per iter (1 byte)
       float qa0, qa1, qa2, qa3;
+#ifdef MPK_QKV_ROPE_REG
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_KV_SPREAD) ||                 \
+    defined(MPK_QKV_PF3) || defined(MPK_QKV_KSPLIT)
+#error "MPK_QKV_ROPE_REG is wired for the single-chain loop, alone"
+#endif
+      static_assert(TOK_ROWS == 1 && HEAD_DIM == 64 && OUTPUT_PER_WG == 64 &&
+                        TILES_PER_WAVE == 1,
+                    "MPK_QKV_ROPE_REG: batch 1, 64-row head tiles");
+      uint64_t epi_b4 = 0, epi_c = 0, epi_s = 0;
+      unsigned long long const epi_pb = (unsigned long long)(
+          d_bias + wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
+      long long const epi_cs = (long long)s_global_pos[0] * HEAD_DIM +
+                               8 * wave_tile + (g & 1) * 4;
+      unsigned long long const epi_pc =
+          (unsigned long long)((unsigned short const *)cos_ptr + epi_cs);
+      unsigned long long const epi_ps =
+          (unsigned long long)((unsigned short const *)sin_ptr + epi_cs);
+#endif
+#ifdef MPK_QKV_EPI_PRELOAD
+      uint64_t epi_b4 = 0;
+      unsigned epi_c = 0, epi_s = 0;
+      unsigned long long const epi_pb = (unsigned long long)(
+          d_bias + wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
+      long long const epi_cs = (long long)s_global_pos[0] * HEAD_DIM +
+                               (lane_id & (HEAD_DIM / 2 - 1));
+      unsigned long long const epi_pc =
+          (unsigned long long)((unsigned short const *)cos_ptr + epi_cs);
+      unsigned long long const epi_ps =
+          (unsigned long long)((unsigned short const *)sin_ptr + epi_cs);
+#endif
+#ifdef MPK_QKV_B_MASK
+      unsigned long long qkv_bsv;
+#endif
+#ifdef MPK_KV_SPREAD
+      float qb0 = 0.f, qb1 = 0.f, qb2 = 0.f, qb3 = 0.f;
+      bool const kv_dual = wg_idx < NUM_Q_PER_KV && warp_id == 0;
+      // The K/V block's epilogue operands, loaded ahead of the MFMA loop so
+      // it covers their latency: its 4 biases (right after the Q biases at
+      // NUM_Q_PER_KV*OUTPUT_PER_WG + block*16), and for K lanes g < 2 the
+      // cos/sin of their 4 dims.
+      // Loaded inside the dual-chain asm (global_load into its outputs): a
+      // C++ load here lands in registers that asm clobbers, and the compiler
+      // then waits for it before the loop just to move it.
+      uint64_t kv_bias4 = 0, kv_cos4 = 0, kv_sin4 = 0;
+      int const kv_d = 8 * (wg_idx & 3) + (g & 1) * 4;
+      long long const kv_cs = (long long)s_global_pos[0] * HEAD_DIM + kv_d;
+      unsigned long long const kv_pb = (unsigned long long)(
+          d_bias + NUM_Q_PER_KV * OUTPUT_PER_WG + wg_idx * 16 + g * 4);
+      unsigned long long const kv_pc =
+          (unsigned long long)((unsigned short const *)cos_ptr + kv_cs);
+      unsigned long long const kv_ps =
+          (unsigned long long)((unsigned short const *)sin_ptr + kv_cs);
+#endif
       {
+#ifdef MPK_ABLATE_QKV_KMAJOR_ADDR
+#if defined(MPK_KV_SPREAD) || !defined(MPK_QKV_PF_BEFORE_WAIT) ||              \
+    defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_MFMA_UNROLLED)
+#error "MPK_ABLATE_QKV_KMAJOR_ADDR is wired for the PF_BEFORE_WAIT single-chain loop"
+#endif
+        unsigned w_addr = (unsigned)(uintptr_t)(lds_wd + lane_id * 16);
+#else
         unsigned w_addr =
             (unsigned)(uintptr_t)(lds_wd + col * ROW_DATA + g * 16);
+#endif
         unsigned ws_addr = (unsigned)(uintptr_t)(lds_ws + col * ROW_SCALE + g);
         // B operand: lane (g, col) reads token row `col`. Inactive lanes clamp
         // to row 0 rather than skipping -- see the exec-mask note in
@@ -3133,7 +3804,737 @@ __device__ __noinline__ void
                      : "v"(iters_m1_val));
 #endif
 
+#ifdef MPK_KV_SPREAD
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_MFMA_UNROLLED) ||             \
+    defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_TSC_PTR_INCREMENT) ||   \
+    defined(MPK_QKV_ACC_UNDER_LDS) || !defined(MPK_QKV_PF_BEFORE_WAIT) ||      \
+    !defined(MPK_QKV_PREFETCH_SCALES) || defined(MPK_QKV_DMA_IN_SLAB) ||       \
+    defined(MPK_ABLATE_KV_EXTRA) || defined(MPK_ABLATE_QKV_DMA)
+#error "MPK_KV_SPREAD is wired for the shipped QKV loop (PF_BEFORE_WAIT, PREFETCH_SCALES, unsplit)"
+#endif
+        static_assert(G::TOK_ROWS == 1 && OUTPUT_PER_WG == 64 &&
+                          HEAD_DIM == 64 && NUM_Q_PER_KV == 8,
+                      "MPK_KV_SPREAD: batch 1, 64-row tiles, 8 Q heads per KV");
+        static_assert(G::W_END + G::TILE_BYTES <= 149 * 1024,
+                      "MPK_KV_SPREAD: LDS slot NUM_WAVES must fit");
+        if (kv_dual) {
+          uint8_t *lds_kv = lds_qkv_base + NUM_WAVES * QKV_TILE_BYTES;
+          i32x4_t kv_a2b0, kv_a2b1;
+          int kv_a2s0, kv_a2s1;
+          unsigned w2_addr =
+              (unsigned)(uintptr_t)(lds_kv + col * ROW_DATA + g * 16);
+          unsigned ws2_addr = (unsigned)(uintptr_t)(
+              lds_kv + QKV_TILE_DATA_PADDED + col * ROW_SCALE + g);
+          // The loop below with a second accumulator a[4:7] and its own A
+          // banks (v[40:43]/v50 and v[44:47]/v51); B is shared. Each half-step
+          // issues the next A1 stripe, waits for the current bank, runs
+          // MFMA 1, issues the next B and A2 stripes, then runs MFMA 2, so
+          // every prefetch is issued after the MFMA that last read its
+          // registers, as in the single-chain ping-pong.
+#ifdef MPK_KV_SPREAD_A2REG
+#ifdef MPK_QKV_B_MASK
+#error "MPK_KV_SPREAD_A2REG does not implement MPK_QKV_B_MASK"
+#endif
+          static_assert(MFMA_ITERS == 23,
+                        "MPK_KV_SPREAD_A2REG is generated for 23 K-steps");
+          asm volatile(
+              "global_load_dwordx2 %[kb], %[pb], off\n"
+              "global_load_dwordx2 %[kc], %[pc], off\n"
+              "global_load_dwordx2 %[ks], %[ps], off\n"
+              "v_accvgpr_write_b32 a0, 0\n"
+              "v_accvgpr_write_b32 a1, 0\n"
+              "v_accvgpr_write_b32 a2, 0\n"
+              "v_accvgpr_write_b32 a3, 0\n"
+              "v_accvgpr_write_b32 a4, 0\n"
+              "v_accvgpr_write_b32 a5, 0\n"
+              "v_accvgpr_write_b32 a6, 0\n"
+              "v_accvgpr_write_b32 a7, 0\n"
+              "ds_read_b128 v[52:55], %[w2a] offset:0\n"
+              "ds_read_b128 v[56:59], %[w2a] offset:64\n"
+              "ds_read_b128 v[60:63], %[w2a] offset:128\n"
+              "ds_read_b128 v[64:67], %[w2a] offset:192\n"
+              "ds_read_b128 v[68:71], %[w2a] offset:256\n"
+              "ds_read_b128 v[72:75], %[w2a] offset:320\n"
+              "ds_read_b128 v[76:79], %[w2a] offset:384\n"
+              "ds_read_b128 v[80:83], %[w2a] offset:448\n"
+              "ds_read_b128 v[84:87], %[w2a] offset:512\n"
+              "ds_read_b128 v[88:91], %[w2a] offset:576\n"
+              "ds_read_b128 v[92:95], %[w2a] offset:640\n"
+              "ds_read_b128 v[96:99], %[w2a] offset:704\n"
+              "ds_read_b128 v[100:103], %[w2a] offset:768\n"
+              "ds_read_b128 v[104:107], %[w2a] offset:832\n"
+              "ds_read_b128 v[108:111], %[w2a] offset:896\n"
+              "ds_read_b128 v[112:115], %[w2a] offset:960\n"
+              "ds_read_b128 v[116:119], %[w2a] offset:1024\n"
+              "ds_read_b128 v[120:123], %[w2a] offset:1088\n"
+              "ds_read_b128 v[124:127], %[w2a] offset:1152\n"
+              "ds_read_b128 v[128:131], %[w2a] offset:1216\n"
+              "ds_read_b128 v[132:135], %[w2a] offset:1280\n"
+              "ds_read_b128 v[136:139], %[w2a] offset:1344\n"
+              "ds_read_b128 v[140:143], %[w2a] offset:1408\n"
+              "ds_read_u8   v144, %[ws2a] offset:0\n"
+              "ds_read_u8   v145, %[ws2a] offset:4\n"
+              "ds_read_u8   v146, %[ws2a] offset:8\n"
+              "ds_read_u8   v147, %[ws2a] offset:12\n"
+              "ds_read_u8   v148, %[ws2a] offset:16\n"
+              "ds_read_u8   v149, %[ws2a] offset:20\n"
+              "ds_read_u8   v150, %[ws2a] offset:24\n"
+              "ds_read_u8   v151, %[ws2a] offset:28\n"
+              "ds_read_u8   v152, %[ws2a] offset:32\n"
+              "ds_read_u8   v153, %[ws2a] offset:36\n"
+              "ds_read_u8   v154, %[ws2a] offset:40\n"
+              "ds_read_u8   v155, %[ws2a] offset:44\n"
+              "ds_read_u8   v156, %[ws2a] offset:48\n"
+              "ds_read_u8   v157, %[ws2a] offset:52\n"
+              "ds_read_u8   v158, %[ws2a] offset:56\n"
+              "ds_read_u8   v159, %[ws2a] offset:60\n"
+              "ds_read_u8   v160, %[ws2a] offset:64\n"
+              "ds_read_u8   v161, %[ws2a] offset:68\n"
+              "ds_read_u8   v162, %[ws2a] offset:72\n"
+              "ds_read_u8   v163, %[ws2a] offset:76\n"
+              "ds_read_u8   v164, %[ws2a] offset:80\n"
+              "ds_read_u8   v165, %[ws2a] offset:84\n"
+              "ds_read_u8   v166, %[ws2a] offset:88\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, %[tsa]\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 1, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[52:55], v[8:15], a[4:7], v144, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 2, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[56:59], v[32:39], a[4:7], v145, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 3, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[60:63], v[8:15], a[4:7], v146, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 4, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[64:67], v[32:39], a[4:7], v147, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 5, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[68:71], v[8:15], a[4:7], v148, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 6, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[72:75], v[32:39], a[4:7], v149, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 7, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[76:79], v[8:15], a[4:7], v150, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 8, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[80:83], v[32:39], a[4:7], v151, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 9, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[84:87], v[8:15], a[4:7], v152, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 10, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[88:91], v[32:39], a[4:7], v153, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 11, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[92:95], v[8:15], a[4:7], v154, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 12, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[96:99], v[32:39], a[4:7], v155, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 13, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[100:103], v[8:15], a[4:7], v156, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 14, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[104:107], v[32:39], a[4:7], v157, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 15, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[108:111], v[8:15], a[4:7], v158, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 16, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[112:115], v[32:39], a[4:7], v159, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 17, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[116:119], v[8:15], a[4:7], v160, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 18, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[120:123], v[32:39], a[4:7], v161, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 19, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[124:127], v[8:15], a[4:7], v162, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 20, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[128:131], v[32:39], a[4:7], v163, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 21, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[132:135], v[8:15], a[4:7], v164, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 22, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[136:139], v[32:39], a[4:7], v165, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[140:143], v[8:15], a[4:7], v166, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_nop 15\n"
+              "s_nop 15\n"
+              "s_nop 15\n"
+              "s_nop 15\n"
+              "v_accvgpr_read_b32 %[acc0], a0\n"
+              "v_accvgpr_read_b32 %[acc1], a1\n"
+              "v_accvgpr_read_b32 %[acc2], a2\n"
+              "v_accvgpr_read_b32 %[acc3], a3\n"
+              "v_accvgpr_read_b32 %[bcc0], a4\n"
+              "v_accvgpr_read_b32 %[bcc1], a5\n"
+              "v_accvgpr_read_b32 %[bcc2], a6\n"
+              "v_accvgpr_read_b32 %[bcc3], a7\n"
+              "s_waitcnt vmcnt(0)\n"
+              : [acc0] "=v"(qa0), [acc1] "=v"(qa1), [acc2] "=v"(qa2),
+                [acc3] "=v"(qa3), [bcc0] "=v"(qb0), [bcc1] "=v"(qb1),
+                [bcc2] "=v"(qb2), [bcc3] "=v"(qb3), [wa] "+v"(w_addr),
+                [wsa] "+v"(ws_addr), [ta] "+v"(t_addr), [kb] "=&v"(kv_bias4),
+                [kc] "=&v"(kv_cos4), [ks] "=&v"(kv_sin4)
+              : [tsa] "v"(ts_addr), [w2a] "v"(w2_addr), [ws2a] "v"(ws2_addr),
+                [pb] "v"(kv_pb), [pc] "v"(kv_pc), [ps] "v"(kv_ps)
+              : "memory", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v52", "v53", "v54", "v55", "v56", "v57", "v58", "v59", "v60", "v61", "v62", "v63", "v64", "v65", "v66", "v67", "v68", "v69", "v70", "v71", "v72", "v73", "v74", "v75", "v76", "v77", "v78", "v79", "v80", "v81", "v82", "v83", "v84", "v85", "v86", "v87", "v88", "v89", "v90", "v91", "v92", "v93", "v94", "v95", "v96", "v97", "v98", "v99", "v100", "v101", "v102", "v103", "v104", "v105", "v106", "v107", "v108", "v109", "v110", "v111", "v112", "v113", "v114", "v115", "v116", "v117", "v118", "v119", "v120", "v121", "v122", "v123", "v124", "v125", "v126", "v127", "v128", "v129", "v130", "v131", "v132", "v133", "v134", "v135", "v136", "v137", "v138", "v139", "v140", "v141", "v142", "v143", "v144", "v145", "v146", "v147", "v148", "v149", "v150", "v151", "v152", "v153", "v154", "v155", "v156", "v157", "v158", "v159", "v160", "v161", "v162", "v163", "v164", "v165", "v166", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7");
+#else
+          asm volatile(
+              "global_load_dwordx2 %[kb], %[pb], off\n"
+              "global_load_dwordx2 %[kc], %[pc], off\n"
+              "global_load_dwordx2 %[ks], %[ps], off\n"
+              "v_accvgpr_write_b32 a0, 0\n"
+              "v_accvgpr_write_b32 a1, 0\n"
+              "v_accvgpr_write_b32 a2, 0\n"
+              "v_accvgpr_write_b32 a3, 0\n"
+              "v_accvgpr_write_b32 a4, 0\n"
+              "v_accvgpr_write_b32 a5, 0\n"
+              "v_accvgpr_write_b32 a6, 0\n"
+              "v_accvgpr_write_b32 a7, 0\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, %[tsa]\n"
+              "ds_read_b128 %[a2b0], %[w2a]\n"
+              "ds_read_u8   %[a2s0], %[ws2a]\n"
+              "s_mov_b32 s13, 0\n"
+              "KVD_LOOP_%=:\n"
+              // ---- consume bank 0, prefetch into bank 1 ----
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 %[w2a], 64, %[w2a]\n"
+              "v_add_u32_e32 %[ws2a], 4, %[ws2a]\n"
+              "s_add_i32 s13, s13, 1\n"
+              "v_add_u32_e32 v17, s13, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+              "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_ON
+#endif
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "ds_read_u8   v19, v17\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_OFF
+#endif
+              "ds_read_b128 %[a2b1], %[w2a]\n"
+              "ds_read_u8   %[a2s1], %[ws2a]\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b0], v[8:15], "
+              "a[4:7], %[a2s0], v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+              "s_cbranch_scc0 KVD_TAIL_B1_%=\n"
+              // ---- consume bank 1, prefetch into bank 0 ----
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 %[w2a], 64, %[w2a]\n"
+              "v_add_u32_e32 %[ws2a], 4, %[ws2a]\n"
+              "s_add_i32 s13, s13, 1\n"
+              "v_add_u32_e32 v17, s13, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+              "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_ON
+#endif
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, v17\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_OFF
+#endif
+              "ds_read_b128 %[a2b0], %[w2a]\n"
+              "ds_read_u8   %[a2s0], %[ws2a]\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b1], v[32:39], "
+              "a[4:7], %[a2s1], v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+              "s_cbranch_scc1 KVD_LOOP_%=\n"
+              // Both tails, as below: odd MFMA_ITERS leaves through here.
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+              "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b0], v[8:15], "
+              "a[4:7], %[a2s0], v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_branch KVD_ACC_%=\n"
+              "KVD_TAIL_B1_%=:\n"
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+              "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b1], v[32:39], "
+              "a[4:7], %[a2s1], v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "KVD_ACC_%=:\n"
+              // Two 32-cycle MFMAs may still be in flight.
+              "s_nop 15\n"
+              "s_nop 15\n"
+              "s_nop 15\n"
+              "s_nop 15\n"
+              "v_accvgpr_read_b32 %[acc0], a0\n"
+              "v_accvgpr_read_b32 %[acc1], a1\n"
+              "v_accvgpr_read_b32 %[acc2], a2\n"
+              "v_accvgpr_read_b32 %[acc3], a3\n"
+              "v_accvgpr_read_b32 %[bcc0], a4\n"
+              "v_accvgpr_read_b32 %[bcc1], a5\n"
+              "v_accvgpr_read_b32 %[bcc2], a6\n"
+              "v_accvgpr_read_b32 %[bcc3], a7\n"
+              "s_waitcnt vmcnt(0)\n"
+              : [acc0] "=v"(qa0),
+                [acc1] "=v"(qa1),
+                [acc2] "=v"(qa2),
+                [acc3] "=v"(qa3),
+                [bcc0] "=v"(qb0),
+                [bcc1] "=v"(qb1),
+                [bcc2] "=v"(qb2),
+                [bcc3] "=v"(qb3),
+                [wa] "+v"(w_addr),
+                [wsa] "+v"(ws_addr),
+                [ta] "+v"(t_addr),
+                [w2a] "+v"(w2_addr),
+                [ws2a] "+v"(ws2_addr),
+                [kb] "=&v"(kv_bias4),
+                [kc] "=&v"(kv_cos4),
+                [ks] "=&v"(kv_sin4),
+                [a2b0] "=&v"(kv_a2b0),
+                [a2b1] "=&v"(kv_a2b1),
+                [a2s0] "=&v"(kv_a2s0),
+                [a2s1] "=&v"(kv_a2s1)
+#ifdef MPK_QKV_B_MASK
+                ,
+                [bsv] "=&s"(qkv_bsv)
+#endif
+              : [tsa] "v"(ts_addr), [iters_m1] "n"(MFMA_ITERS - 1),
+                [pb] "v"(kv_pb), [pc] "v"(kv_pc), [ps] "v"(kv_ps)
+              : "memory", "s13", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+                "v14", "v15", "v16", "v17", "v18", "v19", "v22", "v23", "v24",
+                "v25", "v26", "v27", "v28", "v29", "v32", "v33", "v34", "v35",
+                "v36", "v37", "v38", "v39", "a0", "a1", "a2", "a3", "a4",
+                "a5", "a6", "a7");
+#endif
+        } else
+#endif
+#ifdef MPK_QKV_PF3
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_MFMA_UNROLLED) ||             \
+    defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_TSC_PTR_INCREMENT) ||   \
+    defined(MPK_QKV_ACC_UNDER_LDS) || defined(MPK_QKV_B_MASK) ||               \
+    defined(MPK_ABLATE_QKV_KMAJOR_ADDR) || defined(MPK_KV_SPREAD)
+#error "MPK_QKV_PF3 replaces the shipped single-chain loop only"
+#endif
+        static_assert(MFMA_ITERS == 23,
+                      "MPK_QKV_PF3 is generated for 23 K-steps");
         asm volatile(
+            "v_accvgpr_write_b32 a0, 0\n"
+            "v_accvgpr_write_b32 a1, 0\n"
+            "v_accvgpr_write_b32 a2, 0\n"
+            "v_accvgpr_write_b32 a3, 0\n"
+            "ds_read_b128 v[22:25], %[wa] offset:0\n"
+            "ds_read_u8   v7, %[wsa] offset:0\n"
+            "ds_read_b128 v[8:11], %[ta] offset:0\n"
+            "ds_read_b128 v[12:15], %[ta] offset:64\n"
+            "ds_read_u8   v16, %[tsa] offset:0\n"
+            "ds_read_b128 v[26:29], %[wa] offset:64\n"
+            "ds_read_u8   v18, %[wsa] offset:4\n"
+            "ds_read_b128 v[32:35], %[ta] offset:128\n"
+            "ds_read_b128 v[36:39], %[ta] offset:192\n"
+            "ds_read_u8   v19, %[tsa] offset:1\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:128\n"
+            "ds_read_u8   v52, %[wsa] offset:8\n"
+            "ds_read_b128 v[40:43], %[ta] offset:256\n"
+            "ds_read_b128 v[44:47], %[ta] offset:320\n"
+            "ds_read_u8   v53, %[tsa] offset:2\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:192\n"
+            "ds_read_u8   v7, %[wsa] offset:12\n"
+            "ds_read_b128 v[8:11], %[ta] offset:384\n"
+            "ds_read_b128 v[12:15], %[ta] offset:448\n"
+            "ds_read_u8   v16, %[tsa] offset:3\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:256\n"
+            "ds_read_u8   v18, %[wsa] offset:16\n"
+            "ds_read_b128 v[32:35], %[ta] offset:512\n"
+            "ds_read_b128 v[36:39], %[ta] offset:576\n"
+            "ds_read_u8   v19, %[tsa] offset:4\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:320\n"
+            "ds_read_u8   v52, %[wsa] offset:20\n"
+            "ds_read_b128 v[40:43], %[ta] offset:640\n"
+            "ds_read_b128 v[44:47], %[ta] offset:704\n"
+            "ds_read_u8   v53, %[tsa] offset:5\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:384\n"
+            "ds_read_u8   v7, %[wsa] offset:24\n"
+            "ds_read_b128 v[8:11], %[ta] offset:768\n"
+            "ds_read_b128 v[12:15], %[ta] offset:832\n"
+            "ds_read_u8   v16, %[tsa] offset:6\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:448\n"
+            "ds_read_u8   v18, %[wsa] offset:28\n"
+            "ds_read_b128 v[32:35], %[ta] offset:896\n"
+            "ds_read_b128 v[36:39], %[ta] offset:960\n"
+            "ds_read_u8   v19, %[tsa] offset:7\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:512\n"
+            "ds_read_u8   v52, %[wsa] offset:32\n"
+            "ds_read_b128 v[40:43], %[ta] offset:1024\n"
+            "ds_read_b128 v[44:47], %[ta] offset:1088\n"
+            "ds_read_u8   v53, %[tsa] offset:8\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:576\n"
+            "ds_read_u8   v7, %[wsa] offset:36\n"
+            "ds_read_b128 v[8:11], %[ta] offset:1152\n"
+            "ds_read_b128 v[12:15], %[ta] offset:1216\n"
+            "ds_read_u8   v16, %[tsa] offset:9\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:640\n"
+            "ds_read_u8   v18, %[wsa] offset:40\n"
+            "ds_read_b128 v[32:35], %[ta] offset:1280\n"
+            "ds_read_b128 v[36:39], %[ta] offset:1344\n"
+            "ds_read_u8   v19, %[tsa] offset:10\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:704\n"
+            "ds_read_u8   v52, %[wsa] offset:44\n"
+            "ds_read_b128 v[40:43], %[ta] offset:1408\n"
+            "ds_read_b128 v[44:47], %[ta] offset:1472\n"
+            "ds_read_u8   v53, %[tsa] offset:11\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:768\n"
+            "ds_read_u8   v7, %[wsa] offset:48\n"
+            "ds_read_b128 v[8:11], %[ta] offset:1536\n"
+            "ds_read_b128 v[12:15], %[ta] offset:1600\n"
+            "ds_read_u8   v16, %[tsa] offset:12\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:832\n"
+            "ds_read_u8   v18, %[wsa] offset:52\n"
+            "ds_read_b128 v[32:35], %[ta] offset:1664\n"
+            "ds_read_b128 v[36:39], %[ta] offset:1728\n"
+            "ds_read_u8   v19, %[tsa] offset:13\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:896\n"
+            "ds_read_u8   v52, %[wsa] offset:56\n"
+            "ds_read_b128 v[40:43], %[ta] offset:1792\n"
+            "ds_read_b128 v[44:47], %[ta] offset:1856\n"
+            "ds_read_u8   v53, %[tsa] offset:14\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:960\n"
+            "ds_read_u8   v7, %[wsa] offset:60\n"
+            "ds_read_b128 v[8:11], %[ta] offset:1920\n"
+            "ds_read_b128 v[12:15], %[ta] offset:1984\n"
+            "ds_read_u8   v16, %[tsa] offset:15\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:1024\n"
+            "ds_read_u8   v18, %[wsa] offset:64\n"
+            "ds_read_b128 v[32:35], %[ta] offset:2048\n"
+            "ds_read_b128 v[36:39], %[ta] offset:2112\n"
+            "ds_read_u8   v19, %[tsa] offset:16\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:1088\n"
+            "ds_read_u8   v52, %[wsa] offset:68\n"
+            "ds_read_b128 v[40:43], %[ta] offset:2176\n"
+            "ds_read_b128 v[44:47], %[ta] offset:2240\n"
+            "ds_read_u8   v53, %[tsa] offset:17\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:1152\n"
+            "ds_read_u8   v7, %[wsa] offset:72\n"
+            "ds_read_b128 v[8:11], %[ta] offset:2304\n"
+            "ds_read_b128 v[12:15], %[ta] offset:2368\n"
+            "ds_read_u8   v16, %[tsa] offset:18\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:1216\n"
+            "ds_read_u8   v18, %[wsa] offset:76\n"
+            "ds_read_b128 v[32:35], %[ta] offset:2432\n"
+            "ds_read_b128 v[36:39], %[ta] offset:2496\n"
+            "ds_read_u8   v19, %[tsa] offset:19\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:1280\n"
+            "ds_read_u8   v52, %[wsa] offset:80\n"
+            "ds_read_b128 v[40:43], %[ta] offset:2560\n"
+            "ds_read_b128 v[44:47], %[ta] offset:2624\n"
+            "ds_read_u8   v53, %[tsa] offset:20\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:1344\n"
+            "ds_read_u8   v7, %[wsa] offset:84\n"
+            "ds_read_b128 v[8:11], %[ta] offset:2688\n"
+            "ds_read_b128 v[12:15], %[ta] offset:2752\n"
+            "ds_read_u8   v16, %[tsa] offset:21\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:1408\n"
+            "ds_read_u8   v18, %[wsa] offset:88\n"
+            "ds_read_b128 v[32:35], %[ta] offset:2816\n"
+            "ds_read_b128 v[36:39], %[ta] offset:2880\n"
+            "ds_read_u8   v19, %[tsa] offset:22\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_nop 15\n"
+            "s_nop 15\n"
+            "v_accvgpr_read_b32 %[acc0], a0\n"
+            "v_accvgpr_read_b32 %[acc1], a1\n"
+            "v_accvgpr_read_b32 %[acc2], a2\n"
+            "v_accvgpr_read_b32 %[acc3], a3\n"
+            : [acc0] "=v"(qa0), [acc1] "=v"(qa1), [acc2] "=v"(qa2),
+              [acc3] "=v"(qa3)
+            : [wa] "v"(w_addr), [wsa] "v"(ws_addr), [ta] "v"(t_addr),
+              [tsa] "v"(ts_addr)
+            : "memory", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v18", "v19", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v50", "v51", "v52", "v53", "a0", "a1", "a2", "a3");
+        if (false)
+#endif
+#ifdef MPK_ABLATE_QKV_HALF_WAVES
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3)
+#error "MPK_ABLATE_QKV_HALF_WAVES is wired for the shipped single-chain loop"
+#endif
+        if (warp_id >= 2) {
+          qa0 = qa1 = qa2 = qa3 = 0.f;
+        } else
+#endif
+        asm volatile(
+#ifdef MPK_QKV_EPI_PRELOAD
+            "global_load_dwordx2 %[eb], %[pb], off\n"
+            "global_load_ushort %[ec], %[pc], off\n"
+            "global_load_ushort %[es], %[ps], off\n"
+#endif
+#ifdef MPK_QKV_ROPE_REG
+            "global_load_dwordx2 %[eb], %[pb], off\n"
+            "global_load_dwordx2 %[ec], %[pc], off\n"
+            "global_load_dwordx2 %[es], %[ps], off\n"
+#endif
 #ifndef MPK_QKV_ACC_UNDER_LDS
             // Zero accumulator
             "v_accvgpr_write_b32 a0, 0\n"
@@ -3213,7 +4614,11 @@ __device__ __noinline__ void
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
             "s_waitcnt lgkmcnt(5)\n"
 #else
+#ifdef MPK_ABLATE_QKV_KMAJOR_ADDR
+            "v_add_u32_e32 %[wa], 0x400, %[wa]\n"
+#else
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
+#endif
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_QKV_MFMA_UNROLLED
@@ -3227,13 +4632,20 @@ __device__ __noinline__ void
 #endif
 #ifdef MPK_QKV_TSC_PTR_INCREMENT
             "ds_read_u8   v19, %[tsa]\n"
-#else
+#elif !defined(MPK_QKV_B_MASK)
             "ds_read_u8   v19, v17\n"
 #endif
             "ds_read_b128 v[26:29], %[wa]\n"
             "ds_read_u8   v18, %[wsa]\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_ON
+            "ds_read_u8   v19, v17\n"
+#endif
             "ds_read_b128 v[32:35], %[ta]\n"
             "ds_read_b128 v[36:39], %[ta] offset:64\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_OFF
+#endif
             "s_waitcnt lgkmcnt(5)\n"
 #endif
 #else
@@ -3296,7 +4708,11 @@ __device__ __noinline__ void
             "s_waitcnt lgkmcnt(5)\n"
 #endif
 #else
+#ifdef MPK_ABLATE_QKV_KMAJOR_ADDR
+            "v_add_u32_e32 %[wa], 0x400, %[wa]\n"
+#else
             "v_add_u32_e32 %[wa], 64, %[wa]\n"
+#endif
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
 #ifdef MPK_QKV_MFMA_UNROLLED
@@ -3310,13 +4726,20 @@ __device__ __noinline__ void
 #endif
 #ifdef MPK_QKV_TSC_PTR_INCREMENT
             "ds_read_u8   v16, %[tsa]\n"
-#else
+#elif !defined(MPK_QKV_B_MASK)
             "ds_read_u8   v16, v17\n"
 #endif
             "ds_read_b128 v[22:25], %[wa]\n"
             "ds_read_u8   v7, %[wsa]\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_ON
+            "ds_read_u8   v16, v17\n"
+#endif
             "ds_read_b128 v[8:11], %[ta]\n"
             "ds_read_b128 v[12:15], %[ta] offset:64\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_OFF
+#endif
 #ifndef MPK_QKV_SKIP_B1_WAIT
             "s_waitcnt lgkmcnt(5)\n"
 #endif
@@ -3399,6 +4822,9 @@ __device__ __noinline__ void
             "v_accvgpr_read_b32 %[acc1], a1\n"
             "v_accvgpr_read_b32 %[acc2], a2\n"
             "v_accvgpr_read_b32 %[acc3], a3\n"
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+            "s_waitcnt vmcnt(0)\n"
+#endif
             : [acc0] "=v"(qa0),
               [acc1] "=v"(qa1),
               [acc2] "=v"(qa2),
@@ -3410,6 +4836,16 @@ __device__ __noinline__ void
               ,
               [tsa] "+v"(ts_addr)
 #endif
+#ifdef MPK_QKV_B_MASK
+              ,
+              [bsv] "=&s"(qkv_bsv)
+#endif
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+              ,
+              [eb] "=&v"(epi_b4),
+              [ec] "=&v"(epi_c),
+              [es] "=&v"(epi_s)
+#endif
             :
 #ifndef MPK_QKV_TSC_PTR_INCREMENT
               [tsa] "v"(ts_addr),
@@ -3420,6 +4856,12 @@ __device__ __noinline__ void
               [iters_m1] "n"(MFMA_ITERS - 1),
 #endif
               [unroll_pairs] "n"((MFMA_ITERS - 1) / 2)
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+              ,
+              [pb] "v"(epi_pb),
+              [pc] "v"(epi_pc),
+              [ps] "v"(epi_ps)
+#endif
             : "memory",
               "s13",
               "v7",
@@ -3458,11 +4900,78 @@ __device__ __noinline__ void
               "a2",
               "a3");
       }
+#ifdef MPK_ABLATE_KV_EXTRA
+      if (tile_iter < _abl_extra) {
+        asm volatile("" ::"v"(qa0), "v"(qa1), "v"(qa2), "v"(qa3));
+        continue;
+      }
+#endif
       f32x4_t acc;
       acc[0] = qa0;
       acc[1] = qa1;
       acc[2] = qa2;
       acc[3] = qa3;
+#ifdef MPK_KV_SPREAD
+      // This tile's K/V block (wave 0, second chain): lane (g, col) holds
+      // block rows g*4..g*4+3. Stored here so the stores overlap the Q
+      // epilogue below.
+      if (kv_dual && tok_active) {
+        float const qb[4] = {qb0, qb1, qb2, qb3};
+        unsigned short const *b4 = (unsigned short const *)&kv_bias4;
+        unsigned short val[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned bt = (unsigned)b4[i] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+          val[i] = _gang_float_to_bf16(qb[i] + bv);
+        }
+        long long const kv_row = (long long)s_dst_idx[0] * kv_stride +
+                                 _kvupd_get_xcd_id() * HEAD_DIM;
+        if (wg_idx < 4) {
+          // K rows 0..7 of the block are dims 8*block+i and rows 8..15 their
+          // RoPE partners (host order), so lane g pairs with lane g ^ 2.
+          unsigned short pv[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            pv[i] = (unsigned short)__shfl_xor((int)val[i], 32, 64);
+          }
+          if (g < 2) {
+            unsigned short const *c4 = (unsigned short const *)&kv_cos4;
+            unsigned short const *s4 = (unsigned short const *)&kv_sin4;
+            unsigned short lo[4], hi[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              unsigned v0b = (unsigned)val[i] << 16;
+              unsigned v1b = (unsigned)pv[i] << 16;
+              float v0, v1;
+              __builtin_memcpy(&v0, &v0b, 4);
+              __builtin_memcpy(&v1, &v1b, 4);
+              unsigned cb = (unsigned)c4[i] << 16;
+              unsigned sb_r = (unsigned)s4[i] << 16;
+              float c, s;
+              __builtin_memcpy(&c, &cb, 4);
+              __builtin_memcpy(&s, &sb_r, 4);
+              lo[i] = _gang_float_to_bf16(v0 * c - v1 * s);
+              hi[i] = _gang_float_to_bf16(v0 * s + v1 * c);
+            }
+            uint64_t lo4, hi4;
+            __builtin_memcpy(&lo4, lo, 8);
+            __builtin_memcpy(&hi4, hi, 8);
+            auto *d_k = (__attribute__((address_space(1))) uint64_t *)(
+                (unsigned short *)k_cache_ptr + kv_row + 8 * wg_idx + g * 4);
+            d_k[0] = lo4;
+            d_k[(HEAD_DIM / 2) / 4] = hi4;
+          }
+        } else {
+          uint64_t v4;
+          __builtin_memcpy(&v4, val, 8);
+          *(__attribute__((address_space(1))) uint64_t *)(
+              (unsigned short *)v_cache_ptr + kv_row + (wg_idx - 4) * 16 +
+              g * 4) = v4;
+        }
+      }
+#endif
 
 #ifdef MPK_QKV_KSPLIT
       // k_part 0 publishes its 4 AccVGPR floats and skips RoPE/KV; k_part 1
@@ -3527,6 +5036,68 @@ __device__ __noinline__ void
 #endif
 
       MPK_QKVSUB(4);
+#ifdef MPK_QKV_ROPE_REG
+      // Wave w holds dims 8w..8w+7 (rows 0..7) and their RoPE partners
+      // 32+8w.. (rows 8..15); lane (g, col) holds rows g*4..g*4+3, so lanes
+      // g < 2 own the pairs and lane g ^ 2 carries the partner values.
+      if (wg_idx <= NUM_Q_PER_KV) {
+        if (tok_active) {
+          float const av[4] = {acc[0], acc[1], acc[2], acc[3]};
+          unsigned short const *b4 = (unsigned short const *)&epi_b4;
+          unsigned short val[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            unsigned bt = (unsigned)b4[i] << 16;
+            float bv;
+            __builtin_memcpy(&bv, &bt, 4);
+            val[i] = _gang_float_to_bf16(av[i] + bv);
+          }
+          unsigned short pv[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            pv[i] = (unsigned short)__shfl_xor((int)val[i], 32, 64);
+          }
+          if (g < 2) {
+            unsigned short const *c4 = (unsigned short const *)&epi_c;
+            unsigned short const *s4 = (unsigned short const *)&epi_s;
+            unsigned short lo[4], hi[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              unsigned v0b = (unsigned)val[i] << 16;
+              unsigned v1b = (unsigned)pv[i] << 16;
+              float v0, v1;
+              __builtin_memcpy(&v0, &v0b, 4);
+              __builtin_memcpy(&v1, &v1b, 4);
+              unsigned cb = (unsigned)c4[i] << 16;
+              unsigned sb_r = (unsigned)s4[i] << 16;
+              float c, s;
+              __builtin_memcpy(&c, &cb, 4);
+              __builtin_memcpy(&s, &sb_r, 4);
+              lo[i] = _gang_float_to_bf16(v0 * c - v1 * s);
+              hi[i] = _gang_float_to_bf16(v0 * s + v1 * c);
+            }
+            uint64_t lo4, hi4;
+            __builtin_memcpy(&lo4, lo, 8);
+            __builtin_memcpy(&hi4, hi, 8);
+            int const d = 8 * wave_tile + g * 4;
+            unsigned short *row;
+            if (wg_idx < NUM_Q_PER_KV) {
+              row = (unsigned short *)q_workspace_ptr +
+                    (long long)tok_row_base * q_ws_stride +
+                    (_kvupd_get_xcd_id() * NUM_Q_PER_KV + wg_idx) * HEAD_DIM;
+            } else {
+              row = (unsigned short *)k_cache_ptr +
+                    (long long)s_dst_idx[0] * kv_stride +
+                    _kvupd_get_xcd_id() * HEAD_DIM;
+            }
+            auto *dst = (__attribute__((address_space(1))) uint64_t *)(row + d);
+            dst[0] = lo4;
+            dst[(HEAD_DIM / 2) / 4] = hi4;
+          }
+        }
+      } else
+#endif
+      {
       // ── Fused KV_UPD epilogue (N-axis packed) ──────────────────────────
       // Position metadata is per token and already in s_global_pos /
       // s_dst_idx. RoPE scratch aliases the token region, which is dead now
@@ -3566,6 +5137,17 @@ __device__ __noinline__ void
       unsigned short *s_rope = (unsigned short *)s_tok_fp8;
       if (wg_idx < NUM_Q_PER_KV) {
         int q_head_global = kv_head * NUM_Q_PER_KV + wg_idx;
+#ifdef MPK_QKV_EPI_PRELOAD
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3) || defined(MPK_QKV_KSPLIT)
+#error "MPK_QKV_EPI_PRELOAD is wired for the single-chain loop"
+#endif
+        _kvupd_rope_epilogue_packed_pre<HEAD_DIM, TOK_ROWS>(
+            (float const *)&acc, epi_b4, epi_c, epi_s, wave_tile, g, col, tid,
+            tok_active, n_valid_tok < TOK_ROWS ? n_valid_tok : TOK_ROWS,
+            (unsigned short *)q_workspace_ptr, q_ws_stride, tok_row_base,
+            q_head_global * HEAD_DIM, s_rope);
+        if (false)
+#endif
         _kvupd_rope_epilogue_packed<HEAD_DIM, TOK_ROWS>(
             (float const *)&acc,
             d_bias,
@@ -3593,7 +5175,11 @@ __device__ __noinline__ void
         if (tok_active) {
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+          bias4 = epi_b4;
+#else
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+#endif
           unsigned short const *b4 = (unsigned short const *)&bias4;
 #pragma unroll
           for (int i = 0; i < 4; i++) {
@@ -3620,8 +5206,15 @@ __device__ __noinline__ void
           float v0, v1;
           __builtin_memcpy(&v0, &v0b, 4);
           __builtin_memcpy(&v1, &v1b, 4);
+#ifdef MPK_QKV_EPI_PRELOAD
+          (void)cos_row;
+          (void)sin_row;
+          unsigned cb = (epi_c & 0xFFFFu) << 16;
+          unsigned sb_r = (epi_s & 0xFFFFu) << 16;
+#else
           unsigned cb = (unsigned)cos_row[d] << 16;
           unsigned sb_r = (unsigned)sin_row[d] << 16;
+#endif
           float c, s;
           __builtin_memcpy(&c, &cb, 4);
           __builtin_memcpy(&s, &sb_r, 4);
@@ -3645,7 +5238,11 @@ __device__ __noinline__ void
         if (tok_active) {
           int d0 = wave_tile * 16 + g * 4;
           uint64_t bias4;
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+          bias4 = epi_b4;
+#else
           __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+#endif
           unsigned short const *b4 = (unsigned short const *)&bias4;
           long long row_off =
               (long long)s_dst_idx[col] * kv_stride + kv_head * HEAD_DIM;
@@ -3657,6 +5254,7 @@ __device__ __noinline__ void
             d_v[row_off + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
           }
         }
+      }
       }
     }
   }

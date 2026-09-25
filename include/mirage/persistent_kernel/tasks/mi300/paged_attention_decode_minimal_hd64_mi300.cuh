@@ -136,6 +136,18 @@ __device__ __forceinline__ void
 // -0.0017 (se 0.0028, t=-0.61), i.e. inside the yardstick and if anything on
 // the good side. T=8 keeps most of the speed: ctx 4096 2.148 vs 2.137 for T=4
 // and 2.206 for T=16.
+#ifndef MPK_ATTN_STAGE_OFF
+#define MPK_ATTN_STAGE_OFF 32768
+#endif
+// MPK_ATTN_KV_EARLY2: packed tiles in the QKV slab staging area (above the
+// QKV weights at 115392, below the layer word at 155644).
+#ifndef MPK_ATTN_STAGE2_OFF
+#define MPK_ATTN_STAGE2_OFF 115712
+#endif
+// Tiles per chunk: ceil(ceil(MS/16)/NC).
+#define MPK_ATTN_STAGED_TPC(MS, NC) ((((MS) + 15) / 16 + (NC) - 1) / (NC))
+// Tiles per wave the early K/V staging must hold: ceil(ceil(ceil(MS/16)/NC)/4).
+#define MPK_ATTN_STAGED_TPW(MS, NC) (((((MS) + 15) / 16 + (NC) - 1) / (NC) + 3) / 4)
 #ifndef MPK_ATTN_WAVE_LOCAL_MIN_TILES
 #define MPK_ATTN_WAVE_LOCAL_MIN_TILES 8
 #endif
@@ -347,7 +359,9 @@ template <int NUM_QO_PER_KV,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE,
-          int NUM_KV_HEADS>
+          int NUM_KV_HEADS,
+          bool KV_STAGED = false,
+          int STAGED_TPW = 0>
 __device__ __noinline__ void
     __attn_wave_local_scan_hd64(void const *q_workspace_ptr,
                                 char const *k_base,
@@ -363,7 +377,8 @@ __device__ __noinline__ void
                                 int kv_start,
                                 int effective_len,
                                 int ntiles,
-                                int split_part = 0) {
+                                int split_part = 0,
+                                int newest_rel = -1) {
   constexpr int KV_TILE = 16;
   constexpr int NUM_K32 = HEAD_DIM / 32; // 2
   constexpr int WAVES = 4;
@@ -378,6 +393,7 @@ __device__ __noinline__ void
   (void)split_part;
 #endif
 
+  MPK_ASSTAMP(0);
   // Wave-private staging at 4 KB stride, then merge scratch. Disjoint by
   // construction: no wave ever addresses another's K/V.
   extern __shared__ char smem_minimal[];
@@ -388,6 +404,20 @@ __device__ __noinline__ void
   float *l_lds = reinterpret_cast<float *>(smem_minimal + 16384 + 256);
   float *o_lds = reinterpret_cast<float *>(smem_minimal + 16384 + 512);
 
+#ifdef MPK_ATTN_PID_ONCE
+#if defined(MPK_ATTN_WL_PAIR) || !MPK_ATTN_SCALAR_PAGE
+#error "MPK_ATTN_PID_ONCE assumes the 4-wave tile split and the scalar page id"
+#endif
+  // The first tile's page id, requested ahead of Q so the two round trips
+  // overlap. Same wave -> tile split as below; an empty wave takes tile 0's
+  // (valid) page and never uses it.
+  int const pf_tpw = (ntiles + WAVES - 1) / WAVES;
+  int const pf_first =
+      (wave_id < WAVES && wave_id * pf_tpw < ntiles) ? wave_id * pf_tpw : 0;
+  int pid_page = (kv_start + pf_first * KV_TILE) / PAGE_SIZE;
+  int pid_raw = ((__attribute__((address_space(1))) int const *)
+                     kv_indices)[first_page + pid_page];
+#endif
   // Q is wave-invariant; every wave loads the same 8 heads.
   _Float16 qr[NUM_K32][8];
   {
@@ -400,7 +430,17 @@ __device__ __noinline__ void
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       int dim_off = kc * 32 + kgrp * 8;
+#ifdef MPK_ATTN_PID_ONCE
+      // GLOBAL: as a generic load Q also counted against lgkmcnt, so the next
+      // s_load's wait drained it.
+      typedef uint32_t _pid_u32x4 __attribute__((ext_vector_type(4)));
+      _pid_u32x4 const qv =
+          *(__attribute__((address_space(1))) _pid_u32x4 const *)(q_ptr +
+                                                                  dim_off * 2);
+      uint4 raw = make_uint4(qv[0], qv[1], qv[2], qv[3]);
+#else
       uint4 raw = *reinterpret_cast<uint4 const *>(q_ptr + dim_off * 2);
+#endif
       unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
 #pragma unroll
       for (int i = 0; i < 4; i++) {
@@ -432,6 +472,7 @@ __device__ __noinline__ void
   // -> tpw 2 -> wave 3 starts at 6). It contributes m=-inf, l=0 to the merge.
   int const w_ntiles = (w_first < ntiles) ? (w_last - w_first) : 0;
   int const w_kv_start = kv_start + w_first * KV_TILE;
+  MPK_ASVALUE(7, ntiles * 16 + w_ntiles);
   int w_len = w_ntiles * KV_TILE;
   {
     int const remaining = effective_len - w_first * KV_TILE;
@@ -458,6 +499,9 @@ __device__ __noinline__ void
   };
 
   uint2 k_pre[4], v_pre[4];
+#ifdef MPK_ATTN_WL_PF2
+  uint2 k_pre1[4], v_pre1[4];
+#endif
   bool has_pre = false;
 
   // A tile's page id is uniform, and that is a provable property here, not an
@@ -494,7 +538,13 @@ __device__ __noinline__ void
   // Both are bit-exact: identical addresses, identical bytes, no reassociation.
   // MPK_ATTN_SCALAR_PAGE=0 ablates back to the per-lane form.
   using _kv_u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+#ifdef MPK_ATTN_WL_PF2
+  // The parameters shadow the outer k_pre / v_pre, so the body below writes
+  // whichever buffer the caller names.
+  auto prefetch_tile_to = [&](int t, uint2(&k_pre)[4], uint2(&v_pre)[4]) {
+#else
   auto prefetch_tile = [&](int t) {
+#endif
     int const base = t * KV_TILE;
     int tlen = w_len - base;
     if (tlen > KV_TILE) {
@@ -502,8 +552,18 @@ __device__ __noinline__ void
     }
 #if MPK_ATTN_SCALAR_PAGE
     int const tile_tok0 = w_kv_start + base;
+#ifdef MPK_ATTN_PID_ONCE
+    int const tile_page = tile_tok0 / PAGE_SIZE;
+    if (tile_page != pid_page) {
+      pid_page = tile_page;
+      pid_raw = ((__attribute__((address_space(1))) int const *)
+                     kv_indices)[first_page + tile_page];
+    }
+    int const pid = __builtin_amdgcn_readfirstlane(pid_raw);
+#else
     int const pid = __builtin_amdgcn_readfirstlane(
         kv_indices[first_page + tile_tok0 / PAGE_SIZE]);
+#endif
     long const tile_off =
         (static_cast<long>(pid) * PAGE_SIZE * KV_CACHE_STRIDE +
          static_cast<long>(tile_tok0 % PAGE_SIZE) * KV_CACHE_STRIDE) *
@@ -546,11 +606,18 @@ __device__ __noinline__ void
 #endif
     has_pre = true;
   };
+#ifdef MPK_ATTN_WL_PF2
+  auto prefetch_tile = [&](int t) { prefetch_tile_to(t, k_pre, v_pre); };
+#endif
 
   // Padding rows must be zeroed, not left stale: a partial tail tile otherwise
   // reuses the previous tile's K/V for the masked lanes. The score mask covers
   // QK, but PV consumes V for every row.
+#ifdef MPK_ATTN_WL_PF2
+  auto commit_from = [&](uint2(&k_pre)[4], uint2(&v_pre)[4]) {
+#else
   auto commit_prefetch = [&]() {
+#endif
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       int tok = ld_tok + i * 4;
@@ -561,14 +628,61 @@ __device__ __noinline__ void
       *(uint64_t *)&wv[tok * HEAD_DIM + ld_dim] = *(uint64_t *)vf;
     }
   };
+#ifdef MPK_ATTN_WL_PF2
+  auto commit_prefetch = [&]() { commit_from(k_pre, v_pre); };
+#endif
 
+#ifdef MPK_ATTN_KV_EARLY
+#if defined(MPK_ATTN_WL_PF2) || defined(MPK_ATTN_WL_PAIR) || \
+    defined(MPK_ATTN_K_VEC_LOAD) || defined(MPK_ATTN_PID_ONCE) || \
+    !MPK_ATTN_SCALAR_PAGE
+#error "MPK_ATTN_KV_EARLY is wired for the default wave-local scan"
+#endif
+#endif
+  // KV_STAGED: every tile but the newest token's was DMA'd raw (bf16) into
+  // this wave's staging region before the QKV epoch. The newest tile goes
+  // through the masked register path and is stored raw alongside.
+#ifdef MPK_ATTN_KV_EARLY2
+  char *const mpk_stg = smem_minimal + MPK_ATTN_STAGE2_OFF + w_first * 4096;
+#else
+  char *const mpk_stg =
+      smem_minimal + MPK_ATTN_STAGE_OFF + wave_id * (STAGED_TPW * 4096);
+#endif
+  if constexpr (KV_STAGED) {
+    if (w_ntiles > 0 && newest_rel >= w_first &&
+        newest_rel < w_first + w_ntiles) {
+      int const tl = newest_rel - w_first;
+      prefetch_tile(tl);
+      char *const st = mpk_stg + tl * 4096;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        int const tok = ld_tok + i * 4;
+        *reinterpret_cast<uint2 *>(st + (tok * HEAD_DIM + ld_dim) * 2) =
+            k_pre[i];
+        *reinterpret_cast<uint2 *>(st + 2048 + (tok * HEAD_DIM + ld_dim) * 2) =
+            v_pre[i];
+      }
+      has_pre = false;
+    }
+    MPK_ASSTAMP(1);
+  } else
   if (w_ntiles > 0) {
     prefetch_tile(0);
     commit_prefetch();
     has_pre = false;
+    MPK_ASSTAMP(1);
+#ifdef MPK_ATTN_WL_PF2
+    if (w_ntiles > 1) {
+      prefetch_tile_to(1, k_pre1, v_pre1);
+    }
+    if (w_ntiles > 2) {
+      prefetch_tile(2);
+    }
+#else
     if (w_ntiles > 1) {
       prefetch_tile(1);
     }
+#endif
   }
 
   __mfma_hd64_fp32x4 o_acc[DBLK];
@@ -593,6 +707,28 @@ __device__ __noinline__ void
     __builtin_amdgcn_wave_barrier();
 
     _Float16 kr[NUM_K32][8];
+    __mfma_hd64_fp16x4 va[DBLK];
+    if constexpr (KV_STAGED) {
+      char const *const st = mpk_stg + t * 4096;
+#pragma unroll
+      for (int kc = 0; kc < NUM_K32; kc++) {
+        uint4 const raw = *reinterpret_cast<uint4 const *>(
+            st + (midx * HEAD_DIM + kc * 32 + kgrp * 8) * 2);
+        __cvt_bf16x4_to_fp16(&kr[kc][0], make_uint2(raw.x, raw.y));
+        __cvt_bf16x4_to_fp16(&kr[kc][4], make_uint2(raw.z, raw.w));
+      }
+#pragma unroll
+      for (int d = 0; d < DBLK; d++) {
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+          unsigned const w = *reinterpret_cast<unsigned short const *>(
+              st + 2048 + ((kgrp * 4 + r) * HEAD_DIM + d * 16 + midx) * 2);
+          float f;
+          asm("v_cvt_f32_bf16 %0, %1" : "=v"(f) : "v"(w));
+          va[d][r] = (_Float16)f;
+        }
+      }
+    } else {
 #pragma unroll
     for (int kc = 0; kc < NUM_K32; kc++) {
       _Float16 const *k_ptr = &wk[midx * HEAD_DIM + kc * 32 + kgrp * 8];
@@ -606,7 +742,6 @@ __device__ __noinline__ void
 #endif
     }
 
-    __mfma_hd64_fp16x4 va[DBLK];
 #pragma unroll
     for (int d = 0; d < DBLK; d++) {
       _Float16 const *v_ptr = &wv[(kgrp * 4) * HEAD_DIM + d * 16 + midx];
@@ -614,6 +749,7 @@ __device__ __noinline__ void
       va[d][1] = v_ptr[1 * HEAD_DIM];
       va[d][2] = v_ptr[2 * HEAD_DIM];
       va[d][3] = v_ptr[3 * HEAD_DIM];
+    }
     }
 
     __builtin_amdgcn_wave_barrier();
@@ -688,10 +824,20 @@ __device__ __noinline__ void
 
     // Tile t is fully register-resident now, so staging t+1 is free to run
     // ahead of the PV MFMAs below.
-    if (has_pre) {
+#ifdef MPK_ATTN_WL_PF2
+    if (t + 1 < w_ntiles) {
+      if ((t & 1) == 0) {
+        commit_from(k_pre1, v_pre1);
+      } else {
+        commit_from(k_pre, v_pre);
+      }
+    }
+#else
+    if (!KV_STAGED && has_pre) {
       commit_prefetch();
       has_pre = false;
     }
+#endif
 
     __mfma_hd64_fp16x4 pb;
     pb[0] = (_Float16)w0;
@@ -712,8 +858,21 @@ __device__ __noinline__ void
     m_running = new_max;
 #endif
 
-    if (t + 2 < w_ntiles) {
+#ifdef MPK_ATTN_WL_PF2
+    if (t + 3 < w_ntiles) {
+      if ((t & 1) == 0) {
+        prefetch_tile_to(t + 3, k_pre1, v_pre1);
+      } else {
+        prefetch_tile(t + 3);
+      }
+    }
+#else
+    if (!KV_STAGED && t + 2 < w_ntiles) {
       prefetch_tile(t + 2);
+    }
+#endif
+    if (t < 3) {
+      MPK_ASSTAMP(2 + t);
     }
   }
 
@@ -753,6 +912,7 @@ __device__ __noinline__ void
     }
   }
   __syncthreads();
+  MPK_ASSTAMP(5);
 
   constexpr int LSE_S = NUM_KV_HEADS * NUM_KV_CHUNKS * NUM_QO_PER_KV;
   constexpr int O_S = LSE_S * HEAD_DIM;
@@ -767,7 +927,12 @@ __device__ __noinline__ void
   // element rather than staged behind a second barrier -- four FMAs against an
   // s_barrier is not a close call.
   constexpr int NOUT = NUM_QO_PER_KV * HEAD_DIM;
+#ifdef MPK_ATTN_EPI_UNROLL
+  static_assert(NOUT % 256 == 0, "every thread takes NOUT / 256 outputs");
+#pragma unroll
+#else
 #pragma unroll 1
+#endif
   for (int idx = tid; idx < NOUT; idx += 256) {
     int const q = idx / HEAD_DIM;
     int const d = idx % HEAD_DIM;
@@ -813,6 +978,7 @@ __device__ __noinline__ void
     *lse_out =
         (den > 0.0f) ? ((mg + __log2f(den)) * INV_LOG2E) : -1e30f;
   }
+  MPK_ASSTAMP(6);
 }
 
 template <typename T,
@@ -823,7 +989,9 @@ template <typename T,
           int NUM_KV_CHUNKS,
           int Q_WORKSPACE_STRIDE,
           int KV_CACHE_STRIDE,
-          int NUM_KV_HEADS>
+          int NUM_KV_HEADS,
+          bool META_PRE = false,
+          bool KV_STAGED = false>
 __device__ __noinline__ void
     paged_attention_minimal_decode_hd64(void const *q_workspace_ptr,
                                         void *paged_k_cache_ptr,
@@ -840,7 +1008,12 @@ __device__ __noinline__ void
                                         float scale_s,
                                         int sliding_window = 0,
                                         void const *sinks_ptr = nullptr,
-                                        int split_part = 0) {
+                                        int split_part = 0,
+                                        int pre_q0 = 0,
+                                        int pre_k0 = 0,
+                                        int pre_k1 = 0,
+                                        int pre_lpl = 0,
+                                        int pre_pid0 = 0) {
   using bf16 = __hip_bfloat16;
   static_assert(HEAD_DIM == 64, "This kernel is HD=64 only");
 #ifndef MPK_ATTN_SPLIT_CHUNK
@@ -848,14 +1021,19 @@ __device__ __noinline__ void
 #endif
 
   int const req = request_id;
-  int const query_start = qo_indptr[req];
-  if (query_start == qo_indptr[req + 1]) {
-    return;
+  // META_PRE: values loaded by the fused layer before the QKV epoch; the
+  // split-KV entry already returned on an empty query.
+  int const query_start = META_PRE ? pre_q0 : qo_indptr[req];
+  if constexpr (!META_PRE) {
+    if (query_start == qo_indptr[req + 1]) {
+      return;
+    }
   }
 
-  int const first_page = kv_indptr[req];
-  int const num_pages = kv_indptr[req + 1] - first_page;
-  int const seqlen_k = (num_pages - 1) * PAGE_SIZE + kv_last_page_len[req];
+  int const first_page = META_PRE ? pre_k0 : kv_indptr[req];
+  int const num_pages = (META_PRE ? pre_k1 : kv_indptr[req + 1]) - first_page;
+  int const seqlen_k = (num_pages - 1) * PAGE_SIZE +
+                       (META_PRE ? pre_lpl : kv_last_page_len[req]);
 
   int const tid = threadIdx.x;
   int const warp_id = tid / 64;
@@ -899,6 +1077,7 @@ __device__ __noinline__ void
   int my_tok = tid / 16;
   int my_dim = (tid % 16) * 4;
 
+#ifndef MPK_ATTN_Q_AFTER_WL
   // Load Q (lanes >= NUM_QO_PER_KV map to head 0; output is guarded)
   _Float16 qr[NUM_K32][8];
   {
@@ -924,6 +1103,7 @@ __device__ __noinline__ void
       }
     }
   }
+#endif
 
   // Sliding window: skip KV positions before the window.
   // kv_start is aligned down to KV_TILE for clean tiling.
@@ -934,6 +1114,7 @@ __device__ __noinline__ void
   int effective_len = seqlen_k - kv_start;
 
   int ntiles = (effective_len + KV_TILE - 1) / KV_TILE;
+  int const mpk_ntiles_all = ntiles;
 
   // Split-KV partitioning: each chunk_idx processes a contiguous slice of
   // tiles. For NUM_KV_CHUNKS==1 this is a no-op (chunk_first=0,
@@ -1066,7 +1247,10 @@ __device__ __noinline__ void
                                   NUM_KV_CHUNKS,
                                   Q_WORKSPACE_STRIDE,
                                   KV_CACHE_STRIDE,
-                                  NUM_KV_HEADS>(q_workspace_ptr,
+                                  NUM_KV_HEADS,
+                                  KV_STAGED,
+                                  MPK_ATTN_STAGED_TPW(MAX_SEQ_LEN, NUM_KV_CHUNKS)>(
+                                                q_workspace_ptr,
                                                 k_base,
                                                 v_base,
                                                 output_ptr,
@@ -1080,8 +1264,63 @@ __device__ __noinline__ void
                                                 kv_start,
                                                 effective_len,
                                                 ntiles,
-                                                split_part);
+                                                split_part,
+                                                (KV_STAGED &&
+                                                 chunk_last_tile == mpk_ntiles_all)
+                                                    ? ntiles - 1
+                                                    : -1);
       return;
+    }
+  }
+#endif
+
+#if defined(MPK_ATTN_Q_AFTER_WL) && !defined(MPK_ATTN_SL_OVERLAP)
+  // Load Q (lanes >= NUM_QO_PER_KV map to head 0; output is guarded)
+  _Float16 qr[NUM_K32][8];
+  {
+    int q_midx = (midx < NUM_QO_PER_KV) ? midx : 0;
+    char const *q_ptr =
+        reinterpret_cast<char const *>(q_workspace_ptr) +
+        (static_cast<long>(query_start) * Q_WORKSPACE_STRIDE +
+         static_cast<long>(kv_head_idx * NUM_QO_PER_KV + q_midx) * HEAD_DIM) *
+            2;
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      int dim_off = kc * 32 + kgrp * 8;
+      // 8 bf16 = uint4 load
+      uint4 raw = *reinterpret_cast<uint4 const *>(q_ptr + dim_off * 2);
+      unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float lo_f, hi_f;
+        asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
+        asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+        qr[kc][i * 2] = (_Float16)lo_f;
+        qr[kc][i * 2 + 1] = (_Float16)hi_f;
+      }
+    }
+  }
+#elif defined(MPK_ATTN_SL_OVERLAP)
+#if !defined(MPK_ATTN_Q_AFTER_WL) || !defined(MPK_ATTN_META_EARLY)
+#error "MPK_ATTN_SL_OVERLAP needs MPK_ATTN_Q_AFTER_WL and MPK_ATTN_META_EARLY"
+#endif
+  // Q is loaded here and converted just before the main loop, so its round
+  // trip overlaps tile 0's K/V instead of preceding it. GLOBAL, not generic:
+  // a flat load would also count against lgkmcnt.
+  typedef uint32_t _slq_u32x4 __attribute__((ext_vector_type(4)));
+  _slq_u32x4 q_raw[NUM_K32];
+  {
+    int q_midx = (midx < NUM_QO_PER_KV) ? midx : 0;
+    char const *q_ptr =
+        reinterpret_cast<char const *>(q_workspace_ptr) +
+        (static_cast<long>(query_start) * Q_WORKSPACE_STRIDE +
+         static_cast<long>(kv_head_idx * NUM_QO_PER_KV + q_midx) * HEAD_DIM) *
+            2;
+#pragma unroll
+    for (int kc = 0; kc < NUM_K32; kc++) {
+      int dim_off = kc * 32 + kgrp * 8;
+      q_raw[kc] = *(__attribute__((address_space(1))) _slq_u32x4 const *)(
+          q_ptr + dim_off * 2);
     }
   }
 #endif
@@ -1113,8 +1352,16 @@ __device__ __noinline__ void
   //
   // Bit-exact: identical page id, identical address, identical bytes.
   auto get_kv_tile_off = [&](int tile_tok0) -> long {
+#ifdef MPK_ATTN_SL_OVERLAP
+    // Page 0's id came with the request metadata (META_PRE).
+    int const pid = (META_PRE && tile_tok0 < PAGE_SIZE)
+                        ? pre_pid0
+                        : __builtin_amdgcn_readfirstlane(
+                              kv_indices[first_page + tile_tok0 / PAGE_SIZE]);
+#else
     int const pid = __builtin_amdgcn_readfirstlane(
         kv_indices[first_page + tile_tok0 / PAGE_SIZE]);
+#endif
     return (static_cast<long>(pid) * PAGE_SIZE * KV_CACHE_STRIDE +
             static_cast<long>(tile_tok0 % PAGE_SIZE) * KV_CACHE_STRIDE) *
            2;
@@ -1247,6 +1494,22 @@ __device__ __noinline__ void
       __load_bf16x4_raw(&v_pre2, v_base + kv2p);
 #endif
       has_pre2 = true;
+    }
+  }
+#endif
+
+#ifdef MPK_ATTN_SL_OVERLAP
+  _Float16 qr[NUM_K32][8];
+#pragma unroll
+  for (int kc = 0; kc < NUM_K32; kc++) {
+    unsigned words[4] = {q_raw[kc][0], q_raw[kc][1], q_raw[kc][2], q_raw[kc][3]};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float lo_f, hi_f;
+      asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
+      asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+      qr[kc][i * 2] = (_Float16)lo_f;
+      qr[kc][i * 2 + 1] = (_Float16)hi_f;
     }
   }
 #endif

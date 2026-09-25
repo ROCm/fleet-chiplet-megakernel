@@ -547,6 +547,25 @@ def get_compile_command(
             # A/B 2026-08-30: −19 / −28 / +6 µs. V1 hash 1ca7e851 vs e86d7dc;
             # V2–V3 matched. Do not promote. Stays opt-in.
             flags = flags + ["-DMPK_ATTN_O_VEC_STORE"]
+        if int(os.environ.get("MPK_ATTN_META_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_META_EARLY"]
+        if int(os.environ.get("MPK_QKV_KV_RANK_SWAP", "0")) > 0:
+            flags = flags + ["-DMPK_QKV_KV_RANK_SWAP="
+                             + str(int(os.environ["MPK_QKV_KV_RANK_SWAP"]))]
+        if int(os.environ.get("MPK_QKV_EPOCH_POLL_ARRIVE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPOCH_POLL_ARRIVE"]
+        if int(os.environ.get("MPK_ATTN_Q_AFTER_WL", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_Q_AFTER_WL"]
+        if int(os.environ.get("MPK_ATTN_SL_OVERLAP", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_SL_OVERLAP"]
+        if int(os.environ.get("MPK_ATTN_EPI_UNROLL", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_EPI_UNROLL"]
+        if int(os.environ.get("MPK_ATTN_KV_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_KV_EARLY"]
+        if int(os.environ.get("MPK_ATTN_KV_EARLY2", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_KV_EARLY2"]
+        if int(os.environ.get("MPK_ATTN_PTR_EARLY", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_PTR_EARLY"]
         if int(os.environ.get("MPK_ATTN_LSE_DPP", "0")) == 1:
             # TESTED AND NOT ADOPTED (mixed). l_sum permlane16 then 32 vs
             # __shfl_xor. Hash e86d7dc all six. A/B +18 / −18 / +1 µs.
@@ -887,6 +906,17 @@ def get_compile_command(
             if int(os.environ.get("MPK_MOE_XCD_PAIR", "1")) != 1:
                 raise RuntimeError("MPK_MOE_W2_REMAP needs MPK_MOE_XCD_PAIR")
             flags = flags + ["-DMPK_MOE_W2_REMAP"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP2", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP2"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP3", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP3"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP3_R0", "0")) > 0:
+                flags = flags + ["-DMPK_MOE_W2_REMAP3_R0="
+                                 + str(int(os.environ["MPK_MOE_W2_REMAP3_R0"]))]
+            if int(os.environ.get("MPK_MOE_W2_REMAP3_NODELAY89", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP3_NODELAY89"]
+            if int(os.environ.get("MPK_MOE_W2_REMAP2_NODELAY", "0")) == 1:
+                flags = flags + ["-DMPK_MOE_W2_REMAP2_NODELAY"]
             if int(os.environ.get("MPK_MOE_W2_REMAP_DELAY_US", "0")) > 0:
                 flags = flags + [
                     "-DMPK_MOE_W2_REMAP_DELAY_US="
@@ -910,6 +940,65 @@ def get_compile_command(
             flags = flags + ["-DMPK_P9_DEFER"]
         if int(os.environ.get("MPK_POLL_PIPE", "0")) == 1:
             flags = flags + ["-DMPK_POLL_PIPE"]
+        if int(os.environ.get("MPK_QKV_PF_PAGE_LATE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF_PAGE_LATE"]
+        if int(os.environ.get("MPK_QKV_GAMMA_NORMREG", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_GAMMA_NORMREG", "-DMPK_QKV_GAMMA_LDS"]
+        if int(os.environ.get("MPK_QKV_GAMMA_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_GAMMA_LDS"]
+        if int(os.environ.get("MPK_QKV_WDMA_AFTER_SLAB", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_WDMA_AFTER_SLAB"]
+        if os.environ.get("MPK_QKV_LDS_POISON_HI"):
+            flags = flags + ["-DMPK_QKV_LDS_POISON_LO=" + str(int(os.environ.get("MPK_QKV_LDS_POISON_LO", "0"))),
+                             "-DMPK_QKV_LDS_POISON_HI=" + str(int(os.environ["MPK_QKV_LDS_POISON_HI"]))]
+        if int(os.environ.get("MPK_ATTN_PID_ONCE", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_PID_ONCE"]
+        if int(os.environ.get("MPK_QKV_RED_LDS_BAR", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_RED_LDS_BAR"]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS"]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS_SHADOW", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_SHADOW"]
+        if os.environ.get("MPK_QKV_SLAB_LDS_AUX"):
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_AUX=" + str(int(os.environ["MPK_QKV_SLAB_LDS_AUX"]))]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS_NODMA", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_NODMA"]
+        if int(os.environ.get("MPK_QKV_SLAB_LDS_FLATSTORE", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_LDS_FLATSTORE"]
+        if int(os.environ.get("MPK_QKV_ROPE_REG", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_ROPE_REG"]
+        if int(os.environ.get("MPK_QKV_EPI_PRELOAD", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_EPI_PRELOAD"]
+        if int(os.environ.get("MPK_QKV_SLAB_HOIST", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_SLAB_HOIST"]
+        if int(os.environ.get("MPK_ABLATE_QKV_HALF_WAVES", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_QKV_HALF_WAVES"]
+        if int(os.environ.get("MPK_QKV_PF3", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_PF3"]
+        if int(os.environ.get("MPK_ABLATE_QKV_KMAJOR_ADDR", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_QKV_KMAJOR_ADDR"]
+        if int(os.environ.get("MPK_KV_SPREAD_A2REG", "0")) == 1:
+            flags = flags + ["-DMPK_KV_SPREAD_A2REG"]
+        if int(os.environ.get("MPK_QKV_B_MASK", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_B_MASK"]
+        if int(os.environ.get("MPK_KV_SPREAD", "0")) == 1:
+            flags = flags + ["-DMPK_KV_SPREAD"]
+        if int(os.environ.get("MPK_ABLATE_KV_EXTRA", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_KV_EXTRA"]
+        if int(os.environ.get("MPK_ABLATE_KV_TILES", "0")) == 1:
+            flags = flags + ["-DMPK_ABLATE_KV_TILES"]
+        if int(os.environ.get("MPK_QKV_DMA_IN_SLAB", "0")) == 1:
+            flags = flags + ["-DMPK_QKV_DMA_IN_SLAB"]
+        if int(os.environ.get("MPK_ATTN_WL_PF2", "0")) == 1:
+            flags = flags + ["-DMPK_ATTN_WL_PF2"]
+        if int(os.environ.get("MPK_TASK_FENCE_DRAIN", "0")) == 1:
+            flags = flags + ["-DMPK_TASK_FENCE_DRAIN"]
+        if int(os.environ.get("MPK_ATTSUB", "0")) == 1:
+            flags = flags + ["-DMPK_ATTSUB"]
+        if int(os.environ.get("MPK_ATTSUB_SLIDING", "0")) == 1:
+            flags = flags + ["-DMPK_ATTSUB_SLIDING"]
+        if int(os.environ.get("MPK_ATTSCAN", "0")) == 1:
+            flags = flags + ["-DMPK_ATTSCAN"]
         if int(os.environ.get("MPK_ATTN_Q_EPOCH", "0")) == 1:
             flags = flags + ["-DMPK_ATTN_Q_EPOCH"]
         if int(os.environ.get("MPK_P9_DEFER_INV_L1", "0")) == 1:
@@ -922,18 +1011,6 @@ def get_compile_command(
             flags = flags + ["-DMPK_OPROJ_TILE_FLAGS"]
         if int(os.environ.get("MPK_LM_STAMPS", "0")) == 1:
             flags = flags + ["-DMPK_LM_STAMPS"]
-        if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:
-            flags = flags + ["-DMPK_EMB_FIRST"]
-        if int(os.environ.get("MPK_LM_RESADD", "0")) == 1:
-            flags = flags + ["-DMPK_LM_RESADD"]
-        if int(os.environ.get("MPK_LTK_SEL64", "0")) == 1:
-            flags = flags + ["-DMPK_LTK_SEL64"]
-        if int(os.environ.get("MPK_LM_NORM_LDS", "0")) == 1:
-            flags = flags + ["-DMPK_LM_NORM_LDS"]
-        if int(os.environ.get("MPK_ARGMAX_IDX_PF", "0")) == 1:
-            flags = flags + ["-DMPK_ARGMAX_IDX_PF"]
-        if int(os.environ.get("MPK_EVT_FAST", "0")) == 1:
-            flags = flags + ["-DMPK_EVT_FAST"]
         if int(os.environ.get("MPK_EMB_FIRST", "0")) == 1:
             flags = flags + ["-DMPK_EMB_FIRST"]
         if int(os.environ.get("MPK_LM_RESADD", "0")) == 1:
