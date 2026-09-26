@@ -673,6 +673,11 @@ __device__ __noinline__ void
   int const _pslot_w = xcd_id * workers_per_xcd + xcd_rank;
   MPK_PHASE_MARK(_pslot_w, 0);
   MPK_QKVSUB(6);
+#ifdef MPK_QKV_KV_L2WARM
+  // Next layer's QKV weight pointer, taken while the TaskDesc slot is known
+  // to hold it (the ml loop wrote it before this layer started).
+  void const *const mpk_warm_qkvw = input_ptrs[24];
+#endif
   MPK_ILSTAMP(7, s_ilsub_ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_ILSUB
   if (tid == 0 && s_ilsub_ml == MPK_ILSUB_L0 + 1) {
@@ -2345,10 +2350,10 @@ __device__ __noinline__ void
 #ifdef MPK_QKV_KV_L2WARM
       // The K/V QKV ranks pull next layer's weight record into L2 while they
       // wait; their Phase 9 prefetch then reads it with a plain DMA.
-      if (qkv_does_qkv && input_ptrs[24] != nullptr) {
+      if (qkv_does_qkv && mpk_warm_qkvw != nullptr) {
         qkv_warm_weights_l2<QKV_BATCH_SIZE, QKV_OUTPUT_PER_WG,
                             QKV_REDUCTION_SIZE>(
-            input_ptrs[24], qkv_n_wgs_per_xcd, qkv_attn_rank);
+            mpk_warm_qkvw, qkv_n_wgs_per_xcd, qkv_attn_rank);
       }
 #endif
       while (__builtin_amdgcn_s_memrealtime() - w2d_t0 <
@@ -2998,7 +3003,7 @@ __device__ __noinline__ void
           qkv_k_iter0,
           qkv_k_niters);
 #else
-#ifdef MPK_QKV_KV_L2WARM
+#ifdef MPK_QKV_KV_PF_PLAIN
       if (qkv_attn_rank >= 8) {
         qkv_prefetch_weights_lds<QKV_BATCH_SIZE,
                                  QKV_OUTPUT_PER_WG,

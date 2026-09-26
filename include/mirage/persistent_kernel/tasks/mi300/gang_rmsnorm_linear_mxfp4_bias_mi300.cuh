@@ -256,13 +256,19 @@ __device__ __forceinline__ void qkv_warm_weights_l2(void const *weight_ptr,
   static_assert(G::WG_BYTES <= 25 * 4096,
                 "qkv_warm_weights_l2 covers 25 x 4 KiB per record");
   int const wg_idx = tile_idx % n_wgs_per_xcd;
+  // The resource spans the one record, so the last step's overhang past it
+  // reads zeros instead of touching whatever follows.
   i32x4_t const rsrc = make_w_buffer_rsrc(
-      (uint8_t const *)weight_ptr,
-      static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
-  uint32_t voff = static_cast<uint32_t>(wg_idx) * G::WG_BYTES +
-                  static_cast<uint32_t>(threadIdx.x) * 16u;
+      (uint8_t const *)weight_ptr +
+          static_cast<size_t>(wg_idx) * G::WG_BYTES,
+      static_cast<uint32_t>(G::WG_BYTES));
+  uint32_t voff = static_cast<uint32_t>(threadIdx.x) * 16u;
   unsigned sink;
-  asm volatile("buffer_load_dword %[d], %[v], %[r], 0 offen\n"
+  // The resource's SGPRs were just written by v_readfirstlane: a VALU SGPR
+  // write needs 5 wait states before a VMEM instruction reads it, and the
+  // compiler does not insert them in front of inline asm.
+  asm volatile("s_nop 4\n"
+               "buffer_load_dword %[d], %[v], %[r], 0 offen\n"
                ".rept 24\n"
                "v_add_u32_e32 %[v], 0x1000, %[v]\n"
                "buffer_load_dword %[d], %[v], %[r], 0 offen\n"
