@@ -1899,6 +1899,9 @@ def get_compile_command(
             # Ablation 2026-08-30 (=0): +21 / −4 / −14 µs, hash e86d7dc all
             # six. Mixed; keep default ON.
             flags = flags + ["-DMPK_ML_TABLE_PREFETCH"]
+        if int(os.environ.get("MPK_W13_T1_IMM", "0")) == 1:
+            # W13 tile-1 pair loop with immediate LDS offsets (no pointer bumps, no inner nops).
+            flags = flags + ["-DMPK_W13_T1_IMM"]
         if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
             # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
             # re-issue its quarter of the tile after the gate. tid 0 is the only

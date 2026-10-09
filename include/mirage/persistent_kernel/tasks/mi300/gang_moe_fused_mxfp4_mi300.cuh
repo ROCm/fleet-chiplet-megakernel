@@ -1,3 +1,6 @@
+#if defined(MPK_W13_T1_IMM) && !defined(MPK_W13_T1_B0_WAIT_SHIFT)
+#error "MPK_W13_T1_IMM rewrites the MPK_W13_T1_B0_WAIT_SHIFT tile-1 pair loop"
+#endif
 /* Copyright 2025 CMU
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -3677,6 +3680,35 @@ gang_moe_fused_mxfp4_kernel_mi300(
 #else
                 ".set MPK_W13_T1_SKIP0_%=, 0\n"
 #endif
+#ifdef MPK_W13_T1_IMM
+                ".macro MPK_W13_REC_T1_PAIR wait_odd, wait_even, odd, even\n"
+                "s_waitcnt vmcnt(\\wait_odd)\n"
+                "ds_read_u8   v19, %[tsa] offset:\\odd\n"
+                "ds_read_b128 v[26:29], %[wa] offset:(\\odd*0x400)\n"
+                "ds_read_u8   v18, %[wsa] offset:(\\odd*4)\n"
+                "ds_read_b128 v[32:35], %[ta] offset:(\\odd*0x80)\n"
+                "ds_read_b128 v[36:39], %[ta] offset:(\\odd*0x80+64)\n"
+                ".if MPK_W13_T1_SKIP_B0W_%= == 0\n"
+                "s_waitcnt lgkmcnt(5)\n"
+                ".endif\n"
+                ".set MPK_W13_T1_SKIP_B0W_%=, 0\n"
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], "
+                "v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+                "s_waitcnt lgkmcnt(0)\n"
+                "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[26:29], "
+                "v[32:39], a[4:7], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+                "s_waitcnt vmcnt(\\wait_even)\n"
+                "ds_read_u8   v16, %[tsa] offset:\\even\n"
+                "ds_read_b128 v[22:25], %[wa] offset:(\\even*0x400)\n"
+                "ds_read_u8   v7, %[wsa] offset:(\\even*4)\n"
+                "ds_read_b128 v[8:11], %[ta] offset:(\\even*0x80)\n"
+                "ds_read_b128 v[12:15], %[ta] offset:(\\even*0x80+64)\n"
+                ".if MPK_W13_T1_PAIR_N_%= == 10\n"
+                "s_waitcnt lgkmcnt(0)\n"
+                ".endif\n"
+                ".set MPK_W13_T1_PAIR_N_%=, MPK_W13_T1_PAIR_N_%= + 1\n"
+                ".endm\n"
+#else
                 ".macro MPK_W13_REC_T1_PAIR wait_odd, wait_even, odd, even\n"
                 ".if MPK_W13_T1_SKIP_B1_%= == 0\n"
 #ifdef MPK_W13_DS_BEFORE_ADDR
@@ -3792,6 +3824,7 @@ gang_moe_fused_mxfp4_kernel_mi300(
                 ".set MPK_W13_T1_PAIR_N_%=, MPK_W13_T1_PAIR_N_%= + 1\n"
 #endif
                 ".endm\n"
+#endif  // MPK_W13_T1_IMM
 #ifdef MPK_W13_REC_FIFO
                 "v_add_u32_e32 %[wa], 0x400, %[wa]\n"
                 "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
@@ -3846,6 +3879,12 @@ gang_moe_fused_mxfp4_kernel_mi300(
                 ".purgem MPK_W13_REC_T1_PAIR\n"
                 "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], "
                 "v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_W13_T1_IMM
+                // the pointers end where the bumping loop left them: 22 K-steps on
+                "v_add_u32_e32 %[wa], 0x5800, %[wa]\n"
+                "v_add_u32_e32 %[wsa], 88, %[wsa]\n"
+                "v_add_u32_e32 %[ta], 0xb00, %[ta]\n"
+#endif
 #ifdef MPK_W13_T1_ACC_PAD16
                 "s_nop 15\n"
                 "v_accvgpr_read_b32 v22, a4\n"
