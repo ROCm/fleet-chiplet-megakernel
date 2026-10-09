@@ -1324,6 +1324,88 @@ __device__ __attribute__((noinline)) void
         DO_MFMA_LDS_FP8(ki1 + 2);
         DO_MFMA_LDS_FP8(ki1 + 3);
       }
+#elif defined(MPK_OPROJ_IMM)
+#ifndef MPK_OPROJ_KMAJOR
+#error "MPK_OPROJ_IMM: needs MPK_OPROJ_KMAJOR (one 1 KiB A block per K-step)"
+#endif
+      {
+        static_assert(KP_BASE == 8 && KP_EXTRA == 0 && K_PER_MFMA == 128 &&
+                          LDS_DATA_K_STRIDE == 1024,
+                      "MPK_OPROJ_IMM: 8 K-steps of 128 per wave, K-major A");
+#define MPK_OI_LDS(p)                                                          \
+  static_cast<unsigned>(reinterpret_cast<uintptr_t>(                           \
+      (__attribute__((address_space(3))) uint8_t const *)(p)))
+        unsigned const oi_w = MPK_OI_LDS(MPK_OPROJ_W_ADDR(kp_ki_start));
+        unsigned const oi_sa = MPK_OI_LDS(lds_w_scales + lds_row_scale_base +
+                                          kp_ki_start * 4 + g);
+        unsigned const oi_b =
+            MPK_OI_LDS(b_tok + kp_ki_start * K_PER_MFMA + g * 16);
+        unsigned const oi_sb = MPK_OI_LDS(b_scl + kp_ki_start);
+#undef MPK_OI_LDS
+        asm volatile(
+            "ds_read_b128 v[80:83], %[vw] offset:0\n"
+            "ds_read_u8 v84, %[vsa] offset:0\n"
+            "ds_read_b128 v[64:67], %[vb] offset:0\n"
+            "ds_read_b128 v[68:71], %[vb] offset:64\n"
+            "ds_read_u8 v85, %[vsb] offset:0\n"
+            "ds_read_b128 v[96:99], %[vw] offset:1024\n"
+            "ds_read_u8 v86, %[vsa] offset:4\n"
+            "ds_read_b128 v[48:51], %[vb] offset:128\n"
+            "ds_read_b128 v[52:55], %[vb] offset:192\n"
+            "ds_read_u8 v87, %[vsb] offset:1\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[80:83], %[vw] offset:2048\n"
+            "ds_read_u8 v84, %[vsa] offset:8\n"
+            "ds_read_b128 v[64:67], %[vb] offset:256\n"
+            "ds_read_b128 v[68:71], %[vb] offset:320\n"
+            "ds_read_u8 v85, %[vsb] offset:2\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[96:99], %[vw] offset:3072\n"
+            "ds_read_u8 v86, %[vsa] offset:12\n"
+            "ds_read_b128 v[48:51], %[vb] offset:384\n"
+            "ds_read_b128 v[52:55], %[vb] offset:448\n"
+            "ds_read_u8 v87, %[vsb] offset:3\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[80:83], %[vw] offset:4096\n"
+            "ds_read_u8 v84, %[vsa] offset:16\n"
+            "ds_read_b128 v[64:67], %[vb] offset:512\n"
+            "ds_read_b128 v[68:71], %[vb] offset:576\n"
+            "ds_read_u8 v85, %[vsb] offset:4\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[96:99], %[vw] offset:5120\n"
+            "ds_read_u8 v86, %[vsa] offset:20\n"
+            "ds_read_b128 v[48:51], %[vb] offset:640\n"
+            "ds_read_b128 v[52:55], %[vb] offset:704\n"
+            "ds_read_u8 v87, %[vsb] offset:5\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[80:83], %[vw] offset:6144\n"
+            "ds_read_u8 v84, %[vsa] offset:24\n"
+            "ds_read_b128 v[64:67], %[vb] offset:768\n"
+            "ds_read_b128 v[68:71], %[vb] offset:832\n"
+            "ds_read_u8 v85, %[vsb] offset:6\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[96:99], %[vw] offset:7168\n"
+            "ds_read_u8 v86, %[vsa] offset:28\n"
+            "ds_read_b128 v[48:51], %[vb] offset:896\n"
+            "ds_read_b128 v[52:55], %[vb] offset:960\n"
+            "ds_read_u8 v87, %[vsb] offset:7\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[80:83], v[64:71], %[acc], v84, v85 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 %[acc], v[96:99], v[48:55], %[acc], v86, v87 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_nop 7\n"
+            "s_nop 7\n"
+            "s_nop 2\n"
+            : [acc] "+v"(acc)
+            : [vw] "v"(oi_w), [vsa] "v"(oi_sa), [vb] "v"(oi_b), [vsb] "v"(oi_sb)
+            : "v48", "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v64", "v65", "v66", "v67", "v68", "v69", "v70", "v71", "v80", "v81", "v82", "v83", "v84", "v85", "v86", "v87", "v96", "v97", "v98", "v99", "memory");
+      }
 #else
       DO_MFMA_LDS_FP8(kp_ki_start + 0);
       DO_MFMA_LDS_FP8(kp_ki_start + 1);

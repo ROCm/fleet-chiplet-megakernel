@@ -1902,6 +1902,8 @@ def get_compile_command(
         if int(os.environ.get("MPK_W13_T1_IMM", "0")) == 1:
             # W13 tile-1 pair loop with immediate LDS offsets (no pointer bumps, no inner nops).
             flags = flags + ["-DMPK_W13_T1_IMM"]
+        if int(os.environ.get("MPK_OPROJ_IMM", "0")) == 1:
+            flags = flags + ["-DMPK_OPROJ_IMM"]
         if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
             # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
             # re-issue its quarter of the tile after the gate. tid 0 is the only
