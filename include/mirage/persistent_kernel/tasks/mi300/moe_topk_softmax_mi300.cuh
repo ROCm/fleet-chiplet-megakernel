@@ -438,12 +438,23 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
         int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
+#ifdef MPK_TOPK_TIE_FIX
+        // (value, -index) order: every lane ends on the same winner, so the
+        // blanking below removes exactly one column and a tie is not dropped.
+        {
+          bool const take = other_max > max_val ||
+                            (other_max == max_val && other_expert < expert);
+          max_val = take ? other_max : max_val;
+          expert = take ? other_expert : expert;
+        }
+#else
         asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
                      "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
                      "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
                      : [mv] "+v"(max_val), [ex] "+v"(expert)
                      : [om] "v"(other_max), [oe] "v"(other_expert)
                      : "vcc");
+#endif
       }
 
       // ── Step 3: Write top-k result ──
@@ -623,6 +634,9 @@ __device__ __forceinline__ int ltk_bitrev4(int r) {
 }
 #endif
 
+#if defined(MPK_TOPK_TIE_FIX) && defined(MPK_LTK_SEL64)
+#error "MPK_TOPK_TIE_FIX does not cover MPK_LTK_SEL64"
+#endif
 template <int NUM_EXPERTS, int K>
 __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
                                                int const *norm_flags = nullptr,
@@ -930,6 +944,18 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
         // xor 8 = row_ror:8; xor 4 = row_shl:4 for lanes with bit 2 clear, row_shr:4
         // for the rest; xor 2 / xor 1 = quad_perm [2,3,0,1] / [1,0,3,2].
         bool const ltk_hi4 = (tid & 4) != 0;
+#ifdef MPK_TOPK_TIE_FIX
+        // (value, -index) order, as in the shuffle reductions.
+#define MPK_LTK_STEP(OM, OE)                                              \
+        do {                                                                    \
+          float const other_max = __int_as_float(OM);                           \
+          int const other_expert = (OE);                                        \
+          bool const take = other_max > max_val ||                              \
+                            (other_max == max_val && other_expert < expert);    \
+          max_val = take ? other_max : max_val;                                 \
+          expert = take ? other_expert : expert;                                \
+        } while (0)
+#else
 #define MPK_LTK_STEP(OM, OE)                                              \
         do {                                                                    \
           float const other_max = __int_as_float(OM);                           \
@@ -941,6 +967,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
                        : [om] "v"(other_max), [oe] "v"(other_expert)            \
                        : "vcc");                                                 \
         } while (0)
+#endif
         MPK_LTK_STEP(__builtin_amdgcn_update_dpp(0, __float_as_int(max_val), 0x128, 0xF, 0xF, false),
                      __builtin_amdgcn_update_dpp(0, expert, 0x128, 0xF, 0xF, false));
         {
@@ -960,12 +987,23 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
       for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         float other_max = __shfl_xor(max_val, mask, THREADS_PER_ROW);
         int other_expert = __shfl_xor(expert, mask, THREADS_PER_ROW);
+#ifdef MPK_TOPK_TIE_FIX
+        // (value, -index) order: every lane ends on the same winner, so the
+        // blanking below removes exactly one column and a tie is not dropped.
+        {
+          bool const take = other_max > max_val ||
+                            (other_max == max_val && other_expert < expert);
+          max_val = take ? other_max : max_val;
+          expert = take ? other_expert : expert;
+        }
+#else
         asm volatile("v_cmp_gt_f32 vcc, %[om], %[mv]\n"
                      "v_cndmask_b32 %[mv], %[mv], %[om], vcc\n"
                      "v_cndmask_b32 %[ex], %[ex], %[oe], vcc\n"
                      : [mv] "+v"(max_val), [ex] "+v"(expert)
                      : [om] "v"(other_max), [oe] "v"(other_expert)
                      : "vcc");
+#endif
       }
 #endif
       if (tid == 0) {
