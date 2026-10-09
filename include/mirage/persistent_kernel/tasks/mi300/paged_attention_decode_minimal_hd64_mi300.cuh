@@ -279,6 +279,18 @@ __device__ __forceinline__ __mfma_hd64_fp32x4
   return __builtin_amdgcn_mfma_f32_16x16x16f16(av, bv, c, 0, 0, 0);
 }
 
+// bf16 in bits [15:0] of x -> f32. MPK_ATTN_CVT_BUILTIN: as plain bits, schedulable and
+// speculatable; otherwise the inline-asm v_cvt_f32_bf16 it replaces.
+__device__ __forceinline__ float __cvt_bf16lo_f32_hd64(unsigned x) {
+#ifdef MPK_ATTN_CVT_BUILTIN
+  return __uint_as_float(x << 16);
+#else
+  float f;
+  asm("v_cvt_f32_bf16 %0, %1" : "=v"(f) : "v"(x));
+  return f;
+#endif
+}
+
 __device__ __forceinline__ float __fast_exp2_hd64(float x) {
 #ifdef MPK_ATTN_EXP2_BUILTIN
   // Same v_exp_f32, but speculatable: `(m == -inf) ? 0 : exp2(..)` becomes a v_cndmask.
@@ -299,8 +311,8 @@ __device__ __forceinline__ void
 #pragma unroll
   for (int i = 0; i < 2; i++) {
     float lo_f, hi_f;
-    asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
-    asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+    lo_f = __cvt_bf16lo_f32_hd64(words[i]);
+    hi_f = __cvt_bf16lo_f32_hd64(words[i] >> 16);
     dst[i * 2] = (_Float16)lo_f;
     dst[i * 2 + 1] = (_Float16)hi_f;
   }
@@ -319,8 +331,8 @@ __device__ __forceinline__ void __cvt_bf16x4_to_fp16(_Float16 *__restrict__ dst,
 #pragma unroll
   for (int i = 0; i < 2; i++) {
     float lo_f, hi_f;
-    asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
-    asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+    lo_f = __cvt_bf16lo_f32_hd64(words[i]);
+    hi_f = __cvt_bf16lo_f32_hd64(words[i] >> 16);
     dst[i * 2] = (_Float16)lo_f;
     dst[i * 2 + 1] = (_Float16)hi_f;
   }
@@ -458,8 +470,8 @@ __device__ MPK_ATTN_NOINL void
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         float lo_f, hi_f;
-        asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
-        asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+        lo_f = __cvt_bf16lo_f32_hd64(words[i]);
+        hi_f = __cvt_bf16lo_f32_hd64(words[i] >> 16);
         qr[kc][i * 2] = (_Float16)lo_f;
         qr[kc][i * 2 + 1] = (_Float16)hi_f;
       }
@@ -737,7 +749,7 @@ __device__ MPK_ATTN_NOINL void
           unsigned const w = *reinterpret_cast<unsigned short const *>(
               st + 2048 + ((kgrp * 4 + r) * HEAD_DIM + d * 16 + midx) * 2);
           float f;
-          asm("v_cvt_f32_bf16 %0, %1" : "=v"(f) : "v"(w));
+          f = __cvt_bf16lo_f32_hd64(w);
           va[d][r] = (_Float16)f;
         }
       }
@@ -1109,8 +1121,8 @@ __device__ MPK_ATTN_NOINL void
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         float lo_f, hi_f;
-        asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
-        asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+        lo_f = __cvt_bf16lo_f32_hd64(words[i]);
+        hi_f = __cvt_bf16lo_f32_hd64(words[i] >> 16);
         qr[kc][i * 2] = (_Float16)lo_f;
         qr[kc][i * 2 + 1] = (_Float16)hi_f;
       }
@@ -1306,8 +1318,8 @@ __device__ MPK_ATTN_NOINL void
 #pragma unroll
       for (int i = 0; i < 4; i++) {
         float lo_f, hi_f;
-        asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
-        asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+        lo_f = __cvt_bf16lo_f32_hd64(words[i]);
+        hi_f = __cvt_bf16lo_f32_hd64(words[i] >> 16);
         qr[kc][i * 2] = (_Float16)lo_f;
         qr[kc][i * 2 + 1] = (_Float16)hi_f;
       }
@@ -1519,8 +1531,8 @@ __device__ MPK_ATTN_NOINL void
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       float lo_f, hi_f;
-      asm("v_cvt_f32_bf16 %0, %1" : "=v"(lo_f) : "v"(words[i]));
-      asm("v_cvt_f32_bf16 %0, %1" : "=v"(hi_f) : "v"(words[i] >> 16));
+      lo_f = __cvt_bf16lo_f32_hd64(words[i]);
+      hi_f = __cvt_bf16lo_f32_hd64(words[i] >> 16);
       qr[kc][i * 2] = (_Float16)lo_f;
       qr[kc][i * 2 + 1] = (_Float16)hi_f;
     }

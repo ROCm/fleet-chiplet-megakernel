@@ -1910,6 +1910,9 @@ def get_compile_command(
         if int(os.environ.get("MPK_ATTN_EXP2_BUILTIN", "0")) == 1:
             # HD64 attention exp2 as the intrinsic (speculatable), not inline asm.
             flags = flags + ["-DMPK_ATTN_EXP2_BUILTIN"]
+        if int(os.environ.get("MPK_ATTN_CVT_BUILTIN", "0")) == 1:
+            # HD64 attention bf16 -> f32 as plain bits, not inline asm.
+            flags = flags + ["-DMPK_ATTN_CVT_BUILTIN"]
         if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
             # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
             # re-issue its quarter of the tile after the gate. tid 0 is the only
