@@ -2597,6 +2597,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
             }
             __syncthreads();
 #endif
+#if defined(MPK_PFIN_RETIRE) && defined(MPK_ML_TABLE_PREFETCH)
+            // The first row's load must be retired in the compiler's wait
+            // model before the loop header, or the header joins it as pending
+            // and every boundary copy below gets a vmcnt(0) that also drains
+            // the Phase 9 QKV weight DMA. The back edge is retired in the fused
+            // layer's Phase 9, before that DMA is issued.
+            __builtin_amdgcn_s_waitcnt(0x0F70);  // vmcnt(0)
+#endif
             for (int ml = 0; ml < config.ml_num_layers; ml++) {
               MPK_ILSTAMP(2, ml == MPK_ILSUB_L0 + 1);
 #ifdef MPK_DRAIN_STATS

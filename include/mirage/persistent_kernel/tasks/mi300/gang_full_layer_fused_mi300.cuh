@@ -2963,6 +2963,15 @@ __device__ __noinline__ void
     // input_ptrs[24] is null on the last layer of the iteration -- see the
     // publish site in persistent_kernel.cuh for why nothing may be staged
     // across the iteration boundary.
+#ifdef MPK_PFIN_RETIRE
+#if !defined(MPK_FUSED_INLINE) || defined(MPK_QKV_PF_EARLY)
+#error "MPK_PFIN_RETIRE: inlined fused layer, Phase 9 prefetch issued here only"
+#endif
+    // On every path, before the DMA: nothing the compiler issued is still in
+    // flight here, and the worker loop's table registers are then retired at
+    // the next boundary instead of waited for behind this DMA.
+    __builtin_amdgcn_s_waitcnt(0x0F70);  // vmcnt(0)
+#endif
     if (input_ptrs[24] != nullptr &&
         qkv_does_qkv
 #ifdef MPK_QKV_PF_SKIP_W2
