@@ -50,6 +50,9 @@
 // right before its A read. The unrolled body keeps k in MPK_W2_T0_SC_%=
 // (2p+1 at pair p). down_proj is stored K-major on the host, so fragment k is
 // K-step k.
+#if defined(MPK_W2_IMM) && (!defined(MPK_W2_T0_MFMA_UNROLLED) || defined(MPK_W2_QUAD_ACC))
+#error "MPK_W2_IMM covers the unrolled single-chain W2 body only"
+#endif
 #ifdef MPK_W2_KWIN
 #if defined(MPK_W2_QUAD_ACC) || defined(MPK_MOE_QUAD_ACCUMULATOR) ||         \
     defined(MPK_W2_PF_BEFORE_WAIT) || !defined(MPK_W2_T0_MFMA_UNROLLED) ||    \
@@ -5406,7 +5409,16 @@ gang_moe_fused_mxfp4_kernel_mi300(
             "PIPELINED_W2_T0_%=:\n"
 #endif
             // ---- consume bank 0, prefetch into bank 1 ----
-#ifdef MPK_W2_PF_BEFORE_WAIT
+#if defined(MPK_W2_IMM)
+            // K-step SC into bank 1 at immediate offsets; the base registers stay put.
+            "ds_read_u8   v19, %[tsa] offset:MPK_W2_T0_SC_%=\n"
+            MPK_W2_KWA
+            "ds_read_b128 v[26:29], %[wa] offset:(MPK_W2_T0_SC_%= * 0x400)\n"
+            "ds_read_u8   v18, %[wsa] offset:(MPK_W2_T0_SC_%= * 4)\n"
+            "ds_read_b128 v[32:35], %[ta] offset:(MPK_W2_T0_SC_%= * 0x80)\n"
+            "ds_read_b128 v[36:39], %[ta] offset:(MPK_W2_T0_SC_%= * 0x80 + 64)\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#elif defined(MPK_W2_PF_BEFORE_WAIT)
             "v_add_u32_e32 %[wa], " MPK_W2_WA_STEP ", %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
@@ -5449,7 +5461,16 @@ gang_moe_fused_mxfp4_kernel_mi300(
 #endif
 
             // ---- consume bank 1, prefetch into bank 0 ----
-#ifdef MPK_W2_PF_BEFORE_WAIT
+#if defined(MPK_W2_IMM)
+            // K-step SC + 1 into bank 0.
+            "ds_read_u8   v16, %[tsa] offset:(MPK_W2_T0_SC_%= + 1)\n"
+            MPK_W2_KWB
+            "ds_read_b128 v[22:25], %[wa] offset:((MPK_W2_T0_SC_%= + 1) * 0x400)\n"
+            "ds_read_u8   v7, %[wsa] offset:((MPK_W2_T0_SC_%= + 1) * 4)\n"
+            "ds_read_b128 v[8:11], %[ta] offset:((MPK_W2_T0_SC_%= + 1) * 0x80)\n"
+            "ds_read_b128 v[12:15], %[ta] offset:((MPK_W2_T0_SC_%= + 1) * 0x80 + 64)\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#elif defined(MPK_W2_PF_BEFORE_WAIT)
             "v_add_u32_e32 %[wa], " MPK_W2_WA_STEP ", %[wa]\n"
             "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
             "v_add_u32_e32 %[ta], 0x80, %[ta]\n"

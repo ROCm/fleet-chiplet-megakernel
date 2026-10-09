@@ -1172,6 +1172,9 @@ def get_compile_command(
             flags = flags + ["-DMPK_W13_T0_MFMA_UNROLLED"]
         if _opt("MPK_W2_T0_MFMA_UNROLLED"):
             flags = flags + ["-DMPK_W2_T0_MFMA_UNROLLED"]
+        if int(os.environ.get("MPK_W2_IMM", "0")) == 1:
+            # Unrolled W2 MFMA body: immediate LDS offsets, wait behind the next reads.
+            flags = flags + ["-DMPK_W2_IMM"]
         if int(os.environ.get("MPK_W2_PF_BEFORE_WAIT", "0")) == 1:
             # TESTED AND NOT ADOPTED (confirm failed). First A/B +6 / −16 /
             # −26 µs. Confirm C=ON V=0: −15 / +8 / +8. OFF was faster on
