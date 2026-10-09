@@ -1919,6 +1919,12 @@ def get_compile_command(
         if int(os.environ.get("MPK_PFIN_RETIRE", "0")) == 1:
             # Retire the ml-table prefetch registers before the Phase 9 QKV weight DMA.
             flags = flags + ["-DMPK_PFIN_RETIRE"]
+        if int(os.environ.get("MPK_QKV_PF_DELAY_US", "0")) > 0:
+            # Q ranks issue the next layer's QKV weight DMA N us after their Phase 9 arrival.
+            flags = flags + [
+                "-DMPK_QKV_PF_DELAY_US="
+                + str(int(os.environ["MPK_QKV_PF_DELAY_US"]))
+            ]
         if int(os.environ.get("MPK_QKV_PF_WAVE_SPLIT", "0")) == 1:
             # Keep wave 0 out of the pre-gate half of MPK_PREFETCH_NEXT_QKV and
             # re-issue its quarter of the tile after the gate. tid 0 is the only

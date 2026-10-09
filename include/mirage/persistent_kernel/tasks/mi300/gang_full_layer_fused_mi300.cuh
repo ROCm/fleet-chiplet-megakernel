@@ -2972,6 +2972,18 @@ __device__ __noinline__ void
     // the next boundary instead of waited for behind this DMA.
     __builtin_amdgcn_s_waitcnt(0x0F70);  // vmcnt(0)
 #endif
+#ifdef MPK_QKV_PF_DELAY_US
+    // Q ranks (W13-only under the W2 remap) issue this DMA later, so it lands after
+    // the W13+W2 ranks' W2 fragment stream (the MoE's critical path) instead of
+    // competing with it; they need the weights only after the layer gate.
+    if (qkv_does_qkv && qkv_attn_rank < 8 && input_ptrs[24] != nullptr) {
+      unsigned long long const pfd_t0 = __builtin_amdgcn_s_memrealtime();
+      while (__builtin_amdgcn_s_memrealtime() - pfd_t0 <
+             100ull * (MPK_QKV_PF_DELAY_US)) {
+        __builtin_amdgcn_s_sleep(8);
+      }
+    }
+#endif
     if (input_ptrs[24] != nullptr &&
         qkv_does_qkv
 #ifdef MPK_QKV_PF_SKIP_W2
