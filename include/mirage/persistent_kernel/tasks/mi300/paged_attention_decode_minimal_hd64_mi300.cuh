@@ -280,9 +280,14 @@ __device__ __forceinline__ __mfma_hd64_fp32x4
 }
 
 __device__ __forceinline__ float __fast_exp2_hd64(float x) {
+#ifdef MPK_ATTN_EXP2_BUILTIN
+  // Same v_exp_f32, but speculatable: `(m == -inf) ? 0 : exp2(..)` becomes a v_cndmask.
+  return __builtin_amdgcn_exp2f(x);
+#else
   float r;
   asm("v_exp_f32 %0, %1" : "=v"(r) : "v"(x));
   return r;
+#endif
 }
 
 // Vectorized bf16 load + convert to fp16 (uint4 = 8 bf16 → 8 fp16).
