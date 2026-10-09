@@ -22,6 +22,14 @@
 
 // Default ON. See prefetch_tile in __attn_wave_local_scan_hd64 for what this
 // gates and why it is bit-exact; MPK_ATTN_SCALAR_PAGE=0 ablates.
+// MPK_ATTN_INLINE: inline the decode call and the wave-local scan. A __noinline__
+// callee opens with s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0) and saves / restores its
+// callee-saved registers through scratch, on every layer's attention.
+#ifdef MPK_ATTN_INLINE
+#define MPK_ATTN_NOINL __forceinline__
+#else
+#define MPK_ATTN_NOINL __noinline__
+#endif
 #ifndef MPK_ATTN_SCALAR_PAGE
 #define MPK_ATTN_SCALAR_PAGE 1
 #endif
@@ -362,7 +370,7 @@ template <int NUM_QO_PER_KV,
           int NUM_KV_HEADS,
           bool KV_STAGED = false,
           int STAGED_TPW = 0>
-__device__ __noinline__ void
+__device__ MPK_ATTN_NOINL void
     __attn_wave_local_scan_hd64(void const *q_workspace_ptr,
                                 char const *k_base,
                                 char const *v_base,
@@ -992,7 +1000,7 @@ template <typename T,
           int NUM_KV_HEADS,
           bool META_PRE = false,
           bool KV_STAGED = false>
-__device__ __noinline__ void
+__device__ MPK_ATTN_NOINL void
     paged_attention_minimal_decode_hd64(void const *q_workspace_ptr,
                                         void *paged_k_cache_ptr,
                                         void *paged_v_cache_ptr,
