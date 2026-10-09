@@ -2245,6 +2245,11 @@ def get_compile_command(
         # Space-separated; passed through verbatim to the JIT compile.
         if os.environ.get("MPK_EXTRA_FLAGS"):
             flags = flags + os.environ["MPK_EXTRA_FLAGS"].split()
+        # Backend options, comma-separated: MPK_LLVM_OPTS=-amdgpu-sched-strategy=max-ilp
+        if os.environ.get("MPK_LLVM_OPTS"):
+            for _o in os.environ["MPK_LLVM_OPTS"].split(","):
+                if _o:
+                    flags = flags + ["-mllvm", _o]
         if int(os.environ.get("PRECOMPUTED_DISPATCH", "1")) == 1:
             flags = flags + ["-DMPK_PRECOMPUTED_DISPATCH"]
             flags = flags + ["-DMPK_FUSED_LAYER_BATCHING"]
