@@ -1816,7 +1816,9 @@ oproj_barrier :
         st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
                   (unsigned)oproj_rel_epoch);
       }
+#ifndef MPK_PUB_NOWAIT
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
     }
 
     // Issue prefetch loads AFTER barrier atomics but BEFORE poll loop.

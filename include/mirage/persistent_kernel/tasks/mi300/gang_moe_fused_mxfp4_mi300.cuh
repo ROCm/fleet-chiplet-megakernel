@@ -4549,7 +4549,9 @@ gang_moe_fused_mxfp4_kernel_mi300(
           st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
                     (unsigned)release_val);
         }
+#ifndef MPK_PUB_NOWAIT
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
       }
     }
 

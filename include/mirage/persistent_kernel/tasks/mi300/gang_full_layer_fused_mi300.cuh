@@ -1517,7 +1517,9 @@ __device__ __noinline__ void
         if (tid == 0) {
           st_wt_u32((void *)&attn_release[xcd_id * 16],
                     (unsigned)attn_release_expected);
+#ifndef MPK_PUB_NOWAIT
           asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
         }
 #else
         if (tid == 0) {
@@ -1572,7 +1574,9 @@ __device__ __noinline__ void
               st_wt_u32((void *)&attn_release[x * 16],
                         (unsigned)attn_release_expected);
             }
+#ifndef MPK_PUB_NOWAIT
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
           }
         }
 #endif
@@ -2902,7 +2906,9 @@ __device__ __noinline__ void
       if (tid < 8) {
         st_wt_u32((void *)&layer_release[tid * 16], (unsigned)lean_rel_epoch);
       }
+#ifndef MPK_PUB_NOWAIT
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
     }
 
 #ifdef MPK_DRAIN_OVERLAP
