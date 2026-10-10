@@ -637,6 +637,47 @@ __device__ __forceinline__ int ltk_bitrev4(int r) {
 #if defined(MPK_TOPK_TIE_FIX) && defined(MPK_LTK_SEL64)
 #error "MPK_TOPK_TIE_FIX does not cover MPK_LTK_SEL64"
 #endif
+#ifdef MPK_LTK_KSEL
+#if !defined(MPK_LTK_SELLOGIT) || !defined(MPK_TOPK_TIE_FIX) || defined(MPK_LTK_SEL64)
+#error "MPK_LTK_KSEL selects on raw logits (MPK_LTK_SELLOGIT) in MPK_TOPK_TIE_FIX's order"
+#endif
+// Expert e's selection key: the bf16 logit's bits mapped so that u32 order is
+// float order (-0 folded onto +0, which the float compare ties), above
+// 127 - e, so equal logits go to the lower expert. Keys are unique and above 0.
+__device__ __forceinline__ unsigned ksel_key(unsigned b, int e) {
+  b = b == 0x8000u ? 0u : b;
+  unsigned const o = (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
+  return (o << 16) | (unsigned)(127 - e);
+}
+
+// Wave-wide u32 max, broadcast from lane 63, one v_max_u32_dpp per step. The
+// compiler does not insert wait states into inline asm: five before the first
+// DPP (an exec write may precede the block), two before each later one, five
+// after the readlane.
+__device__ __forceinline__ unsigned ksel_wave_max(unsigned v) {
+  unsigned x = v;
+  unsigned g;
+  asm volatile(
+      "s_nop 4\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:4 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_ror:8 row_mask:0xf bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_max_u32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf\n"
+      "s_nop 1\n"
+      "v_readlane_b32 %1, %0, 63\n"
+      "s_nop 4"
+      : "+v"(x), "=s"(g));
+  return g;
+}
+#endif
+
 struct mpk_ltk_noside {
   __device__ __forceinline__ void operator()() const {}
 };
@@ -816,7 +857,35 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
     }
   }
 #endif
+#ifdef MPK_LTK_KSEL
+  // Wave 0 alone: K rounds of a wave-wide max over two keys per lane, each
+  // followed by clearing the selected key (unique, so one lane matches).
+  if (tid < 64) {
+    unsigned k0 = ksel_key(s_ltk_logit[2 * tid], 2 * tid);
+    unsigned k1 = ksel_key(s_ltk_logit[2 * tid + 1], 2 * tid + 1);
+    unsigned ksel_g[K];
+#pragma unroll
+    for (int k_idx = 0; k_idx < K; ++k_idx) {
+      unsigned const g = ksel_wave_max(k0 > k1 ? k0 : k1);
+      ksel_g[k_idx] = g;
+      if (k0 == g) k0 = 0u;
+      if (k1 == g) k1 = 0u;
+    }
+    if (tid == 0) {
+#pragma unroll
+      for (int k_idx = 0; k_idx < K; ++k_idx) {
+        unsigned const g = ksel_g[k_idx];
+        unsigned const o = g >> 16;
+        unsigned const b = (o & 0x8000u) ? (o & 0x7FFFu) : (~o & 0xFFFFu);
+        s_ltk_sel[k_idx] = 127 - (int)(g & 0xFFFFu);
+        s_ltk_w[k_idx] = __uint_as_float(b << 16);
+      }
+    }
+  }
+  if (false) {
+#else
   if (tid < THREADS_PER_ROW) {
+#endif
     float row_chunk[VPT];
     for (int e = 0; e < VPT; ++e) {
       // bf16 -> f32 is exact: the bf16 bits are the float's top half.

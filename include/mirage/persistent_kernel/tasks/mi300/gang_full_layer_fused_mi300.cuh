@@ -2055,6 +2055,16 @@ __device__ __noinline__ void
                                    xcd_id * (NUM_EXPERTS / MPK_ROP_XCDS);
         rop_bias = __uint_as_float((unsigned)rb[tid] << 16);
       }
+#ifdef MPK_LTK_KSEL
+      // The TopK runs on wave 0 alone: waves 1 / 3 / 2 quantize units 0-63 /
+      // 64-127 / 128-183, one per lane.
+      int const rop_w = tid >> 6;
+      bool const rop_qw = rop_w != 0;
+      int const rop_ua = (tid & 63) + (rop_w == 3 ? 64 : rop_w == 2 ? 128 : 0);
+      int const rop_ub = 0;
+      bool const rop_va = rop_qw && rop_ua < rop_units;
+      bool const rop_vb = false;
+#else
       // Waves 1 and 3 quantize while waves 0 and 2 run the TopK: wave 1 owns
       // units [0, 64) and [128, 192), wave 3 owns [64, 128). 8-lane domains
       // stay lane-aligned in both sets.
@@ -2063,6 +2073,7 @@ __device__ __noinline__ void
       int const rop_ub = rop_ua + 128;
       bool const rop_va = rop_qw && rop_ua < rop_units;
       bool const rop_vb = rop_qw && rop_ub < rop_units;
+#endif
       rop7_i32x4_t rop_g0 = {}, rop_g1 = {}, rop_h0 = {}, rop_h1 = {};
       rop7_i32x4_t rop_g2 = {}, rop_g3 = {}, rop_h2 = {}, rop_h3 = {};
       unsigned short const *const rop_gb =
@@ -2077,6 +2088,10 @@ __device__ __noinline__ void
         rop_g2 = gp[0];
         rop_g3 = gp[1];
       }
+#ifdef MPK_ROP_MERGED_POLL
+#define MPK_ROP_GSC "sc1"
+#else
+#define MPK_ROP_GSC "sc0 sc1"
       // Stage 1: one wave waits for all eight XCDs' sum-of-squares word.
       if (tid < 64) {
         int const *const p = rop_agg + (tid & 7) * MPK_ROP_AGG_INTS + 2 * 128;
@@ -2089,9 +2104,11 @@ __device__ __noinline__ void
         }
       }
       __syncthreads();
+#endif
       // Stage 2: the hidden row (every XCD's columns retired before that XCD's
       // sums were published) and the 8 x 129 sums.
       char const *const rop_hb = (char const *)output_ptrs[5];
+#ifndef MPK_ROP_MERGED_POLL
       if (rop_va) {
         char const *hp = rop_hb + rop_ua * 32;
         asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1\n"
@@ -2108,19 +2125,20 @@ __device__ __noinline__ void
                      : "v"(hp)
                      : "memory");
       }
+#endif
       if (tid < 129) {
         char const *a0 = (char const *)(rop_agg + 2 * tid);
         char const *a1 = a0 + 4 * MPK_ROP_AGG_INTS * 4;
         unsigned long long e0, e1, e2, e3, e4, e5, e6, e7;
         while (true) {
-          asm volatile("global_load_dwordx2 %0, %8, off sc0 sc1\n"
-                       "global_load_dwordx2 %1, %8, off offset:1152 sc0 sc1\n"
-                       "global_load_dwordx2 %2, %8, off offset:2304 sc0 sc1\n"
-                       "global_load_dwordx2 %3, %8, off offset:3456 sc0 sc1\n"
-                       "global_load_dwordx2 %4, %9, off sc0 sc1\n"
-                       "global_load_dwordx2 %5, %9, off offset:1152 sc0 sc1\n"
-                       "global_load_dwordx2 %6, %9, off offset:2304 sc0 sc1\n"
-                       "global_load_dwordx2 %7, %9, off offset:3456 sc0 sc1\n"
+          asm volatile("global_load_dwordx2 %0, %8, off " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %1, %8, off offset:1152 " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %2, %8, off offset:2304 " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %3, %8, off offset:3456 " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %4, %9, off " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %5, %9, off offset:1152 " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %6, %9, off offset:2304 " MPK_ROP_GSC "\n"
+                       "global_load_dwordx2 %7, %9, off offset:3456 " MPK_ROP_GSC "\n"
                        "s_waitcnt vmcnt(0)"
                        : "=&v"(e0), "=&v"(e1), "=&v"(e2), "=&v"(e3),
                          "=&v"(e4), "=&v"(e5), "=&v"(e6), "=&v"(e7)
@@ -2149,6 +2167,26 @@ __device__ __noinline__ void
       }
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       __syncthreads();
+#ifdef MPK_ROP_MERGED_POLL
+      // Every XCD has published (all 129 threads saw its tags), so its row
+      // columns are visible; the quantizing waves wait for these first.
+      if (rop_va) {
+        char const *hp = rop_hb + rop_ua * 32;
+        asm volatile("global_load_dwordx4 %0, %2, off " MPK_ROP_GSC "\n"
+                     "global_load_dwordx4 %1, %2, off offset:16 " MPK_ROP_GSC
+                     : "=&v"(rop_h0), "=&v"(rop_h1)
+                     : "v"(hp)
+                     : "memory");
+      }
+      if (rop_vb) {
+        char const *hp = rop_hb + rop_ub * 32;
+        asm volatile("global_load_dwordx4 %0, %2, off " MPK_ROP_GSC "\n"
+                     "global_load_dwordx4 %1, %2, off offset:16 " MPK_ROP_GSC
+                     : "=&v"(rop_h2), "=&v"(rop_h3)
+                     : "v"(hp)
+                     : "memory");
+      }
+#endif
       float const rop_irms =
           rsqrtf(s_rop[128] / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
       if (tid < NUM_EXPERTS) {
@@ -2196,9 +2234,20 @@ __device__ __noinline__ void
           q[2 * d + 1] = __uint_as_float(pk & 0xFFFF0000u);
           amax = fmaxf(amax, fmaxf(fabsf(q[2 * d]), fabsf(q[2 * d + 1])));
         }
+#ifdef MPK_LTK_KSEL
+        // Quad max, then row_half_mirror pairs each quad with the other quad
+        // of its 8-lane domain.
+        amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_update_dpp(
+                               0, __float_as_int(amax), 0xB1, 0xF, 0xF, false)));
+        amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_update_dpp(
+                               0, __float_as_int(amax), 0x4E, 0xF, 0xF, false)));
+        amax = fmaxf(amax, __int_as_float(__builtin_amdgcn_update_dpp(
+                               0, __float_as_int(amax), 0x141, 0xF, 0xF, false)));
+#else
         amax = fmaxf(amax, __shfl_xor(amax, 1));
         amax = fmaxf(amax, __shfl_xor(amax, 2));
         amax = fmaxf(amax, __shfl_xor(amax, 4));
+#endif
         uint8_t const se = _gang_compute_e8m0_fp8(amax);
         float scale_f = 1.0f;
         if (se != 0) {
@@ -2227,15 +2276,21 @@ __device__ __noinline__ void
         }
       };
       auto rop_side = [&]() {
+#ifdef MPK_ROP_MERGED_POLL
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
         if (rop_qw) {
           rop_quant(rop_h0, rop_h1, rop_g0, rop_g1, rop_ua, rop_va);
+#ifndef MPK_LTK_KSEL
           if ((tid >> 6) == 1) {
             rop_quant(rop_h2, rop_h3, rop_g2, rop_g3, rop_ub, rop_vb);
           }
+#endif
         }
       };
       // The trailing __syncthreads publishes s_ltk_sel and the row.
       mpk_local_topk<128, 4>(nullptr, routing_expected, nullptr, 0, rop_side);
+#undef MPK_ROP_GSC
     }
 #elif defined(MPK_LTK_EARLY_TAG)
     // Writers per XCD: the router's pq_split election (MAX_ITERS tiles).

@@ -1928,6 +1928,15 @@ def get_compile_command(
         if int(os.environ.get("MPK_TOPK_TIE_FIX", "0")) == 1:
             # TopK: break logit ties by expert index; a tie no longer drops an expert.
             flags = flags + ["-DMPK_TOPK_TIE_FIX"]
+        if int(os.environ.get("MPK_LTK_KSEL", "0")) == 1:
+            # Local TopK on one wave: two u32 keys per lane, a wave-wide DPP max
+            # per round. Same selection as MPK_TOPK_TIE_FIX.
+            flags = flags + ["-DMPK_LTK_KSEL"]
+        if int(os.environ.get("MPK_ROP_MERGED_POLL", "0")) == 1:
+            if int(os.environ.get("MPK_ROUTER_OPROJ_PARTIAL", "0")) != 1:
+                raise RuntimeError("MPK_ROP_MERGED_POLL needs MPK_ROUTER_OPROJ_PARTIAL=1")
+            # Phase 7b: the gather threads poll the tagged sums themselves.
+            flags = flags + ["-DMPK_ROP_MERGED_POLL"]
         if int(os.environ.get("MPK_ROUTER_OPROJ_PARTIAL", "0")) == 1:
             # Router logits from per-tile partials in the O-proj epilogue, summed per
             # XCD and across the eight in Phase 7b; replaces the O-proj release wait,
