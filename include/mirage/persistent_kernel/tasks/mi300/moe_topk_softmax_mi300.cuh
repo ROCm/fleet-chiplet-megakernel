@@ -637,10 +637,17 @@ __device__ __forceinline__ int ltk_bitrev4(int r) {
 #if defined(MPK_TOPK_TIE_FIX) && defined(MPK_LTK_SEL64)
 #error "MPK_TOPK_TIE_FIX does not cover MPK_LTK_SEL64"
 #endif
-template <int NUM_EXPERTS, int K>
+struct mpk_ltk_noside {
+  __device__ __forceinline__ void operator()() const {}
+};
+
+// tags == nullptr: the caller already wrote s_ltk_logit. side: work for the
+// waves the TopK leaves idle (1 and 3), run right after the logits barrier.
+template <int NUM_EXPERTS, int K, typename Side = mpk_ltk_noside>
 __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
                                                int const *norm_flags = nullptr,
-                                               int n_norm = 0) {
+                                               int n_norm = 0,
+                                               Side const &side = Side{}) {
   static_assert(NUM_EXPERTS == 128, "MPK_LOCAL_TOPK: s_ltk_* sized for 128");
   static_assert(K <= 8, "MPK_LOCAL_TOPK: topk_vals holds 8");
   constexpr int VPT = 8;
@@ -648,7 +655,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
   static_assert(THREADS_PER_ROW == 16, "one 16-lane row");
   int const tid = threadIdx.x;
   unsigned const want = mpk_ltk_tag(expected);
-  if (tid < 64) {
+  if (tags != nullptr && tid < 64) {
     // One wave reads all 128 words, two per lane, at the same system scope as
     // the routing_ready poll this replaces. Each word is a single
     // write-through store, so a matching tag carries its own logit.
@@ -728,6 +735,7 @@ __device__ __forceinline__ void mpk_local_topk(int const *tags, int expected,
     s_ltk_logit[2 * tid + 1] = (unsigned short)((v >> 32) & 0xFFFFu);
   }
   __syncthreads();
+  side();
 #ifdef MPK_LTK_EARLY_TAG
   if (n_norm > 0 && tid >= 64 && tid < 128) {
     // Wave 1 waits for this XCD's normed row while wave 0 runs the TopK.

@@ -619,6 +619,20 @@ __device__ __forceinline__ unsigned mpk_ltk_tag(int epoch) {
 __shared__ int s_ltk_sel[8];
 __shared__ float s_ltk_w[8];
 __shared__ unsigned short s_ltk_logit[128];
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+// Router partials, one scratch buffer zeroed once (launch_persistent_kernel):
+//   [parity][xcd][24 slots][160 ints]  each O-proj tile's 128 expert partials
+//                                      and its sum of squares (slot 23 stays 0)
+//   [parity][xcd][288 ints]            each XCD's 129 sums as (value, epoch)
+__constant__ int *g_rop_buf;
+constexpr int MPK_ROP_XCDS = 8;  // SPX: eight XCDs, one slot row each
+constexpr int MPK_ROP_WG_SLOTS = 24;
+constexpr int MPK_ROP_WG_INTS = 160;
+constexpr int MPK_ROP_AGG_INTS = 288;
+constexpr int MPK_ROP_WG_BASE_INTS = 0;
+constexpr int MPK_ROP_AGG_BASE_INTS = 2 * 8 * MPK_ROP_WG_SLOTS * MPK_ROP_WG_INTS;
+constexpr int MPK_ROP_BUF_INTS = MPK_ROP_AGG_BASE_INTS + 2 * 8 * MPK_ROP_AGG_INTS;
+#endif
 #endif
 
 #ifdef MPK_OPROJ_TILE_FLAGS

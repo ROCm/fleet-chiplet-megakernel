@@ -1990,7 +1990,7 @@ __device__ __noinline__ void
   // Counts move run to run (33/22/32/32 across reps at the shipped geometry),
   // so do not size a change here off a single run -- always rebuild with the
   // ablation flag and compare inside one build.
-#ifndef MPK_NO_OPROJ_SKIP_GATE
+#if !defined(MPK_NO_OPROJ_SKIP_GATE) && !defined(MPK_ROUTER_OPROJ_PARTIAL)
   if (!does_oproj) {
     int *oproj_hier = static_cast<int *>(input_ptrs[16]);
 #ifdef MPK_OPROJ_TILE_FLAGS
@@ -2030,7 +2030,214 @@ __device__ __noinline__ void
     // No routing_ready poll: rebuild this layer's routing from the 128
     // epoch-tagged router logits, then take this XCD pair's pick -- the
     // same selection-order entry the completer's u64 record carries.
-#ifdef MPK_LTK_EARLY_TAG
+#if defined(MPK_ROUTER_OPROJ_PARTIAL)
+    {
+      // Router logits and this workgroup's FP8 MoE row, from the O-proj
+      // partials. Every XCD's last O-proj arrival published 129 sums (expert
+      // partials over its 368 columns + their sum of squares); add the eight,
+      // then normalize and quantize the row straight into the W13 handoff LDS.
+      // Replaces the O-proj release wait, the router workers and the handoff
+      // load.
+      static_assert(MPK_ROP_AGG_INTS == 288, "agg offsets below are 1152 B");
+      static_assert(NUM_EXPERTS == 128 && QKV_BATCH_SIZE == 1, "bs1 / 128");
+      typedef int __attribute__((ext_vector_type(4))) rop7_i32x4_t;
+      __shared__ float s_rop[132];
+      extern __shared__ char _rop_smem[];
+      unsigned const rop_tag = (unsigned)routing_expected;
+      int const rop_units = oproj_output_stride / 16;
+      int const *const rop_agg = g_rop_buf + MPK_ROP_AGG_BASE_INTS +
+                                 (routing_expected & 1) * MPK_ROP_XCDS *
+                                     MPK_ROP_AGG_INTS;
+      // Layer constants first; they overlap the wait.
+      float rop_bias = 0.0f;
+      if (tid < NUM_EXPERTS && input_ptrs[14] != nullptr) {
+        unsigned short const *rb = (unsigned short const *)input_ptrs[14] -
+                                   xcd_id * (NUM_EXPERTS / MPK_ROP_XCDS);
+        rop_bias = __uint_as_float((unsigned)rb[tid] << 16);
+      }
+      // Waves 1 and 3 quantize while waves 0 and 2 run the TopK: wave 1 owns
+      // units [0, 64) and [128, 192), wave 3 owns [64, 128). 8-lane domains
+      // stay lane-aligned in both sets.
+      bool const rop_qw = ((tid >> 6) & 1) != 0;
+      int const rop_ua = (tid & 63) + ((tid >> 7) << 6);
+      int const rop_ub = rop_ua + 128;
+      bool const rop_va = rop_qw && rop_ua < rop_units;
+      bool const rop_vb = rop_qw && rop_ub < rop_units;
+      rop7_i32x4_t rop_g0 = {}, rop_g1 = {}, rop_h0 = {}, rop_h1 = {};
+      rop7_i32x4_t rop_g2 = {}, rop_g3 = {}, rop_h2 = {}, rop_h3 = {};
+      unsigned short const *const rop_gb =
+          (unsigned short const *)input_ptrs[11];
+      if (rop_va) {
+        rop7_i32x4_t const *gp = (rop7_i32x4_t const *)(rop_gb + rop_ua * 16);
+        rop_g0 = gp[0];
+        rop_g1 = gp[1];
+      }
+      if (rop_vb) {
+        rop7_i32x4_t const *gp = (rop7_i32x4_t const *)(rop_gb + rop_ub * 16);
+        rop_g2 = gp[0];
+        rop_g3 = gp[1];
+      }
+      // Stage 1: one wave waits for all eight XCDs' sum-of-squares word.
+      if (tid < 64) {
+        int const *const p = rop_agg + (tid & 7) * MPK_ROP_AGG_INTS + 2 * 128;
+        while (true) {
+          unsigned long long const v = ld_sys_u64((void *)p);
+          if (__all((unsigned)(v >> 32) == rop_tag)) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      }
+      __syncthreads();
+      // Stage 2: the hidden row (every XCD's columns retired before that XCD's
+      // sums were published) and the 8 x 129 sums.
+      char const *const rop_hb = (char const *)output_ptrs[5];
+      if (rop_va) {
+        char const *hp = rop_hb + rop_ua * 32;
+        asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1\n"
+                     "global_load_dwordx4 %1, %2, off offset:16 sc0 sc1"
+                     : "=&v"(rop_h0), "=&v"(rop_h1)
+                     : "v"(hp)
+                     : "memory");
+      }
+      if (rop_vb) {
+        char const *hp = rop_hb + rop_ub * 32;
+        asm volatile("global_load_dwordx4 %0, %2, off sc0 sc1\n"
+                     "global_load_dwordx4 %1, %2, off offset:16 sc0 sc1"
+                     : "=&v"(rop_h2), "=&v"(rop_h3)
+                     : "v"(hp)
+                     : "memory");
+      }
+      if (tid < 129) {
+        char const *a0 = (char const *)(rop_agg + 2 * tid);
+        char const *a1 = a0 + 4 * MPK_ROP_AGG_INTS * 4;
+        unsigned long long e0, e1, e2, e3, e4, e5, e6, e7;
+        while (true) {
+          asm volatile("global_load_dwordx2 %0, %8, off sc0 sc1\n"
+                       "global_load_dwordx2 %1, %8, off offset:1152 sc0 sc1\n"
+                       "global_load_dwordx2 %2, %8, off offset:2304 sc0 sc1\n"
+                       "global_load_dwordx2 %3, %8, off offset:3456 sc0 sc1\n"
+                       "global_load_dwordx2 %4, %9, off sc0 sc1\n"
+                       "global_load_dwordx2 %5, %9, off offset:1152 sc0 sc1\n"
+                       "global_load_dwordx2 %6, %9, off offset:2304 sc0 sc1\n"
+                       "global_load_dwordx2 %7, %9, off offset:3456 sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(e0), "=&v"(e1), "=&v"(e2), "=&v"(e3),
+                         "=&v"(e4), "=&v"(e5), "=&v"(e6), "=&v"(e7)
+                       : "v"(a0), "v"(a1)
+                       : "memory");
+          if ((unsigned)(e0 >> 32) == rop_tag &&
+              (unsigned)(e1 >> 32) == rop_tag &&
+              (unsigned)(e2 >> 32) == rop_tag &&
+              (unsigned)(e3 >> 32) == rop_tag &&
+              (unsigned)(e4 >> 32) == rop_tag &&
+              (unsigned)(e5 >> 32) == rop_tag &&
+              (unsigned)(e6 >> 32) == rop_tag &&
+              (unsigned)(e7 >> 32) == rop_tag) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        s_rop[tid] = __uint_as_float((unsigned)e0) +
+                     __uint_as_float((unsigned)e1) +
+                     __uint_as_float((unsigned)e2) +
+                     __uint_as_float((unsigned)e3) +
+                     __uint_as_float((unsigned)e4) +
+                     __uint_as_float((unsigned)e5) +
+                     __uint_as_float((unsigned)e6) +
+                     __uint_as_float((unsigned)e7);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      __syncthreads();
+      float const rop_irms =
+          rsqrtf(s_rop[128] / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+      if (tid < NUM_EXPERTS) {
+        float s = s_rop[tid];
+        s *= rop_irms;
+        s += rop_bias;
+        s_ltk_logit[tid] =
+            __builtin_bit_cast(unsigned short, __float2bfloat16(s));
+      }
+      // Normed row -> FP8 + E8M0 (128-element domains = 8 lanes), the same
+      // bits the router's prequant published: bf16 round trip, then quant. One
+      // call quantizes one 16-element unit per lane; the whole wave calls it
+      // (the amax shuffles), `ok` only gates the stores.
+      auto rop_quant = [&](rop7_i32x4_t const &h0, rop7_i32x4_t const &h1,
+                           rop7_i32x4_t const &g0, rop7_i32x4_t const &g1,
+                           int unit, bool ok) {
+        unsigned const hw[8] = {(unsigned)h0[0], (unsigned)h0[1],
+                                (unsigned)h0[2], (unsigned)h0[3],
+                                (unsigned)h1[0], (unsigned)h1[1],
+                                (unsigned)h1[2], (unsigned)h1[3]};
+        unsigned const gw[8] = {(unsigned)g0[0], (unsigned)g0[1],
+                                (unsigned)g0[2], (unsigned)g0[3],
+                                (unsigned)g1[0], (unsigned)g1[1],
+                                (unsigned)g1[2], (unsigned)g1[3]};
+        float q[16];
+        float amax = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+          float n0 = __uint_as_float(hw[d] << 16) * rop_irms *
+                     __uint_as_float(gw[d] << 16);
+          float n1 = __uint_as_float(hw[d] & 0xFFFF0000u) * rop_irms *
+                     __uint_as_float(gw[d] & 0xFFFF0000u);
+          int const e = unit * 16 + d * 2;
+          if (e >= ACTUAL_HIDDEN_DIM) {
+            n0 = 0.0f;
+          }
+          if (e + 1 >= ACTUAL_HIDDEN_DIM) {
+            n1 = 0.0f;
+          }
+          uint32_t pk;
+          asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
+                       : "=v"(pk)
+                       : "v"(n0), "v"(n1));
+          q[2 * d] = __uint_as_float(pk << 16);
+          q[2 * d + 1] = __uint_as_float(pk & 0xFFFF0000u);
+          amax = fmaxf(amax, fmaxf(fabsf(q[2 * d]), fabsf(q[2 * d + 1])));
+        }
+        amax = fmaxf(amax, __shfl_xor(amax, 1));
+        amax = fmaxf(amax, __shfl_xor(amax, 2));
+        amax = fmaxf(amax, __shfl_xor(amax, 4));
+        uint8_t const se = _gang_compute_e8m0_fp8(amax);
+        float scale_f = 1.0f;
+        if (se != 0) {
+          uint32_t const sbits = (uint32_t)se << 23;
+          __builtin_memcpy(&scale_f, &sbits, sizeof(scale_f));
+        }
+        rop7_i32x4_t out;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          fp8x4_t pk = {};
+          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, q[4 * k],
+                                                        q[4 * k + 1], scale_f,
+                                                        false);
+          pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, q[4 * k + 2],
+                                                        q[4 * k + 3], scale_f,
+                                                        true);
+          int bits;
+          __builtin_memcpy(&bits, &pk, sizeof(bits));
+          out[k] = bits;
+        }
+        if (ok) {
+          *(rop7_i32x4_t *)(_rop_smem + unit * 16) = out;
+          if ((unit & 7) == 0) {
+            _rop_smem[oproj_output_stride + (unit >> 3)] = (char)se;
+          }
+        }
+      };
+      auto rop_side = [&]() {
+        if (rop_qw) {
+          rop_quant(rop_h0, rop_h1, rop_g0, rop_g1, rop_ua, rop_va);
+          if ((tid >> 6) == 1) {
+            rop_quant(rop_h2, rop_h3, rop_g2, rop_g3, rop_ub, rop_vb);
+          }
+        }
+      };
+      // The trailing __syncthreads publishes s_ltk_sel and the row.
+      mpk_local_topk<128, 4>(nullptr, routing_expected, nullptr, 0, rop_side);
+    }
+#elif defined(MPK_LTK_EARLY_TAG)
     // Writers per XCD: the router's pq_split election (MAX_ITERS tiles).
     constexpr int ltk_row_iters = (ACTUAL_HIDDEN_DIM / 4 + 255) / 256;
     mpk_local_topk<128, 4>(oproj_counters_base + MPK_LTK_TAG_SLOT,

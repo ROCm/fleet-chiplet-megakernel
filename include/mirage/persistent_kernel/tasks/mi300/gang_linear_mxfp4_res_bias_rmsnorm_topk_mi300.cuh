@@ -49,6 +49,23 @@
 #include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh"    // FP4xFP8 helpers
 #include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // topk_noinline
 
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+#if !defined(MPK_LOCAL_TOPK) || !defined(MPK_W13_PREQUANT) ||                  \
+    !defined(MPK_W13_KMAJOR_RECYCLE) || !defined(MPK_OPROJ_TREE_BARRIER) ||    \
+    defined(MPK_OPROJ_TILE_FLAGS) || defined(MPK_OPROJ_POLL_GLOBAL) ||         \
+    defined(MPK_ROUTER_XCD_FOLD) || defined(MPK_OPROJ_ARRIVE_ONLY) ||          \
+    defined(MPK_POLL_PIPE)
+#error "MPK_ROUTER_OPROJ_PARTIAL: LOCAL_TOPK + W13_PREQUANT + W13_KMAJOR_RECYCLE + OPROJ_TREE_BARRIER, none of the O-proj barrier variants"
+#endif
+// O-proj workers publish router partials and leave; nobody waits on the
+// O-proj release any more (Phase 7b waits on the partial sums).
+#define MPK_ROP_SKIP true
+typedef int __attribute__((ext_vector_type(4))) rop_i32x4_t;
+typedef float __attribute__((ext_vector_type(4))) rop_f32x4_t;
+#else
+#define MPK_ROP_SKIP false
+#endif
+
 namespace kernel {
 
 // ── O-proj LDS layout, shared with the Phase-6 weight DMA ─────────────────
@@ -1129,6 +1146,40 @@ __device__ __attribute__((noinline)) void
                      : "v"(bias_addr), "v"(res_addr)
                      : "memory");
       }
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+      // This tile's 16 columns of router rows `lane` and `lane + 64`, and of
+      // the post-norm gamma. The router pointer is pre-offset to this XCD's
+      // 16 rows; undo that. Retired by the bias/residual vmcnt(0) below.
+      static_assert(BATCH_SIZE == 1 && OUTPUT_PER_WG == 16 &&
+                        NUM_EXPERTS == 128,
+                    "MPK_ROUTER_OPROJ_PARTIAL is bs1 / 16-col O-proj / 128 experts / 8 XCDs");
+      int const rop_c0 = xcd_output_col_offset + wg_idx * OUTPUT_PER_WG;
+      // 2880 is a multiple of 16, so a tile is all real or all padding.
+      bool const rop_live = rop_c0 < ACTUAL_HIDDEN_DIM;
+      rop_i32x4_t rop_w0 = {}, rop_w1 = {}, rop_w2 = {}, rop_w3 = {};
+      rop_i32x4_t rop_g0 = {}, rop_g1 = {};
+      if (warp_id == 0 && rop_live) {
+        char const *rop_rw =
+            (char const *)((unsigned short const *)router_weight_ptr +
+                           ((int64_t)lane_id -
+                            xcd_id * (NUM_EXPERTS / MPK_ROP_XCDS)) *
+                               output_stride +
+                           rop_c0);
+        char const *rop_rw1 = rop_rw + (int64_t)64 * output_stride * 2;
+        char const *rop_gm =
+            (char const *)((unsigned short const *)norm_weight_ptr + rop_c0);
+        asm volatile("global_load_dwordx4 %0, %6, off\n"
+                     "global_load_dwordx4 %1, %6, off offset:16\n"
+                     "global_load_dwordx4 %2, %7, off\n"
+                     "global_load_dwordx4 %3, %7, off offset:16\n"
+                     "global_load_dwordx4 %4, %8, off\n"
+                     "global_load_dwordx4 %5, %8, off offset:16"
+                     : "=&v"(rop_w0), "=&v"(rop_w1), "=&v"(rop_w2),
+                       "=&v"(rop_w3), "=&v"(rop_g0), "=&v"(rop_g1)
+                     : "v"(rop_rw), "v"(rop_rw1), "v"(rop_gm)
+                     : "memory");
+      }
+#endif
 
       // Read weights from LDS (populated by Phase 6 buffer_load_lds DMA).
       // LDS layout mirrors HBM tile layout: data at [0..WG_DATA_BYTES),
@@ -1480,6 +1531,9 @@ __device__ __attribute__((noinline)) void
 #endif
       __syncthreads();
 
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+      unsigned rop_y01 = 0u, rop_y23 = 0u;
+#endif
       if (warp_id == 0 && tok_active) {
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
         // Each lane reduces its own (g, col) slot: output columns g*4..g*4+3
@@ -1564,8 +1618,72 @@ __device__ __attribute__((noinline)) void
         unsigned long long out64 =
             (unsigned long long)o0 | ((unsigned long long)o1 << 16) |
             ((unsigned long long)o2 << 32) | ((unsigned long long)o3 << 48);
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+        rop_y01 = (unsigned)out64;
+        rop_y23 = (unsigned)(out64 >> 32);
+#endif
         st_wt_u64(&d_output[out_idx_base], out64);
       }
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+      if (warp_id == 0) {
+        // Lane l: sum_j w[l][j] * (y_j * g_j) and the same for expert l + 64
+        // over this tile's 16 columns; y is the bf16 hidden exactly as stored.
+        // The rmsnorm scale is uniform, so it is applied once in Phase 7b.
+        float rop_y[16];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          unsigned const a = __builtin_amdgcn_readlane(rop_y01, q * 16);
+          unsigned const b = __builtin_amdgcn_readlane(rop_y23, q * 16);
+          rop_y[q * 4 + 0] = __uint_as_float(a << 16);
+          rop_y[q * 4 + 1] = __uint_as_float(a & 0xFFFF0000u);
+          rop_y[q * 4 + 2] = __uint_as_float(b << 16);
+          rop_y[q * 4 + 3] = __uint_as_float(b & 0xFFFF0000u);
+        }
+        unsigned const rop_wd[16] = {
+            (unsigned)rop_w0[0], (unsigned)rop_w0[1], (unsigned)rop_w0[2],
+            (unsigned)rop_w0[3], (unsigned)rop_w1[0], (unsigned)rop_w1[1],
+            (unsigned)rop_w1[2], (unsigned)rop_w1[3], (unsigned)rop_w2[0],
+            (unsigned)rop_w2[1], (unsigned)rop_w2[2], (unsigned)rop_w2[3],
+            (unsigned)rop_w3[0], (unsigned)rop_w3[1], (unsigned)rop_w3[2],
+            (unsigned)rop_w3[3]};
+        unsigned const rop_gd[8] = {
+            (unsigned)rop_g0[0], (unsigned)rop_g0[1], (unsigned)rop_g0[2],
+            (unsigned)rop_g0[3], (unsigned)rop_g1[0], (unsigned)rop_g1[1],
+            (unsigned)rop_g1[2], (unsigned)rop_g1[3]};
+        float rop_p0 = 0.0f, rop_p1 = 0.0f, rop_ssq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          int const d = j >> 1;
+          int const sh = (j & 1) ? 0 : 16;
+          unsigned const msk = 0xFFFF0000u;
+          float const gj = __uint_as_float((rop_gd[d] << sh) & msk);
+          float const w0 = __uint_as_float((rop_wd[d] << sh) & msk);
+          float const w1 = __uint_as_float((rop_wd[8 + d] << sh) & msk);
+          float const yg = rop_y[j] * gj;
+          rop_p0 += w0 * yg;
+          rop_p1 += w1 * yg;
+          rop_ssq += rop_y[j] * rop_y[j];
+        }
+        if (!rop_live) {
+          rop_p0 = 0.0f;
+          rop_p1 = 0.0f;
+          rop_ssq = 0.0f;
+        }
+        // Plain stores into this XCD's L2; the XCD's last arrival reads them
+        // there. Drained by the vmcnt(0) ahead of this block's arrival.
+        float *const rop_slot =
+            (float *)(g_rop_buf + MPK_ROP_WG_BASE_INTS +
+                      (((layer_epoch & 1) * MPK_ROP_XCDS + xcd_id) *
+                           MPK_ROP_WG_SLOTS +
+                       wg_idx) *
+                          MPK_ROP_WG_INTS);
+        rop_slot[lane_id] = rop_p0;
+        rop_slot[64 + lane_id] = rop_p1;
+        if (lane_id == 0) {
+          rop_slot[128] = rop_ssq;
+        }
+      }
+#endif
     }
   }
 
@@ -1679,6 +1797,9 @@ oproj_barrier :
     // value. Zero means "not the releaser", which is unambiguous because a
     // real epoch is >= 1.
     int oproj_rel_epoch = 0;
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+    int rop_last = 0;
+#endif
 #ifdef MPK_OPROJ_TILE_FLAGS
     bool const mpk_tf = layer_epoch > 0;
     if (tid == 0 && mpk_tf) {
@@ -1785,6 +1906,11 @@ oproj_barrier :
       int const local_prev =
           atom_add_xcd_local_s32(&hier_local[xcd_id * HIER_STRIDE], 1);
       if ((local_prev % tiles_per_xcd) == tiles_per_xcd - 1) {
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+        // Last worker on this XCD: it sums the XCD's partials below. No
+        // global arrival -- nothing waits on the O-proj release.
+        rop_last = 1;
+#else
         // Last worker on this XCD. Its own stores are drained (above) and so
         // are every other arriving worker's on this XCD -- each drained
         // before its own arrival, and all of those arrivals precede this one
@@ -1813,6 +1939,7 @@ oproj_barrier :
             oproj_rel_epoch = oproj_release_expected;
           }
         }
+#endif
       }
 #else
       // Single global arrival (all workers increment one counter)
@@ -1828,6 +1955,44 @@ oproj_barrier :
     // the note above the arrival for why readfirstlane carries the epoch and
     // why 0 is a safe "not the releaser" sentinel.
     oproj_rel_epoch = __builtin_amdgcn_readfirstlane(oproj_rel_epoch);
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+    rop_last = __builtin_amdgcn_readfirstlane(rop_last);
+    if (rop_last) {
+      // Last O-proj arrival on this XCD (wave 0 only: lane 0 of the other
+      // waves never set it). Every tile's partials precede its arrival in this
+      // L2; sum them in tile order and publish 129 epoch-tagged floats.
+      int const rop_l = tid & 63;
+      int const rop_par = layer_epoch & 1;
+      float const *const rop_wg =
+          (float const *)(g_rop_buf + MPK_ROP_WG_BASE_INTS +
+                          (rop_par * MPK_ROP_XCDS + xcd_id) * MPK_ROP_WG_SLOTS *
+                              MPK_ROP_WG_INTS);
+      // vL1 may hold these lines from two layers ago.
+      asm volatile("buffer_inv sc0" ::: "memory");
+      if (rop_l < 33) {
+        rop_f32x4_t rop_s = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int w = 0; w < MPK_ROP_WG_SLOTS; ++w) {
+          rop_s += *(rop_f32x4_t const *)(rop_wg + w * MPK_ROP_WG_INTS +
+                                          rop_l * 4);
+        }
+        int const rop_tg = layer_epoch;
+        rop_i32x4_t const lo = {__float_as_int(rop_s[0]), rop_tg,
+                                __float_as_int(rop_s[1]), rop_tg};
+        rop_i32x4_t const hi = {__float_as_int(rop_s[2]), rop_tg,
+                                __float_as_int(rop_s[3]), rop_tg};
+        char *const dst = (char *)(g_rop_buf + MPK_ROP_AGG_BASE_INTS +
+                                   (rop_par * MPK_ROP_XCDS + xcd_id) *
+                                       MPK_ROP_AGG_INTS) +
+                          rop_l * 32;
+        asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1\n"
+                     "global_store_dwordx4 %0, %2, off offset:16 sc0 sc1" ::"v"(
+                         dst),
+                     "v"(lo), "v"(hi)
+                     : "memory");
+      }
+    }
+#endif
     if (oproj_rel_epoch != 0) {
       if (tid < 8) {
         st_wt_u32((void *)&hier_barrier[tid * HIER_STRIDE],
@@ -1839,7 +2004,7 @@ oproj_barrier :
     }
 
     // Issue prefetch loads AFTER barrier atomics but BEFORE poll loop.
-    if (local_tile < router_tile_n) {
+    if (!MPK_ROP_SKIP && local_tile < router_tile_n) {
       char const *g_base_pf = (char const *)norm_weight_ptr;
       char const *w_base_pf = (char const *)router_weight_ptr +
                               (int64_t)local_tile * output_stride * 2;
@@ -1964,8 +2129,9 @@ oproj_barrier :
                       oproj_release_expected);
       while (false) {
 #else
-      while (MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
-             oproj_release_expected) {
+      while (!MPK_ROP_SKIP &&
+             MPK_LD_GATE2(&hier_barrier[xcd_id * HIER_STRIDE]) <
+                 oproj_release_expected) {
 #endif
 #endif
         __builtin_amdgcn_s_sleep(1);
@@ -2075,7 +2241,7 @@ oproj_barrier :
   // All workers redundantly compute RMSNorm on d_output (O-PROJ result).
   // Each worker computes one router expert's logit.
 
-  if (local_tile >= router_tile_n) {
+  if (MPK_ROP_SKIP || local_tile >= router_tile_n) {
     // This worker has no TopK tile — skip TopK entirely.
     // Do NOT participate in topk_counter atomicAdd.
     goto done;

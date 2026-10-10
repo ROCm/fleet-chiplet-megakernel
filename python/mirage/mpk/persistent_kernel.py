@@ -1928,6 +1928,14 @@ def get_compile_command(
         if int(os.environ.get("MPK_TOPK_TIE_FIX", "0")) == 1:
             # TopK: break logit ties by expert index; a tie no longer drops an expert.
             flags = flags + ["-DMPK_TOPK_TIE_FIX"]
+        if int(os.environ.get("MPK_ROUTER_OPROJ_PARTIAL", "0")) == 1:
+            # Router logits from per-tile partials in the O-proj epilogue, summed per
+            # XCD and across the eight in Phase 7b; replaces the O-proj release wait,
+            # the router workers and the W13 handoff load. Not bit-identical (logit
+            # summation order).
+            if int(os.environ.get("MPK_LOCAL_TOPK", "0")) != 1:
+                raise RuntimeError("MPK_ROUTER_OPROJ_PARTIAL requires MPK_LOCAL_TOPK=1")
+            flags = flags + ["-DMPK_ROUTER_OPROJ_PARTIAL"]
         if int(os.environ.get("MPK_PQ_AMAX_DPP", "0")) == 1:
             # O-proj prequant: the 16-lane amax on DPP instead of four ds_bpermute shuffles.
             flags = flags + ["-DMPK_PQ_AMAX_DPP"]

@@ -1334,7 +1334,13 @@ gang_moe_fused_mxfp4_kernel_mi300(
     constexpr int W13_HANDOFF_BYTES = 3 * 1024;
     static_assert(W13_HANDOFF_BYTES == LDS_W13_OFF);
     i32x4_t quantized_chunk;
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+    // Phase 7b already quantized this row into LDS [0, 3 KiB). Dropping the
+    // oldest load keeps the counted waits below sound (VMEM retires in order).
+    bool const handoff_active = false;
+#else
     bool const handoff_active = warp_id < 3;
+#endif
     if (handoff_active) {
       uint8_t const *prequantized = (uint8_t const *)input_base;
       asm volatile("global_load_dwordx4 %0, %1, off sc0 sc1"
