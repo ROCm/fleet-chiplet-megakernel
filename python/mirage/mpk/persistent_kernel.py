@@ -1928,6 +1928,9 @@ def get_compile_command(
         if int(os.environ.get("MPK_TOPK_TIE_FIX", "0")) == 1:
             # TopK: break logit ties by expert index; a tie no longer drops an expert.
             flags = flags + ["-DMPK_TOPK_TIE_FIX"]
+        if int(os.environ.get("MPK_MOE_NARROW_RELEASE", "0")) == 1:
+            # W13 -> W2 expert barrier: one release line for every XCD, not one each.
+            flags = flags + ["-DMPK_MOE_NARROW_RELEASE"]
         if int(os.environ.get("MPK_LTK_KSEL", "0")) == 1:
             # Local TopK on one wave: two u32 keys per lane, a wave-wide DPP max
             # per round. Same selection as MPK_TOPK_TIE_FIX.

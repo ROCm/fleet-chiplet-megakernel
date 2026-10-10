@@ -4551,10 +4551,17 @@ gang_moe_fused_mxfp4_kernel_mi300(
         int layer_idx =
             *reinterpret_cast<int *>(&_fused_smem[LAYER_IDX_SMEM_OFF]);
         int release_val = layer_idx + 1;
+#ifdef MPK_MOE_NARROW_RELEASE
+        // One release line for every XCD: all W2 waves of this expert poll
+        // slot 0, so the drain below waits for one write-through store, not
+        // for the slowest of eight.
+        st_wt_u32((void *)&d_barrier[base], (unsigned)release_val);
+#else
         for (int x = 0; x < 8; x++) {
           st_wt_u32((void *)&d_barrier[base + x * MOE_BAR_LINE],
                     (unsigned)release_val);
         }
+#endif
 #ifndef MPK_PUB_NOWAIT
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
@@ -4937,16 +4944,21 @@ gang_moe_fused_mxfp4_kernel_mi300(
     MPK_WS_WAVE_CLEAR(warp_id);
     int _obs;
     int _spins = 0;
+#ifdef MPK_MOE_NARROW_RELEASE
+    int const moe_rel_line = base;
+#else
+    int const moe_rel_line = base + xcd_id * MOE_BAR_LINE;
+#endif
 #ifdef MPK_MOE_POLL_COUNTER
     while ((_obs = MPK_LD_GATE2(
                 &d_barrier[base + MOE_BAR_COUNTER_SLOT * MOE_BAR_LINE])) <
            W13_TILES * expected) {
 #else
 #ifdef MPK_POLL_PIPE
-    mpk_poll_ge_s32(&d_barrier[base + xcd_id * MOE_BAR_LINE], expected);
+    mpk_poll_ge_s32(&d_barrier[moe_rel_line], expected);
     while (false) {
 #else
-    while ((_obs = MPK_LD_GATE2(&d_barrier[base + xcd_id * MOE_BAR_LINE])) <
+    while ((_obs = MPK_LD_GATE2(&d_barrier[moe_rel_line])) <
            expected) {
 #endif
 #endif
