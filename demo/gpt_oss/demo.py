@@ -1200,6 +1200,11 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+    if os.environ.get("PPL_STAGE_DUMP") and os.environ.get(
+            "MPK_ROUTER_OPROJ_PARTIAL") == "1":
+        # The stage dump reads rmsnorm_out_moe, which the router-partial
+        # path keeps in LDS unless asked to publish it.
+        os.environ.setdefault("MPK_ROP_STAGE_ROW", "1")
 
     # Serving measures per-token latency, and the [FWD_PASS] trace is device
     # printf: inline it perturbs the iteration it reports, and its end-of-launch

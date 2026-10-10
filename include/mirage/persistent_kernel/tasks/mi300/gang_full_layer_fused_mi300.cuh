@@ -2291,6 +2291,22 @@ __device__ __noinline__ void
       // The trailing __syncthreads publishes s_ltk_sel and the row.
       mpk_local_topk<128, 4>(nullptr, routing_expected, nullptr, 0, rop_side);
 #undef MPK_ROP_GSC
+#ifdef MPK_ROP_STAGE_ROW
+      // Stage dumps only: the row in the router's prequant layout (FP8
+      // payload, then one E8M0 byte per 128 elements), which nothing in the
+      // megakernel reads on this path.
+      if (xcd_id == 0 && xcd_rank == 0 && input_ptrs[12] != nullptr) {
+        char *const stage = (char *)input_ptrs[12];
+        if (tid < rop_units) {
+          *(rop7_i32x4_t *)(stage + tid * 16) =
+              *(rop7_i32x4_t const *)(_rop_smem + tid * 16);
+        }
+        if (tid < rop_units / 8) {
+          stage[oproj_output_stride + tid] =
+              _rop_smem[oproj_output_stride + tid];
+        }
+      }
+#endif
     }
 #elif defined(MPK_LTK_EARLY_TAG)
     // Writers per XCD: the router's pq_split election (MAX_ITERS tiles).

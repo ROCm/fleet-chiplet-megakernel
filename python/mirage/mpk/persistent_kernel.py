@@ -1940,6 +1940,9 @@ def get_compile_command(
                 raise RuntimeError("MPK_ROP_MERGED_POLL needs MPK_ROUTER_OPROJ_PARTIAL=1")
             # Phase 7b: the gather threads poll the tagged sums themselves.
             flags = flags + ["-DMPK_ROP_MERGED_POLL"]
+        if int(os.environ.get("MPK_ROP_STAGE_ROW", "0")) == 1:
+            # Stage dumps: the router-partial path also publishes the MoE row.
+            flags = flags + ["-DMPK_ROP_STAGE_ROW"]
         if int(os.environ.get("MPK_ROUTER_OPROJ_PARTIAL", "0")) == 1:
             # Router logits from per-tile partials in the O-proj epilogue, summed per
             # XCD and across the eight in Phase 7b; replaces the O-proj release wait,

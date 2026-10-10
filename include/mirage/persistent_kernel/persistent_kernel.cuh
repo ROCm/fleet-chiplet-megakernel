@@ -4961,6 +4961,21 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     }
   }
 
+#ifdef MPK_ROUTER_OPROJ_PARTIAL
+  {
+    // Router partials, here rather than with the multi-layer tables below,
+    // which a single-layer graph skips. Zeroed here only: every slot that is
+    // polled carries its layer epoch, and epochs never repeat in a process.
+    static int *rop_buf = nullptr;
+    if (rop_buf == nullptr) {
+      rop_buf = gpu_malloc<int>(MPK_ROP_BUF_INTS * sizeof(int));
+      (void)cudaMemset(rop_buf, 0, MPK_ROP_BUF_INTS * sizeof(int));
+      (void)hipMemcpyToSymbol(HIP_SYMBOL(g_rop_buf), &rop_buf,
+                              sizeof(rop_buf));
+    }
+  }
+#endif
+
 #ifdef MPK_PRECOMPUTED_DISPATCH
   // =========================================================================
   // Multi-layer fusion: build pointer table from all 36 layers, then compact
@@ -5288,19 +5303,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
           gpu_malloc<int>(8 * 16 * sizeof(int));
       (void)cudaMemset(
           global_runtime_config.ml_barrier_release, 0, 8 * 16 * sizeof(int));
-#ifdef MPK_ROUTER_OPROJ_PARTIAL
-      {
-        // Router partials. Zeroed here only: every slot that is polled
-        // carries its layer epoch, and epochs never repeat in a process.
-        static int *rop_buf = nullptr;
-        if (rop_buf == nullptr) {
-          rop_buf = gpu_malloc<int>(MPK_ROP_BUF_INTS * sizeof(int));
-          (void)cudaMemset(rop_buf, 0, MPK_ROP_BUF_INTS * sizeof(int));
-          (void)hipMemcpyToSymbol(HIP_SYMBOL(g_rop_buf), &rop_buf,
-                                  sizeof(rop_buf));
-        }
-      }
-#endif
 
       global_runtime_config.ml_num_layers = ml_layers;
       // ml_workers_per_xcd set later after workers_per_xcd is computed
