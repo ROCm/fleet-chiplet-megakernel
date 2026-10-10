@@ -1928,6 +1928,9 @@ def get_compile_command(
         if int(os.environ.get("MPK_TOPK_TIE_FIX", "0")) == 1:
             # TopK: break logit ties by expert index; a tie no longer drops an expert.
             flags = flags + ["-DMPK_TOPK_TIE_FIX"]
+        if int(os.environ.get("MPK_PQ_AMAX_DPP", "0")) == 1:
+            # O-proj prequant: the 16-lane amax on DPP instead of four ds_bpermute shuffles.
+            flags = flags + ["-DMPK_PQ_AMAX_DPP"]
         if int(os.environ.get("MPK_SCHED_ONE_FENCE", "0")) == 1:
             # Dependency wait: one acquire fence, not one before the poll and one after it.
             flags = flags + ["-DMPK_SCHED_ONE_FENCE"]
