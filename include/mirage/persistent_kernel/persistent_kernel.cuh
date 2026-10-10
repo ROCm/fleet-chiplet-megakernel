@@ -2011,7 +2011,14 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config,
                               __ATOMIC_RELAXED);
 #if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
           // Agent-scope acquire fence (GPU-only, not system scope)
+#ifdef MPK_SCHED_ONE_FENCE
+          // If the poll below runs, its trailing fence is the acquire.
+          if (actual_counts >= needed_counts) {
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+          }
+#else
           __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
 #else
           __atomic_thread_fence(__ATOMIC_ACQUIRE);
 #endif
