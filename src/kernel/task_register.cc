@@ -3692,7 +3692,7 @@ int TaskRegister::register_moe_topk_softmax_mi300_task(
   // renormalize was hardcoded true. Models with norm_topk_prob=false (e.g.
   // DeepSeek-V2-Lite, whose six gate weights sum to 0.2079) must not rescale:
   // renormalising scales the routed-expert contribution by ~4.81x.
-  code.e("    $);", renormalize ? "true" : "false");
+  code.e("    $);", renormalize);
   return register_task_variant(TASK_MOE_TOPK_SOFTMAX_MI300, code.to_string());
 }
 
