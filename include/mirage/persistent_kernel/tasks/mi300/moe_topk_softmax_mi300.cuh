@@ -222,9 +222,11 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   // compaction writes land on indices 0..k-1 while an inactive expert below
   // the compacted count may not have been read yet, so a cleared slot can be
   // made to look active (phantom expert). Stage every mark, barrier, then
-  // compact. At 64 experts with blockDim 256 only threads 0..63 run, a
-  // single wavefront, which issues all loads before any store, so it cannot
-  // fire there. It is live once active counts span wavefronts.
+  // compact. Staging holds one entry per stride of blockDim.x, which is 256
+  // threads here (see Block size above). At 64 experts with blockDim 256
+  // only threads 0..63 run, a single wavefront, which issues all loads
+  // before any store, so it cannot fire there. It can fire once active
+  // counts span wavefronts with inactive experts below the compacted count.
   if (active_expert_ids != nullptr) {
     constexpr int MARKS_PER_THREAD = (NUM_EXPERTS + 255) / 256;
     int my_expert[MARKS_PER_THREAD];
