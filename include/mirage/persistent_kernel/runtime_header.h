@@ -42,10 +42,14 @@ constexpr int LAYER_IDX_SMEM_OFFSET_FROM_END = 4;
 
 // AMD LDS limits per GPU generation:
 // - MI300 (gfx942): 64KB LDS per workgroup, use conservative 60KB
-// - MI350 (gfx950): 160KB LDS per workgroup, use 155KB for LDS-resident weights
+// - MI350 (gfx950): 160KB LDS per workgroup, use 154KB for LDS-resident weights.
+//   Not more: with the worker's static LDS on top, one LDS allocation block
+//   must stay free so a scheduler workgroup can share a worker's CU. With none
+//   free, the split launch needs all 256 CUs and can leave a worker unplaced,
+//   which hangs the launch.
 #if (MPK_TARGET_CC == 95)
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
-    155 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+    154 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
 #elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300) ||            \
     (MPK_TARGET_CC == 94)
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
