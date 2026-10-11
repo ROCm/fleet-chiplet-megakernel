@@ -1200,6 +1200,45 @@ if __name__ == "__main__":
         help="Dump the PPL_MODE result to this JSON path.",
     )
     args = parser.parse_args()
+    # Defaults: the decode recipe measured on MI355X in SPX/NPS1 at batch 1 (1k prompt + 1024 new
+    # tokens: ~1.20 ms/token, ~2.0 with every flag off). A variable already set in the environment
+    # wins (e.g. MPK_ROUTER_OPROJ_PARTIAL=0); MPK_DEFAULT_RECIPE=0 skips the whole recipe.
+    if (os.environ.get("MPK_DEFAULT_RECIPE", "1") == "1"
+            and (args.use_mirage or args.verify)
+            and args.max_num_batched_tokens == 1
+            and args.max_num_batched_requests == 1):
+        _recipe = (
+            "MPK_LOCAL_TOPK=1 MPK_TERM_RECHECK=1 MPK_QKV_POS_PREFETCH=1 MPK_QKV_INLINE=1 "
+            "MPK_ATTN_KV_PREFETCH=1 MPK_LTK_DPP=1 MPK_OPROJ_SWAP_ATTN=1 MPK_LTK_NO_LOGIT_STORE=1 "
+            "MPK_LTK_EARLY_TAG=1 MPK_P9_POLL_GLOBAL2=1 MPK_MOE_W2_REMAP=1 MPK_P9_DEFER=1 "
+            "MPK_LTK_SELLOGIT=1 MPK_MOE_BAR_NO_REFRESH=1 MPK_QKV_ROPE_REG=1 MPK_QKV_GAMMA_LDS=1 "
+            "MPK_QKV_GAMMA_NORMREG=1 MPK_QKV_SLAB_LDS=1 MPK_QKV_RED_LDS_BAR=1 "
+            "MPK_ATTN_META_EARLY=1 MPK_ATTN_Q_AFTER_WL=1 MPK_ATTN_PTR_EARLY=1 "
+            "MPK_ATTN_KV_EARLY=1 MPK_MOE_W2_REMAP3=1 MPK_MOE_W2_REMAP3_R0=29 MPK_W2_KWIN=23 "
+            "MPK_MERGE_META_PRE=1 MPK_W2_GATHER_NO_NT=1 MPK_OPROJ_DATA_POLL=1 "
+            "MPK_FUSED_INLINE=1 MPK_ATTN_SL_OVERLAP=1 MPK_ATTN_EPI_UNROLL=1 "
+            "MPK_ATTN_PF_DURING_QK=1 MPK_W13_T1_B0_WAIT_SHIFT=1 MPK_MOE_W2_REMAP_DELAY_US=4 "
+            "MPK_P9_DEFER_INV_L1=1 MPK_W2_IMM=1 MPK_W13_T1_IMM=1 MPK_OPROJ_IMM=1 "
+            "MPK_ATTN_INLINE=1 MPK_ATTN_EXP2_BUILTIN=1 MPK_ATTN_CVT_BUILTIN=1 MPK_PUB_NOWAIT=1 "
+            "MPK_PFIN_RETIRE=1 MPK_QKV_PF_DELAY_US=1 "
+            "MPK_LLVM_OPTS=-amdgpu-sched-strategy=max-ilp MPK_SCHED_ONE_FENCE=1 "
+            "MPK_PQ_AMAX_DPP=1 MPK_TOPK_TIE_FIX=1 "
+            "MPK_ROUTER_OPROJ_PARTIAL=1 MPK_LTK_KSEL=1 MPK_ROP_MERGED_POLL=1 "
+            "MPK_MOE_NARROW_RELEASE=1 MPK_LM_RESADD=1 MPK_LM_NORM_LDS=1 MPK_EMBED_PIPE=1 "
+            "MPK_EMB_FIRST=1")
+        # A flag whose prerequisite was turned off stays off instead of failing the build.
+        _requires = {
+            "MPK_PFIN_RETIRE": ("MPK_FUSED_INLINE",),
+            "MPK_LTK_KSEL": ("MPK_LTK_SELLOGIT", "MPK_TOPK_TIE_FIX"),
+            "MPK_ROUTER_OPROJ_PARTIAL": ("MPK_LOCAL_TOPK",),
+            "MPK_ROP_MERGED_POLL": ("MPK_ROUTER_OPROJ_PARTIAL",),
+        }
+        for _kv in _recipe.split():
+            _k, _v = _kv.split("=", 1)
+            if _k == "MPK_LM_RESADD" and os.environ.get("PPL_MODE", "0") == "1":
+                continue
+            if all(os.environ.get(_r, "0") == "1" for _r in _requires.get(_k, ())):
+                os.environ.setdefault(_k, _v)
     if os.environ.get("PPL_STAGE_DUMP") and os.environ.get(
             "MPK_ROUTER_OPROJ_PARTIAL") == "1":
         # The stage dump reads rmsnorm_out_moe, which the router-partial
