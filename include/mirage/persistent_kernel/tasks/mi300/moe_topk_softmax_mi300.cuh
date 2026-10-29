@@ -58,6 +58,9 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
   int *routing_indices = static_cast<int *>(routing_indices_ptr);
   int *active_expert_ids = static_cast<int *>(active_expert_ids_ptr);
 
+  static_assert(WARPS_PER_CTA * MI300_WARP_SIZE == 256,
+                "staging assumes a 256-thread block");
+
   // Initialize routing indices to 0 and active expert marks to -1
   for (int expert = start_expert + threadIdx.x; expert < end_expert;
        expert += blockDim.x) {
@@ -216,15 +219,34 @@ __device__ __forceinline__ void topk_softmax_mi300_task_impl(
 
   __syncthreads();
 
-  // Compact active expert marks into dense list
+  // Compact active expert marks into a dense list.
+  //
+  // Reads and writes target the same array with no ordering between them:
+  // compaction writes land on indices 0..count-1, and a later wavefront or
+  // earlier iteration can overwrite an inactive slot before its owner loads
+  // it, making the slot look active (phantom expert). Stage every mark,
+  // barrier, then compact. Staging holds one entry per stride of blockDim.x,
+  // which is 256 threads here (see Block size above). At 64 experts with
+  // blockDim 256 only threads 0..63 run, a single wavefront, which issues all
+  // loads before any store, so it cannot fire there. It can fire when a
+  // later wavefront or earlier iteration writes a slot below the number of
+  // active experts that can run before that slot's owner loads.
   if (active_expert_ids != nullptr) {
+    constexpr int MARKS_PER_THREAD = (NUM_EXPERTS + 255) / 256;
+    int my_expert[MARKS_PER_THREAD];
+    int my_mark[MARKS_PER_THREAD];
+    int n_mine = 0;
     for (int expert = start_expert + threadIdx.x; expert < end_expert;
          expert += blockDim.x) {
-      int const local_expert = expert - start_expert;
-      int const mark = active_expert_ids[local_expert];
-      if (mark >= 0) {
+      my_expert[n_mine] = expert;
+      my_mark[n_mine] = active_expert_ids[expert - start_expert];
+      ++n_mine;
+    }
+    __syncthreads();
+    for (int i = 0; i < n_mine; ++i) {
+      if (my_mark[i] >= 0) {
         int const pos = atomicAdd(active_expert_ids + NUM_EXPERTS, 1);
-        active_expert_ids[pos] = expert;
+        active_expert_ids[pos] = my_expert[i];
       }
     }
   }
