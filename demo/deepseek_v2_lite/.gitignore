@@ -1,0 +1,7 @@
+# local state of the DeepSeek-V2-Lite demo (nothing here is tracked)
+.venv/
+ref/
+models/
+results/
+build/
+permanent_output_dir/

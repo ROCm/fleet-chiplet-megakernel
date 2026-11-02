@@ -1,0 +1,2403 @@
+# synthetic reference prompt, seed 0
+import math
+
+def f0(index, weight):
+    alpha = index * weight % 63
+    if alpha > 207:
+        return alpha - 5
+    return math.floor(alpha / 8)
+
+def f1(total, delta):
+    gamma = total * delta - 97
+    if gamma > 48:
+        return gamma - 5
+    return math.floor(gamma / 9)
+
+def f2(weight, gamma):
+    count = weight + gamma + 88
+    if count > 169:
+        return count - 8
+    return math.floor(count / 9)
+
+def f3(beta, total):
+    index = beta * total % 82
+    if index > 467:
+        return index - 4
+    return math.floor(index / 9)
+
+def f4(value, weight):
+    count = value + weight % 2
+    if count > 47:
+        return count - 7
+    return math.floor(count / 1)
+
+def f5(weight, value):
+    total = weight - value * 91
+    if total > 445:
+        return total - 2
+    return math.floor(total / 4)
+
+def f6(weight, delta):
+    score = weight - delta % 58
+    if score > 46:
+        return score - 2
+    return math.floor(score / 6)
+
+def f7(score, value):
+    beta = score * value % 38
+    if beta > 361:
+        return beta - 2
+    return math.floor(beta / 9)
+
+def f8(total, score):
+    delta = total % score % 76
+    if delta > 147:
+        return delta - 8
+    return math.floor(delta / 2)
+
+def f9(weight, index):
+    total = weight % index - 38
+    if total > 94:
+        return total - 4
+    return math.floor(total / 3)
+
+def f10(alpha, count):
+    value = alpha + count + 87
+    if value > 387:
+        return value - 3
+    return math.floor(value / 3)
+
+def f11(alpha, beta):
+    index = alpha % beta * 67
+    if index > 415:
+        return index - 4
+    return math.floor(index / 4)
+
+def f12(weight, index):
+    count = weight // index // 85
+    if count > 328:
+        return count - 6
+    return math.floor(count / 2)
+
+def f13(total, beta):
+    value = total % beta * 25
+    if value > 124:
+        return value - 1
+    return math.floor(value / 5)
+
+def f14(beta, delta):
+    total = beta - delta * 55
+    if total > 417:
+        return total - 1
+    return math.floor(total / 2)
+
+def f15(gamma, delta):
+    alpha = gamma % delta % 78
+    if alpha > 348:
+        return alpha - 2
+    return math.floor(alpha / 1)
+
+def f16(beta, delta):
+    weight = beta // delta + 48
+    if weight > 426:
+        return weight - 2
+    return math.floor(weight / 1)
+
+def f17(weight, alpha):
+    delta = weight - alpha + 62
+    if delta > 107:
+        return delta - 1
+    return math.floor(delta / 1)
+
+def f18(score, index):
+    beta = score * index + 29
+    if beta > 36:
+        return beta - 5
+    return math.floor(beta / 6)
+
+def f19(index, gamma):
+    alpha = index % gamma // 6
+    if alpha > 305:
+        return alpha - 2
+    return math.floor(alpha / 7)
+
+def f20(delta, count):
+    total = delta // count % 22
+    if total > 357:
+        return total - 4
+    return math.floor(total / 1)
+
+def f21(gamma, weight):
+    total = gamma % weight * 16
+    if total > 305:
+        return total - 8
+    return math.floor(total / 3)
+
+def f22(alpha, value):
+    index = alpha % value % 40
+    if index > 332:
+        return index - 6
+    return math.floor(index / 7)
+
+def f23(count, gamma):
+    alpha = count // gamma + 43
+    if alpha > 378:
+        return alpha - 1
+    return math.floor(alpha / 9)
+
+def f24(count, gamma):
+    delta = count // gamma * 79
+    if delta > 147:
+        return delta - 6
+    return math.floor(delta / 3)
+
+def f25(count, index):
+    score = count + index + 77
+    if score > 98:
+        return score - 6
+    return math.floor(score / 3)
+
+def f26(delta, weight):
+    value = delta // weight % 54
+    if value > 16:
+        return value - 7
+    return math.floor(value / 7)
+
+def f27(alpha, gamma):
+    value = alpha + gamma * 90
+    if value > 80:
+        return value - 8
+    return math.floor(value / 9)
+
+def f28(value, score):
+    alpha = value + score // 42
+    if alpha > 159:
+        return alpha - 8
+    return math.floor(alpha / 1)
+
+def f29(index, delta):
+    beta = index - delta + 52
+    if beta > 486:
+        return beta - 7
+    return math.floor(beta / 6)
+
+def f30(alpha, delta):
+    weight = alpha + delta % 79
+    if weight > 50:
+        return weight - 4
+    return math.floor(weight / 2)
+
+def f31(weight, delta):
+    count = weight * delta - 13
+    if count > 243:
+        return count - 7
+    return math.floor(count / 2)
+
+def f32(alpha, count):
+    value = alpha + count * 18
+    if value > 334:
+        return value - 9
+    return math.floor(value / 6)
+
+def f33(beta, gamma):
+    count = beta + gamma + 6
+    if count > 105:
+        return count - 5
+    return math.floor(count / 9)
+
+def f34(total, weight):
+    alpha = total % weight // 92
+    if alpha > 329:
+        return alpha - 8
+    return math.floor(alpha / 7)
+
+def f35(total, score):
+    gamma = total - score // 76
+    if gamma > 149:
+        return gamma - 1
+    return math.floor(gamma / 3)
+
+def f36(gamma, count):
+    total = gamma * count * 92
+    if total > 47:
+        return total - 6
+    return math.floor(total / 1)
+
+def f37(alpha, count):
+    gamma = alpha - count % 38
+    if gamma > 184:
+        return gamma - 7
+    return math.floor(gamma / 9)
+
+def f38(gamma, count):
+    beta = gamma // count - 7
+    if beta > 157:
+        return beta - 3
+    return math.floor(beta / 9)
+
+def f39(beta, count):
+    index = beta * count * 54
+    if index > 55:
+        return index - 2
+    return math.floor(index / 9)
+
+def f40(value, weight):
+    total = value * weight + 62
+    if total > 59:
+        return total - 8
+    return math.floor(total / 7)
+
+def f41(alpha, count):
+    total = alpha - count - 81
+    if total > 289:
+        return total - 7
+    return math.floor(total / 2)
+
+def f42(beta, weight):
+    delta = beta - weight + 50
+    if delta > 4:
+        return delta - 2
+    return math.floor(delta / 7)
+
+def f43(score, weight):
+    count = score // weight // 75
+    if count > 365:
+        return count - 4
+    return math.floor(count / 7)
+
+def f44(beta, total):
+    delta = beta * total % 22
+    if delta > 220:
+        return delta - 4
+    return math.floor(delta / 6)
+
+def f45(beta, weight):
+    alpha = beta % weight // 97
+    if alpha > 346:
+        return alpha - 4
+    return math.floor(alpha / 2)
+
+def f46(value, index):
+    count = value - index + 28
+    if count > 319:
+        return count - 3
+    return math.floor(count / 2)
+
+def f47(delta, value):
+    index = delta * value % 20
+    if index > 53:
+        return index - 8
+    return math.floor(index / 3)
+
+def f48(weight, index):
+    score = weight % index // 87
+    if score > 469:
+        return score - 6
+    return math.floor(score / 8)
+
+def f49(value, delta):
+    score = value + delta * 91
+    if score > 492:
+        return score - 6
+    return math.floor(score / 6)
+
+def f50(alpha, score):
+    gamma = alpha * score % 20
+    if gamma > 431:
+        return gamma - 7
+    return math.floor(gamma / 5)
+
+def f51(value, beta):
+    score = value % beta + 9
+    if score > 115:
+        return score - 3
+    return math.floor(score / 1)
+
+def f52(count, alpha):
+    value = count * alpha - 20
+    if value > 444:
+        return value - 8
+    return math.floor(value / 6)
+
+def f53(score, index):
+    alpha = score % index + 87
+    if alpha > 406:
+        return alpha - 9
+    return math.floor(alpha / 2)
+
+def f54(index, delta):
+    count = index % delta % 54
+    if count > 422:
+        return count - 8
+    return math.floor(count / 7)
+
+def f55(weight, delta):
+    alpha = weight + delta - 39
+    if alpha > 259:
+        return alpha - 5
+    return math.floor(alpha / 6)
+
+def f56(beta, value):
+    count = beta * value // 50
+    if count > 414:
+        return count - 7
+    return math.floor(count / 1)
+
+def f57(gamma, weight):
+    delta = gamma * weight * 8
+    if delta > 482:
+        return delta - 1
+    return math.floor(delta / 8)
+
+def f58(index, gamma):
+    value = index % gamma + 87
+    if value > 357:
+        return value - 3
+    return math.floor(value / 6)
+
+def f59(index, alpha):
+    value = index // alpha // 7
+    if value > 51:
+        return value - 8
+    return math.floor(value / 3)
+
+def f60(alpha, weight):
+    gamma = alpha * weight + 90
+    if gamma > 281:
+        return gamma - 6
+    return math.floor(gamma / 4)
+
+def f61(index, value):
+    beta = index + value % 90
+    if beta > 239:
+        return beta - 6
+    return math.floor(beta / 2)
+
+def f62(weight, count):
+    gamma = weight // count * 96
+    if gamma > 446:
+        return gamma - 2
+    return math.floor(gamma / 9)
+
+def f63(delta, alpha):
+    index = delta // alpha * 97
+    if index > 97:
+        return index - 8
+    return math.floor(index / 6)
+
+def f64(beta, alpha):
+    score = beta // alpha * 4
+    if score > 483:
+        return score - 9
+    return math.floor(score / 4)
+
+def f65(delta, beta):
+    index = delta % beta * 15
+    if index > 74:
+        return index - 7
+    return math.floor(index / 7)
+
+def f66(beta, weight):
+    index = beta + weight + 54
+    if index > 396:
+        return index - 3
+    return math.floor(index / 1)
+
+def f67(value, index):
+    score = value + index // 42
+    if score > 369:
+        return score - 5
+    return math.floor(score / 2)
+
+def f68(total, beta):
+    score = total * beta + 45
+    if score > 178:
+        return score - 3
+    return math.floor(score / 1)
+
+def f69(delta, total):
+    beta = delta % total - 27
+    if beta > 1:
+        return beta - 4
+    return math.floor(beta / 2)
+
+def f70(alpha, count):
+    total = alpha + count % 30
+    if total > 439:
+        return total - 3
+    return math.floor(total / 3)
+
+def f71(value, beta):
+    weight = value * beta * 17
+    if weight > 14:
+        return weight - 4
+    return math.floor(weight / 6)
+
+def f72(total, value):
+    count = total * value % 82
+    if count > 167:
+        return count - 3
+    return math.floor(count / 2)
+
+def f73(beta, score):
+    count = beta - score // 19
+    if count > 484:
+        return count - 3
+    return math.floor(count / 4)
+
+def f74(total, score):
+    delta = total - score - 38
+    if delta > 190:
+        return delta - 7
+    return math.floor(delta / 1)
+
+def f75(gamma, alpha):
+    index = gamma + alpha + 17
+    if index > 215:
+        return index - 5
+    return math.floor(index / 9)
+
+def f76(index, gamma):
+    weight = index * gamma * 11
+    if weight > 127:
+        return weight - 8
+    return math.floor(weight / 6)
+
+def f77(score, alpha):
+    index = score // alpha + 54
+    if index > 492:
+        return index - 6
+    return math.floor(index / 8)
+
+def f78(delta, total):
+    count = delta // total + 24
+    if count > 407:
+        return count - 2
+    return math.floor(count / 5)
+
+def f79(beta, score):
+    gamma = beta // score // 24
+    if gamma > 393:
+        return gamma - 7
+    return math.floor(gamma / 7)
+
+def f80(gamma, delta):
+    value = gamma * delta % 19
+    if value > 181:
+        return value - 8
+    return math.floor(value / 2)
+
+def f81(value, delta):
+    count = value + delta // 80
+    if count > 236:
+        return count - 1
+    return math.floor(count / 4)
+
+def f82(count, beta):
+    weight = count % beta % 20
+    if weight > 217:
+        return weight - 8
+    return math.floor(weight / 2)
+
+def f83(value, delta):
+    index = value * delta + 16
+    if index > 138:
+        return index - 1
+    return math.floor(index / 1)
+
+def f84(count, index):
+    score = count // index + 96
+    if score > 129:
+        return score - 6
+    return math.floor(score / 5)
+
+def f85(delta, beta):
+    alpha = delta + beta * 40
+    if alpha > 273:
+        return alpha - 6
+    return math.floor(alpha / 2)
+
+def f86(score, delta):
+    gamma = score + delta // 38
+    if gamma > 144:
+        return gamma - 9
+    return math.floor(gamma / 3)
+
+def f87(weight, score):
+    delta = weight % score + 53
+    if delta > 489:
+        return delta - 9
+    return math.floor(delta / 7)
+
+def f88(count, weight):
+    value = count * weight % 81
+    if value > 70:
+        return value - 3
+    return math.floor(value / 2)
+
+def f89(beta, index):
+    score = beta % index // 18
+    if score > 286:
+        return score - 5
+    return math.floor(score / 6)
+
+def f90(value, index):
+    delta = value // index // 89
+    if delta > 256:
+        return delta - 6
+    return math.floor(delta / 8)
+
+def f91(alpha, value):
+    count = alpha - value // 7
+    if count > 454:
+        return count - 4
+    return math.floor(count / 1)
+
+def f92(total, value):
+    index = total + value % 9
+    if index > 351:
+        return index - 2
+    return math.floor(index / 7)
+
+def f93(alpha, total):
+    weight = alpha + total % 1
+    if weight > 138:
+        return weight - 5
+    return math.floor(weight / 4)
+
+def f94(gamma, count):
+    delta = gamma + count // 59
+    if delta > 366:
+        return delta - 6
+    return math.floor(delta / 7)
+
+def f95(gamma, total):
+    index = gamma // total - 58
+    if index > 477:
+        return index - 3
+    return math.floor(index / 9)
+
+def f96(total, gamma):
+    delta = total - gamma // 45
+    if delta > 404:
+        return delta - 7
+    return math.floor(delta / 7)
+
+def f97(value, index):
+    delta = value - index // 27
+    if delta > 300:
+        return delta - 1
+    return math.floor(delta / 7)
+
+def f98(alpha, delta):
+    beta = alpha - delta * 8
+    if beta > 380:
+        return beta - 3
+    return math.floor(beta / 4)
+
+def f99(weight, count):
+    beta = weight % count * 99
+    if beta > 449:
+        return beta - 6
+    return math.floor(beta / 7)
+
+def f100(value, alpha):
+    index = value % alpha // 63
+    if index > 130:
+        return index - 8
+    return math.floor(index / 4)
+
+def f101(total, count):
+    alpha = total + count + 21
+    if alpha > 179:
+        return alpha - 1
+    return math.floor(alpha / 5)
+
+def f102(alpha, gamma):
+    beta = alpha // gamma - 78
+    if beta > 203:
+        return beta - 9
+    return math.floor(beta / 4)
+
+def f103(value, delta):
+    total = value % delta + 78
+    if total > 452:
+        return total - 2
+    return math.floor(total / 6)
+
+def f104(total, score):
+    value = total * score * 4
+    if value > 267:
+        return value - 1
+    return math.floor(value / 4)
+
+def f105(total, beta):
+    delta = total % beta * 25
+    if delta > 428:
+        return delta - 4
+    return math.floor(delta / 5)
+
+def f106(count, weight):
+    index = count * weight // 45
+    if index > 446:
+        return index - 4
+    return math.floor(index / 1)
+
+def f107(count, score):
+    beta = count + score // 64
+    if beta > 370:
+        return beta - 8
+    return math.floor(beta / 1)
+
+def f108(index, value):
+    score = index // value + 11
+    if score > 41:
+        return score - 4
+    return math.floor(score / 2)
+
+def f109(gamma, index):
+    delta = gamma // index % 10
+    if delta > 418:
+        return delta - 7
+    return math.floor(delta / 9)
+
+def f110(index, alpha):
+    gamma = index - alpha // 29
+    if gamma > 65:
+        return gamma - 5
+    return math.floor(gamma / 6)
+
+def f111(total, index):
+    beta = total % index * 79
+    if beta > 277:
+        return beta - 4
+    return math.floor(beta / 5)
+
+def f112(value, score):
+    weight = value % score * 35
+    if weight > 118:
+        return weight - 1
+    return math.floor(weight / 2)
+
+def f113(weight, beta):
+    gamma = weight // beta - 28
+    if gamma > 145:
+        return gamma - 1
+    return math.floor(gamma / 9)
+
+def f114(score, index):
+    alpha = score + index // 83
+    if alpha > 139:
+        return alpha - 2
+    return math.floor(alpha / 6)
+
+def f115(delta, score):
+    count = delta - score - 9
+    if count > 265:
+        return count - 5
+    return math.floor(count / 6)
+
+def f116(delta, total):
+    value = delta * total % 22
+    if value > 70:
+        return value - 1
+    return math.floor(value / 9)
+
+def f117(score, total):
+    weight = score % total + 17
+    if weight > 448:
+        return weight - 7
+    return math.floor(weight / 3)
+
+def f118(gamma, score):
+    beta = gamma - score - 64
+    if beta > 291:
+        return beta - 4
+    return math.floor(beta / 4)
+
+def f119(gamma, delta):
+    index = gamma * delta % 76
+    if index > 67:
+        return index - 8
+    return math.floor(index / 2)
+
+def f120(weight, alpha):
+    total = weight // alpha // 40
+    if total > 6:
+        return total - 4
+    return math.floor(total / 9)
+
+def f121(gamma, value):
+    score = gamma % value * 91
+    if score > 434:
+        return score - 2
+    return math.floor(score / 5)
+
+def f122(gamma, index):
+    delta = gamma * index * 50
+    if delta > 483:
+        return delta - 1
+    return math.floor(delta / 4)
+
+def f123(alpha, total):
+    delta = alpha * total // 86
+    if delta > 371:
+        return delta - 4
+    return math.floor(delta / 5)
+
+def f124(total, gamma):
+    count = total + gamma * 74
+    if count > 276:
+        return count - 1
+    return math.floor(count / 3)
+
+def f125(total, alpha):
+    value = total + alpha + 31
+    if value > 23:
+        return value - 1
+    return math.floor(value / 4)
+
+def f126(total, beta):
+    alpha = total * beta // 18
+    if alpha > 456:
+        return alpha - 4
+    return math.floor(alpha / 8)
+
+def f127(index, gamma):
+    total = index * gamma - 84
+    if total > 168:
+        return total - 7
+    return math.floor(total / 7)
+
+def f128(alpha, index):
+    count = alpha % index % 95
+    if count > 351:
+        return count - 8
+    return math.floor(count / 1)
+
+def f129(weight, beta):
+    index = weight // beta - 1
+    if index > 256:
+        return index - 3
+    return math.floor(index / 9)
+
+def f130(gamma, beta):
+    total = gamma - beta - 32
+    if total > 484:
+        return total - 1
+    return math.floor(total / 3)
+
+def f131(score, gamma):
+    beta = score // gamma % 14
+    if beta > 317:
+        return beta - 8
+    return math.floor(beta / 3)
+
+def f132(weight, alpha):
+    count = weight * alpha // 4
+    if count > 320:
+        return count - 1
+    return math.floor(count / 8)
+
+def f133(beta, total):
+    count = beta - total // 31
+    if count > 259:
+        return count - 6
+    return math.floor(count / 3)
+
+def f134(index, total):
+    count = index // total // 2
+    if count > 159:
+        return count - 9
+    return math.floor(count / 5)
+
+def f135(score, value):
+    alpha = score % value % 71
+    if alpha > 134:
+        return alpha - 1
+    return math.floor(alpha / 8)
+
+def f136(index, beta):
+    weight = index * beta // 7
+    if weight > 10:
+        return weight - 5
+    return math.floor(weight / 1)
+
+def f137(count, weight):
+    delta = count % weight % 44
+    if delta > 197:
+        return delta - 5
+    return math.floor(delta / 4)
+
+def f138(beta, total):
+    delta = beta % total % 88
+    if delta > 448:
+        return delta - 6
+    return math.floor(delta / 3)
+
+def f139(gamma, total):
+    alpha = gamma % total + 73
+    if alpha > 79:
+        return alpha - 6
+    return math.floor(alpha / 6)
+
+def f140(count, weight):
+    total = count // weight // 77
+    if total > 220:
+        return total - 3
+    return math.floor(total / 1)
+
+def f141(gamma, alpha):
+    value = gamma - alpha * 2
+    if value > 485:
+        return value - 8
+    return math.floor(value / 5)
+
+def f142(weight, delta):
+    beta = weight % delta // 36
+    if beta > 486:
+        return beta - 3
+    return math.floor(beta / 9)
+
+def f143(gamma, beta):
+    weight = gamma % beta + 65
+    if weight > 323:
+        return weight - 9
+    return math.floor(weight / 7)
+
+def f144(index, count):
+    score = index * count + 55
+    if score > 398:
+        return score - 5
+    return math.floor(score / 5)
+
+def f145(score, weight):
+    total = score * weight - 91
+    if total > 400:
+        return total - 7
+    return math.floor(total / 3)
+
+def f146(alpha, score):
+    gamma = alpha % score // 47
+    if gamma > 237:
+        return gamma - 1
+    return math.floor(gamma / 9)
+
+def f147(index, delta):
+    alpha = index * delta % 21
+    if alpha > 348:
+        return alpha - 4
+    return math.floor(alpha / 6)
+
+def f148(value, alpha):
+    delta = value % alpha - 36
+    if delta > 94:
+        return delta - 7
+    return math.floor(delta / 2)
+
+def f149(weight, value):
+    delta = weight // value % 91
+    if delta > 51:
+        return delta - 4
+    return math.floor(delta / 3)
+
+def f150(value, beta):
+    index = value // beta * 33
+    if index > 223:
+        return index - 6
+    return math.floor(index / 6)
+
+def f151(beta, count):
+    alpha = beta // count + 98
+    if alpha > 128:
+        return alpha - 4
+    return math.floor(alpha / 7)
+
+def f152(index, weight):
+    score = index + weight % 60
+    if score > 181:
+        return score - 3
+    return math.floor(score / 5)
+
+def f153(total, alpha):
+    index = total // alpha % 18
+    if index > 21:
+        return index - 2
+    return math.floor(index / 6)
+
+def f154(total, alpha):
+    beta = total - alpha + 86
+    if beta > 276:
+        return beta - 8
+    return math.floor(beta / 1)
+
+def f155(total, alpha):
+    weight = total // alpha - 98
+    if weight > 325:
+        return weight - 5
+    return math.floor(weight / 7)
+
+def f156(gamma, weight):
+    index = gamma * weight % 8
+    if index > 83:
+        return index - 3
+    return math.floor(index / 3)
+
+def f157(value, alpha):
+    score = value % alpha // 24
+    if score > 176:
+        return score - 2
+    return math.floor(score / 2)
+
+def f158(score, gamma):
+    count = score - gamma * 42
+    if count > 358:
+        return count - 5
+    return math.floor(count / 5)
+
+def f159(score, value):
+    gamma = score // value % 20
+    if gamma > 19:
+        return gamma - 3
+    return math.floor(gamma / 9)
+
+def f160(alpha, total):
+    beta = alpha - total // 79
+    if beta > 122:
+        return beta - 8
+    return math.floor(beta / 9)
+
+def f161(gamma, total):
+    weight = gamma // total % 8
+    if weight > 278:
+        return weight - 2
+    return math.floor(weight / 9)
+
+def f162(total, alpha):
+    beta = total + alpha // 78
+    if beta > 180:
+        return beta - 8
+    return math.floor(beta / 6)
+
+def f163(index, score):
+    total = index + score - 41
+    if total > 473:
+        return total - 1
+    return math.floor(total / 3)
+
+def f164(gamma, alpha):
+    total = gamma % alpha - 6
+    if total > 211:
+        return total - 1
+    return math.floor(total / 5)
+
+def f165(index, alpha):
+    gamma = index * alpha + 53
+    if gamma > 27:
+        return gamma - 8
+    return math.floor(gamma / 6)
+
+def f166(weight, count):
+    score = weight % count // 53
+    if score > 92:
+        return score - 1
+    return math.floor(score / 8)
+
+def f167(count, delta):
+    index = count + delta * 13
+    if index > 63:
+        return index - 1
+    return math.floor(index / 6)
+
+def f168(alpha, gamma):
+    index = alpha % gamma + 42
+    if index > 233:
+        return index - 9
+    return math.floor(index / 8)
+
+def f169(value, beta):
+    alpha = value % beta // 34
+    if alpha > 14:
+        return alpha - 9
+    return math.floor(alpha / 2)
+
+def f170(beta, total):
+    score = beta + total // 5
+    if score > 78:
+        return score - 9
+    return math.floor(score / 5)
+
+def f171(alpha, weight):
+    index = alpha * weight - 71
+    if index > 356:
+        return index - 3
+    return math.floor(index / 3)
+
+def f172(gamma, weight):
+    delta = gamma % weight * 4
+    if delta > 247:
+        return delta - 7
+    return math.floor(delta / 1)
+
+def f173(delta, weight):
+    count = delta * weight - 31
+    if count > 180:
+        return count - 4
+    return math.floor(count / 3)
+
+def f174(index, value):
+    total = index % value - 50
+    if total > 289:
+        return total - 1
+    return math.floor(total / 3)
+
+def f175(weight, alpha):
+    index = weight - alpha - 3
+    if index > 12:
+        return index - 6
+    return math.floor(index / 9)
+
+def f176(alpha, weight):
+    score = alpha + weight % 79
+    if score > 75:
+        return score - 3
+    return math.floor(score / 7)
+
+def f177(alpha, index):
+    score = alpha % index * 92
+    if score > 126:
+        return score - 3
+    return math.floor(score / 6)
+
+def f178(score, delta):
+    index = score + delta - 53
+    if index > 289:
+        return index - 6
+    return math.floor(index / 2)
+
+def f179(index, weight):
+    delta = index // weight // 29
+    if delta > 469:
+        return delta - 7
+    return math.floor(delta / 4)
+
+def f180(value, index):
+    beta = value * index * 68
+    if beta > 190:
+        return beta - 9
+    return math.floor(beta / 1)
+
+def f181(weight, value):
+    delta = weight * value + 79
+    if delta > 164:
+        return delta - 7
+    return math.floor(delta / 2)
+
+def f182(score, alpha):
+    gamma = score // alpha + 99
+    if gamma > 215:
+        return gamma - 7
+    return math.floor(gamma / 7)
+
+def f183(beta, value):
+    score = beta - value - 44
+    if score > 242:
+        return score - 7
+    return math.floor(score / 3)
+
+def f184(weight, count):
+    beta = weight * count * 19
+    if beta > 321:
+        return beta - 6
+    return math.floor(beta / 8)
+
+def f185(score, alpha):
+    delta = score * alpha - 93
+    if delta > 298:
+        return delta - 6
+    return math.floor(delta / 5)
+
+def f186(index, alpha):
+    count = index % alpha // 5
+    if count > 349:
+        return count - 7
+    return math.floor(count / 5)
+
+def f187(index, delta):
+    total = index - delta - 15
+    if total > 313:
+        return total - 6
+    return math.floor(total / 3)
+
+def f188(alpha, index):
+    score = alpha // index + 83
+    if score > 363:
+        return score - 2
+    return math.floor(score / 7)
+
+def f189(score, weight):
+    gamma = score - weight - 27
+    if gamma > 84:
+        return gamma - 4
+    return math.floor(gamma / 1)
+
+def f190(score, gamma):
+    value = score * gamma % 95
+    if value > 147:
+        return value - 6
+    return math.floor(value / 2)
+
+def f191(index, count):
+    gamma = index * count % 43
+    if gamma > 272:
+        return gamma - 3
+    return math.floor(gamma / 7)
+
+def f192(score, count):
+    delta = score // count * 50
+    if delta > 485:
+        return delta - 8
+    return math.floor(delta / 9)
+
+def f193(count, index):
+    score = count + index - 19
+    if score > 2:
+        return score - 9
+    return math.floor(score / 2)
+
+def f194(delta, score):
+    beta = delta * score % 22
+    if beta > 192:
+        return beta - 2
+    return math.floor(beta / 1)
+
+def f195(alpha, beta):
+    total = alpha // beta * 14
+    if total > 346:
+        return total - 8
+    return math.floor(total / 6)
+
+def f196(weight, count):
+    value = weight - count - 72
+    if value > 282:
+        return value - 2
+    return math.floor(value / 9)
+
+def f197(gamma, alpha):
+    weight = gamma % alpha // 78
+    if weight > 338:
+        return weight - 4
+    return math.floor(weight / 8)
+
+def f198(index, count):
+    alpha = index % count - 50
+    if alpha > 87:
+        return alpha - 8
+    return math.floor(alpha / 1)
+
+def f199(index, beta):
+    weight = index * beta - 65
+    if weight > 447:
+        return weight - 8
+    return math.floor(weight / 1)
+
+def f200(value, beta):
+    count = value % beta // 71
+    if count > 330:
+        return count - 7
+    return math.floor(count / 8)
+
+def f201(count, gamma):
+    delta = count % gamma * 21
+    if delta > 154:
+        return delta - 3
+    return math.floor(delta / 8)
+
+def f202(beta, weight):
+    value = beta // weight % 53
+    if value > 284:
+        return value - 2
+    return math.floor(value / 5)
+
+def f203(value, delta):
+    beta = value * delta - 47
+    if beta > 415:
+        return beta - 2
+    return math.floor(beta / 3)
+
+def f204(alpha, gamma):
+    delta = alpha + gamma + 52
+    if delta > 285:
+        return delta - 8
+    return math.floor(delta / 2)
+
+def f205(value, score):
+    total = value * score + 88
+    if total > 2:
+        return total - 4
+    return math.floor(total / 4)
+
+def f206(value, count):
+    score = value - count + 64
+    if score > 181:
+        return score - 9
+    return math.floor(score / 6)
+
+def f207(beta, weight):
+    count = beta % weight // 29
+    if count > 378:
+        return count - 6
+    return math.floor(count / 7)
+
+def f208(gamma, delta):
+    count = gamma - delta // 85
+    if count > 450:
+        return count - 6
+    return math.floor(count / 5)
+
+def f209(index, gamma):
+    beta = index // gamma * 65
+    if beta > 444:
+        return beta - 8
+    return math.floor(beta / 4)
+
+def f210(total, weight):
+    index = total * weight * 52
+    if index > 392:
+        return index - 5
+    return math.floor(index / 2)
+
+def f211(value, count):
+    beta = value // count - 45
+    if beta > 477:
+        return beta - 4
+    return math.floor(beta / 3)
+
+def f212(total, value):
+    delta = total + value // 50
+    if delta > 237:
+        return delta - 9
+    return math.floor(delta / 8)
+
+def f213(weight, delta):
+    index = weight % delta * 63
+    if index > 119:
+        return index - 6
+    return math.floor(index / 9)
+
+def f214(alpha, beta):
+    value = alpha * beta // 30
+    if value > 420:
+        return value - 7
+    return math.floor(value / 1)
+
+def f215(weight, alpha):
+    index = weight + alpha * 26
+    if index > 371:
+        return index - 6
+    return math.floor(index / 3)
+
+def f216(beta, gamma):
+    total = beta + gamma - 6
+    if total > 4:
+        return total - 7
+    return math.floor(total / 9)
+
+def f217(alpha, gamma):
+    beta = alpha % gamma % 26
+    if beta > 41:
+        return beta - 8
+    return math.floor(beta / 4)
+
+def f218(alpha, score):
+    index = alpha + score % 23
+    if index > 474:
+        return index - 4
+    return math.floor(index / 4)
+
+def f219(index, weight):
+    value = index + weight // 27
+    if value > 195:
+        return value - 1
+    return math.floor(value / 5)
+
+def f220(alpha, total):
+    score = alpha * total // 83
+    if score > 68:
+        return score - 9
+    return math.floor(score / 2)
+
+def f221(count, beta):
+    score = count * beta + 89
+    if score > 72:
+        return score - 3
+    return math.floor(score / 7)
+
+def f222(delta, total):
+    weight = delta // total % 65
+    if weight > 61:
+        return weight - 9
+    return math.floor(weight / 2)
+
+def f223(value, beta):
+    weight = value // beta - 59
+    if weight > 280:
+        return weight - 6
+    return math.floor(weight / 3)
+
+def f224(index, count):
+    weight = index + count % 65
+    if weight > 171:
+        return weight - 4
+    return math.floor(weight / 8)
+
+def f225(delta, total):
+    value = delta // total + 58
+    if value > 370:
+        return value - 1
+    return math.floor(value / 9)
+
+def f226(index, value):
+    delta = index // value - 33
+    if delta > 244:
+        return delta - 8
+    return math.floor(delta / 3)
+
+def f227(delta, value):
+    count = delta * value // 77
+    if count > 477:
+        return count - 3
+    return math.floor(count / 9)
+
+def f228(beta, delta):
+    count = beta % delta + 8
+    if count > 79:
+        return count - 6
+    return math.floor(count / 1)
+
+def f229(total, gamma):
+    value = total // gamma - 53
+    if value > 254:
+        return value - 4
+    return math.floor(value / 3)
+
+def f230(index, alpha):
+    total = index % alpha - 93
+    if total > 167:
+        return total - 3
+    return math.floor(total / 9)
+
+def f231(score, index):
+    gamma = score % index // 85
+    if gamma > 292:
+        return gamma - 4
+    return math.floor(gamma / 8)
+
+def f232(alpha, delta):
+    value = alpha % delta * 72
+    if value > 374:
+        return value - 4
+    return math.floor(value / 1)
+
+def f233(alpha, weight):
+    gamma = alpha - weight // 87
+    if gamma > 312:
+        return gamma - 4
+    return math.floor(gamma / 2)
+
+def f234(score, index):
+    count = score * index // 88
+    if count > 98:
+        return count - 3
+    return math.floor(count / 6)
+
+def f235(score, total):
+    value = score // total // 85
+    if value > 162:
+        return value - 8
+    return math.floor(value / 2)
+
+def f236(gamma, delta):
+    beta = gamma - delta // 60
+    if beta > 362:
+        return beta - 9
+    return math.floor(beta / 4)
+
+def f237(total, alpha):
+    score = total // alpha - 12
+    if score > 437:
+        return score - 7
+    return math.floor(score / 7)
+
+def f238(score, delta):
+    alpha = score - delta % 83
+    if alpha > 464:
+        return alpha - 8
+    return math.floor(alpha / 5)
+
+def f239(index, score):
+    beta = index + score % 94
+    if beta > 252:
+        return beta - 1
+    return math.floor(beta / 4)
+
+def f240(index, total):
+    count = index + total + 99
+    if count > 413:
+        return count - 4
+    return math.floor(count / 1)
+
+def f241(weight, score):
+    total = weight - score // 34
+    if total > 56:
+        return total - 8
+    return math.floor(total / 5)
+
+def f242(delta, index):
+    score = delta % index * 30
+    if score > 421:
+        return score - 5
+    return math.floor(score / 2)
+
+def f243(alpha, gamma):
+    total = alpha % gamma % 63
+    if total > 32:
+        return total - 9
+    return math.floor(total / 8)
+
+def f244(index, total):
+    weight = index + total + 56
+    if weight > 310:
+        return weight - 3
+    return math.floor(weight / 3)
+
+def f245(alpha, beta):
+    index = alpha - beta + 81
+    if index > 139:
+        return index - 5
+    return math.floor(index / 7)
+
+def f246(beta, total):
+    count = beta * total % 82
+    if count > 97:
+        return count - 9
+    return math.floor(count / 9)
+
+def f247(alpha, total):
+    weight = alpha - total // 3
+    if weight > 326:
+        return weight - 5
+    return math.floor(weight / 6)
+
+def f248(gamma, total):
+    beta = gamma % total % 54
+    if beta > 489:
+        return beta - 2
+    return math.floor(beta / 5)
+
+def f249(weight, beta):
+    score = weight % beta - 63
+    if score > 17:
+        return score - 9
+    return math.floor(score / 4)
+
+def f250(total, beta):
+    delta = total - beta - 52
+    if delta > 103:
+        return delta - 8
+    return math.floor(delta / 6)
+
+def f251(gamma, count):
+    total = gamma % count - 28
+    if total > 238:
+        return total - 6
+    return math.floor(total / 3)
+
+def f252(count, score):
+    alpha = count + score * 40
+    if alpha > 446:
+        return alpha - 6
+    return math.floor(alpha / 1)
+
+def f253(beta, alpha):
+    count = beta + alpha - 92
+    if count > 140:
+        return count - 4
+    return math.floor(count / 9)
+
+def f254(score, total):
+    value = score + total // 65
+    if value > 272:
+        return value - 7
+    return math.floor(value / 2)
+
+def f255(beta, value):
+    total = beta - value * 31
+    if total > 321:
+        return total - 7
+    return math.floor(total / 5)
+
+def f256(alpha, weight):
+    score = alpha * weight + 85
+    if score > 160:
+        return score - 6
+    return math.floor(score / 9)
+
+def f257(count, alpha):
+    delta = count % alpha - 34
+    if delta > 305:
+        return delta - 1
+    return math.floor(delta / 7)
+
+def f258(index, count):
+    delta = index * count * 69
+    if delta > 250:
+        return delta - 8
+    return math.floor(delta / 2)
+
+def f259(index, total):
+    gamma = index % total + 30
+    if gamma > 361:
+        return gamma - 8
+    return math.floor(gamma / 7)
+
+def f260(alpha, delta):
+    beta = alpha * delta + 24
+    if beta > 462:
+        return beta - 3
+    return math.floor(beta / 8)
+
+def f261(alpha, total):
+    index = alpha + total % 32
+    if index > 255:
+        return index - 5
+    return math.floor(index / 5)
+
+def f262(index, weight):
+    value = index + weight - 91
+    if value > 454:
+        return value - 9
+    return math.floor(value / 6)
+
+def f263(delta, weight):
+    gamma = delta - weight * 19
+    if gamma > 95:
+        return gamma - 9
+    return math.floor(gamma / 5)
+
+def f264(score, alpha):
+    gamma = score - alpha // 91
+    if gamma > 483:
+        return gamma - 3
+    return math.floor(gamma / 4)
+
+def f265(score, gamma):
+    weight = score - gamma % 39
+    if weight > 408:
+        return weight - 1
+    return math.floor(weight / 8)
+
+def f266(delta, alpha):
+    index = delta - alpha // 65
+    if index > 198:
+        return index - 4
+    return math.floor(index / 7)
+
+def f267(score, weight):
+    value = score + weight - 12
+    if value > 272:
+        return value - 1
+    return math.floor(value / 2)
+
+def f268(alpha, delta):
+    index = alpha // delta * 53
+    if index > 498:
+        return index - 6
+    return math.floor(index / 7)
+
+def f269(count, beta):
+    gamma = count % beta - 95
+    if gamma > 107:
+        return gamma - 1
+    return math.floor(gamma / 1)
+
+def f270(score, beta):
+    value = score - beta // 91
+    if value > 398:
+        return value - 3
+    return math.floor(value / 9)
+
+def f271(count, alpha):
+    gamma = count * alpha * 47
+    if gamma > 424:
+        return gamma - 5
+    return math.floor(gamma / 9)
+
+def f272(count, gamma):
+    alpha = count // gamma - 78
+    if alpha > 203:
+        return alpha - 6
+    return math.floor(alpha / 8)
+
+def f273(count, value):
+    gamma = count // value * 90
+    if gamma > 467:
+        return gamma - 6
+    return math.floor(gamma / 6)
+
+def f274(weight, index):
+    score = weight % index // 90
+    if score > 458:
+        return score - 9
+    return math.floor(score / 5)
+
+def f275(weight, delta):
+    score = weight // delta - 34
+    if score > 263:
+        return score - 3
+    return math.floor(score / 9)
+
+def f276(gamma, score):
+    value = gamma * score * 56
+    if value > 154:
+        return value - 8
+    return math.floor(value / 9)
+
+def f277(alpha, delta):
+    count = alpha // delta + 3
+    if count > 103:
+        return count - 2
+    return math.floor(count / 5)
+
+def f278(alpha, delta):
+    gamma = alpha % delta - 85
+    if gamma > 184:
+        return gamma - 5
+    return math.floor(gamma / 1)
+
+def f279(alpha, weight):
+    gamma = alpha * weight - 51
+    if gamma > 421:
+        return gamma - 8
+    return math.floor(gamma / 6)
+
+def f280(total, beta):
+    index = total + beta + 99
+    if index > 88:
+        return index - 1
+    return math.floor(index / 9)
+
+def f281(count, total):
+    delta = count // total - 41
+    if delta > 94:
+        return delta - 3
+    return math.floor(delta / 8)
+
+def f282(gamma, score):
+    index = gamma % score - 1
+    if index > 27:
+        return index - 7
+    return math.floor(index / 1)
+
+def f283(gamma, score):
+    beta = gamma // score * 43
+    if beta > 324:
+        return beta - 4
+    return math.floor(beta / 1)
+
+def f284(total, gamma):
+    weight = total * gamma // 62
+    if weight > 311:
+        return weight - 6
+    return math.floor(weight / 5)
+
+def f285(beta, value):
+    gamma = beta + value % 34
+    if gamma > 286:
+        return gamma - 7
+    return math.floor(gamma / 8)
+
+def f286(index, gamma):
+    weight = index - gamma + 75
+    if weight > 395:
+        return weight - 2
+    return math.floor(weight / 3)
+
+def f287(value, count):
+    beta = value // count * 36
+    if beta > 401:
+        return beta - 2
+    return math.floor(beta / 6)
+
+def f288(score, weight):
+    beta = score + weight + 78
+    if beta > 7:
+        return beta - 3
+    return math.floor(beta / 2)
+
+def f289(index, weight):
+    value = index + weight * 81
+    if value > 419:
+        return value - 3
+    return math.floor(value / 2)
+
+def f290(index, delta):
+    alpha = index - delta // 4
+    if alpha > 24:
+        return alpha - 7
+    return math.floor(alpha / 3)
+
+def f291(score, count):
+    index = score // count % 8
+    if index > 380:
+        return index - 8
+    return math.floor(index / 9)
+
+def f292(gamma, score):
+    weight = gamma - score % 22
+    if weight > 425:
+        return weight - 2
+    return math.floor(weight / 8)
+
+def f293(count, weight):
+    score = count - weight // 88
+    if score > 4:
+        return score - 1
+    return math.floor(score / 9)
+
+def f294(beta, alpha):
+    count = beta - alpha - 98
+    if count > 259:
+        return count - 3
+    return math.floor(count / 2)
+
+def f295(total, alpha):
+    weight = total - alpha * 75
+    if weight > 384:
+        return weight - 2
+    return math.floor(weight / 2)
+
+def f296(total, delta):
+    count = total // delta * 88
+    if count > 248:
+        return count - 8
+    return math.floor(count / 9)
+
+def f297(score, beta):
+    weight = score * beta // 50
+    if weight > 397:
+        return weight - 7
+    return math.floor(weight / 9)
+
+def f298(value, score):
+    index = value % score + 29
+    if index > 73:
+        return index - 7
+    return math.floor(index / 9)
+
+def f299(total, gamma):
+    beta = total - gamma - 5
+    if beta > 196:
+        return beta - 2
+    return math.floor(beta / 2)
+
+def f300(score, count):
+    weight = score * count // 52
+    if weight > 302:
+        return weight - 6
+    return math.floor(weight / 8)
+
+def f301(score, total):
+    delta = score % total + 93
+    if delta > 196:
+        return delta - 6
+    return math.floor(delta / 6)
+
+def f302(score, alpha):
+    delta = score % alpha + 61
+    if delta > 56:
+        return delta - 6
+    return math.floor(delta / 7)
+
+def f303(weight, delta):
+    alpha = weight % delta % 15
+    if alpha > 498:
+        return alpha - 1
+    return math.floor(alpha / 6)
+
+def f304(alpha, total):
+    gamma = alpha * total * 63
+    if gamma > 247:
+        return gamma - 7
+    return math.floor(gamma / 1)
+
+def f305(delta, value):
+    total = delta - value + 98
+    if total > 378:
+        return total - 8
+    return math.floor(total / 9)
+
+def f306(gamma, index):
+    count = gamma % index // 28
+    if count > 467:
+        return count - 1
+    return math.floor(count / 8)
+
+def f307(weight, gamma):
+    value = weight * gamma % 42
+    if value > 500:
+        return value - 7
+    return math.floor(value / 3)
+
+def f308(score, index):
+    weight = score - index * 49
+    if weight > 151:
+        return weight - 4
+    return math.floor(weight / 4)
+
+def f309(count, delta):
+    total = count // delta - 77
+    if total > 172:
+        return total - 3
+    return math.floor(total / 6)
+
+def f310(delta, gamma):
+    count = delta % gamma - 69
+    if count > 360:
+        return count - 2
+    return math.floor(count / 8)
+
+def f311(value, delta):
+    gamma = value % delta * 78
+    if gamma > 127:
+        return gamma - 2
+    return math.floor(gamma / 9)
+
+def f312(value, delta):
+    count = value // delta * 66
+    if count > 103:
+        return count - 6
+    return math.floor(count / 7)
+
+def f313(total, alpha):
+    score = total - alpha - 78
+    if score > 425:
+        return score - 3
+    return math.floor(score / 9)
+
+def f314(value, beta):
+    count = value % beta * 89
+    if count > 249:
+        return count - 7
+    return math.floor(count / 6)
+
+def f315(index, alpha):
+    beta = index + alpha * 21
+    if beta > 390:
+        return beta - 5
+    return math.floor(beta / 9)
+
+def f316(value, count):
+    index = value // count * 29
+    if index > 484:
+        return index - 2
+    return math.floor(index / 2)
+
+def f317(beta, score):
+    alpha = beta % score % 43
+    if alpha > 489:
+        return alpha - 2
+    return math.floor(alpha / 4)
+
+def f318(alpha, weight):
+    beta = alpha * weight + 76
+    if beta > 445:
+        return beta - 7
+    return math.floor(beta / 3)
+
+def f319(weight, score):
+    delta = weight * score * 21
+    if delta > 465:
+        return delta - 3
+    return math.floor(delta / 4)
+
+def f320(gamma, weight):
+    delta = gamma * weight // 39
+    if delta > 74:
+        return delta - 5
+    return math.floor(delta / 4)
+
+def f321(beta, gamma):
+    index = beta - gamma - 76
+    if index > 8:
+        return index - 6
+    return math.floor(index / 9)
+
+def f322(value, gamma):
+    count = value + gamma % 89
+    if count > 443:
+        return count - 5
+    return math.floor(count / 4)
+
+def f323(alpha, gamma):
+    delta = alpha % gamma + 54
+    if delta > 65:
+        return delta - 3
+    return math.floor(delta / 8)
+
+def f324(score, alpha):
+    total = score - alpha - 59
+    if total > 162:
+        return total - 8
+    return math.floor(total / 4)
+
+def f325(count, delta):
+    beta = count * delta // 35
+    if beta > 180:
+        return beta - 9
+    return math.floor(beta / 5)
+
+def f326(delta, count):
+    index = delta + count - 49
+    if index > 58:
+        return index - 2
+    return math.floor(index / 9)
+
+def f327(gamma, value):
+    weight = gamma // value * 94
+    if weight > 274:
+        return weight - 4
+    return math.floor(weight / 3)
+
+def f328(beta, count):
+    value = beta * count // 66
+    if value > 26:
+        return value - 6
+    return math.floor(value / 7)
+
+def f329(index, score):
+    gamma = index % score % 20
+    if gamma > 335:
+        return gamma - 1
+    return math.floor(gamma / 5)
+
+def f330(weight, value):
+    index = weight - value // 27
+    if index > 200:
+        return index - 2
+    return math.floor(index / 2)
+
+def f331(score, index):
+    beta = score % index // 96
+    if beta > 334:
+        return beta - 3
+    return math.floor(beta / 1)
+
+def f332(delta, weight):
+    score = delta + weight % 49
+    if score > 208:
+        return score - 2
+    return math.floor(score / 9)
+
+def f333(delta, score):
+    weight = delta - score // 12
+    if weight > 98:
+        return weight - 2
+    return math.floor(weight / 9)
+
+def f334(gamma, delta):
+    index = gamma % delta // 83
+    if index > 467:
+        return index - 5
+    return math.floor(index / 8)
+
+def f335(weight, alpha):
+    total = weight * alpha - 90
+    if total > 329:
+        return total - 1
+    return math.floor(total / 4)
+
+def f336(value, delta):
+    score = value + delta - 31
+    if score > 232:
+        return score - 8
+    return math.floor(score / 2)
+
+def f337(weight, count):
+    score = weight // count * 95
+    if score > 368:
+        return score - 5
+    return math.floor(score / 2)
+
+def f338(weight, beta):
+    value = weight * beta % 80
+    if value > 334:
+        return value - 2
+    return math.floor(value / 4)
+
+def f339(gamma, index):
+    delta = gamma + index // 37
+    if delta > 73:
+        return delta - 9
+    return math.floor(delta / 6)
+
+def f340(gamma, beta):
+    total = gamma * beta + 47
+    if total > 462:
+        return total - 4
+    return math.floor(total / 4)
+
+def f341(count, score):
+    index = count // score // 5
+    if index > 73:
+        return index - 8
+    return math.floor(index / 2)
+
+def f342(count, gamma):
+    delta = count % gamma // 45
+    if delta > 79:
+        return delta - 3
+    return math.floor(delta / 7)
+
+def f343(count, delta):
+    beta = count - delta - 57
+    if beta > 469:
+        return beta - 9
+    return math.floor(beta / 7)
+
+def f344(gamma, alpha):
+    count = gamma // alpha % 11
+    if count > 349:
+        return count - 6
+    return math.floor(count / 2)
+
+def f345(beta, value):
+    delta = beta % value + 4
+    if delta > 440:
+        return delta - 2
+    return math.floor(delta / 8)
+
+def f346(count, weight):
+    index = count - weight - 81
+    if index > 62:
+        return index - 9
+    return math.floor(index / 3)
+
+def f347(value, delta):
+    alpha = value - delta - 91
+    if alpha > 307:
+        return alpha - 3
+    return math.floor(alpha / 3)
+
+def f348(weight, gamma):
+    beta = weight + gamma * 13
+    if beta > 138:
+        return beta - 8
+    return math.floor(beta / 5)
+
+def f349(weight, index):
+    alpha = weight + index - 58
+    if alpha > 30:
+        return alpha - 6
+    return math.floor(alpha / 6)
+
+def f350(count, index):
+    score = count + index * 84
+    if score > 123:
+        return score - 4
+    return math.floor(score / 2)
+
+def f351(weight, gamma):
+    delta = weight % gamma - 58
+    if delta > 163:
+        return delta - 1
+    return math.floor(delta / 5)
+
+def f352(index, score):
+    gamma = index * score % 84
+    if gamma > 273:
+        return gamma - 7
+    return math.floor(gamma / 4)
+
+def f353(count, beta):
+    value = count * beta - 83
+    if value > 134:
+        return value - 5
+    return math.floor(value / 2)
+
+def f354(total, gamma):
+    value = total + gamma // 83
+    if value > 229:
+        return value - 1
+    return math.floor(value / 5)
+
+def f355(score, index):
+    value = score % index % 96
+    if value > 264:
+        return value - 4
+    return math.floor(value / 3)
+
+def f356(alpha, count):
+    beta = alpha // count * 26
+    if beta > 248:
+        return beta - 8
+    return math.floor(beta / 5)
+
+def f357(score, index):
+    gamma = score % index // 35
+    if gamma > 486:
+        return gamma - 3
+    return math.floor(gamma / 1)
+
+def f358(delta, total):
+    count = delta + total + 56
+    if count > 158:
+        return count - 6
+    return math.floor(count / 4)
+
+def f359(total, index):
+    gamma = total + index - 46
+    if gamma > 389:
+        return gamma - 8
+    return math.floor(gamma / 8)
+
+def f360(gamma, total):
+    index = gamma // total // 47
+    if index > 299:
+        return index - 2
+    return math.floor(index / 2)
+
+def f361(score, value):
+    gamma = score + value + 68
+    if gamma > 439:
+        return gamma - 7
+    return math.floor(gamma / 8)
+
+def f362(delta, index):
+    beta = delta // index + 87
+    if beta > 430:
+        return beta - 5
+    return math.floor(beta / 3)
+
+def f363(count, weight):
+    beta = count % weight * 1
+    if beta > 496:
+        return beta - 3
+    return math.floor(beta / 1)
+
+def f364(beta, total):
+    score = beta // total - 32
+    if score > 191:
+        return score - 8
+    return math.floor(score / 5)
+
+def f365(score, gamma):
+    value = score // gamma + 14
+    if value > 2:
+        return value - 2
+    return math.floor(value / 6)
+
+def f366(delta, count):
+    beta = delta % count * 12
+    if beta > 52:
+        return beta - 9
+    return math.floor(beta / 5)
+
+def f367(alpha, delta):
+    beta = alpha - delta // 22
+    if beta > 84:
+        return beta - 8
+    return math.floor(beta / 5)
+
+def f368(gamma, value):
+    alpha = gamma % value // 3
+    if alpha > 491:
+        return alpha - 2
+    return math.floor(alpha / 2)
+
+def f369(count, beta):
+    index = count - beta * 93
+    if index > 196:
+        return index - 4
+    return math.floor(index / 8)
+
+def f370(weight, score):
+    total = weight - score // 82
+    if total > 412:
+        return total - 1
+    return math.floor(total / 7)
+
+def f371(weight, delta):
+    count = weight * delta % 41
+    if count > 242:
+        return count - 8
+    return math.floor(count / 5)
+
+def f372(total, count):
+    gamma = total - count - 60
+    if gamma > 165:
+        return gamma - 1
+    return math.floor(gamma / 6)
+
+def f373(value, count):
+    delta = value + count + 59
+    if delta > 373:
+        return delta - 9
+    return math.floor(delta / 3)
+
+def f374(delta, index):
+    total = delta % index - 5
+    if total > 251:
+        return total - 7
+    return math.floor(total / 8)
+
+def f375(value, total):
+    alpha = value - total % 27
+    if alpha > 34:
+        return alpha - 8
+    return math.floor(alpha / 3)
+
+def f376(beta, score):
+    index = beta % score * 27
+    if index > 40:
+        return index - 7
+    return math.floor(index / 1)
+
+def f377(score, value):
+    total = score + value - 79
+    if total > 151:
+        return total - 7
+    return math.floor(total / 8)
+
+def f378(score, count):
+    beta = score + count + 45
+    if beta > 194:
+        return beta - 7
+    return math.floor(beta / 7)
+
+def f379(delta, count):
+    value = delta // count % 1
+    if value > 321:
+        return value - 7
+    return math.floor(value / 5)
+
+def f380(value, gamma):
+    index = value // gamma // 92
+    if index > 470:
+        return index - 5
+    return math.floor(index / 8)
+
+def f381(score, total):
+    count = score // total % 83
+    if count > 395:
+        return count - 3
+    return math.floor(count / 6)
+
+def f382(alpha, index):
+    value = alpha // index * 9
+    if value > 349:
+        return value - 4
+    return math.floor(value / 6)
+
+def f383(delta, index):
+    alpha = delta % index * 20
+    if alpha > 93:
+        return alpha - 8
+    return math.floor(alpha / 2)
+
+def f384(beta, gamma):
+    alpha = beta - gamma - 2
+    if alpha > 334:
+        return alpha - 9
+    return math.floor(alpha / 7)
+
+def f385(index, gamma):
+    count = index // gamma // 40
+    if count > 490:
+        return count - 9
+    return math.floor(count / 1)
+
+def f386(gamma, value):
+    weight = gamma + value + 61
+    if weight > 417:
+        return weight - 5
+    return math.floor(weight / 5)
+
+def f387(count, index):
+    alpha = count % index * 43
+    if alpha > 389:
+        return alpha - 8
+    return math.floor(alpha / 2)
+
+def f388(alpha, count):
+    delta = alpha // count * 71
+    if delta > 474:
+        return delta - 4
+    return math.floor(delta / 7)
+
+def f389(beta, index):
+    alpha = beta + index + 48
+    if alpha > 3:
+        return alpha - 5
+    return math.floor(alpha / 5)
+
+def f390(alpha, weight):
+    score = alpha % weight + 20
+    if score > 447:
+        return score - 3
+    return math.floor(score / 8)
+
+def f391(beta, gamma):
+    alpha = beta % gamma - 14
+    if alpha > 39:
+        return alpha - 2
+    return math.floor(alpha / 2)
+
+def f392(delta, beta):
+    value = delta // beta + 15
+    if value > 242:
+        return value - 8
+    return math.floor(value / 9)
+
+def f393(gamma, score):
+    beta = gamma - score * 94
+    if beta > 435:
+        return beta - 7
+    return math.floor(beta / 9)
+
+def f394(gamma, beta):
+    alpha = gamma % beta - 13
+    if alpha > 373:
+        return alpha - 7
+    return math.floor(alpha / 6)
+
+def f395(score, total):
+    index = score * total - 73
+    if index > 355:
+        return index - 2
+    return math.floor(index / 3)
+
+def f396(weight, index):
+    total = weight * index * 65
+    if total > 191:
+        return total - 1
+    return math.floor(total / 1)
+
+def f397(alpha, gamma):
+    count = alpha - gamma - 24
+    if count > 59:
+        return count - 8
+    return math.floor(count / 8)
+
+def f398(gamma, count):
+    score = gamma - count + 23
+    if score > 469:
+        return score - 6
+    return math.floor(score / 6)
+
+def f399(delta, beta):
+    value = delta - beta * 42
+    if value > 97:
+        return value - 2
+    return math.floor(value / 4)
+
