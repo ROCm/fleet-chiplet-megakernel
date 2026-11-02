@@ -17,7 +17,9 @@
 #include "mirage/kernel/task_register.h"
 #include "mirage/transpiler/utils.h"
 #include "mirage/utils/json_utils.h"
+#include <algorithm>
 #include <queue>
+#include <set>
 
 namespace mirage {
 namespace kernel {
@@ -184,6 +186,12 @@ void register_mugraph(
   kn::KNCustomizedOp const *pre_op = nullptr;
   std::map<dim3, TaskId, Dim3Comparator> pre_task_map;
   std::unordered_set<size_t> nvshmem_events_idx;
+  // DeepSeek-V2-Lite DAG registration (design D12a): per op, the ops that wrote each tensor guid, its ancestors, its
+  // output TB ops and its position, so an op may consume tensors of any earlier op (DAG), not only the previous one.
+  std::map<type::GuidType, std::vector<kn::KNOperator *>> ds_writers;
+  std::map<kn::KNOperator *, std::set<kn::KNOperator *>> ds_ancestors;
+  std::map<kn::KNOperator *, std::vector<tb::TBInputOp *>> ds_outputs;
+  std::map<kn::KNOperator *, size_t> ds_index;
   for (auto const &op : graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
       continue;
@@ -211,6 +219,40 @@ void register_mugraph(
         input_ops.push_back(static_cast<tb::TBInputOp *>(op));
       } else {
         output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+      }
+    }
+    // Decision 12a: producers = writers of this op's input tensors minus writers that are ancestors of another writer.
+    // For a straight chain that is {previous op}, and Fleet's code below runs unchanged.
+    std::vector<kn::KNOperator *> ds_producers;
+    {
+      std::set<kn::KNOperator *> writers;
+      for (auto const &input : input_ops) {
+        auto it = ds_writers.find(input->dtensor.guid);
+        if (it != ds_writers.end()) {
+          writers.insert(it->second.begin(), it->second.end());
+        }
+      }
+      std::set<kn::KNOperator *> ancestors = writers;
+      for (auto p : writers) {
+        ancestors.insert(ds_ancestors[p].begin(), ds_ancestors[p].end());
+      }
+      for (auto p : writers) {
+        bool reached = false;
+        for (auto q : writers) {
+          reached = reached || (q != p && ds_ancestors[q].count(p) > 0);
+        }
+        if (!reached) {
+          ds_producers.push_back(p);
+        }
+      }
+      std::sort(ds_producers.begin(), ds_producers.end(),
+                [&](kn::KNOperator *a, kn::KNOperator *b) { return ds_index[a] < ds_index[b]; });
+      size_t idx = ds_index.size();
+      ds_index[op] = idx;
+      ds_ancestors[op] = ancestors;
+      ds_outputs[op] = output_ops;
+      for (auto const &output : output_ops) {
+        ds_writers[output->dtensor.guid].push_back(op);
       }
     }
     // Specical handling for ALLREDUCE
@@ -401,6 +443,13 @@ void register_mugraph(
             task.task_metadata.expert_offset =
                 (int)((bid.y << 16) | (bid.x & 0xFFFF));
           }
+          // DeepSeek-V2-Lite tasks that read bid: x = low 16 bits, y = high 16 bits
+          if (task_type == TASK_GEMV_BF16 || task_type == TASK_ATTN_CHUNK_192_128 ||
+              task_type == TASK_ATTN_MERGE || task_type == TASK_MOE_EXPERT_W13_SILU ||
+              task_type == TASK_MOE_EXPERT_W2) {
+            task.task_metadata.expert_offset =
+                (int)((bid.y << 16) | (bid.x & 0xFFFF));
+          }
           // Set gang task metadata: n_tile_count = tiles per XCD
           if (task_type == TASK_GANG_LINEAR_MI300 ||
               task_type == TASK_GANG_LINEAR_N_TILING_MI300 ||
@@ -496,8 +545,81 @@ void register_mugraph(
         }
       }
     }
+    // Decision 12a: a task still waits on ONE dependent event and triggers ONE event. Producers other than {previous op}:
+    // (a) all producer tasks already trigger one event whose launched range ends here -> fan-out, extend its range;
+    // (b) one producer -> Fleet's gcd event code below, against that producer instead of the previous op;
+    // (c) several producers -> one event launching this op, num_triggers = every producer task.
+    bool ds_handled = false;
+    if (pre_op != nullptr && !(ds_producers.size() == 1 && ds_producers[0] == pre_op)) {
+      assert(!ds_producers.empty() && "decision 12a: an op after the first must read a tensor an earlier op wrote");
+      auto ds_push_tasks = [&]() {
+        dim3 b;
+        for (b.x = 0; b.x < bgraph.grid_dim.x; b.x++) {
+          for (b.y = 0; b.y < bgraph.grid_dim.y; b.y++) {
+            for (b.z = 0; b.z < bgraph.grid_dim.z; b.z++) {
+              cur_task_map[b] = all_tasks.size();
+              all_tasks.push_back(tasks[b.x * bgraph.grid_dim.y * bgraph.grid_dim.z + b.y * bgraph.grid_dim.z + b.z]);
+            }
+          }
+        }
+      };
+      EventId shared = EVENT_INVALID_ID;
+      bool same = true;
+      int n_prod = 0;
+      for (auto p : ds_producers) {
+        for (auto const &it : all_task_maps.at(p)) {
+          EventId e = all_tasks[it.second].trigger_event;
+          if (n_prod++ == 0) {
+            shared = e;
+          } else if (e != shared) {
+            same = false;
+          }
+        }
+      }
+      auto massive = [](EventDesc const &e) {
+        return e.last_task_id >= e.first_task_id + 8 ? EVENT_LAUNCH_MASSIVE_TASKS : EVENT_LAUNCH_TASKS;
+      };
+      if (same && shared != EVENT_INVALID_ID) {  // (a)
+        EventDesc &ev = all_events[shared & 0xffffffff];
+        assert(ev.num_triggers == n_prod && ev.last_task_id == all_tasks.size() &&
+               "decision 12a fan-out: consumers of one event must be adjacent and read all of its producers");
+        ds_push_tasks();
+        ev.last_task_id = all_tasks.size();
+        ev.event_type = massive(ev);
+        ds_handled = true;
+      } else {
+        for (auto p : ds_producers) {
+          for (auto const &it : all_task_maps.at(p)) {
+            assert(all_tasks[it.second].trigger_event == EVENT_INVALID_ID &&
+                   "decision 12a: a producer task already triggers another event (unsupported fan-out shape)");
+          }
+        }
+        if (ds_producers.size() == 1) {  // (b)
+          pre_op = dynamic_cast<kn::KNCustomizedOp const *>(ds_producers[0]);
+          pre_output_ops = ds_outputs.at(ds_producers[0]);
+          pre_task_map = all_task_maps.at(ds_producers[0]);
+        } else {  // (c)
+          EventDesc ev;
+          ev.num_triggers = 0;
+          ev.first_task_id = all_tasks.size();
+          ds_push_tasks();
+          ev.last_task_id = all_tasks.size();
+          for (auto p : ds_producers) {
+            for (auto const &it : all_task_maps.at(p)) {
+              all_tasks[it.second].trigger_event = get_event_id(my_gpu_id, all_events.size(), false /*nvshmem_event*/);
+              ev.num_triggers++;
+            }
+          }
+          ev.event_type = massive(ev);
+          all_events.push_back(ev);
+          ds_handled = true;
+        }
+      }
+    }
     // Step 2: create events between operators
-    if (pre_op == nullptr) {
+    if (ds_handled) {
+      // events and tasks added above (decision 12a)
+    } else if (pre_op == nullptr) {
       dim3 bid;
       for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
         for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
@@ -587,8 +709,16 @@ void register_mugraph(
           get_event_id(my_gpu_id, all_events.size(), false /*nvshmem_event*/);
     }
   }
+  // Decision 12a: in a DAG an op whose outputs nobody reads is a sink too; its tasks also trigger the END event.
+  int ds_sinks = 0;
+  for (size_t t = 2; t < all_tasks.size(); t++) {
+    if (all_tasks[t].trigger_event == EVENT_INVALID_ID) {
+      all_tasks[t].trigger_event = get_event_id(my_gpu_id, all_events.size(), false /*nvshmem_event*/);
+      ds_sinks++;
+    }
+  }
   all_events.push_back(
-      EventDesc(EVENT_END_OF_TASK_GRAPH, pre_task_map.size(), 0, 0));
+      EventDesc(EVENT_END_OF_TASK_GRAPH, pre_task_map.size() + ds_sinks, 0, 0));
 
   // Prelaunch all tasks at the begining of an iteration
   all_events[1].first_task_id = 2;
@@ -707,6 +837,16 @@ TaskGraphResult print_task_graph(
     }
   }
   code.e("#include \"persistent_kernel.cuh\"");
+  {
+    // DeepSeek-V2-Lite tasks: include/mirage/persistent_kernel/kernels/
+    TaskRegister *tr = TaskRegister::get_instance();
+    for (auto const &t : tr->all_task_variants) {
+      if (t.first >= TASK_GEMV_BF16 && t.first < TASK_DS_END) {
+        code.e("#include \"kernels/fleet_dispatch.cuh\"");
+        break;
+      }
+    }
+  }
   if (use_json_format) {
     code.e("#include <nlohmann/json.hpp>");
     code.e("#include <fstream>");
@@ -856,35 +996,45 @@ TaskGraphResult print_task_graph(
   if (use_json_format) {
     code.e("std::map<std::string, void*> all_tensors;");
   }
+  // Tensor names are C++ identifiers below but string keys in all_tensors: dots (e.g. "L0.mlp.w13",
+  // fleet_ds/mirage_graph.py) are legal keys, not identifiers, so the variable uses '_' instead.
+  auto ident = [](std::string s) {
+    for (auto &c : s) {
+      if (c == '.') {
+        c = '_';
+      }
+    }
+    return s;
+  };
   for (auto const &iter : io_configs) {
     IODesc desc = iter.second;
     switch (desc.type) {
       case IODesc::TorchTensor: {
-        code.e("char *$ = (char*)($);", desc.name, desc.torch_data_ptr);
+        code.e("char *$ = (char*)($);", ident(desc.name), desc.torch_data_ptr);
         if (use_json_format) {
-          code.e("all_tensors[\"$\"] = $;", desc.name, desc.name);
+          code.e("all_tensors[\"$\"] = $;", desc.name, ident(desc.name));
         }
         break;
       }
       case IODesc::FusedTorchTensor: {
         for (auto const &sdesc : desc.sub_descs) {
-          code.e("char *$ = (char*)($);", sdesc.name, sdesc.torch_data_ptr);
+          code.e("char *$ = (char*)($);", ident(sdesc.name), sdesc.torch_data_ptr);
           if (use_json_format) {
-            code.e("all_tensors[\"$\"] = $;", sdesc.name, sdesc.name);
+            code.e("all_tensors[\"$\"] = $;", sdesc.name, ident(sdesc.name));
           }
         }
         break;
       }
       case IODesc::CUDAMallocTensor: {
-        code.e("void *$;", desc.name);
+        code.e("void *$;", ident(desc.name));
         size_t size = mirage::type::get_datatype_size(
             static_cast<type::DataType>(desc.tensor.data_type));
         for (int i = 0; i < desc.tensor.num_dims; i++) {
           size *= desc.tensor.dim[i];
         }
-        code.e("CUDA_CHECK(cudaMalloc(&$, $));", desc.name, size);
+        code.e("CUDA_CHECK(cudaMalloc(&$, $));", ident(desc.name), size);
         if (use_json_format) {
-          code.e("all_tensors[\"$\"] = $;", desc.name, desc.name);
+          code.e("all_tensors[\"$\"] = $;", desc.name, ident(desc.name));
         }
         break;
       }
@@ -1558,6 +1708,18 @@ TaskGraphResult print_task_graph(
       "TASK_KV_CACHE_UPDATE_MI300";
   task_type_to_name[TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300] =
       "TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300";
+  // DeepSeek-V2-Lite tasks (src/kernel/ds_task_register.cc)
+  task_type_to_name[TASK_GEMV_BF16] = "TASK_GEMV_BF16";
+  task_type_to_name[TASK_GEMV_BF16_SILU] = "TASK_GEMV_BF16_SILU";
+  task_type_to_name[TASK_GEMV_BF16_RES] = "TASK_GEMV_BF16_RES";
+  task_type_to_name[TASK_GEMV_SPLITK] = "TASK_GEMV_SPLITK";
+  task_type_to_name[TASK_MLA_PREP] = "TASK_MLA_PREP";
+  task_type_to_name[TASK_ATTN_CHUNK_192_128] = "TASK_ATTN_CHUNK_192_128";
+  task_type_to_name[TASK_ATTN_MERGE] = "TASK_ATTN_MERGE";
+  task_type_to_name[TASK_MOE_TOPK] = "TASK_MOE_TOPK";
+  task_type_to_name[TASK_MOE_EXPERT_W13_SILU] = "TASK_MOE_EXPERT_W13_SILU";
+  task_type_to_name[TASK_MOE_EXPERT_W2] = "TASK_MOE_EXPERT_W2";
+  task_type_to_name[TASK_MOE_COMBINE] = "TASK_MOE_COMBINE";
   code.e("__device__ __forceinline__");
   code.e("void _execute_task(TaskDesc const* task_desc,");
   code.e("                   RuntimeConfig const &runtime_config) {");
