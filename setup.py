@@ -275,7 +275,7 @@ try:
         cwd=build_dir,
         env=os.environ.copy(),
     )
-    subprocess.check_call(["make", "-j8"], cwd=build_dir, env=os.environ.copy())
+    subprocess.check_call(["make", "-j" + os.environ.get("MAX_JOBS", "8")], cwd=build_dir, env=os.environ.copy())  # MAX_JOBS: RAM-limited hosts
     print("Mirage runtime library built successfully.")
 except subprocess.CalledProcessError as e:
     print("Failed to build runtime library.")
