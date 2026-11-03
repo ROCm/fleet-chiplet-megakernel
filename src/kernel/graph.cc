@@ -436,6 +436,12 @@ DTensor *Graph::shuffle_tensors(std::vector<DTensor const *> inputs,
   return shuffled;
 }
 
+// src/kernel/ds_task_register.cc (DeepSeek-V2-Lite tasks, demo/deepseek_v2_lite)
+bool ds_register_task(std::string const &name,
+                      threadblock::Graph const &bgraph,
+                      std::vector<int> const &params,
+                      std::tuple<int, int, runtime::TaskType, int> &cfg);
+
 void Graph::register_task(char const *task_type, std::vector<int> params) {
   std::string name = std::string(task_type);
   KNOperator const *op = operators.back();
@@ -841,6 +847,8 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(3, 1, TASK_MOE_MUL_SUM_ADD_MI300, variant_id);
+  } else if (ds_register_task(name, customized->bgraph, params, task_config[op])) {
+    // DeepSeek-V2-Lite tasks: src/kernel/ds_task_register.cc
   } else {
     printf("Unsupported task name: %s\n", name.c_str());
     assert(false && "Unsupported task type");
